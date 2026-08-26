@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use scribe_common::protocol::{
     CiJob, CiJobStep, CiRunConclusion, CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun,
-    CiWorkflowStatus,
+    CiWorkflowStatus, MAX_CI_TRACKED_HEADS,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
@@ -30,6 +30,10 @@ const MAX_REPOSITORY_ROOTS: usize = 64;
 /// Bound on a workflow run's triggering event, kept well above the longest
 /// event GitHub documents so two distinct events cannot dedup into one key.
 const MAX_EVENT_BYTES: usize = 64;
+
+/// One tracked head of one repository. Windows are per head, so branches that
+/// run at the same time each keep their own bar.
+type WindowKey = (GithubRepository, String);
 
 /// Dedup identity of a workflow run at one head: the workflow file plus the
 /// event that triggered it, so a `push` and a `pull_request` run of the same
@@ -637,6 +641,7 @@ struct PollWindow {
     repository: GithubRepository,
     roots: BTreeSet<PathBuf>,
     head_sha: String,
+    opened_at: Instant,
     discovery_deadline: Option<Instant>,
     next_attempt: Instant,
     etag: Option<String>,
@@ -659,6 +664,7 @@ impl PollWindow {
             repository,
             roots: BTreeSet::from([root]),
             head_sha,
+            opened_at: now,
             discovery_deadline: now.checked_add(DISCOVERY_WINDOW),
             next_attempt: now,
             etag: None,
@@ -783,7 +789,7 @@ enum PollStep {
 
 #[derive(Default)]
 pub struct GithubCiTracker {
-    windows: HashMap<GithubRepository, PollWindow>,
+    windows: HashMap<WindowKey, PollWindow>,
     details: HashMap<(PathBuf, String), DetailTrace>,
     scheduler: PollScheduler,
     token: Option<SecretToken>,
@@ -801,9 +807,8 @@ impl GithubCiTracker {
             );
             return None;
         };
-        if let Some(window) = self.windows.get_mut(&repository)
-            && window.head_sha == push.head_sha
-        {
+        let key = (repository, push.head_sha.clone());
+        if let Some(window) = self.windows.get_mut(&key) {
             if window.roots.len() < MAX_REPOSITORY_ROOTS {
                 window.roots.insert(push.repository_root);
             }
@@ -826,23 +831,44 @@ impl GithubCiTracker {
                 publications: Vec::new(),
             });
         }
-        let mut roots = BTreeSet::from([push.repository_root.clone()]);
-        self.details.retain(|_, trace| trace.repository != repository);
-        let publications = self.windows.remove(&repository).map_or_else(Vec::new, |previous| {
-            roots.extend(previous.roots.iter().take(MAX_REPOSITORY_ROOTS).cloned());
-            previous.observed.map_or_else(Vec::new, |state| {
-                publications(&previous.roots, &CiRunDelta::Cleared { head_sha: state.head_sha })
-            })
-        });
-        let mut window =
-            PollWindow::new(repository.clone(), push.repository_root, push.head_sha, now);
-        window.roots = roots;
-        self.windows.insert(repository, window);
+        // A concurrent head keeps its own window, so several branches or
+        // worktrees can run at once. Only the head cap retires one.
+        self.windows.insert(
+            key.clone(),
+            PollWindow::new(key.0.clone(), push.repository_root, push.head_sha, now),
+        );
+        let publications = self.retire_oldest_heads(&key.0);
         Some(PushResult {
             #[cfg(test)]
             new_head: true,
             publications,
         })
+    }
+
+    /// Keep at most [`MAX_CI_TRACKED_HEADS`] windows per repository, retiring
+    /// the heads opened first and clearing whatever they published.
+    fn retire_oldest_heads(&mut self, repository: &GithubRepository) -> Vec<(PathBuf, CiRunDelta)> {
+        let mut opened = self
+            .windows
+            .iter()
+            .filter(|((tracked, _), _)| tracked == repository)
+            .map(|(key, window)| (window.opened_at, key.clone()))
+            .collect::<Vec<_>>();
+        if opened.len() <= MAX_CI_TRACKED_HEADS {
+            return Vec::new();
+        }
+        opened.sort_unstable_by_key(|(opened_at, _)| *opened_at);
+        opened
+            .drain(..opened.len() - MAX_CI_TRACKED_HEADS)
+            .filter_map(|(_, key)| self.windows.remove(&key).map(|window| (key, window)))
+            .flat_map(|(key, window)| {
+                // Roots as well as head: a fork and its upstream are separate
+                // repositories that share commit SHAs.
+                self.details
+                    .retain(|(root, head), _| head != &key.1 || !window.roots.contains(root));
+                publications(&window.roots, &CiRunDelta::Cleared { head_sha: key.1 })
+            })
+            .collect()
     }
 
     // @lat: [[server#Sessions#GitHub Actions Tracking]]
@@ -934,7 +960,7 @@ impl GithubCiTracker {
 
     async fn poll_run(
         &mut self,
-        key: GithubRepository,
+        key: WindowKey,
         now: Instant,
         observed_epoch_secs: u64,
         api: &dyn GithubApi,
@@ -987,12 +1013,12 @@ impl GithubCiTracker {
             ),
             Ok(ApiResponse::Jobs { .. }) => Vec::new(),
             Err(ApiError::Authentication) => {
-                warn!(repository = %key.full_name(), "GitHub CI polling lost authentication; stopping window");
+                warn!(repository = %key.0.full_name(), head = %key.1, "GitHub CI polling lost authentication; stopping window");
                 self.token = None;
                 self.stop_failed_window(&key)
             }
             Err(ApiError::Permission) => {
-                warn!(repository = %key.full_name(), "GitHub CI account cannot read repository Actions; stopping window");
+                warn!(repository = %key.0.full_name(), head = %key.1, "GitHub CI account cannot read repository Actions; stopping window");
                 self.stop_failed_window(&key)
             }
             Err(ApiError::RateLimited(delay)) => {
@@ -1095,7 +1121,7 @@ impl GithubCiTracker {
 
     fn apply_runs(
         &mut self,
-        key: &GithubRepository,
+        key: &WindowKey,
         observation: RunsObservation,
     ) -> Vec<(PathBuf, CiRunDelta)> {
         let Some(window) = self.windows.get_mut(key) else {
@@ -1137,7 +1163,7 @@ impl GithubCiTracker {
                 .or(Some(observation.epoch_secs));
         }
         let state = CiRunState {
-            repository: key.full_name(),
+            repository: key.0.full_name(),
             head_sha: window.head_sha.clone(),
             branch: observation.branch,
             rollup: aggregate_status(&workflows),
@@ -1149,7 +1175,7 @@ impl GithubCiTracker {
         }
         window.observed = Some(state.clone());
         // A terminal head stops polling but stays tracked, so a later same-OID
-        // generation reopens it in place rather than starting blind.
+        // generation reopens it in place and the head cap can retire it.
         let terminal = matches!(
             state.rollup,
             CiRunStatus::Success | CiRunStatus::Failure | CiRunStatus::Cancelled
@@ -1160,7 +1186,7 @@ impl GithubCiTracker {
 
     fn mark_stale_or_backoff(
         &mut self,
-        key: &GithubRepository,
+        key: &WindowKey,
         now: Instant,
     ) -> Vec<(PathBuf, CiRunDelta)> {
         let Some(window) = self.windows.get_mut(key) else {
@@ -1169,7 +1195,7 @@ impl GithubCiTracker {
         window.next_attempt = now + window.offline_backoff;
         window.offline_backoff = (window.offline_backoff * 2).min(Duration::from_secs(30));
         if !window.transient_logged {
-            warn!(repository = %key.full_name(), "GitHub CI request failed; retrying with bounded backoff");
+            warn!(repository = %key.0.full_name(), head = %key.1, "GitHub CI request failed; retrying with bounded backoff");
             window.transient_logged = true;
         }
         let Some(mut state) = window.observed.clone() else {
@@ -1183,7 +1209,7 @@ impl GithubCiTracker {
         publications(&window.roots, &CiRunDelta::Set(state))
     }
 
-    fn stop_failed_window(&mut self, key: &GithubRepository) -> Vec<(PathBuf, CiRunDelta)> {
+    fn stop_failed_window(&mut self, key: &WindowKey) -> Vec<(PathBuf, CiRunDelta)> {
         let Some(window) = self.windows.remove(key) else {
             return Vec::new();
         };
@@ -1282,7 +1308,7 @@ impl GithubCiTracker {
                 state.stale = false;
                 state
             });
-            tracker.windows.insert(saved.repository, window);
+            tracker.windows.insert((saved.repository, window.head_sha.clone()), window);
         }
         tracker
     }
@@ -1299,23 +1325,35 @@ impl GithubCiTracker {
     }
 
     #[cfg(test)]
-    fn roots_for(&self, full_name: &str) -> Vec<PathBuf> {
+    fn roots_for(&self, full_name: &str, head_sha: &str) -> Vec<PathBuf> {
         self.windows
             .iter()
-            .find(|(repository, _)| repository.full_name() == full_name)
+            .find(|((repository, head), _)| repository.full_name() == full_name && head == head_sha)
             .map_or_else(Vec::new, |(_, window)| window.roots.iter().cloned().collect())
+    }
+
+    #[cfg(test)]
+    fn heads_for(&self, full_name: &str) -> Vec<String> {
+        let mut heads = self
+            .windows
+            .keys()
+            .filter(|(repository, _)| repository.full_name() == full_name)
+            .map(|(_, head)| head.clone())
+            .collect::<Vec<_>>();
+        heads.sort();
+        heads
     }
 
     #[cfg(test)]
     fn head_for(&self, full_name: &str) -> Option<&str> {
         self.windows
             .iter()
-            .find(|(repository, _)| repository.full_name() == full_name)
+            .find(|((repository, _), _)| repository.full_name() == full_name)
             .map(|(_, window)| window.head_sha.as_str())
     }
 }
 
-fn warn_tracker_error(repository: &GithubRepository, error: &ApiError, observed: bool) {
+fn warn_tracker_error(key: &WindowKey, error: &ApiError, observed: bool) {
     let reason = match error {
         ApiError::Authentication => "gh is unavailable or not authenticated for github.com",
         ApiError::Permission => "the active GitHub account cannot read this repository's Actions",
@@ -1324,7 +1362,7 @@ fn warn_tracker_error(repository: &GithubRepository, error: &ApiError, observed:
         ApiError::Transient => "the GitHub API is temporarily unavailable",
         ApiError::RateLimited(_) => "GitHub API rate limit delayed polling",
     };
-    warn!(repository = %repository.full_name(), observed, reason, "GitHub CI window stopped");
+    warn!(repository = %key.0.full_name(), head = %key.1, observed, reason, "GitHub CI window stopped");
 }
 
 /// Start the dormant push-gated tracker. Construction performs no subprocess
@@ -1622,9 +1660,9 @@ mod tests {
         );
     }
 
-    // @lat: [[test#GitHub CI Tracking#Shared latest-head window]]
+    // @lat: [[test#GitHub CI Tracking#Concurrent head windows]]
     #[test]
-    fn same_remote_repo_deduplicates_roots_and_latest_head_replaces_old_window() {
+    fn one_head_shares_roots_while_concurrent_heads_track_side_by_side() {
         let now = Instant::now();
         let mut tracker = GithubCiTracker::default();
         assert!(
@@ -1641,20 +1679,56 @@ mod tests {
         );
         assert_eq!(tracker.window_count(), 1);
         assert_eq!(
-            tracker.roots_for("acme/widget"),
+            tracker.roots_for("acme/widget", "head-a"),
             vec![std::path::PathBuf::from("/a"), std::path::PathBuf::from("/b")]
         );
 
-        assert!(
-            tracker
-                .accept_push(
-                    push("ssh://git@github.com/acme/widget", "/b", "head-b"),
-                    now + Duration::from_secs(1),
-                )
-                .unwrap()
-                .new_head
+        let second = tracker
+            .accept_push(
+                push("ssh://git@github.com/acme/widget", "/b", "head-b"),
+                now + Duration::from_secs(1),
+            )
+            .expect("second head opens its own window");
+        assert!(second.new_head);
+        assert!(second.publications.is_empty(), "a concurrent head must not clear another");
+        assert_eq!(tracker.heads_for("acme/widget"), vec!["head-a", "head-b"]);
+        assert_eq!(
+            tracker.roots_for("acme/widget", "head-b"),
+            vec![std::path::PathBuf::from("/b")],
+            "a newer head must not inherit another head's roots"
         );
-        assert_eq!(tracker.head_for("acme/widget"), Some("head-b"));
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Concurrent head windows]]
+    #[tokio::test]
+    async fn a_fourth_head_retires_the_oldest_tracked_head() {
+        let start = Instant::now();
+        let api = RunsApi::with_responses(vec![runs_response(CiWorkflowStatus::InProgress, None)]);
+        let mut tracker = GithubCiTracker::default();
+        for (offset, head) in ["head-a", "head-b", "head-c"].into_iter().enumerate() {
+            tracker.accept_push(
+                push("git@github.com:acme/widget.git", "/a", head),
+                start + Duration::from_secs(offset as u64),
+            );
+        }
+        assert_eq!(tracker.poll_one(start, 1_000, &api).await.len(), 1);
+
+        let fourth = tracker
+            .accept_push(
+                push("git@github.com:acme/widget.git", "/a", "head-d"),
+                start + Duration::from_secs(3),
+            )
+            .expect("fourth head");
+        assert_eq!(tracker.heads_for("acme/widget"), vec!["head-b", "head-c", "head-d"]);
+        assert!(
+            matches!(
+                fourth.publications.as_slice(),
+                [(root, CiRunDelta::Cleared { head_sha })]
+                    if root == std::path::Path::new("/a") && head_sha == "head-a"
+            ),
+            "the retired head must clear its own bar: {:?}",
+            fourth.publications
+        );
     }
 
     // @lat: [[test#GitHub CI Tracking#Server-wide request budget]]
@@ -2084,11 +2158,6 @@ mod tests {
         let CiRunDelta::Set(old_only) = &old_only[0].1 else { panic!("expected state") };
         assert_eq!(old_only.rollup, CiRunStatus::Failure);
         assert_eq!(
-            old_only.workflows[0].updated_at_epoch_secs,
-            Some(1_000),
-            "a run that reported no news must keep the clock the bar already shows"
-        );
-        assert_eq!(
             tracker.polling_count(),
             1,
             "an old-only response closed the generation before its new run appeared"
@@ -2123,8 +2192,36 @@ mod tests {
         assert_eq!(tracker.window_count(), 2);
 
         tracker.poll_one(start + DISCOVERY_WINDOW + Duration::from_secs(5), 1_130, &api).await;
-        assert_eq!(tracker.window_count(), 1, "the settled head outlived its generation window");
-        assert_eq!(tracker.head_for("acme/other"), Some("head-b"), "a live head must not expire");
+        assert_eq!(tracker.heads_for("acme/widget"), Vec::<String>::new());
+        assert_eq!(tracker.heads_for("acme/other"), vec!["head-b"], "a live head must not expire");
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Old-only generation response keeps polling]]
+    #[tokio::test]
+    async fn an_awaited_generation_does_not_advance_the_previous_run_clock() {
+        let start = Instant::now();
+        let failed = run(900, CiWorkflowStatus::Completed, Some(CiRunConclusion::Failure));
+        let api = RunsApi::with_responses(vec![
+            workflows_response(vec![(pushed(50), failed.clone())]),
+            workflows_response(vec![(pushed(50), failed)]),
+        ]);
+        let mut tracker = GithubCiTracker::default();
+        tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
+        tracker.poll_one(start, 1_000, &api).await;
+        tracker
+            .accept_push(
+                generation_push("git@github.com:acme/widget.git", "/a", "head-a"),
+                start + Duration::from_secs(1),
+            )
+            .expect("trusted generation");
+
+        let old_only = tracker.poll_one(start + Duration::from_secs(5), 1_005, &api).await;
+        let CiRunDelta::Set(old_only) = &old_only[0].1 else { panic!("expected state") };
+        assert_eq!(
+            old_only.workflows[0].updated_at_epoch_secs,
+            Some(1_000),
+            "a run that reported no news must keep the clock the bar already shows"
+        );
     }
 
     // @lat: [[test#GitHub CI Tracking#Every triggering event at the head]]

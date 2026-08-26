@@ -516,7 +516,8 @@ where
                 ci_runs.apply(received_root, delta);
                 if ci_runs
                     .get(repo_root)
-                    .is_some_and(|state| state.head_sha == head_sha && state.stale == stale)
+                    .iter()
+                    .any(|state| state.head_sha == head_sha && state.stale == stale)
                 {
                     return Ok(ci_run_observation(&ci_runs, repo_root, false));
                 }
@@ -546,7 +547,7 @@ fn ci_run_observation(
     repo_root: &Path,
     owner_controls: bool,
 ) -> CiRunObservation {
-    let state = ci_runs.get(repo_root).cloned();
+    let state = ci_runs.get(repo_root).first().cloned();
     let (action_mode, open_url) = state.as_ref().map_or((None, None), |state| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let model = CiBarModel::build(state, now, owner_controls);

@@ -16,10 +16,10 @@ contract and separates offline automation from the required real-GitHub gate.
 ## Goals
 
 - A workspace whose repo is hosted on github.com shows a CI bar at the top
-  of the workspace for the user's last locally pushed head commit. All
-  observed workflows contribute to a worst-status rollup. Terminal state
-  remains visible until the owner dismisses it or a later observed head
-  replaces it.
+  of the workspace for each locally pushed head still running, newest on
+  top and capped at three. All observed workflows for a head contribute to
+  that head's worst-status rollup. Terminal state remains visible until the
+  owner dismisses it or a later observed head replaces it.
 - The bar tracks the run in near-realtime: overall status, per-job progress,
   elapsed time, and completion result (success/failure/cancelled).
 - The user is notified when their own push triggers a CI run without Scribe
@@ -318,6 +318,7 @@ cheaply re-derivable after hot upgrade (constitution #2/#7).
 - `CiRunState`: trusted `owner/name`, head SHA, branch, at most 100 workflow
   entries (run id, name, status, conclusion, observation timestamps),
   worst-status rollup, and stale flag. Elapsed text is derived client-side.
+  One repository root holds one `CiRunState` per concurrently tracked head.
 - `CiRunDetails`: head-qualified jobs and steps, fetched only while a matching
   panel is open. Each workflow response is bounded to 100 jobs and each job
   to 100 steps; provider strings are truncated to 256 UTF-8 bytes.
@@ -333,15 +334,23 @@ The tracker normalizes each poll response to the newest run per workflow and
 triggering event at the pushed head, so a superseded run (a retag replacing an
 earlier attempt) never enters rollup, details, link selection, or terminal-stop
 decisions, while distinct workflows running concurrently at the same head both
-survive.
-A trusted same-OID ref event reopens a window at an unchanged head in place,
-settled or not, carrying its observed state and roots forward rather than
-clearing it; only an actual head change clears and opens a fresh window. A
-terminal head settles rather than disappearing: it stops polling and leaves
-handoff state, but stays reopenable until an expiry sweep past its own
-discovery window retires it. While a reopened generation has produced nothing
-newer than the run it already published, responses publish without settling the
-window, so a run GitHub creates a few seconds late is still adopted.
+survive. A trusted same-OID ref event reopens an active window at an unchanged
+head in place, carrying its observed state and roots forward rather than
+clearing it.
+
+Each head owns its own window and roots. A push on another branch therefore
+starts a second window rather than retiring the first, and the client stacks
+one band per tracked head. `MAX_CI_TRACKED_HEADS` in `scribe-common` caps
+every side at three heads per repository — poll windows, dismissal memory, and
+stacked bands — so the three cannot drift apart. The server retires the head
+opened first with a `Cleared` delta, and a client-side new head also retires
+that root's already-terminal heads so finished work makes way for running work.
+
+A terminal head settles rather than disappearing: it stops polling and leaves
+handoff state, but stays reopenable by a same-OID generation until an expiry
+sweep past its own discovery window retires it. Dismissal memory is per head
+for the same reason, so dismissing one stacked band cannot be undone by another
+band's ordinary refresh.
 
 Hot handoff carries active repository/head descriptors, remaining discovery
 time, roots, and last bounded run state. It never carries the GitHub token. The
@@ -432,6 +441,11 @@ evidence with an offline rerun.
   event, and no-op pushes that write no ref remain invisible. Scheduled and
   dispatched runs are visible only when they sit at a head a local push
   already opened a window for.
+- Only three heads per repository are tracked at once; a fourth push retires
+  the head opened first even if its run is still going.
+- Stacked bands and an expanded panel yield before the terminal does: a region
+  reserves at most its height less three text rows, so a short region shows
+  fewer bands rather than no terminal.
 - Terminal snapshots stop polling but stay visible in the client until owner
   dismissal or replacement by an observed later head.
 

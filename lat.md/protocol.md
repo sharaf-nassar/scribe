@@ -436,7 +436,7 @@ All three variants honour the attach-time `clipboard_gating` negotiation: the se
 
 ### CI Run State
 
-`CiRunState { repo_root, delta }` carries a bounded full replacement or head-identified clear for one repository's active pushed head.
+`CiRunState { repo_root, delta }` carries a bounded full replacement or head-identified clear for one of a repository's active pushed heads. Every delta names its head, so one root can carry up to [[crates/scribe-common/src/protocol.rs#MAX_CI_TRACKED_HEADS]] independent snapshots.
 
 The replacement contains trusted `owner/name`, head SHA, branch, at most 100 per-workflow run id/name/status/conclusion/timestamp entries, queued-to-terminal rollup, and stale overlay. Elapsed text and dismissal are derived state, not wire fields.
 
@@ -462,7 +462,7 @@ The server sends CI frames only to `ci_run_bar` participants attached to windows
 
 The server stores the dismissed `(repo_root, head_sha)`, broadcasts `Cleared { head_sha }` to every capable matching participant, and suppresses that head.
 
-A different head removes the dismissal. Clear identity lets clients ignore a delayed clear for an older head instead of erasing its replacement.
+One root can display several concurrent heads, so a root retains a dismissed head per stacked band, bounded by [[crates/scribe-common/src/protocol.rs#MAX_CI_TRACKED_HEADS]]. Another head's updates leave those dismissals untouched; a dismissal ends with its own head's `Cleared`. Clear identity lets clients ignore a delayed clear for an older head instead of erasing its replacement.
 
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries independent window and icon titles, active AI state, AI provider hint, provider task label, shell basename, session context, CWD, and detected git branch — enough to restore tab ownership and status chrome without post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 

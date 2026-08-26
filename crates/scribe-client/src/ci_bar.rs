@@ -14,7 +14,7 @@ use gpui::{
 use scribe_common::{
     protocol::{
         CiJob, CiRunConclusion, CiRunDelta, CiRunDetails, CiRunState, CiRunStatus, CiWorkflowRun,
-        CiWorkflowStatus,
+        CiWorkflowStatus, MAX_CI_TRACKED_HEADS,
     },
     theme::Theme,
 };
@@ -31,11 +31,12 @@ pub const CI_TRACE_ROW_HEIGHT: f32 = 26.0;
 /// Loading state shown immediately after expansion and before the first reply.
 pub const CI_TRACE_LOADING_HEIGHT: f32 = 54.0;
 
-/// Server-owned CI snapshots keyed by their trusted repository root.
+/// Server-owned CI snapshots keyed by their trusted repository root. One root
+/// holds one snapshot per concurrently tracked head, newest first.
 #[derive(Debug, Default)]
 pub struct CiRunBars {
-    states: HashMap<PathBuf, CiRunState>,
-    details: HashMap<PathBuf, CiRunDetails>,
+    states: HashMap<PathBuf, Vec<CiRunState>>,
+    details: HashMap<(PathBuf, String), CiRunDetails>,
 }
 
 impl CiRunBars {
@@ -43,42 +44,69 @@ impl CiRunBars {
     pub fn apply(&mut self, repo_root: PathBuf, delta: CiRunDelta) {
         match delta {
             CiRunDelta::Set(state) => {
-                if self
-                    .details
-                    .get(&repo_root)
-                    .is_some_and(|details| details.head_sha != state.head_sha)
+                let heads = self.states.entry(repo_root.clone()).or_default();
+                if let Some(tracked) =
+                    heads.iter_mut().find(|tracked| tracked.head_sha == state.head_sha)
                 {
-                    self.details.remove(&repo_root);
+                    *tracked = state;
+                    return;
                 }
-                self.states.insert(repo_root, state);
+                // A new head replaces finished work but never a run still
+                // going, so concurrent branches stay visible side by side.
+                heads.retain(|tracked| !terminal(tracked.rollup));
+                heads.insert(0, state);
+                heads.truncate(MAX_CI_TRACKED_HEADS);
+                self.retain_open_details(&repo_root);
             }
             CiRunDelta::Cleared { head_sha } => {
-                if self.states.get(&repo_root).is_some_and(|state| state.head_sha == head_sha) {
+                let empty = self.states.get_mut(&repo_root).is_some_and(|heads| {
+                    heads.retain(|state| state.head_sha != head_sha);
+                    heads.is_empty()
+                });
+                if empty {
                     self.states.remove(&repo_root);
-                    self.details.remove(&repo_root);
                 }
+                self.details.remove(&(repo_root, head_sha));
             }
         }
     }
 
-    /// Current snapshot for `repo_root`, if its bar is visible.
-    #[must_use]
-    pub fn get(&self, repo_root: &Path) -> Option<&CiRunState> {
-        self.states.get(repo_root)
+    /// Drop cached detail for heads this root no longer tracks.
+    fn retain_open_details(&mut self, repo_root: &Path) {
+        let heads = self.states.get(repo_root).map(Vec::as_slice).unwrap_or_default();
+        self.details.retain(|(root, head), _| {
+            root != repo_root || heads.iter().any(|state| &state.head_sha == head)
+        });
     }
 
-    /// Store detail only when it belongs to the repository's visible head.
+    /// Every visible snapshot for `repo_root`, newest head first.
+    #[must_use]
+    pub fn get(&self, repo_root: &Path) -> &[CiRunState] {
+        self.states.get(repo_root).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// Store detail only when it belongs to one of the root's visible heads.
     pub fn apply_details(&mut self, repo_root: PathBuf, details: CiRunDetails) {
-        if self.states.get(&repo_root).is_some_and(|state| state.head_sha == details.head_sha) {
-            self.details.insert(repo_root, details);
+        if self
+            .states
+            .get(&repo_root)
+            .is_some_and(|heads| heads.iter().any(|state| state.head_sha == details.head_sha))
+        {
+            self.details.insert((repo_root, details.head_sha.clone()), details);
         }
     }
 
     /// Detail for exactly `head_sha`; old cached heads never enter a new panel.
     #[must_use]
     pub fn details(&self, repo_root: &Path, head_sha: &str) -> Option<&CiRunDetails> {
-        self.details.get(repo_root).filter(|details| details.head_sha == head_sha)
+        self.details.get(&(repo_root.to_path_buf(), head_sha.to_owned()))
     }
+}
+
+/// Whether a rollup has stopped moving.
+#[must_use]
+pub const fn terminal(rollup: CiRunStatus) -> bool {
+    matches!(rollup, CiRunStatus::Success | CiRunStatus::Failure | CiRunStatus::Cancelled)
 }
 
 /// Whether the collapsed band's host actions are available.
@@ -187,10 +215,7 @@ impl CiBarModel {
             .filter(|workflow| workflow.status == CiWorkflowStatus::Completed)
             .count();
         let total = state.workflows.len();
-        let terminal = matches!(
-            state.rollup,
-            CiRunStatus::Success | CiRunStatus::Failure | CiRunStatus::Cancelled
-        );
+        let terminal = terminal(state.rollup);
         let action_mode = if owner_controls { CiActionMode::Owner } else { CiActionMode::ReadOnly };
         let open_url =
             owner_controls.then(|| preferred_run(&state.workflows)).flatten().map(|workflow| {
@@ -1104,13 +1129,49 @@ mod tests {
         bars.apply(root.clone(), CiRunDelta::Set(current));
 
         bars.apply(root.clone(), CiRunDelta::Cleared { head_sha: "head-a".to_owned() });
-        assert_eq!(
-            bars.get(Path::new("/work/scribe")).map(|run| run.head_sha.as_str()),
-            Some("head-b")
-        );
+        assert_eq!(heads(&bars), ["head-b"]);
 
         bars.apply(root, CiRunDelta::Cleared { head_sha: "head-b".to_owned() });
-        assert!(bars.get(Path::new("/work/scribe")).is_none());
+        assert!(bars.get(Path::new("/work/scribe")).is_empty());
+    }
+
+    fn heads(bars: &CiRunBars) -> Vec<String> {
+        bars.get(Path::new("/work/scribe"))
+            .iter()
+            .map(|run| run.head_sha.clone())
+            .collect::<Vec<_>>()
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Concurrent heads stack]]
+    #[test]
+    fn running_heads_stack_while_finished_heads_make_way() {
+        let root = PathBuf::from("/work/scribe");
+        let mut bars = CiRunBars::default();
+        let mut finished = state(CiRunStatus::Failure, false);
+        finished.head_sha = "head-a".to_owned();
+        bars.apply(root.clone(), CiRunDelta::Set(finished));
+        for head in ["head-b", "head-c"] {
+            let mut running = state(CiRunStatus::Running, false);
+            running.head_sha = head.to_owned();
+            bars.apply(root.clone(), CiRunDelta::Set(running));
+        }
+        assert_eq!(heads(&bars), ["head-c", "head-b"], "a finished head must not survive a push");
+
+        for head in ["head-d", "head-e"] {
+            let mut running = state(CiRunStatus::Running, false);
+            running.head_sha = head.to_owned();
+            bars.apply(root.clone(), CiRunDelta::Set(running));
+        }
+        assert_eq!(
+            heads(&bars),
+            ["head-e", "head-d", "head-c"],
+            "stacked bands stop at MAX_CI_TRACKED_HEADS, retiring the oldest"
+        );
+
+        let mut refreshed = state(CiRunStatus::Success, false);
+        refreshed.head_sha = "head-d".to_owned();
+        bars.apply(root, CiRunDelta::Set(refreshed));
+        assert_eq!(heads(&bars), ["head-e", "head-d", "head-c"], "an update must not reorder");
     }
 
     // @lat: [[test#GPUI CI Run Bar#Owner actions stay local]]

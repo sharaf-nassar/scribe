@@ -137,13 +137,14 @@ for snapshot in scenario["runs"]:
             run["head_sha"] = flow_head
             run["head_branch"] = "main"
 # One workflow file, two executions: the retag's newer run must collapse the
-# older one out of the rollup, so both carry the same workflow_id.
+# older one out of the rollup, so both carry the same workflow_id and event.
 old = {
     "id": 104,
     "workflow_id": 21,
     "name": "old failure",
     "head_sha": generation_head,
     "head_branch": "main",
+    "event": "push",
     "status": "completed",
     "conclusion": "failure",
 }
@@ -153,6 +154,7 @@ active = {
     "name": "new generation",
     "head_sha": generation_head,
     "head_branch": "main",
+    "event": "push",
     "status": "in_progress",
     "conclusion": None,
 }
@@ -168,6 +170,7 @@ scenario["runs"].extend([
         "name": "stale",
         "head_sha": stale_head,
         "head_branch": "main",
+        "event": "push",
         "status": "in_progress",
         "conclusion": None,
     }]},

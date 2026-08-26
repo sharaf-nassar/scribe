@@ -31,11 +31,11 @@ use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
     BeadsEpicGraphOutcome, BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult,
-    CiRunDelta, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo,
-    PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch,
-    ServerMessage, SessionInfo, ShellTool, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo,
-    WindowInfo, WorkspaceListEntry, WorkspaceTransferRefusal, WorkspaceTransferResult,
-    WorkspaceTreeNode,
+    CiRunDelta, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, MAX_CI_TRACKED_HEADS,
+    ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal,
+    SearchMatch, ServerMessage, SessionInfo, ShellTool, TerminalSize, TrustedDeviceInfo,
+    TrustedNetworkInfo, WindowInfo, WorkspaceListEntry, WorkspaceTransferRefusal,
+    WorkspaceTransferResult, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -629,8 +629,10 @@ pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
 /// feature 013.
 pub type WindowShares = Arc<RwLock<HashMap<WindowId, WindowShare>>>;
 
-/// Dismissed CI head per repository. A different published head clears the entry.
-pub type CiDismissals = Arc<RwLock<HashMap<PathBuf, String>>>;
+/// Dismissed CI heads per repository, newest first. A root can display several
+/// concurrent heads, so dismissing one must not un-dismiss another; entries
+/// leave on the head's `Cleared` delta and are bounded by the tracked-head cap.
+pub type CiDismissals = Arc<RwLock<HashMap<PathBuf, Vec<String>>>>;
 
 /// Feature 013: identity of the client currently controlling a window under the
 /// single-writer ownership model. `Local` is a Unix-socket client on this
@@ -9865,14 +9867,23 @@ pub async fn publish_ci_run_delta(
         let mut dismissed = dismissals.write().await;
         match &delta {
             CiRunDelta::Set(state)
-                if dismissed.get(repo_root).is_some_and(|head| head == &state.head_sha) =>
+                if dismissed
+                    .get(repo_root)
+                    .is_some_and(|heads| heads.contains(&state.head_sha)) =>
             {
                 return;
             }
-            CiRunDelta::Set(_) => {
-                dismissed.remove(repo_root);
+            CiRunDelta::Set(_) => {}
+            // The head is gone, so its dismissal has nothing left to suppress.
+            CiRunDelta::Cleared { head_sha } => {
+                let empty = dismissed.get_mut(repo_root).is_some_and(|heads| {
+                    heads.retain(|head| head != head_sha);
+                    heads.is_empty()
+                });
+                if empty {
+                    dismissed.remove(repo_root);
+                }
             }
-            CiRunDelta::Cleared { .. } => {}
         }
     }
     send_ci_run_delta(workspace_manager, window_shares, repo_root, delta).await;
@@ -10006,9 +10017,14 @@ async fn apply_ci_dismissal(
     }
 
     let delta = CiRunDelta::Cleared { head_sha: request.head_sha.clone() };
-    dismissals.write().await.insert(request.repo_root.clone(), request.head_sha);
-    publish_ci_run_delta(workspace_manager, window_shares, dismissals, &request.repo_root, delta)
-        .await;
+    {
+        let mut dismissed = dismissals.write().await;
+        let heads = dismissed.entry(request.repo_root.clone()).or_default();
+        heads.retain(|head| head != &request.head_sha);
+        heads.insert(0, request.head_sha);
+        heads.truncate(MAX_CI_TRACKED_HEADS);
+    }
+    send_ci_run_delta(workspace_manager, window_shares, &request.repo_root, delta).await;
 }
 
 /// Feature 015 (T022, D8): broadcast the full-state `ShareRoster` to every
@@ -15319,7 +15335,7 @@ mod tests {
 
     // @lat: [[protocol#Server Messages#CI Run State#Synchronized dismissal]]
     #[tokio::test]
-    async fn dismissing_a_head_clears_all_capable_views_until_a_new_head() {
+    async fn dismissing_a_head_clears_all_capable_views_and_leaves_other_heads_alone() {
         let base = Path::new("/work");
         let repo = base.join("scribe");
         let sender_window = WindowId::new();
@@ -15363,25 +15379,7 @@ mod tests {
                 } if repo_root == &repo && head_sha == "head-a"
             ));
         }
-        assert_eq!(dismissals.read().await.get(&repo).map(String::as_str), Some("head-a"));
-
-        publish_ci_run_delta(
-            &manager,
-            &shares,
-            &dismissals,
-            &repo,
-            CiRunDelta::Set(ci_state("head-a")),
-        )
-        .await;
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(20),
-                read_message::<ServerMessage, _>(&mut peer_client),
-            )
-            .await
-            .is_err(),
-            "the dismissed head reappeared"
-        );
+        assert_eq!(dismissals.read().await.get(&repo), Some(&vec!["head-a".to_owned()]));
 
         publish_ci_run_delta(
             &manager,
@@ -15397,7 +15395,61 @@ mod tests {
             ServerMessage::CiRunState { delta: CiRunDelta::Set(state), .. }
                 if state.head_sha == "head-b"
         ));
-        assert!(!dismissals.read().await.contains_key(&repo));
+        assert_eq!(
+            dismissals.read().await.get(&repo),
+            Some(&vec!["head-a".to_owned()]),
+            "a concurrent head's own updates must not un-dismiss another band"
+        );
+
+        assert_dismissal_survives_concurrent_head(
+            &manager,
+            &shares,
+            &dismissals,
+            &repo,
+            &mut peer_client,
+        )
+        .await;
+    }
+
+    /// A dismissed band must stay gone while another head at the same root keeps
+    /// publishing, and its memory must leave with the head's `Cleared`.
+    async fn assert_dismissal_survives_concurrent_head(
+        manager: &Arc<RwLock<WorkspaceManager>>,
+        shares: &WindowShares,
+        dismissals: &CiDismissals,
+        repo: &Path,
+        peer_client: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) {
+        publish_ci_run_delta(
+            manager,
+            shares,
+            dismissals,
+            repo,
+            CiRunDelta::Set(ci_state("head-a")),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(peer_client),
+            )
+            .await
+            .is_err(),
+            "the dismissed head reappeared after a concurrent head published"
+        );
+
+        publish_ci_run_delta(
+            manager,
+            shares,
+            dismissals,
+            repo,
+            CiRunDelta::Cleared { head_sha: "head-a".into() },
+        )
+        .await;
+        assert!(
+            !dismissals.read().await.contains_key(repo),
+            "retiring the head drops the dismissal it existed to suppress"
+        );
     }
 
     /// Drive one buffering sink and read back what actually reached its socket.

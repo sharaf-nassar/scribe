@@ -500,8 +500,30 @@ impl PaneShell {
         self.ci_strips = strips;
     }
 
-    /// Resolve one visible collapsed CI band against the region layout.
-    pub fn ci_bar_rect(&self, workspace_id: WorkspaceId, viewport: Rect, cx: &App) -> Option<Rect> {
+    /// One band's slice of a region's CI strip: `offset` below the strip's top,
+    /// `height` tall, clipped to what the strip has left. A band with no room
+    /// resolves to `None` rather than painting over its neighbor or the panes.
+    fn ci_band_rect(strip: Rect, offset: f32, height: f32) -> Option<Rect> {
+        let height = height.min(strip.height - offset);
+        (offset >= 0.0 && height > 0.0).then_some(Rect {
+            x: strip.x,
+            y: strip.y + offset,
+            width: strip.width,
+            height,
+        })
+    }
+
+    /// Resolve one visible CI band against the region layout. Stacked bands
+    /// share the region's reserved strip: `band` is one band's `(offset from
+    /// the strip's top, height)`.
+    pub fn ci_bar_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        band: (f32, f32),
+        viewport: Rect,
+        cx: &App,
+    ) -> Option<Rect> {
+        let (offset, height) = band;
         self.workspace
             .read(cx)
             .layout()
@@ -509,6 +531,7 @@ impl PaneShell {
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
             .and_then(|(_, rect)| Self::ci_rect(rect, self.ci_strip(workspace_id)))
+            .and_then(|strip| Self::ci_band_rect(strip, offset, height))
     }
 
     /// The strip a pinned board reserves inside `workspace_id`'s region, which
@@ -1691,6 +1714,34 @@ mod tests {
         let traced_content = PaneShell::content_rect(top, expanded, 0.0);
         assert!((traced_content.y - expanded).abs() < f32::EPSILON);
         assert!((traced_content.height - (top.height - expanded)).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Stacked bands slice one region strip]]
+    #[test]
+    fn stacked_ci_bands_slice_their_region_strip_in_order() {
+        let bar = scribe_client::ci_bar::CI_BAR_HEIGHT;
+        let region = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
+        let strip = PaneShell::ci_rect(region, 2.0 * bar).expect("region has room for two bands");
+
+        let first = PaneShell::ci_band_rect(strip, 0.0, bar).expect("first band");
+        let second = PaneShell::ci_band_rect(strip, bar, bar).expect("second band");
+        assert!((first.y - strip.y).abs() < f32::EPSILON);
+        assert!((second.y - (strip.y + bar)).abs() < f32::EPSILON);
+        assert!((first.height - bar).abs() < f32::EPSILON, "a band keeps its own height");
+        assert!((second.height - bar).abs() < f32::EPSILON);
+        assert!((first.x - strip.x).abs() < f32::EPSILON, "bands keep the region's columns");
+        assert!((second.width - strip.width).abs() < f32::EPSILON);
+        assert!(
+            (second.y + second.height - (strip.y + strip.height)).abs() < f32::EPSILON,
+            "the stack ends exactly where the reserved strip ends"
+        );
+
+        let clipped = PaneShell::ci_band_rect(strip, 1.5 * bar, bar).expect("partial band");
+        assert!(
+            (clipped.height - 0.5 * bar).abs() < f32::EPSILON,
+            "a band past the strip's end is clipped, never drawn over the panes"
+        );
+        assert!(PaneShell::ci_band_rect(strip, 2.0 * bar, bar).is_none(), "no room, no band");
     }
 
     /// A pinned board takes its strip out of its own region's content, stacking

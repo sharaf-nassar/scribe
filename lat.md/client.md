@@ -2458,15 +2458,15 @@ Verifies  offsets the border below the tab bar and produces corner-safe top/bott
 
 The GPUI client renders server-owned GitHub Actions state as a 40px collapsed trace band inside each matching workspace region.
 
-[[crates/scribe-client/src/ci_bar.rs#CiRunBars#apply]] stores full replacements by trusted repository root and ignores a `Cleared` delta unless its head matches the current snapshot. [[crates/scribe-client/src/ci_bar.rs#CiBarModel#build]] turns each workflow entry into one collapsed trace cell without fetching job detail.
+[[crates/scribe-client/src/ci_bar.rs#CiRunBars#apply]] stores full replacements by trusted repository root and head, and a `Cleared` delta removes only the head it names. One root holds up to [[crates/scribe-common/src/protocol.rs#MAX_CI_TRACKED_HEADS]] snapshots, newest first: a new head retires that root's finished heads but never a run still going, so branches running at the same time stack instead of replacing each other. A refresh of a tracked head updates it in place without reordering, and retiring a head drops its cached detail. [[crates/scribe-client/src/ci_bar.rs#CiBarModel#build]] turns each workflow entry into one collapsed trace cell without fetching job detail.
 
 Every aggregate state pairs a glyph with a word. Running cells also use a square live mark, full-strength text, and an indeterminate shimmer; queued cells use a dashed track. Terminal and stale models disable repeating motion, and GPUI's shared animation policy freezes all motion when configured off.
 
 ### Region placement and reflow
 
-Each band spans only its repository-owning region, below that region's title or tab chrome and above its panes.
+Each band spans only its repository-owning region, below that region's title or tab chrome and above its panes. A region tracking several heads stacks their bands, newest on top.
 
-[[crates/scribe-client/src/main.rs#TerminalView#sync_ci_run_strips]] matches stored repository roots to live workspace regions. [[crates/scribe-client/src/pane_shell.rs#PaneShell#ci_bar_rect]] and the shared content-rect rule reserve the same 40px that [[crates/scribe-client/src/ci_bar.rs#render]] paints, so a state edge republishes affected PTY sizes without shrinking neighboring regions.
+[[crates/scribe-client/src/main.rs#TerminalView#sync_ci_run_strips]] matches stored repository roots to live workspace regions and reserves the sum of that region's bands, capped so three text rows of terminal survive — the floor a pinned Beads board already respects. [[crates/scribe-client/src/pane_shell.rs#PaneShell#ci_band_rect]] slices one band's offset and height out of that reservation and yields no rect once the strip is spent, and the shared content-rect rule reserves the same pixels that [[crates/scribe-client/src/ci_bar.rs#render]] paints, so a state edge republishes affected PTY sizes without shrinking neighboring regions.
 
 The band sits above a pinned Beads board when both are visible. Its bottom hairline uses the owning workspace accent, except failure and stale replace it with their semantic theme colors.
 
@@ -2511,7 +2511,7 @@ server demand.
 
 Only an owning client connected to its local server receives open and dismiss controls; local share joins, LAN clients, and remote clients render a read-only viewer chip.
 
-Both owner controls are stable keyboard tab stops with visible focus and Enter/Space activation. Their GPUI element identities include the full workspace UUID so separate visible bands cannot alias interaction state.
+Both owner controls are stable keyboard tab stops with visible focus and Enter/Space activation. Their GPUI element identities and focus handles include the full workspace UUID and the band's head SHA, so neither separate regions nor bands stacked in one region can alias interaction state.
 
 Open builds `https://github.com/{repository}/actions/runs/{run_id}` from the server-trusted repository and preferred workflow run, then uses the existing host browser helper. Dismiss sends the visible repository root and head through [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#dismiss_ci_run]]; the band remains until the server synchronizes a matching clear.
 

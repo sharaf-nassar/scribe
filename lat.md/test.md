@@ -138,9 +138,15 @@ HTTPS, SSH, and scp push URLs canonicalize to the receiving github.com owner/rep
 
 Non-terminal workflows keep the rollup queued or running; all-terminal sets use failure, cancelled, then success precedence.
 
-### Shared latest-head window
+### Concurrent head windows
 
-Multiple roots for one GitHub repository share one tracker, and a newer pushed head replaces the prior discovery window.
+Multiple roots pushing one head share that head's window, while a second head opens its own window instead of replacing the first, clears nothing, and inherits no roots.
+
+A fourth head retires the head opened first and publishes its `Cleared` delta to that head's roots only.
+
+### Every triggering event at the head
+
+One workflow file triggered twice at the same head by different events keeps both runs, so a `pull_request` run and a `push` run of the same file both reach the rollup.
 
 ### Active same-SHA generation
 
@@ -167,10 +173,6 @@ One scheduler enforces the 5-second minimum cadence and 720-attempt rolling-hour
 ### Zero-idle and auth-failure boundary
 
 An idle tracker performs no auth or HTTP call, and failed token acquisition removes the relevant window before any HTTP request.
-
-### Every triggering event at the head
-
-One workflow file triggered twice at the same head by different events keeps both runs, so a `pull_request` run and a `push` run of the same file both reach the rollup.
 
 ### Trusted API request
 
@@ -5865,13 +5867,21 @@ Queued, running, passed, failed, cancelled, and stale models pair a distinct gly
 
 A clear removes its repository snapshot only when the named head matches, so a delayed clear for an older run cannot erase its replacement.
 
+### Concurrent heads stack
+
+A new head retires the root's finished heads but never a run still going, keeps the newest head first without reordering on refresh, and stops at three stacked bands by dropping the head tracked longest.
+
+### Stacked bands slice one region strip
+
+Bands take successive offsets inside the reservation their region already made, keep its columns, clip at the strip's end, and resolve to no rect once it is spent, so a stack can never paint over the panes below it.
+
 ### Owner actions stay local
 
 The owning model carries its trusted GitHub run URL, while a shared viewer has no host URL and resolves to read-only chrome.
 
 ### Owner action identities are region-scoped
 
-Open and dismiss controls derive distinct GPUI element identities from each region's full workspace UUID so simultaneous bands cannot collide.
+Open and dismiss controls derive distinct GPUI element identities from each region's full workspace UUID and the band's head SHA, so neither simultaneous regions nor bands stacked in one region can collide.
 
 ### Long traces keep actionable cells
 

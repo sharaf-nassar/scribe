@@ -607,6 +607,11 @@ pub struct CiWorkflowRun {
     pub updated_at_epoch_secs: Option<u64>,
 }
 
+/// Heads one repository tracks, and one repository root displays, at once.
+/// The server's poll windows, its dismissal memory, and the client's stacked
+/// bands all bound themselves by this single number so they cannot drift.
+pub const MAX_CI_TRACKED_HEADS: usize = 3;
+
 /// Full bounded snapshot for one repository's currently tracked pushed head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiRunState {

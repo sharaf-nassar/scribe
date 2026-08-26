@@ -1938,7 +1938,7 @@ struct TerminalView {
     /// Client-local open panel identity; the server sees only interest changes.
     ci_expanded: HashMap<WorkspaceId, (PathBuf, String)>,
     /// Stable tab stops for each region's toggle plus owner-only actions.
-    ci_action_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle, FocusHandle)>,
+    ci_action_focus: HashMap<(WorkspaceId, String), (FocusHandle, FocusHandle, FocusHandle)>,
     /// Stable tab stops for visible per-pane jump-to-bottom controls.
     jump_button_focus: HashMap<SessionId, FocusHandle>,
     /// X11 active-window guard, present only when this window has an Xcb/Xlib
@@ -10463,21 +10463,21 @@ async fn drive_redraws(
     }
 }
 
-fn ci_action_ids(workspace_id: WorkspaceId) -> (ElementId, ElementId) {
+fn ci_action_ids(workspace_id: WorkspaceId, head_sha: &str) -> (ElementId, ElementId) {
     (
-        ElementId::from(format!("ci-open-{}", workspace_id.to_full_string())),
-        ElementId::from(format!("ci-dismiss-{}", workspace_id.to_full_string())),
+        ElementId::from(format!("ci-open-{}-{head_sha}", workspace_id.to_full_string())),
+        ElementId::from(format!("ci-dismiss-{}-{head_sha}", workspace_id.to_full_string())),
     )
 }
 
-fn visible_ci_run(
-    runs: &CiRunBars,
-    workspace_id: WorkspaceId,
-    root: PathBuf,
-) -> Option<VisibleCiRun> {
-    let state = runs.get(&root).cloned()?;
-    let details = runs.details(&root, &state.head_sha).cloned();
-    Some((workspace_id, root, state, details))
+fn visible_ci_runs(runs: &CiRunBars, workspace_id: WorkspaceId, root: &Path) -> Vec<VisibleCiRun> {
+    runs.get(root)
+        .iter()
+        .map(|state| {
+            let details = runs.details(root, &state.head_sha).cloned();
+            (workspace_id, root.to_path_buf(), state.clone(), details)
+        })
+        .collect()
 }
 
 fn ci_panel_height(details: Option<&CiRunDetails>, stale: bool) -> f32 {
@@ -11141,7 +11141,7 @@ impl TerminalView {
             |runs| {
                 roots
                     .into_iter()
-                    .filter_map(|(workspace_id, root)| visible_ci_run(&runs, workspace_id, root))
+                    .flat_map(|(workspace_id, root)| visible_ci_runs(&runs, workspace_id, &root))
                     .collect()
             },
         );
@@ -11164,34 +11164,46 @@ impl TerminalView {
             self.ci_expanded.remove(&workspace_id);
             self.set_ci_detail_interest(repo_root, head_sha, false);
         }
-        let visible_ids =
-            visible.iter().map(|(workspace_id, ..)| *workspace_id).collect::<HashSet<_>>();
-        self.ci_action_focus.retain(|workspace_id, _| visible_ids.contains(workspace_id));
-        for workspace_id in &visible_ids {
-            self.ensure_ci_action_focus(*workspace_id, cx);
+        let bands = visible
+            .iter()
+            .map(|(workspace_id, _, head_sha)| (*workspace_id, head_sha.clone()))
+            .collect::<HashSet<_>>();
+        self.ci_action_focus.retain(|band, _| bands.contains(band));
+        for (workspace_id, head_sha) in &bands {
+            self.ensure_ci_action_focus(*workspace_id, head_sha.clone(), cx);
         }
-        self.shell.set_ci_strips(
-            self.visible_ci_runs
-                .iter()
-                .map(|(workspace_id, repo_root, state, details)| {
-                    let expanded = self
-                        .ci_expanded
-                        .get(workspace_id)
-                        .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
-                    let panel =
-                        if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
-                    (*workspace_id, ci_bar::CI_BAR_HEIGHT + panel)
-                })
-                .collect(),
-        );
+        let mut strips: HashMap<WorkspaceId, f32> = HashMap::new();
+        for (workspace_id, repo_root, state, details) in &self.visible_ci_runs {
+            let expanded = self
+                .ci_expanded
+                .get(workspace_id)
+                .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
+            let panel = if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
+            *strips.entry(*workspace_id).or_default() += ci_bar::CI_BAR_HEIGHT + panel;
+        }
+        // Stacked bands and an open panel yield before the terminal does, on
+        // the same three-row floor a pinned Beads board reserves.
+        let viewport = self.pane_viewport();
+        let floor = self.font.line_height * 3.0;
+        for (workspace_id, rect) in self.shell.workspace_rects(viewport, cx) {
+            if let Some(strip) = strips.get_mut(&workspace_id) {
+                *strip = strip.min((rect.height - floor).max(0.0));
+            }
+        }
+        self.shell.set_ci_strips(strips);
     }
 
-    fn ensure_ci_action_focus(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
-        if self.ci_action_focus.contains_key(&workspace_id) {
+    fn ensure_ci_action_focus(
+        &mut self,
+        workspace_id: WorkspaceId,
+        head_sha: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ci_action_focus.contains_key(&(workspace_id, head_sha.clone())) {
             return;
         }
         self.ci_action_focus.insert(
-            workspace_id,
+            (workspace_id, head_sha),
             (
                 cx.focus_handle().tab_index(0).tab_stop(true),
                 cx.focus_handle().tab_index(0).tab_stop(true),
@@ -11269,21 +11281,27 @@ impl TerminalView {
         let colors = CiBarColors::from_theme(&self.config.config().theme, self.opacity);
         let animations = AnimationSettings::from_config(&self.config.config().config);
         let viewport = self.pane_viewport();
+        let mut offsets: HashMap<WorkspaceId, f32> = HashMap::new();
         self.visible_ci_runs
             .iter()
             .filter_map(|(workspace_id, repo_root, state, details)| {
-                let rect = self.shell.ci_bar_rect(*workspace_id, viewport, cx)?;
                 let model = CiBarModel::build(state, now, self.shared.ci_owner_controls);
-                let (open_id, dismiss_id) = ci_action_ids(*workspace_id);
+                let (open_id, dismiss_id) = ci_action_ids(*workspace_id, &state.head_sha);
                 let (toggle_focus, open_focus, dismiss_focus) = self
                     .ci_action_focus
-                    .get(workspace_id)
+                    .get(&(*workspace_id, state.head_sha.clone()))
                     .cloned()
                     .map(|(toggle, open, dismiss)| (toggle, Some(open), Some(dismiss)))?;
                 let expanded = self
                     .ci_expanded
                     .get(workspace_id)
                     .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
+                let height = ci_bar::CI_BAR_HEIGHT
+                    + if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
+                let offset = offsets.entry(*workspace_id).or_default();
+                let rect = self.shell.ci_bar_rect(*workspace_id, (*offset, height), viewport, cx);
+                *offset += height;
+                let rect = rect?;
                 let trace_now = if state.stale {
                     state
                         .workflows
@@ -11313,8 +11331,12 @@ impl TerminalView {
                     &model,
                     &colors,
                     ci_bar::CiBarRender {
-                        id: gpui::ElementId::Name(format!("ci-run-{workspace_id}").into()),
-                        trace_id: gpui::ElementId::Name(format!("ci-trace-{workspace_id}").into()),
+                        id: gpui::ElementId::Name(
+                            format!("ci-run-{workspace_id}-{}", state.head_sha).into(),
+                        ),
+                        trace_id: gpui::ElementId::Name(
+                            format!("ci-trace-{workspace_id}-{}", state.head_sha).into(),
+                        ),
                         open_id,
                         dismiss_id,
                         rect,
@@ -17283,14 +17305,18 @@ mod tests {
 
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
     #[test]
-    fn ci_action_ids_are_scoped_to_workspace() {
+    fn ci_action_ids_are_scoped_to_workspace_and_head() {
         let first = "00000000-0000-0000-0000-000000000001".parse().unwrap();
         let second = "10000000-0000-0000-0000-000000000001".parse().unwrap();
-        let (first_open, first_dismiss) = ci_action_ids(first);
-        let (second_open, second_dismiss) = ci_action_ids(second);
+        let (first_open, first_dismiss) = ci_action_ids(first, "head-a");
+        let (second_open, second_dismiss) = ci_action_ids(second, "head-a");
 
         assert_ne!(first_open, second_open);
         assert_ne!(first_dismiss, second_dismiss);
+
+        let (stacked_open, stacked_dismiss) = ci_action_ids(first, "head-b");
+        assert_ne!(first_open, stacked_open, "stacked bands must not alias interaction state");
+        assert_ne!(first_dismiss, stacked_dismiss);
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]
