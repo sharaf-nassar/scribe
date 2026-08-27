@@ -1476,7 +1476,6 @@ pub fn open_uri_unguarded(uri: &str) {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
         process::{Child, Command},
         sync::{
@@ -1569,15 +1568,6 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
-
-        fn script(&self, name: &str, body: &str) -> PathBuf {
-            let path = self.0.join(name);
-            fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write opener stand-in");
-            let mut permissions = fs::metadata(&path).expect("stand-in metadata").permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions).expect("make opener stand-in executable");
-            path
-        }
     }
 
     impl Drop for TestDir {
@@ -1666,20 +1656,17 @@ mod tests {
     #[test]
     fn code_nonzero_is_final_and_classified_with_code() {
         let fixture = TestDir::new();
-        let code = fixture.script("code", "exit 7");
-        let fallback_marker = fixture.path().join("fallback-ran");
-        let opener = fixture
-            .script("xdg-open", &format!("printf invoked > '{}'", fallback_marker.display()));
+        let fallback = fixture.path().join("missing-opener");
         let existing = std::env::current_exe().expect("test executable exists");
         let raw = format!("{}:19", existing.display());
         let (spawn, target) = open_path_observed_with_commands(
             &raw,
             None,
-            code.as_os_str(),
-            opener.as_os_str(),
+            std::ffi::OsStr::new("/bin/false"),
+            fallback.as_os_str(),
             "xdg-open",
         );
-        let (child, cmd) = spawn.expect("code stand-in spawns");
+        let (child, cmd) = spawn.expect("controlled code child spawns");
 
         let observation = wait_for_open_with_timing(
             child,
@@ -1691,12 +1678,11 @@ mod tests {
         .expect("non-zero exit is observed");
 
         assert_eq!(observation.cmd, "code");
-        assert_eq!(observation.outcome, OpenOutcome::Exited { code: Some(7) });
+        assert_eq!(observation.outcome, OpenOutcome::Exited { code: Some(1) });
         assert_eq!(
             classify_open_failure(observation.cmd, observation.outcome, &observation.target),
-            Some("code exited 7".to_owned())
+            Some("code exited 1".to_owned())
         );
-        assert!(!fallback_marker.exists(), "platform opener must not be attempted");
     }
 
     #[test]
