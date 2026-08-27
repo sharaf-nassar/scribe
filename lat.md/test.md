@@ -4996,9 +4996,9 @@ After a split, only the split's session stays live. `retain_sessions` closes the
 
 ### Tab order spans every region of the tree
 
-Checks that flattening a reported tree yields every region's tabs, left to right, including the ones that are not on screen.
+Checks that flattening a reported tree yields every region's tabs left to right, including off-screen ones, and that `wire_tree_pane_sessions` finds every region's split panes under the workspace that owns them.
 
-This is the order a reconnect restores the strip to. Collecting only the sessions currently in panes — which the adoption used to do — left every background tab wherever the server's `SessionList` happened to put it.
+This is the order a reconnect restores the strip to. Collecting only the sessions currently in panes — which the adoption used to do — left every background tab wherever the server's `SessionList` happened to put it. The pane assertion covers the multi-region walk: `wire_tree_pane_sessions` reads the lowered leaves `wire_leaf_display_tabs` produces rather than recursing itself, so tabs and panes can never disagree about which sessions a region's tab already owns.
 
 ### Pane split-tree logic
 

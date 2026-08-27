@@ -1786,38 +1786,28 @@ fn wire_leaf_display_tabs(node: &WorkspaceTreeNode, out: &mut Vec<WireRegionTabs
 /// Sessions that occur only inside a pane tree, paired with their workspace.
 /// Reader-side tab reconciliation uses these to keep reconnects from promoting
 /// split panes into strip tabs.
+///
+/// Reads the same lowered leaves adoption does, so a session counts as a pane
+/// here exactly when [`wire_leaf_display_tabs`] would hand it to a tab's split
+/// rather than to the strip.
 #[must_use]
 pub fn wire_tree_pane_sessions(node: &WorkspaceTreeNode) -> Vec<(SessionId, WorkspaceId)> {
+    let mut leaves = Vec::new();
+    wire_leaf_display_tabs(node, &mut leaves);
     let mut panes = Vec::new();
-    collect_wire_tree_pane_sessions(node, &mut panes);
-    panes
-}
-
-fn collect_wire_tree_pane_sessions(
-    node: &WorkspaceTreeNode,
-    panes: &mut Vec<(SessionId, WorkspaceId)>,
-) {
-    match node {
-        WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, .. } => {
-            for (index, tab) in session_ids.iter().enumerate() {
-                let Some(tree) = wire_tab_pane_tree(session_ids, pane_trees, index) else {
-                    continue;
-                };
-                let mut sessions = Vec::new();
-                collect_pane_sessions(&tree, &mut sessions);
-                panes.extend(
-                    sessions
-                        .into_iter()
-                        .filter(|session_id| session_id != tab)
-                        .map(|session_id| (session_id, *workspace_id)),
-                );
-            }
-        }
-        WorkspaceTreeNode::Split { first, second, .. } => {
-            collect_wire_tree_pane_sessions(first, panes);
-            collect_wire_tree_pane_sessions(second, panes);
+    for (workspace_id, tabs, _) in leaves {
+        for (tab, tree) in tabs {
+            let mut sessions = Vec::new();
+            collect_pane_sessions(&tree, &mut sessions);
+            panes.extend(
+                sessions
+                    .into_iter()
+                    .filter(|session_id| *session_id != tab)
+                    .map(|session_id| (session_id, workspace_id)),
+            );
         }
     }
+    panes
 }
 
 fn collect_pane_sessions(node: &PaneTreeNode, out: &mut Vec<SessionId>) {
@@ -2388,21 +2378,41 @@ mod tests {
     fn tab_order_spans_every_region_of_the_tree() {
         let (ws_a, ws_b) = (WorkspaceId::new(), WorkspaceId::new());
         let (a1, a2, b1) = (SessionId::new(), SessionId::new(), SessionId::new());
+        let (a_pane, b_pane) = (SessionId::new(), SessionId::new());
         let tree = WorkspaceTreeNode::Split {
             direction: LayoutDirection::Horizontal,
             ratio: 0.5,
             first: Box::new(WorkspaceTreeNode::Leaf {
                 workspace_id: ws_a,
                 session_ids: vec![a1, a2],
-                pane_trees: vec![None, None],
+                pane_trees: vec![None, Some(pane_split(a2, a_pane))],
                 active_tab_index: 1,
             }),
-            second: Box::new(leaf(ws_b, b1)),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_b,
+                session_ids: vec![b1],
+                pane_trees: vec![Some(pane_split(b1, b_pane))],
+                active_tab_index: 0,
+            }),
         };
 
         // Background tabs included, regions left to right: this is the order the
         // strip is restored to, so a tab that is not on screen still comes back
         // where the user put it.
         assert_eq!(wire_tree_tab_order(&tree), [a1, a2, b1]);
+
+        // Every region's panes are found too, each under its own workspace, so a
+        // reconnect re-files them as panes instead of promoting them to tabs.
+        assert_eq!(wire_tree_pane_sessions(&tree), [(a_pane, ws_a), (b_pane, ws_b)]);
+    }
+
+    /// A tab whose pane was split once, with `tab` still the first pane.
+    fn pane_split(tab: SessionId, pane: SessionId) -> PaneTreeNode {
+        PaneTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneTreeNode::Leaf { session_id: tab }),
+            second: Box::new(PaneTreeNode::Leaf { session_id: pane }),
+        }
     }
 }

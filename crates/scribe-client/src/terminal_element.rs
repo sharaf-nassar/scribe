@@ -830,37 +830,17 @@ impl TerminalElement {
         cells: &SelectionOverlayPaint<'_>,
         window: &mut Window,
     ) {
-        let thickness = self.link_underline_style.map_or(cells.thickness, |style| style.thickness);
-        for span in &self.link_underline {
-            let Some(resolved) = cells.resolved_rows.get(span.row) else { continue };
-            let end = span.end_col.min(resolved.len().saturating_sub(1));
-            if span.start_col > end {
-                continue;
-            }
-            // The baseline sits above the cell's bottom edge, so the rule is
-            // inset by its own thickness rather than flush with the row below.
-            let top = overlay.bounds.top()
-                + overlay.line_height * grid_f32(span.row)
-                + overlay.line_height
-                - thickness * 2.;
-            for (offset, cell) in resolved
-                .get(span.start_col..=end)
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            {
-                let left = overlay.bounds.left()
-                    + px(overlay.cell_width * grid_f32(span.start_col.saturating_add(offset)));
-                // A double-width glyph's spacer cell is filtered out above, so
-                // the rule under the glyph has to span both of its columns.
-                let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
-                let width = px(overlay.cell_width * f32::from(columns));
-                let rule = Bounds::new(point(left, top), size(width, thickness));
-                let color = self.link_underline_style.map_or(cell.fg, |style| style.color);
-                window.paint_quad(fill(rule, color));
-            }
-        }
+        let style = self.link_underline_style;
+        paint_segment_rule(
+            &SegmentRulePaint {
+                spans: &self.link_underline,
+                resolved_rows: cells.resolved_rows,
+                overlay,
+                thickness: style.map_or(cells.thickness, |style| style.thickness),
+                color: style.map(|style| style.color),
+            },
+            window,
+        );
     }
 
     /// Repaint selected cells after nonnegative images, preserving selected
@@ -1844,6 +1824,54 @@ struct SelectionOverlayPaint<'a> {
     thickness: Pixels,
 }
 
+/// Inputs for one run of segment rules over already-painted cells.
+struct SegmentRulePaint<'a> {
+    /// One visible-row segment per part of the run being ruled.
+    spans: &'a [SelectionSpan],
+    resolved_rows: &'a [Vec<ResolvedCell>],
+    overlay: OverlayGeometry,
+    thickness: Pixels,
+    /// `None` rules each cell in its own resolved foreground.
+    color: Option<Rgba>,
+}
+
+/// Rule every segment of a run, one quad per cell, clipped to the row.
+///
+/// The hovered-link rule and the failed-link annotation rule share this raster
+/// and nothing else: their state, triggering, and dismissal stay separate, and
+/// each supplies its own colour and thickness.
+fn paint_segment_rule(rule: &SegmentRulePaint<'_>, window: &mut Window) {
+    let SegmentRulePaint { spans, resolved_rows, overlay, thickness, color } = *rule;
+    for span in spans {
+        let Some(resolved) = resolved_rows.get(span.row) else { continue };
+        let end = span.end_col.min(resolved.len().saturating_sub(1));
+        if span.start_col > end {
+            continue;
+        }
+        // The baseline sits above the cell's bottom edge, so the rule is inset
+        // by its own thickness rather than flush with the row below.
+        let top =
+            overlay.bounds.top() + overlay.line_height * grid_f32(span.row) + overlay.line_height
+                - thickness * 2.;
+        for (offset, cell) in resolved
+            .get(span.start_col..=end)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+        {
+            let left = overlay.bounds.left()
+                + px(overlay.cell_width * grid_f32(span.start_col.saturating_add(offset)));
+            // A double-width glyph's spacer cell is filtered out above, so the
+            // rule under the glyph has to span both of its columns.
+            let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
+            let width = px(overlay.cell_width * f32::from(columns));
+            let quad = Bounds::new(point(left, top), size(width, thickness));
+            window.paint_quad(fill(quad, color.unwrap_or(cell.fg)));
+        }
+    }
+}
+
 /// Inputs for the one paint-only failed-link annotation pass.
 struct AnnotationPainter<'a> {
     annotation: &'a AnnotationPaint,
@@ -1950,34 +1978,16 @@ impl AnnotationPainter<'_> {
 
     /// Rule every wrapped segment of the failed run with a fixed 2px red line.
     fn paint_underline(&self, window: &mut Window) {
-        let thickness = px(2.0);
-        for span in &self.annotation.run_segments {
-            let Some(resolved) = self.resolved_rows.get(span.row) else { continue };
-            let end = span.end_col.min(resolved.len().saturating_sub(1));
-            if span.start_col > end {
-                continue;
-            }
-            let top = self.overlay.bounds.top()
-                + self.overlay.line_height * grid_f32(span.row)
-                + self.overlay.line_height
-                - thickness * 2.0;
-            for (offset, cell) in resolved
-                .get(span.start_col..=end)
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            {
-                let left = self.overlay.bounds.left()
-                    + px(self.overlay.cell_width * grid_f32(span.start_col.saturating_add(offset)));
-                let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
-                let rule = Bounds::new(
-                    point(left, top),
-                    size(px(self.overlay.cell_width * f32::from(columns)), thickness),
-                );
-                window.paint_quad(fill(rule, self.annotation.ansi_red));
-            }
-        }
+        paint_segment_rule(
+            &SegmentRulePaint {
+                spans: &self.annotation.run_segments,
+                resolved_rows: self.resolved_rows,
+                overlay: self.overlay,
+                thickness: px(2.0),
+                color: Some(self.annotation.ansi_red),
+            },
+            window,
+        );
     }
 }
 
