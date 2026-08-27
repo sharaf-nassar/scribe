@@ -2458,7 +2458,6 @@ mod tests_apply {
 #[cfg(test)]
 mod tests_apply_shells {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2502,18 +2501,8 @@ mod tests_apply_shells {
     /// A child process inherits exported variables only, so reading the
     /// probes back out of one proves the restore file exported rather
     /// than merely assigned them.
-    fn write_recorder(dir: &Path) -> PathBuf {
-        let recorder = dir.join("recorder.sh");
-        std::fs::write(
-            &recorder,
-            "#!/bin/sh\nprintf '%s\\0%s\\0%s\\0%s\\0' \
-             \"${SCRIBE_PROBE_QUOTE-!unset}\" \"${SCRIBE_PROBE_MULTI-!unset}\" \
-             \"${SCRIBE_PROBE_BS-!unset}\" \"${SCRIBE_PROBE_STALE-!unset}\" > \"$1\"\n",
-        )
-        .expect("write recorder");
-        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod recorder");
-        recorder
+    fn restore_env_recorder() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/restore-env-recorder.sh")
     }
 
     fn stage_restore_file(dir: &Path, kind: ShellKind, extension: &str) -> PathBuf {
@@ -2550,7 +2539,7 @@ mod tests_apply_shells {
             .env("SCRIBE_RECORD_PATH", &out)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        seal_child(&mut command, dir);
+        seal_child(&mut command);
         let result = command.output().expect("run driver");
         assert!(
             result.status.success(),
@@ -2580,7 +2569,7 @@ mod tests_apply_shells {
             return;
         }
         let dir = scratch_dir(shell);
-        let recorder = write_recorder(&dir);
+        let recorder = restore_env_recorder();
         let restore = stage_restore_file(&dir, kind, restore_env_file_extension(kind));
         let driver = format!(
             "export SCRIBE_PROBE_STALE=preexisting\n. '{}'\n'{}' \"$SCRIBE_RECORD_PATH\"\n",
@@ -2608,7 +2597,7 @@ mod tests_apply_shells {
             return;
         }
         let dir = scratch_dir("fish");
-        let recorder = write_recorder(&dir);
+        let recorder = restore_env_recorder();
         let restore = stage_restore_file(&dir, ShellKind::Fish, "fish");
         let driver = format!(
             "set -gx SCRIBE_PROBE_STALE preexisting\nbuiltin source '{}'\n'{}' \
@@ -2627,7 +2616,7 @@ mod tests_apply_shells {
             return;
         }
         let dir = scratch_dir("pwsh");
-        let recorder = write_recorder(&dir);
+        let recorder = restore_env_recorder();
         let restore = stage_restore_file(&dir, ShellKind::PowerShell, "ps1");
         let driver = format!(
             "$env:SCRIBE_PROBE_STALE = 'preexisting'\n. '{}'\n& '{}' $env:SCRIBE_RECORD_PATH\n",
@@ -2669,7 +2658,7 @@ mod tests_apply_shells {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../dist/shell-integration/nushell/vendor/autoload/scribe.nu");
         let dir = scratch_dir("nu");
-        let recorder = write_recorder(&dir);
+        let recorder = restore_env_recorder();
         let restore = stage_restore_file(&dir, ShellKind::Nushell, "json");
         let driver = format!(
             "source '{}'\n$env.SCRIBE_PROBE_STALE = 'preexisting'\n__scribe-apply-restore '{}'\n\

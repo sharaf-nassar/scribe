@@ -219,13 +219,8 @@ fn inject_nushell(env: &mut HashMap<String, String>, scripts_dir: &Path) {
 /// run to a no-op stub instead.
 #[cfg(test)]
 pub mod desktop_isolation {
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
-
-    /// The programs `System.Diagnostics.Process` will exec on Unix when
-    /// `UseShellExecute` is set, in the order it tries them.
-    const DESKTOP_OPENERS: [&str; 3] = ["xdg-open", "gnome-open", "kfmclient"];
 
     /// The live-session variables Scribe exports into every shell it hosts.
     /// A developer (or agent) running the test suite *inside* a Scribe
@@ -257,11 +252,11 @@ pub mod desktop_isolation {
         }
     }
 
-    /// Scrubs the session handles and puts no-op opener stubs, staged
-    /// under `scratch`, ahead of the inherited `PATH` so the shell still
-    /// finds its own tools further down.
-    pub fn seal_child(command: &mut Command, scratch: &Path) {
-        let stubs = stage_opener_stubs(scratch);
+    /// Scrubs the session handles and puts checked-in no-op opener stubs
+    /// ahead of the inherited `PATH` so the shell still finds its own tools
+    /// further down.
+    pub fn seal_child(command: &mut Command) {
+        let stubs = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opener-stubs");
         let path = match std::env::var_os("PATH") {
             Some(inherited) => {
                 let mut entries = vec![stubs];
@@ -272,25 +267,12 @@ pub mod desktop_isolation {
         };
         scrub_desktop_env(command.env("PATH", path));
     }
-
-    fn stage_opener_stubs(scratch: &Path) -> PathBuf {
-        let bin = scratch.join("opener-stubs");
-        std::fs::create_dir_all(&bin).expect("create opener stub dir");
-        for opener in DESKTOP_OPENERS {
-            let stub = bin.join(opener);
-            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write opener stub");
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod opener stub");
-        }
-        bin
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -363,19 +345,8 @@ mod tests {
         // is what keeps the payload exactly one field even when the helper
         // was handed nothing at all.
         let record = dir.join("calls.bin");
-        let recorder = dir.join("recorder.fish");
-        std::fs::write(
-            &recorder,
-            format!(
-                "#!/usr/bin/env fish\n\
-                 set -l payload (cat | string collect --allow-empty)\n\
-                 string join0 -- CALL $argv STDIN $payload >> '{}'\n",
-                record.display(),
-            ),
-        )
-        .expect("write recorder");
-        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod recorder");
+        let recorder = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fish-hook-helper-recorder.fish");
 
         let driver = dir.join("driver.fish");
         std::fs::write(
@@ -393,9 +364,10 @@ mod tests {
         command
             .arg("--no-config")
             .arg(&driver)
+            .env("SCRIBE_RECORD_PATH", &record)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        seal_child(&mut command, &dir);
+        seal_child(&mut command);
         let status = command.status().expect("run fish");
         assert!(status.success(), "fish driver exited with {status}");
 
@@ -623,11 +595,8 @@ mod tests {
 
         // A child sees only what nushell exports, so reading the variable
         // back out of one is the direct test of the leak.
-        let recorder = dir.join("recorder.sh");
-        std::fs::write(&recorder, "#!/bin/sh\nprintf 'child=%s' \"${XDG_DATA_DIRS-}\" > \"$1\"\n")
-            .expect("write recorder");
-        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod recorder");
+        let recorder =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xdg-data-dirs-recorder.sh");
 
         let child_seen = dir.join("child.txt");
         let baseline_seen = dir.join("baseline.txt");
@@ -651,7 +620,7 @@ mod tests {
         // Sealed first: the scrub drops the host Scribe session's exports,
         // and the explicit `.env` calls below then re-add exactly the ones
         // this driver needs, overriding the removal.
-        seal_child(&mut command, &dir);
+        seal_child(&mut command);
         command
             .arg("--no-config-file")
             .arg(&driver)
