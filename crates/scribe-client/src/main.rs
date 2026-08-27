@@ -211,8 +211,8 @@ use crate::{
         write_or_tear,
     },
     pane_shell::{
-        BoardReservation, ClosedPane, PanePlacement, PaneShell, SnapshotSources, WorkspaceInfo,
-        WorkspaceInfoOutcome,
+        BoardReservation, ClosedPane, PanePlacement, PaneShell, RegionGeometry, SnapshotSources,
+        WorkspaceInfo, WorkspaceInfoOutcome,
     },
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::present_next_burst,
@@ -1250,9 +1250,12 @@ impl ColdStart {
 
 /// The persisted geometry for one window id, normalized and range-checked.
 fn saved_geometry_for(window_id: WindowId) -> Option<WindowGeometry> {
+    let appearance = load_config().unwrap_or_default().appearance;
+    let tab_bar_height =
+        u32::from(round_positive_f32_to_u16(window_chrome::tab_bar_height(&appearance)));
     WindowRegistry::new()
         .load_saved(window_id)
-        .map(|geom| normalize_legacy_geometry(&geom))
+        .map(|geom| normalize_legacy_geometry(&geom, tab_bar_height))
         .filter(geometry_size_is_sane)
         // Clamped into the layout the window is about to open on rather than
         // gated against it: a record whose monitor is gone keeps the placement
@@ -2004,6 +2007,8 @@ struct TerminalView {
     reported_trees: VecDeque<scribe_common::protocol::WorkspaceTreeNode>,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
+    /// One resolved top/lower tab-row height from the live appearance config.
+    tab_bar_height: f32,
     /// Theme chrome, retained to build the overlay palettes on demand.
     chrome: ChromeColors,
     /// Terminal dimensions announced to the server for newly created sessions.
@@ -2683,8 +2688,9 @@ impl TerminalView {
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar = terminal.prompt_bar.clone();
+        let tab_bar_height = window_chrome::tab_bar_height(&config.config().config.appearance);
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
-        let titlebar = Self::build_titlebar(&chrome, opacity, cx);
+        let titlebar = Self::build_titlebar(&chrome, opacity, tab_bar_height, cx);
         Self {
             shared,
             sink,
@@ -2712,6 +2718,7 @@ impl TerminalView {
             focused_pane_size: seed.terminal_size,
             reported_trees: VecDeque::new(),
             titlebar,
+            tab_bar_height,
             chrome,
             terminal_size: seed.terminal_size,
             // The strip starts empty and is filled by the reader's first
@@ -2956,12 +2963,13 @@ impl TerminalView {
     fn build_titlebar(
         chrome: &ChromeColors,
         opacity: f32,
+        tab_bar_height: f32,
         cx: &mut Context<Self>,
     ) -> Entity<TitlebarView> {
         let colors = TabBarColors::from_chrome(chrome, opacity);
         let data = TabSessions::new().to_tab_data();
         let bar = cx.new(|cx| {
-            let mut bar = TitlebarView::new(colors, cx);
+            let mut bar = TitlebarView::new(colors, tab_bar_height, cx);
             bar.set_tabs(data, cx);
             bar
         });
@@ -3065,8 +3073,8 @@ impl TerminalView {
         self.apply_config_reload(plan, cx);
     }
 
-    /// Reapply one reload plan: theme-derived palettes, grid font metrics, and
-    /// the opacity hook, then announce the reload to the server.
+    /// Reapply one reload plan: theme-derived palettes, grid font metrics,
+    /// tab-row geometry, and opacity, then announce the reload to the server.
     ///
     /// Keybindings need no branch here — [`ConfigRuntime`] re-parses them on
     /// every reload and both `handle_overlay_key` and [`Self::handle_binding`]
@@ -3098,6 +3106,10 @@ impl TerminalView {
 
         if plan.opacity_changed() {
             self.apply_opacity_change(cx);
+        }
+
+        if plan.tab_geometry_changed() {
+            self.apply_tab_geometry_change(cx);
         }
 
         // Status-bar stat selection and the prompt-bar toggles are cheap to swap
@@ -3136,6 +3148,7 @@ impl TerminalView {
             theme = plan.theme_changed(),
             font = plan.font_changed(),
             opacity = plan.opacity_changed(),
+            tab_geometry = plan.tab_geometry_changed(),
             "config hot-reloaded"
         );
         cx.notify();
@@ -3160,6 +3173,30 @@ impl TerminalView {
     fn report_cell_metrics(&mut self, cx: &mut Context<Self>) {
         self.pane_sizes.clear();
         self.publish_pane_sizes(cx);
+    }
+
+    /// Apply the live top/lower tab-row height and invalidate every measured
+    /// pane geometry cache before the next frame.
+    ///
+    /// Clearing the measured area avoids publishing the old terminal height in
+    /// the render that schedules the new layout. The new grid canvas records
+    /// its actual bounds during prepaint, then the existing deferred geometry
+    /// path republishes and requests authoritative snapshots for every pane
+    /// whose row count changed.
+    fn apply_tab_geometry_change(&mut self, cx: &mut Context<Self>) {
+        let height = window_chrome::tab_bar_height(&self.config.config().config.appearance);
+        if (self.tab_bar_height - height).abs() <= f32::EPSILON {
+            return;
+        }
+        self.tab_bar_height = height;
+        self.titlebar.update(cx, |bar, ctx| bar.set_height(height, ctx));
+        self.grid_area.set(None);
+        self.published_grid_area = None;
+        self.pane_sizes.clear();
+        for bounds in self.pane_bounds.values() {
+            bounds.set(None);
+        }
+        tracing::info!(height, "config reload: tab geometry applied");
     }
 
     /// Delivery point for the reload plan's `opacity_changed()` signal.
@@ -3356,7 +3393,7 @@ impl TerminalView {
         let badge_palette = &self.config.config().config.workspaces.badge_colors;
         let mut bars: Vec<RegionBarData> = self
             .shell
-            .region_bar_rects(viewport, cx)
+            .region_bar_rects(viewport, self.tab_bar_height, cx)
             .into_iter()
             .map(|(workspace_id, _)| {
                 let accent = self.shell.workspace_accent(workspace_id, cx);
@@ -5859,7 +5896,7 @@ impl TerminalView {
             .collect();
         let launches = self.shell.adopt_restored(rebuilt, cx);
         let viewport = self.pane_viewport();
-        let placements = self.shell.placements(viewport, cx);
+        let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
         let split = placements.len() > 1;
         let sizes: HashMap<PaneId, TerminalSize> = placements
             .into_iter()
@@ -6569,6 +6606,10 @@ impl TerminalView {
         })
     }
 
+    fn region_geometry(&self) -> RegionGeometry {
+        RegionGeometry { viewport: self.pane_viewport(), tab_bar_height: self.tab_bar_height }
+    }
+
     /// The grid area as the paint pass actually measured it, or `None` before
     /// the measuring canvas has reported a positive rect.
     ///
@@ -6697,7 +6738,9 @@ impl TerminalView {
     /// Move pane focus spatially inside the focused region.
     fn focus_pane(&mut self, direction: FocusDirection, cx: &mut Context<Self>) {
         let viewport = self.pane_viewport();
-        let Some(pane) = self.shell.focus_pane_in_direction(direction, viewport, cx) else {
+        let Some(pane) =
+            self.shell.focus_pane_in_direction(direction, viewport, self.tab_bar_height, cx)
+        else {
             tracing::debug!(?direction, "pane focus ignored: no pane in that direction");
             return;
         };
@@ -6955,7 +6998,7 @@ impl TerminalView {
     /// before it.
     fn placed_pane_size(&self, session_id: SessionId, cx: &App) -> Option<TerminalSize> {
         let viewport = self.measured_pane_viewport()?;
-        let placements = self.shell.placements(viewport, cx);
+        let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
         let split = placements.len() > 1;
         placements
             .iter()
@@ -7000,7 +7043,7 @@ impl TerminalView {
                 self.pane_sizes.remove(&session_id);
             }
         }
-        let placements = self.shell.placements(viewport, cx);
+        let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
         let split = placements.len() > 1;
         let live: HashSet<SessionId> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
@@ -7708,7 +7751,7 @@ impl TerminalView {
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
         }
-        let placements = self.shell.placements(viewport, cx);
+        let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
         let (active_sessions, annotations) = self.prepare_pane_paint(&placements, cx);
         let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
@@ -7879,7 +7922,12 @@ impl TerminalView {
         workspace_dividers
             .into_iter()
             .map(|divider| divider.rect)
-            .chain(self.shell.dividers(viewport, cx).into_iter().map(|divider| divider.rect))
+            .chain(
+                self.shell
+                    .dividers(viewport, self.tab_bar_height, cx)
+                    .into_iter()
+                    .map(|divider| divider.rect),
+            )
             .map(|rect| {
                 div()
                     .absolute()
@@ -7909,7 +7957,7 @@ impl TerminalView {
     /// the top of its rect, above the panes [`PaneShell::placements`] already
     /// shrank to make room.
     fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let bar_rects = self.shell.region_bar_rects(self.pane_viewport(), cx);
+        let bar_rects = self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx);
         if bar_rects.is_empty() {
             return Vec::new();
         }
@@ -7981,11 +8029,9 @@ impl TerminalView {
     }
 
     fn workspace_drag_grid_origin(&self) -> DragPoint {
-        self.grid_area
-            .get()
-            .map_or(DragPoint { x: 0.0, y: scribe_client::titlebar::TITLEBAR_HEIGHT }, |bounds| {
-                DragPoint { x: f32::from(bounds.origin.x), y: f32::from(bounds.origin.y) }
-            })
+        self.grid_area.get().map_or(DragPoint { x: 0.0, y: self.tab_bar_height }, |bounds| {
+            DragPoint { x: f32::from(bounds.origin.x), y: f32::from(bounds.origin.y) }
+        })
     }
 
     fn workspace_drag_layout_point(&self, point: DragPoint) -> DragPoint {
@@ -8751,16 +8797,16 @@ impl TerminalView {
         height: f32,
         cx: &App,
     ) -> Option<Rect> {
-        let viewport = self.pane_viewport();
+        let geometry = self.region_geometry();
         if pinned {
             self.shell.reserved_board_rect(
                 workspace_id,
                 BoardReservation { height, terminal: self.font.line_height * 3.0 },
-                viewport,
+                geometry,
                 cx,
             )
         } else {
-            self.shell.board_rect(workspace_id, height, viewport, cx)
+            self.shell.board_rect(workspace_id, height, geometry, cx)
         }
     }
 
@@ -8822,7 +8868,7 @@ impl TerminalView {
                 Some(workspace_layout::start_workspace_drag(divider));
             return true;
         }
-        let dividers = self.shell.dividers(viewport, cx);
+        let dividers = self.shell.dividers(viewport, self.tab_bar_height, cx);
         let Some(divider) = divider::hit_test_divider(&dividers, x, y) else {
             return false;
         };
@@ -8896,12 +8942,14 @@ impl TerminalView {
     fn press_focuses_pane(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         let Some((x, y)) = self.grid_local_position(position) else { return false };
         let viewport = self.pane_viewport();
-        let pressed = self.shell.placements(viewport, cx).into_iter().find(|placement| {
-            x >= placement.rect.x
-                && x < placement.rect.x + placement.rect.width
-                && y >= placement.rect.y
-                && y < placement.rect.y + placement.rect.height
-        });
+        let pressed = self.shell.placements(viewport, self.tab_bar_height, cx).into_iter().find(
+            |placement| {
+                x >= placement.rect.x
+                    && x < placement.rect.x + placement.rect.width
+                    && y >= placement.rect.y
+                    && y < placement.rect.y + placement.rect.height
+            },
+        );
         let Some(placement) = pressed else { return false };
         if placement.focused {
             return false;
@@ -11880,6 +11928,10 @@ impl TerminalView {
         })
     }
 
+    fn ci_run_rect(&self, workspace_id: WorkspaceId, band: (f32, f32), cx: &App) -> Option<Rect> {
+        self.shell.ci_bar_rect(workspace_id, band, self.region_geometry(), cx)
+    }
+
     /// Paint one collapsed trace band in each region whose repository has CI state.
     fn render_ci_run_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let now = std::time::SystemTime::now()
@@ -11888,7 +11940,6 @@ impl TerminalView {
             .as_secs();
         let colors = CiBarColors::from_theme(&self.config.config().theme, self.opacity);
         let animations = AnimationSettings::from_config(&self.config.config().config);
-        let viewport = self.pane_viewport();
         let mut offsets: HashMap<WorkspaceId, f32> = HashMap::new();
         self.visible_ci_runs
             .iter()
@@ -11907,7 +11958,7 @@ impl TerminalView {
                 let height = ci_bar::CI_BAR_HEIGHT
                     + if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
                 let offset = offsets.entry(*workspace_id).or_default();
-                let rect = self.shell.ci_bar_rect(*workspace_id, (*offset, height), viewport, cx);
+                let rect = self.ci_run_rect(*workspace_id, (*offset, height), cx);
                 *offset += height;
                 let rect = rect?;
                 let trace_now = if state.stale {
@@ -12794,8 +12845,14 @@ fn default_terminal_size() -> TerminalSize {
 fn startup_window_size(cx: &App) -> Size<Pixels> {
     let appearance = load_config().unwrap_or_default().appearance;
     let font = GridFont::from_appearance(&appearance);
-    let wanted =
-        window_chrome::default_window_size(COLUMNS, ROWS, font.cell_width(), font.line_height);
+    let tab_bar_height = window_chrome::tab_bar_height(&appearance);
+    let wanted = window_chrome::default_window_size(
+        COLUMNS,
+        ROWS,
+        font.cell_width(),
+        font.line_height,
+        tab_bar_height,
+    );
     let wanted = cx.primary_display().map_or(wanted, |display| {
         let bounds = display.bounds().size;
         window_chrome::clamp_to_display(

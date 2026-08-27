@@ -123,6 +123,20 @@ fn reload_with_only_opacity_change_is_scoped(_cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn reload_detects_tab_geometry_changes(_cx: &mut gpui::TestAppContext) {
+    let base = parse("[appearance]\ntab_height = 16.0\ntab_bar_padding = 0.0\n");
+    let mut client = ClientConfig::from_config(base);
+
+    let taller = parse("[appearance]\ntab_height = 60.0\ntab_bar_padding = 20.0\n");
+    let plan = client.reload(taller);
+
+    assert!(plan.tab_geometry_changed());
+    assert!(!plan.theme_changed());
+    assert!(!plan.font_changed());
+    assert!(!plan.opacity_changed());
+}
+
+#[gpui::test]
 fn reload_with_no_changes_reports_nothing(_cx: &mut gpui::TestAppContext) {
     let cfg = parse("[appearance]\ntheme = \"minimal-dark\"\n");
     let mut client = ClientConfig::from_config(cfg.clone());

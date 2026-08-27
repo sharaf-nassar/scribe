@@ -54,11 +54,14 @@ use scribe_common::{
 /// which only happens if a region is removed between two reads in one frame.
 const FALLBACK_PANE_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
 
-/// Height of the tab bar a lower workspace region reserves at its top edge,
-/// matching [`scribe_client::titlebar::TITLEBAR_HEIGHT`] so stacked regions
-/// read as the same chrome. Regions on the window's top row keep their tabs in
-/// the titlebar and reserve nothing.
-pub const REGION_TAB_BAR_HEIGHT: f32 = scribe_client::titlebar::TITLEBAR_HEIGHT;
+/// Frame-local inputs for geometry inside workspace regions.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionGeometry {
+    /// Grid-area rectangle every workspace split resolves against.
+    pub viewport: Rect,
+    /// Live height lower regions reserve for their tab row.
+    pub tab_bar_height: f32,
+}
 
 /// One leaf pane, resolved against a viewport for a single frame.
 #[derive(Debug, Clone, Copy)]
@@ -596,15 +599,15 @@ impl PaneShell {
     /// Both reservations land here rather than at the call sites so pane math,
     /// painted panes, dividers, and the rows published to the PTY cannot
     /// disagree about where a region's content starts.
-    fn content_rect(rect: Rect, ci: f32, board: f32) -> Rect {
-        let bar = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
+    fn content_rect(rect: Rect, tab_bar_height: f32, ci: f32, board: f32) -> Rect {
+        let bar = if Self::is_lower_region(rect) { tab_bar_height } else { 0.0 };
         let reserved = (bar + ci + board).min(rect.height);
         Rect { x: rect.x, y: rect.y + reserved, width: rect.width, height: rect.height - reserved }
     }
 
     /// The collapsed CI strip inside one raw region rect, directly below tabs.
-    fn ci_rect(rect: Rect, strip: f32) -> Option<Rect> {
-        let tab = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
+    fn ci_rect(rect: Rect, tab_bar_height: f32, strip: f32) -> Option<Rect> {
+        let tab = if Self::is_lower_region(rect) { tab_bar_height } else { 0.0 };
         let height = strip.min((rect.height - tab).max(0.0));
         (height > 0.0).then_some(Rect { x: rect.x, y: rect.y + tab, width: rect.width, height })
     }
@@ -638,17 +641,19 @@ impl PaneShell {
         &self,
         workspace_id: WorkspaceId,
         band: (f32, f32),
-        viewport: Rect,
+        geometry: RegionGeometry,
         cx: &App,
     ) -> Option<Rect> {
         let (offset, height) = band;
         self.workspace
             .read(cx)
             .layout()
-            .compute_workspace_rects(viewport)
+            .compute_workspace_rects(geometry.viewport)
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
-            .and_then(|(_, rect)| Self::ci_rect(rect, self.ci_strip(workspace_id)))
+            .and_then(|(_, rect)| {
+                Self::ci_rect(rect, geometry.tab_bar_height, self.ci_strip(workspace_id))
+            })
             .and_then(|strip| Self::ci_band_rect(strip, offset, height))
     }
 
@@ -670,16 +675,18 @@ impl PaneShell {
         &self,
         workspace_id: WorkspaceId,
         height: f32,
-        viewport: Rect,
+        geometry: RegionGeometry,
         cx: &App,
     ) -> Option<Rect> {
         self.workspace
             .read(cx)
             .layout()
-            .compute_workspace_rects(viewport)
+            .compute_workspace_rects(geometry.viewport)
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
-            .map(|(_, rect)| Self::content_rect(rect, self.ci_strip(workspace_id), 0.0))
+            .map(|(_, rect)| {
+                Self::content_rect(rect, geometry.tab_bar_height, self.ci_strip(workspace_id), 0.0)
+            })
             .map(|content| Rect { height: height.min(content.height), ..content })
     }
 
@@ -690,10 +697,10 @@ impl PaneShell {
         &self,
         workspace_id: WorkspaceId,
         reservation: BoardReservation,
-        viewport: Rect,
+        geometry: RegionGeometry,
         cx: &App,
     ) -> Option<Rect> {
-        let content = self.board_rect(workspace_id, f32::MAX, viewport, cx)?;
+        let content = self.board_rect(workspace_id, f32::MAX, geometry, cx)?;
         Some(Rect {
             height: Self::reserved_board_height(
                 content.height,
@@ -730,7 +737,12 @@ impl PaneShell {
 
     /// The tab-bar strip each lower region reserves at its top, in region
     /// left-to-right, top-to-bottom order.
-    pub fn region_bar_rects(&self, viewport: Rect, cx: &App) -> Vec<(WorkspaceId, Rect)> {
+    pub fn region_bar_rects(
+        &self,
+        viewport: Rect,
+        tab_bar_height: f32,
+        cx: &App,
+    ) -> Vec<(WorkspaceId, Rect)> {
         self.workspace
             .read(cx)
             .layout()
@@ -738,7 +750,7 @@ impl PaneShell {
             .into_iter()
             .filter(|(_, rect)| Self::is_lower_region(*rect))
             .map(|(workspace_id, rect)| {
-                let bar = REGION_TAB_BAR_HEIGHT.min(rect.height);
+                let bar = tab_bar_height.min(rect.height);
                 (workspace_id, Rect { x: rect.x, y: rect.y, width: rect.width, height: bar })
             })
             .collect()
@@ -979,12 +991,13 @@ impl PaneShell {
         &mut self,
         direction: FocusDirection,
         viewport: Rect,
+        tab_bar_height: f32,
         cx: &mut App,
     ) -> Option<PaneId> {
         let workspace_id = self.focused_workspace_id(cx);
         let tab = *self.shown_tabs.get(&workspace_id)?;
         let focused = *self.focused.get(&tab)?;
-        let region = self.region_rect(workspace_id, viewport, cx)?;
+        let region = self.region_rect(workspace_id, viewport, tab_bar_height, cx)?;
         let tree = self.trees.get(&tab)?;
         let pane_tree = tree.read(cx);
         let rects = pane_tree.compute_rects(region);
@@ -1213,13 +1226,14 @@ impl PaneShell {
     }
 
     /// Resolve every pane against `viewport` for one frame.
-    pub fn placements(&self, viewport: Rect, cx: &App) -> Vec<PanePlacement> {
+    pub fn placements(&self, viewport: Rect, tab_bar_height: f32, cx: &App) -> Vec<PanePlacement> {
         let workspace = self.workspace.read(cx);
         let focused_workspace = workspace.focused_workspace_id();
         let mut out = Vec::new();
         for (workspace_id, region) in workspace.layout().compute_workspace_rects(viewport) {
             let region = Self::content_rect(
                 region,
+                tab_bar_height,
                 self.ci_strip(workspace_id),
                 self.board_strip(workspace_id),
             );
@@ -1248,7 +1262,7 @@ impl PaneShell {
     /// The pane trees own their ratios while this shell owns their regions, so
     /// the running view gets both pieces here rather than reimplementing the
     /// tree traversal beside its paint code.
-    pub fn dividers(&self, viewport: Rect, cx: &App) -> Vec<Divider> {
+    pub fn dividers(&self, viewport: Rect, tab_bar_height: f32, cx: &App) -> Vec<Divider> {
         let workspace = self.workspace.read(cx);
         workspace
             .layout()
@@ -1257,6 +1271,7 @@ impl PaneShell {
             .flat_map(|(workspace_id, region)| {
                 let region = Self::content_rect(
                     region,
+                    tab_bar_height,
                     self.ci_strip(workspace_id),
                     self.board_strip(workspace_id),
                 );
@@ -1605,11 +1620,18 @@ impl PaneShell {
 
     /// The content rect `workspace_id` occupies inside `viewport`, minus a
     /// lower region's tab bar, so pane math and painted panes agree.
-    fn region_rect(&self, workspace_id: WorkspaceId, viewport: Rect, cx: &App) -> Option<Rect> {
+    fn region_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        viewport: Rect,
+        tab_bar_height: f32,
+        cx: &App,
+    ) -> Option<Rect> {
         let layout: &WindowLayout = self.workspace.read(cx).layout();
         layout.compute_workspace_rects(viewport).into_iter().find_map(|(id, rect)| {
             (id == workspace_id).then_some(Self::content_rect(
                 rect,
+                tab_bar_height,
                 self.ci_strip(workspace_id),
                 self.board_strip(workspace_id),
             ))
@@ -2127,14 +2149,14 @@ mod tests {
     }
 
     /// A top-row region keeps its full rect — its tabs live in the titlebar —
-    /// while a stacked region cedes [`REGION_TAB_BAR_HEIGHT`] at its top to
-    /// the in-region tab bar, and a region shorter than the bar cannot go
-    /// negative.
+    /// while a stacked region cedes the resolved tab-bar height at its top, and
+    /// a region shorter than the bar cannot go negative.
     // @lat: [[test#GPUI Client Headless Suites#Lower regions reserve their tab bar]]
     #[test]
     fn lower_regions_reserve_their_tab_bar() {
+        let tab_bar_height = 80.0;
         let top = Rect { x: 0.0, y: 0.0, width: 800.0, height: 300.0 };
-        let kept = PaneShell::content_rect(top, 0.0, 0.0);
+        let kept = PaneShell::content_rect(top, tab_bar_height, 0.0, 0.0);
         assert!(
             (kept.y - top.y).abs() < f32::EPSILON
                 && (kept.height - top.height).abs() < f32::EPSILON,
@@ -2142,14 +2164,14 @@ mod tests {
         );
 
         let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 300.0 };
-        let content = PaneShell::content_rect(lower, 0.0, 0.0);
-        assert!((content.y - (300.0 + REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
-        assert!((content.height - (300.0 - REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
+        let content = PaneShell::content_rect(lower, tab_bar_height, 0.0, 0.0);
+        assert!((content.y - (300.0 + tab_bar_height)).abs() < f32::EPSILON);
+        assert!((content.height - (300.0 - tab_bar_height)).abs() < f32::EPSILON);
         assert!((content.x - lower.x).abs() < f32::EPSILON);
         assert!((content.width - lower.width).abs() < f32::EPSILON);
 
         let sliver = Rect { x: 0.0, y: 300.0, width: 800.0, height: 10.0 };
-        let clamped = PaneShell::content_rect(sliver, 0.0, 0.0);
+        let clamped = PaneShell::content_rect(sliver, tab_bar_height, 0.0, 0.0);
         assert!(clamped.height >= 0.0, "a sliver region clamps instead of going negative");
     }
 
@@ -2157,14 +2179,14 @@ mod tests {
     #[test]
     fn ci_band_reflows_only_its_workspace_region() {
         let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
-        let band = PaneShell::ci_rect(top, scribe_client::ci_bar::CI_BAR_HEIGHT)
+        let band = PaneShell::ci_rect(top, 80.0, scribe_client::ci_bar::CI_BAR_HEIGHT)
             .expect("region has room for CI band");
         assert!((band.x - top.x).abs() < f32::EPSILON);
         assert!((band.y - top.y).abs() < f32::EPSILON);
         assert!((band.width - top.width).abs() < f32::EPSILON);
         assert!((band.height - scribe_client::ci_bar::CI_BAR_HEIGHT).abs() < f32::EPSILON);
 
-        let content = PaneShell::content_rect(top, scribe_client::ci_bar::CI_BAR_HEIGHT, 0.0);
+        let content = PaneShell::content_rect(top, 80.0, scribe_client::ci_bar::CI_BAR_HEIGHT, 0.0);
         assert!((content.x - top.x).abs() < f32::EPSILON);
         assert!((content.width - top.width).abs() < f32::EPSILON);
         assert!((content.y - scribe_client::ci_bar::CI_BAR_HEIGHT).abs() < f32::EPSILON);
@@ -2176,9 +2198,10 @@ mod tests {
         let expanded = scribe_client::ci_bar::CI_BAR_HEIGHT
             + scribe_client::ci_bar::CI_TRACE_BASE_HEIGHT
             + 3.0 * scribe_client::ci_bar::CI_TRACE_ROW_HEIGHT;
-        let trace = PaneShell::ci_rect(top, expanded).expect("region has room for trace panel");
+        let trace =
+            PaneShell::ci_rect(top, 80.0, expanded).expect("region has room for trace panel");
         assert!((trace.height - expanded).abs() < f32::EPSILON);
-        let traced_content = PaneShell::content_rect(top, expanded, 0.0);
+        let traced_content = PaneShell::content_rect(top, 80.0, expanded, 0.0);
         assert!((traced_content.y - expanded).abs() < f32::EPSILON);
         assert!((traced_content.height - (top.height - expanded)).abs() < f32::EPSILON);
     }
@@ -2188,7 +2211,8 @@ mod tests {
     fn stacked_ci_bands_slice_their_region_strip_in_order() {
         let bar = scribe_client::ci_bar::CI_BAR_HEIGHT;
         let region = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
-        let strip = PaneShell::ci_rect(region, 2.0 * bar).expect("region has room for two bands");
+        let strip =
+            PaneShell::ci_rect(region, 80.0, 2.0 * bar).expect("region has room for two bands");
 
         let first = PaneShell::ci_band_rect(strip, 0.0, bar).expect("first band");
         let second = PaneShell::ci_band_rect(strip, bar, bar).expect("second band");
@@ -2218,8 +2242,9 @@ mod tests {
     #[test]
     fn a_pinned_board_reserves_only_its_own_region() {
         let board = 246.0;
+        let tab_bar_height = 80.0;
         let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
-        let with_board = PaneShell::content_rect(top, 0.0, board);
+        let with_board = PaneShell::content_rect(top, tab_bar_height, 0.0, board);
         assert!((with_board.y - board).abs() < f32::EPSILON);
         assert!((with_board.height - (600.0 - board)).abs() < f32::EPSILON);
         assert!(
@@ -2229,10 +2254,11 @@ mod tests {
         );
 
         let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 600.0 };
-        let stacked = PaneShell::content_rect(lower, 0.0, board);
-        assert!((stacked.y - (300.0 + REGION_TAB_BAR_HEIGHT + board)).abs() < f32::EPSILON);
+        let stacked = PaneShell::content_rect(lower, tab_bar_height, 0.0, board);
+        assert!((stacked.y - (300.0 + tab_bar_height + board)).abs() < f32::EPSILON);
 
-        let shallow = PaneShell::content_rect(Rect { height: 100.0, ..top }, 0.0, board);
+        let shallow =
+            PaneShell::content_rect(Rect { height: 100.0, ..top }, tab_bar_height, 0.0, board);
         assert!(shallow.height >= 0.0, "a region shorter than the board clamps to zero");
 
         assert!((PaneShell::reserved_board_height(600.0, board, 60.0) - board).abs() < 0.001);

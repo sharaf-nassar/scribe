@@ -3016,6 +3016,8 @@ The integrity oracle counts `moved a session into another workspace region` line
 
 The script screenshots the baseline window, changes only the theme in one save, then asserts three things in order: the client logged a new `config hot-reloaded` line, the client pid is unchanged, and the captured frame is no longer pixel-identical. The settings theme-picker and keybindings suites own their richer live-reload behavior.
 
+Tab geometry has its final-boundary reload oracle in `tests/e2e/visual/window-chrome-bands.sh`: one client changes `tab_height` and `tab_bar_padding` separately, each edit grows the hot-reload and pane-publication logs, and measured top/lower rows follow their effective sum without a restart.
+
 Asserting on the log rather than on pixels alone is deliberate: the status bar's sparklines resample on a timer, so a screenshot diff on its own could pass without any reload having happened.
 
 ### X11 focus guard gates the live key path
@@ -3371,11 +3373,11 @@ Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` tha
 
 ### Window chrome bands stay on screen
 
-`tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level oracle for : it measures, on the running client, that the derived window size really does fit the whole terminal grid *and* every chrome band.
+`tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level geometry oracle for the whole tab-height contract, startup window sizing, terminal grid, prompt strip, and status bar.
 
-The measurement is geometric rather than golden-image. Phase 1 reads the client window's own size with `xdotool getwindowgeometry` and asserts it is the derived 1008x739 — the same arithmetic the crate does, restated in the script so a drift fails here instead of silently clipping pixels — then confirms the whole window is on the Xvfb screen by trimming a full-screen capture. Phases 2-4 crop window-relative bands out of `import -window` captures, so no WM decoration can shift an offset.
+The run starts at `tab_height=16` / `tab_bar_padding=0`, so the fresh 120x36 window must be 1008x721. In the same client process it hot-reloads height 60 and then padding 20, requires both 100px top-band ImageMagick AE comparisons to be nonzero, and measures the painted rows as exactly 16, 60, and 80 px. The pre-fix client produces `tab_height AE=0, tab_bar_padding AE=0`, which is the fail-before signature. Each edit must also republish pane geometry, while the client pid stays fixed.
 
-Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom rows fell outside the viewport, and this is the assertion that catches it. Phase 3 asserts the window status bar carries ink at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the bar *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while the status bar keeps its ink, which is what the bands' `flex_none` layout guarantees.
+After restoring the 16px startup row, the suite fills the shared pane and proves row 36 plus the bottom status bar remain on screen, then raises a real prompt strip and requires its band to repaint without moving status. It finally restores the 80px row, creates a lower workspace through `ctrl+alt+-`, measures the lower bar at the same 80px, paints the lower pane red to locate its first content row, and enables application mouse tracking: a click inside the bar must emit no mouse report, while a click immediately below must reach the pane. Captures use `import -window`, so every offset is window-relative and no WM decoration can shift the measurement.
 
 ### Published columns fit one rendered row
 
@@ -4568,9 +4570,9 @@ A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to 
 
 ### Lower regions reserve their tab bar
 
-Unit coverage for the region content-rect rule behind the in-region tab bars: a top-row region keeps its full rect, a stacked region cedes `REGION_TAB_BAR_HEIGHT` at its top, and a region shorter than the bar clamps instead of going negative.
+Unit coverage for the shared lower-region content-rect rule at a live 80px tab-row height.
 
-Every pane-geometry consumer (`placements`, `dividers`, directional focus) shares this one rule, so painted panes and hit-tests can never disagree about where a lower region's content starts.
+A top-row region keeps its full rect, a stacked region cedes the supplied height, and a region shorter than the bar clamps instead of going negative. Every pane-geometry consumer (`placements`, `dividers`, directional focus, CI/board offsets) receives that same resolved height, so paint and hit tests agree.
 
 ### A pinned board reserves only its own region
 
@@ -5128,9 +5130,9 @@ The test parses the removed-keys TOML into , asserts the live appearance fields 
 
 ### Config live reload
 
-A scripted reload confirms that edits to theme, font, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
+A scripted reload confirms that edits to theme, font, tab geometry, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
 
-Building a  from an initial config and calling  with an edited config, the test asserts the returned  flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed  reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
+Building a  from an initial config and calling  with an edited config, the test asserts the returned  flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed  reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed`, a `tab_height` / `tab_bar_padding` edit is scoped to `tab_geometry_changed`, and an identical config reports no change.
 
 Those cases prove the plan is computed correctly, but not that a running window ever asks for one. The child cases below cover the runtime path that closes that gap — watcher signal, foreground poll, painted font, and the outbound `ConfigReloaded` — and  drives the whole chain against a real window.
 
@@ -5329,7 +5331,13 @@ The test asserts box-drawing and block codepoints become spaces before shaping w
 
 Locks the arithmetic behind the derived startup window size, so the terminal grid and the chrome bands can never again be sized to overlap. See .
 
-These cases cover the derivation only. That the running window really shows its last grid row and all three bands is a display-server property, verified by .
+These cases cover the derivation only. That the running window really shows its last grid row and the configured top/lower rows is a display-server property, verified by `tests/e2e/visual/window-chrome-bands.sh`.
+
+#### Tab row resolves height plus padding
+
+Confirms [[crates/scribe-client/src/window_chrome.rs#tab_bar_height]] resolves both ends of the Settings range: 16 + 0 = 16 and 60 + 20 = 80.
+
+Startup sizing, retained titlebar paint, lower reservations, legacy geometry normalization, and live pane republish consume this value rather than recomputing either field independently.
 
 #### Default window size clears every chrome band
 

@@ -31,10 +31,8 @@ pub const MIN_WINDOW_EDGE: u32 = 40;
 /// Maximum accepted window edge, in logical pixels.
 pub const MAX_WINDOW_EDGE: u32 = 16384;
 
-/// Height, in logical pixels, of the client-drawn custom titlebar. The
-/// geometry-compat normalization grows a legacy window by this amount so the
-/// terminal content area below the titlebar keeps the size it had under the old
-/// client's OS-drawn decoration.
+/// Default client-drawn titlebar height, used by geometry compatibility tests.
+/// Runtime normalization receives the live resolved tab-row height instead.
 pub const CUSTOM_TITLEBAR_HEIGHT: u32 = 36;
 
 /// Errors that can occur during state persistence.
@@ -514,14 +512,17 @@ pub fn geometry_size_is_sane(geom: &WindowGeometry) -> bool {
 /// terminal by one titlebar height. This runs once per legacy window:
 ///
 /// 1. Size is clamped into `[MIN_WINDOW_EDGE, MAX_WINDOW_EDGE]`.
-/// 2. The window height grows by `CUSTOM_TITLEBAR_HEIGHT` so the terminal area
+/// 2. The window height grows by `custom_titlebar_height` so the terminal area
 ///    below the new titlebar matches the old client area (skipped for maximized
 ///    and fullscreen windows, whose size the compositor overrides on restore).
 /// 3. `titlebar_normalized` is set so a re-save + reload is idempotent.
 ///
 /// Already-normalized geometry is returned unchanged.
 #[must_use]
-pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
+pub fn normalize_legacy_geometry(
+    geom: &WindowGeometry,
+    custom_titlebar_height: u32,
+) -> WindowGeometry {
     if geom.titlebar_normalized {
         return geom.clone();
     }
@@ -531,7 +532,7 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
     // its old size, then clamp to the accepted range. Maximized windows are
     // resized by the compositor on restore, so leave their stored size alone.
     let height = if geom.effective_state() == WindowState::Windowed {
-        geom.height.saturating_add(CUSTOM_TITLEBAR_HEIGHT).clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
+        geom.height.saturating_add(custom_titlebar_height).clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
     } else {
         geom.height.clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
     };
@@ -790,7 +791,10 @@ mod tests {
     // @lat: [[test#Window geometry compat#Legacy geometry gains titlebar inset]]
     #[test]
     fn legacy_geometry_grows_by_titlebar_height() {
-        let normalized = normalize_legacy_geometry(&legacy_geom(1200, 800, WindowState::Windowed));
+        let normalized = normalize_legacy_geometry(
+            &legacy_geom(1200, 800, WindowState::Windowed),
+            CUSTOM_TITLEBAR_HEIGHT,
+        );
         assert_eq!(normalized.width, 1200);
         assert_eq!(normalized.height, 800 + CUSTOM_TITLEBAR_HEIGHT);
         assert!(normalized.titlebar_normalized);
@@ -800,19 +804,31 @@ mod tests {
         assert_eq!(normalized.monitor_name.as_deref(), Some("DP-1"));
     }
 
+    #[test]
+    fn legacy_geometry_uses_the_resolved_titlebar_height() {
+        let normalized =
+            normalize_legacy_geometry(&legacy_geom(1200, 800, WindowState::Windowed), 80);
+        assert_eq!(normalized.height, 880);
+    }
+
     // @lat: [[test#Window geometry compat#Normalization is idempotent]]
     #[test]
     fn normalization_is_idempotent() {
-        let once = normalize_legacy_geometry(&legacy_geom(1200, 800, WindowState::Windowed));
-        let twice = normalize_legacy_geometry(&once);
+        let once = normalize_legacy_geometry(
+            &legacy_geom(1200, 800, WindowState::Windowed),
+            CUSTOM_TITLEBAR_HEIGHT,
+        );
+        let twice = normalize_legacy_geometry(&once, CUSTOM_TITLEBAR_HEIGHT);
         assert_eq!(once, twice);
     }
 
     // @lat: [[test#Window geometry compat#Maximized geometry keeps its size]]
     #[test]
     fn maximized_geometry_keeps_size() {
-        let normalized =
-            normalize_legacy_geometry(&legacy_geom(1920, 1080, WindowState::Maximized));
+        let normalized = normalize_legacy_geometry(
+            &legacy_geom(1920, 1080, WindowState::Maximized),
+            CUSTOM_TITLEBAR_HEIGHT,
+        );
         assert_eq!(normalized.height, 1080);
         assert!(normalized.titlebar_normalized);
     }
@@ -820,7 +836,10 @@ mod tests {
     // @lat: [[test#Window geometry compat#Out-of-range legacy size is clamped]]
     #[test]
     fn out_of_range_size_is_clamped() {
-        let huge = normalize_legacy_geometry(&legacy_geom(999_999, 30, WindowState::Windowed));
+        let huge = normalize_legacy_geometry(
+            &legacy_geom(999_999, 30, WindowState::Windowed),
+            CUSTOM_TITLEBAR_HEIGHT,
+        );
         assert_eq!(huge.width, MAX_WINDOW_EDGE);
         // 30 + 36 = 66, already >= MIN_WINDOW_EDGE, so no clamp needed there.
         assert_eq!(huge.height, 30 + CUSTOM_TITLEBAR_HEIGHT);
@@ -832,7 +851,7 @@ mod tests {
     fn default_geometry_is_pre_normalized() {
         let def = WindowGeometry::default();
         assert!(def.titlebar_normalized);
-        assert_eq!(normalize_legacy_geometry(&def), def);
+        assert_eq!(normalize_legacy_geometry(&def, CUSTOM_TITLEBAR_HEIGHT), def);
     }
 
     // @lat: [[test#Window geometry compat#Legacy TOML lacks the normalized flag]]
@@ -848,7 +867,7 @@ maximized = false
 ";
         let geom = adopt_legacy_state(toml::from_str(toml).expect("parse legacy toml"));
         assert!(!geom.titlebar_normalized);
-        let normalized = normalize_legacy_geometry(&geom);
+        let normalized = normalize_legacy_geometry(&geom, CUSTOM_TITLEBAR_HEIGHT);
         assert_eq!(normalized.height, 700 + CUSTOM_TITLEBAR_HEIGHT);
     }
 
@@ -867,7 +886,10 @@ titlebar_normalized = true
         assert_eq!(geom.state, WindowState::Maximized);
         // The fold survives normalization's `titlebar_normalized` short-circuit,
         // which is why it does not live inside it.
-        assert_eq!(normalize_legacy_geometry(&geom).state, WindowState::Maximized);
+        assert_eq!(
+            normalize_legacy_geometry(&geom, CUSTOM_TITLEBAR_HEIGHT).state,
+            WindowState::Maximized
+        );
         // And it is never written back out as a bool.
         let round_tripped = toml::to_string_pretty(&geom).expect("serialize");
         assert!(!round_tripped.contains("maximized ="), "{round_tripped}");

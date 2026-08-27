@@ -518,12 +518,11 @@ e2e-visual-update script="": e2e-visual-image-current
         docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual "/tests/$script"
     done
 
-# Run the window-chrome band visual E2E: the derived window size, the whole
-# terminal grid, and the prompt/status bands all on screen. Uses the shared-pane
-# rig so `scribe-test send` fills the very pane being measured, and the AI hook
-# channel to raise a real prompt strip.
+# Run the window-chrome band visual E2E: live top/lower tab geometry, the
+# derived startup size, the whole terminal grid, and prompt/status bands. The
+# shared-pane rig lets the script verify both painted pixels and PTY hit tests.
 e2e-visual-chrome-bands: e2e-visual-image-current
-    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/window-chrome-bands.sh
+    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/tab-geometry-config.toml)" -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/window-chrome-bands.sh
 
 # Run the terminal-viewport E2E: scrollback paging, zoom, vi mode, split-scroll,
 # and the smart-selection context menu, all against the real window. Needs the

@@ -1,0 +1,5 @@
+[appearance]
+animations = false
+cursor_blink = false
+tab_height = 16
+tab_bar_padding = 0

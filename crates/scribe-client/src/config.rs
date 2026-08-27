@@ -11,8 +11,8 @@
 //! The [`ClientConfig`] snapshot bundles the parsed config, resolved
 //! [`Theme`]/[`ChromeColors`], and parsed [`Bindings`]. [`ClientConfig::reload`]
 //! swaps in a freshly loaded config and returns a [`ConfigReloadPlan`] naming
-//! which live surfaces (theme, font metrics, opacity) must be reapplied — so a
-//! saved edit to theme, font, or keybindings takes effect without a restart.
+//! which live surfaces (theme, font metrics, opacity, tab geometry) must be
+//! reapplied — so a saved edit takes effect without a restart.
 //!
 //! [`ConfigRuntime`] is the piece the terminal window actually owns: it holds
 //! the snapshot, keeps the `notify` watcher alive, and hands the foreground a
@@ -92,11 +92,11 @@ where
 ///
 /// Mirrors the legacy `ConfigReloadPlan`, narrowed to the surfaces the GPUI
 /// spike consumes directly: the resolved terminal/chrome theme, the font
-/// metrics that drive cell-grid layout, and the root-background opacity. Any
-/// keybinding edit is always reapplied (the [`Bindings`] are re-parsed
+/// metrics that drive cell-grid layout, the root-background opacity, and the
+/// tab-row geometry. Any keybinding edit is always reapplied (the [`Bindings`] are re-parsed
 /// unconditionally), so it needs no flag here.
 ///
-/// The three flags are stored as a small bitfield rather than three `bool`
+/// The flags are stored as a small bitfield rather than separate `bool`
 /// fields to satisfy the workspace `clippy::struct_excessive_bools` gate
 /// (`max-struct-bools = 2`), mirroring [`crate::input::KittyFlags`]; the public
 /// surface is the accessor methods below.
@@ -112,6 +112,8 @@ impl ConfigReloadPlan {
     const FONT_CHANGED: u8 = 1 << 1;
     /// The root-background opacity changed.
     const OPACITY_CHANGED: u8 = 1 << 2;
+    /// `tab_height` or `tab_bar_padding` changed.
+    const TAB_GEOMETRY_CHANGED: u8 = 1 << 3;
 
     fn analyze(old: &ScribeConfig, new: &ScribeConfig) -> Self {
         let mut bits = 0;
@@ -123,6 +125,12 @@ impl ConfigReloadPlan {
         }
         if (old.appearance.opacity - new.appearance.opacity).abs() > f32::EPSILON {
             bits |= Self::OPACITY_CHANGED;
+        }
+        if (old.appearance.tab_height - new.appearance.tab_height).abs() > f32::EPSILON
+            || (old.appearance.tab_bar_padding - new.appearance.tab_bar_padding).abs()
+                > f32::EPSILON
+        {
+            bits |= Self::TAB_GEOMETRY_CHANGED;
         }
         Self { bits }
     }
@@ -145,6 +153,12 @@ impl ConfigReloadPlan {
     #[must_use]
     pub const fn opacity_changed(self) -> bool {
         self.bits & Self::OPACITY_CHANGED != 0
+    }
+
+    /// `true` when the effective top/lower tab-row inputs changed.
+    #[must_use]
+    pub const fn tab_geometry_changed(self) -> bool {
+        self.bits & Self::TAB_GEOMETRY_CHANGED != 0
     }
 
     /// `true` when any live surface changed and a repaint is warranted.
@@ -224,8 +238,8 @@ impl ClientConfig {
     ///
     /// The theme, chrome colors, and keybindings are always recomputed so a
     /// saved edit reapplies without a restart; the returned [`ConfigReloadPlan`]
-    /// tells the caller which surfaces (theme, font, opacity) actually differ so
-    /// it can skip redundant reapply work.
+    /// tells the caller which surfaces (theme, font, opacity, tab geometry)
+    /// actually differ so it can skip redundant reapply work.
     pub fn reload(&mut self, new_config: ScribeConfig) -> ConfigReloadPlan {
         let plan = ConfigReloadPlan::analyze(&self.config, &new_config);
         *self = Self::from_config(new_config);

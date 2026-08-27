@@ -11,7 +11,7 @@
 //! This module is the single place those band heights are stated, so the
 //! render path and the startup window size cannot drift apart.
 
-use crate::titlebar::TITLEBAR_HEIGHT;
+use scribe_common::config::AppearanceConfig;
 
 /// Height of the window status bar band, including its 1px top hairline —
 /// GPUI lays divs out border-box, so the border is inside this number.
@@ -44,6 +44,16 @@ pub struct WindowSize {
     pub height: f32,
 }
 
+/// Effective height of one top or lower tab-bar row.
+///
+/// Both appearance controls describe the same row: `tab_height` is its base and
+/// `tab_bar_padding` is the extra vertical room around its contents. Resolving
+/// them here keeps startup sizing and both render paths on one formula.
+#[must_use]
+pub fn tab_bar_height(appearance: &AppearanceConfig) -> f32 {
+    appearance.tab_height + appearance.tab_bar_padding
+}
+
 /// Total height of the chrome bands that are always present.
 ///
 /// The prompt bar is deliberately excluded: it exists only while the attached
@@ -52,8 +62,8 @@ pub struct WindowSize {
 /// flex-grown grid, and the bands below it stay on screen because each one is
 /// laid out `flex_none`.
 #[must_use]
-pub fn chrome_height() -> f32 {
-    TITLEBAR_HEIGHT + STATUS_BAR_HEIGHT
+pub fn chrome_height(tab_bar_height: f32) -> f32 {
+    tab_bar_height + STATUS_BAR_HEIGHT
 }
 
 /// The startup window's inner size: the whole `cols`x`rows` grid at these cell
@@ -64,9 +74,16 @@ pub fn chrome_height() -> f32 {
 /// metrics are what decide whether the last row lands above or below the
 /// window's bottom edge.
 #[must_use]
-pub fn default_window_size(cols: u16, rows: u16, cell_width: f32, line_height: f32) -> WindowSize {
+pub fn default_window_size(
+    cols: u16,
+    rows: u16,
+    cell_width: f32,
+    line_height: f32,
+    tab_bar_height: f32,
+) -> WindowSize {
     let width = ceil_pixels(f32::from(cols) * cell_width.max(0.0));
-    let height = ceil_pixels(f32::from(rows) * line_height.max(0.0)) + chrome_height();
+    let height =
+        ceil_pixels(f32::from(rows) * line_height.max(0.0)) + chrome_height(tab_bar_height);
     WindowSize { width: width.max(MIN_WINDOW_EDGE), height: height.max(MIN_WINDOW_EDGE) }
 }
 
@@ -87,17 +104,37 @@ pub fn clamp_to_display(size: WindowSize, display: WindowSize) -> WindowSize {
 mod tests {
     use super::{
         MIN_WINDOW_EDGE, STATUS_BAR_HEIGHT, WindowSize, chrome_height, clamp_to_display,
-        default_window_size,
+        default_window_size, tab_bar_height,
     };
-    use crate::titlebar::TITLEBAR_HEIGHT;
+    use scribe_common::config::AppearanceConfig;
+
+    const DEFAULT_TAB_BAR_HEIGHT: f32 = 36.0;
+
+    // @lat: [[test#GPUI Client Headless Suites#Window chrome geometry#Tab row resolves height plus padding]]
+    #[test]
+    fn tab_row_resolves_height_plus_padding() {
+        let appearance = AppearanceConfig {
+            tab_height: 60.0,
+            tab_bar_padding: 20.0,
+            ..AppearanceConfig::default()
+        };
+        assert!((tab_bar_height(&appearance) - 80.0).abs() < f32::EPSILON);
+
+        let minimum = AppearanceConfig {
+            tab_height: 16.0,
+            tab_bar_padding: 0.0,
+            ..AppearanceConfig::default()
+        };
+        assert!((tab_bar_height(&minimum) - 16.0).abs() < f32::EPSILON);
+    }
 
     // @lat: [[test#GPUI Client Headless Suites#Window chrome geometry#Default window size clears every chrome band]]
     #[test]
     fn default_window_size_clears_every_chrome_band() {
         // The shipped defaults: a 120x36 grid at font size 14 (line height
         // 14 * 1.35 = 18.9, cell width 14 * 0.6 = 8.4).
-        let size = default_window_size(120, 36, 8.4, 18.9);
-        let grid_height = size.height - chrome_height();
+        let size = default_window_size(120, 36, 8.4, 18.9, DEFAULT_TAB_BAR_HEIGHT);
+        let grid_height = size.height - chrome_height(DEFAULT_TAB_BAR_HEIGHT);
         assert!(
             grid_height >= 36.0 * 18.9,
             "all 36 rows must fit above the chrome: {grid_height} < {}",
@@ -105,19 +142,29 @@ mod tests {
         );
         assert!(size.width >= 120.0 * 8.4, "all 120 columns must fit: {}", size.width);
         // The bands themselves are what the grid has to clear.
-        assert!((chrome_height() - (TITLEBAR_HEIGHT + STATUS_BAR_HEIGHT)).abs() < f32::EPSILON);
+        assert!(
+            (chrome_height(DEFAULT_TAB_BAR_HEIGHT) - (DEFAULT_TAB_BAR_HEIGHT + STATUS_BAR_HEIGHT))
+                .abs()
+                < f32::EPSILON
+        );
         // Float noise must not buy a whole extra pixel: the shipped metrics are
         // 14 * 0.6 and 14 * 1.35, whose products land just either side of a
         // whole pixel in f32.
-        let shipped = default_window_size(120, 36, 14.0 * 0.6, 14.0f32.mul_add(1.35, 0.0));
+        let shipped = default_window_size(
+            120,
+            36,
+            14.0 * 0.6,
+            14.0f32.mul_add(1.35, 0.0),
+            DEFAULT_TAB_BAR_HEIGHT,
+        );
         assert!((shipped.width - 1008.0).abs() < f32::EPSILON, "width was {}", shipped.width);
         assert!(
-            (shipped.height - (681.0 + chrome_height())).abs() < f32::EPSILON,
+            (shipped.height - (681.0 + chrome_height(DEFAULT_TAB_BAR_HEIGHT))).abs() < f32::EPSILON,
             "height was {}",
             shipped.height
         );
         // A degenerate font metric collapses the grid, not the window.
-        let tiny = default_window_size(120, 36, 0.0, -5.0);
+        let tiny = default_window_size(120, 36, 0.0, -5.0, DEFAULT_TAB_BAR_HEIGHT);
         assert!((tiny.width - MIN_WINDOW_EDGE).abs() < f32::EPSILON);
         assert!((tiny.height - MIN_WINDOW_EDGE).abs() < f32::EPSILON);
     }
@@ -126,13 +173,13 @@ mod tests {
     #[test]
     fn startup_size_never_exceeds_the_display() {
         // font_size 72 asks for a window far taller than a 1080p screen.
-        let huge = default_window_size(120, 36, 43.2, 97.2);
+        let huge = default_window_size(120, 36, 43.2, 97.2, DEFAULT_TAB_BAR_HEIGHT);
         let clamped = clamp_to_display(huge, WindowSize { width: 1920.0, height: 1080.0 });
         assert!((clamped.width - 1920.0).abs() < f32::EPSILON);
         assert!((clamped.height - 1080.0).abs() < f32::EPSILON);
 
         // A window that already fits is left alone.
-        let fits = default_window_size(120, 36, 8.4, 18.9);
+        let fits = default_window_size(120, 36, 8.4, 18.9, DEFAULT_TAB_BAR_HEIGHT);
         assert_eq!(clamp_to_display(fits, WindowSize { width: 1920.0, height: 1080.0 }), fits);
 
         // A nonsense display report cannot clamp the window below the floor.

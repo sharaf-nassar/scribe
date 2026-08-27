@@ -93,6 +93,8 @@ Controls font, cursor, opacity, scrollbar, tab bar, status bar, and focus border
 
 Font family, font size (f32), font weight (u16, 100-900), bold weight, ligatures (bool), line padding, cursor shape (Block/Beam/Underline), cursor blink, opacity (0.0-1.0), scrollbar width (2.0-20.0), tab bar padding (0.0-20.0), status bar height (8.0-48.0), tab height (16.0-60.0), focus border colour (hex or empty for None), and focus border width (1.0-10.0).
 
+One top or lower tab-bar row has the effective height `tab_height + tab_bar_padding`. A Settings save hot-reloads that value into the retained titlebar and every lower-region reservation in the same client process; pane paint, divider and pointer geometry, workspace-drag origins, overlays, published PTY rows, restored legacy insets, and fresh startup sizing all consume the same resolution.
+
 Tab width is deliberately absent: `TAB_WIDTH` is flex basis and drag-fallback
 geometry, not a saved setting. Legacy `appearance.tab_width` is ignored on load
 and omitted by the next Settings save.

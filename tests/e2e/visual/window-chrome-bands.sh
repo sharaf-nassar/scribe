@@ -1,80 +1,54 @@
 #!/bin/bash
 [ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
-# Visual E2E: every chrome band is on screen, and the whole terminal grid fits
-# above them.
+# Visual E2E: configured tab-bar geometry is live in both chrome paths, and the
+# startup window still leaves room for the whole terminal grid and status bar.
 #
-# The window used to open at a hardcoded 960x680 — exactly the painted height of
-# the 36-row grid (36 x 18.9 px) and nothing more. The titlebar and window status
-# bar are stacked in the same flex column, so those 58 px came out of the grid:
-# the bottom rows were clipped, and a window
-# only slightly shorter would have squeezed the bands themselves away because
-# they were flex-shrinkable under a flex-grown grid.
+# The run starts at tab_height=16 / tab_bar_padding=0. In the same client
+# process it raises tab_height to 60, then padding to 20, measuring the painted
+# top row after each reload. It restores the startup geometry for the original
+# grid/status/prompt-band checks, then raises the row to 80 again and creates a
+# stacked workspace. The lower row must paint the same 80px it reserves, its
+# pane grid must start immediately below it, and application mouse reporting
+# must begin below — never inside — the bar.
 #
-# The window size is now derived (see
-# `crates/scribe-client/src/window_chrome.rs`) and every band is
-# `flex_none`. This test measures that on the running client:
-#
-#   * the window opens at the derived size and sits entirely on the screen;
-#   * the grid viewport is tall enough for all ROWS rows;
-#   * the grid's LAST row carries ink after the pane is filled;
-#   * the window status bar carries ink at the bottom of the window;
-#   * a real `PromptReceived` hook makes the prompt strip appear INSIDE the
-#     pane, at the top of the grid band (`prompt_bar_position` defaults to
-#     Top), without moving the status bar.
-#
-# Every crop is taken from `import -window`, which captures the client window's
-# own pixels, so all offsets below are window-relative and no WM decoration can
-# shift them.
-#
-# Requires: visual container with SCRIBE_SHARED_PANE=1 (the client must be
-# attached to the pane `scribe-test send` writes to), xdotool, imagemagick.
-set -e
+# Every capture uses `import -window`, so offsets are client-window-relative and
+# no WM decoration can move a crop. Animations and cursor blink are disabled by
+# the recipe's startup config so a zero ImageMagick AE delta really means the
+# running client ignored the edit.
+set -euo pipefail
 
+CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 
-# Layout constants, mirrored from the client so a drift shows up as a failure
-# here rather than as silently clipped pixels:
-#   TITLEBAR_HEIGHT      titlebar.rs
-#   STATUS_BAR_HEIGHT    window_chrome.rs
-#   COLUMNS / ROWS       main.rs
-#   line height / cell width  terminal_element.rs at the default font size 14
-#                             (14 * 1.35 = 18.9 and 14 * 0.6 = 8.4)
-TITLEBAR_H=34
-BAR_H=24
+STATUS_BAR_H=24
 ROWS=36
 COLUMNS=120
-# ceil(36 * 18.9) and ceil(120 * 8.4)
 GRID_H_MIN=681
 EXPECTED_W=1008
-EXPECTED_H=$(( TITLEBAR_H + GRID_H_MIN + BAR_H ))
-# Painted row height x10, so the last row's top edge can be computed in integer
-# arithmetic (14 * 1.35 = 18.9 px). ROW_CROP_H stays under it so the crop cannot
-# spill into the band below.
+START_TAB_H=16
+START_PADDING=0
+START_BAR_H=$(( START_TAB_H + START_PADDING ))
+HEIGHT_BAR_H=60
+PADDED_BAR_H=80
+EXPECTED_H=$(( START_BAR_H + GRID_H_MIN + STATUS_BAR_H ))
 ROW_H_X10=189
 ROW_CROP_H=18
-
-# A band this dark is empty. Rendered text is near-white over a near-black grid
-# (14,14,16) or a near-black chrome band (29,29,31), so a luminance threshold
-# separates ink from either background.
 INK_MIN=40
-
-# The prompt the hook channel raises, and the smallest repaint that counts as
-# "the prompt strip replaced the grid rows that were in that band". Swapping a
-# row of terminal text for the strip's own background, icon, text and timer
-# moves thousands of pixels; with SCRIBE_DISABLE_ANIMATIONS=1 an unchanged band
-# is byte-identical, so this only has to clear sampling noise.
 PROMPT_TEXT="chrome band probe prompt"
 PROMPT_DELTA_MIN="${PROMPT_DELTA_MIN:-200}"
 
 WID=""
 WIN_W=0
 WIN_H=0
+WIN_X=0
+WIN_Y=0
+PUBLISH_GROWTH=0
 
 fail() {
     echo "FAIL: $1" >&2
     echo "--- client log tail ---" >&2
-    tail -40 "$CLIENT_LOG" 2>/dev/null >&2 || true
+    tail -60 "$CLIENT_LOG" 2>/dev/null >&2 || true
     exit 1
 }
 
@@ -87,13 +61,17 @@ find_window() {
 
 focus() {
     WID=$(find_window)
-    [ -z "$WID" ] && fail "no Scribe window found"
+    [ -n "$WID" ] || fail "no Scribe window found"
     xdotool windowactivate --sync "$WID" 2>/dev/null \
         || xdotool windowfocus --sync "$WID" 2>/dev/null || true
     sleep 0.3
+    eval "$(xdotool getwindowgeometry --shell "$WID")"
+    WIN_X="$X"
+    WIN_Y="$Y"
+    WIN_W="$WIDTH"
+    WIN_H="$HEIGHT"
 }
 
-# Capture just the client window's own pixels.
 shot() {
     focus
     sleep 0.3
@@ -101,119 +79,258 @@ shot() {
     echo "captured $1"
 }
 
-# Lit pixels in a window-relative band: $1 image, $2 y, $3 height.
-band_ink() {
+count_log() {
+    grep -cF "$1" "$CLIENT_LOG" 2>/dev/null || true
+}
+
+wait_for_log_growth() {
+    local pattern="$1" baseline="$2" timeout_secs="${3:-15}" started now
+    started=$(date +%s)
+    while true; do
+        now=$(count_log "$pattern")
+        [ "$now" -gt "$baseline" ] && return 0
+        if [ $(( $(date +%s) - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+write_geometry() {
+    local tab_height="$1" padding="$2"
+    cat >"$CONFIG_FILE" <<EOF
+[appearance]
+animations = false
+cursor_blink = false
+tab_height = $tab_height
+tab_bar_padding = $padding
+
+[remote]
+sharing_mode = "free_for_all"
+EOF
+}
+
+reload_geometry() {
+    local tab_height="$1" padding="$2" label="$3"
+    local reloads_before publishes_before publishes_after
+    reloads_before=$(count_log "config hot-reloaded")
+    publishes_before=$(count_log "published a pane's grid size")
+    write_geometry "$tab_height" "$padding"
+    wait_for_log_growth "config hot-reloaded" "$reloads_before" 15 \
+        || fail "$label edit never hot-reloaded"
+    # Do not fail here: the pre-fix proof must reach both screenshot deltas and
+    # report them together. The post-fix assertions below still require each
+    # edit to republish pane geometry.
+    wait_for_log_growth "published a pane's grid size" "$publishes_before" 5 || true
+    publishes_after=$(count_log "published a pane's grid size")
+    PUBLISH_GROWTH=$(( publishes_after - publishes_before ))
+    sleep 0.5
+}
+
+# Measure the bottom of the chrome marks that differ from the stable pane
+# background sampled at the end of this scan. Titlebar and grid backgrounds can
+# be identical; the active underline and bottom hairline still end exactly at
+# the row boundary. The right edge carries no terminal glyph ink below them.
+measure_bar_height() {
+    local image="$1" top="$2" scan_h="$3" label="$4"
+    local x target_y target end mask
+    x=$(( WIN_W - 4 ))
+    target_y=$(( top + scan_h - 2 ))
+    target=$(convert "$image" -format "%[pixel:p{$x,$target_y}]" info:)
+    mask="/tmp/${label}-boundary-mask.png"
+    convert "$image" -crop "1x${scan_h}+${x}+${top}" +repage -alpha on \
+        -fuzz 2% -transparent "$target" "$mask" >/dev/null
+    end=$(convert "$mask" -trim -format '%[fx:page.y+h]' info: 2>/dev/null || true)
+    [ -n "$end" ] || fail "$label row boundary was not measurable"
+    printf '%s' "${end%.*}"
+}
+
+crop_top() {
+    convert "$1" -crop "${WIN_W}x100+0+0" +repage "$2"
+}
+
+image_delta() {
     local value
-    value=$(convert "$1" -crop "${WIN_W}x${3}+0+${2}" +repage \
+    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
+}
+
+band_ink() {
+    local image="$1" y="$2" height="$3" value
+    value=$(convert "$image" -crop "${WIN_W}x${height}+0+${y}" +repage \
         -colorspace Gray -threshold 35% -format "%[fx:mean*w*h]" info:)
     printf '%s' "${value%.*}"
 }
 
-# Write a window-relative band to its own file: $1 src, $2 dest, $3 y, $4 height.
 crop_band() {
     convert "$1" -crop "${WIN_W}x${4}+0+${3}" +repage "$2"
 }
 
-# Differing pixels between two same-size crops.
-band_delta() {
-    local diff
-    diff=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
-    echo "${diff%%.*}"
+first_red_row() {
+    local image="$1" x="$2" top="$3" height="$4" mask offset
+    mask=/tmp/lower-pane-red-mask.png
+    convert "$image" -crop "1x${height}+${x}+${top}" +repage -alpha off \
+        -fx '(r > 0.3 && r > g * 1.25 && r > b * 1.25) ? 1 : 0' "$mask" >/dev/null
+    offset=$(convert "$mask" -trim -format '%[fx:page.y]' info: 2>/dev/null || true)
+    [ -n "$offset" ] || fail "lower pane red content was not measurable"
+    printf '%s' "$(( top + ${offset%.*} ))"
 }
 
-# ── Phase 1: the window opens at the derived size, fully on screen ────────────
+# ── Phase 1: hot reload changes the painted top row in one process ────────────
+sleep 0.8
 focus
-eval "$(xdotool getwindowgeometry --shell "$WID")"
-WIN_W="$WIDTH"
-WIN_H="$HEIGHT"
-echo "window geometry: ${WIN_W}x${WIN_H} at ${X},${Y}"
+INITIAL_W="$WIN_W"
+INITIAL_H="$WIN_H"
+INITIAL_PID=$(pgrep -f '(^|/)scribe-client$' | head -1)
+[ -n "$INITIAL_PID" ] || fail "no running scribe-client process"
 
-[ "$WIN_W" -eq "$EXPECTED_W" ] \
-    || fail "window width $WIN_W != $EXPECTED_W (COLUMNS=$COLUMNS at 8.4 px/cell)"
-[ "$WIN_H" -eq "$EXPECTED_H" ] \
-    || fail "window height $WIN_H != $EXPECTED_H (titlebar+grid+bar)"
+shot /output/chrome-tabs-00-baseline.png
+crop_top /output/chrome-tabs-00-baseline.png /output/chrome-tabs-00-baseline-top.png
+BASELINE_H=$(measure_bar_height /output/chrome-tabs-00-baseline.png 0 100 top-baseline)
 
-GRID_Y="$TITLEBAR_H"
-GRID_H=$(( WIN_H - TITLEBAR_H - BAR_H ))
+reload_geometry 60 0 "tab_height"
+HEIGHT_PUBLISH_GROWTH="$PUBLISH_GROWTH"
+shot /output/chrome-tabs-01-height-60.png
+crop_top /output/chrome-tabs-01-height-60.png /output/chrome-tabs-01-height-60-top.png
+HEIGHT_H=$(measure_bar_height /output/chrome-tabs-01-height-60.png 0 100 top-height)
+HEIGHT_DELTA=$(image_delta \
+    /output/chrome-tabs-00-baseline-top.png /output/chrome-tabs-01-height-60-top.png)
+
+reload_geometry 60 20 "tab_bar_padding"
+PADDING_PUBLISH_GROWTH="$PUBLISH_GROWTH"
+shot /output/chrome-tabs-02-padding-20.png
+crop_top /output/chrome-tabs-02-padding-20.png /output/chrome-tabs-02-padding-20-top.png
+PADDED_H=$(measure_bar_height /output/chrome-tabs-02-padding-20.png 0 100 top-padding)
+PADDING_DELTA=$(image_delta \
+    /output/chrome-tabs-01-height-60-top.png /output/chrome-tabs-02-padding-20-top.png)
+
+CURRENT_PID=$(pgrep -f '(^|/)scribe-client$' | head -1)
+[ "$CURRENT_PID" = "$INITIAL_PID" ] \
+    || fail "client restarted during geometry reload ($INITIAL_PID -> $CURRENT_PID)"
+
+# Keep both fail-before signals in one line: pre-fix main paints 34px for every
+# capture, so both AE values are zero and neither field reaches the runtime.
+if [ "${HEIGHT_DELTA:-0}" -eq 0 ] || [ "${PADDING_DELTA:-0}" -eq 0 ]; then
+    fail "tab geometry stayed fixed (tab_height AE=$HEIGHT_DELTA, tab_bar_padding AE=$PADDING_DELTA)"
+fi
+[ "$BASELINE_H" -eq "$START_BAR_H" ] \
+    || fail "baseline top row measured ${BASELINE_H}px, want ${START_BAR_H}px"
+[ "$HEIGHT_H" -eq "$HEIGHT_BAR_H" ] \
+    || fail "tab_height=60 top row measured ${HEIGHT_H}px"
+[ "$PADDED_H" -eq "$PADDED_BAR_H" ] \
+    || fail "tab_height=60 + tab_bar_padding=20 measured ${PADDED_H}px"
+[ "$HEIGHT_PUBLISH_GROWTH" -gt 0 ] \
+    || fail "tab_height edit did not republish pane geometry"
+[ "$PADDING_PUBLISH_GROWTH" -gt 0 ] \
+    || fail "tab_bar_padding edit did not republish pane geometry"
+[ "$INITIAL_W" -eq "$EXPECTED_W" ] \
+    || fail "startup width $INITIAL_W != $EXPECTED_W"
+[ "$INITIAL_H" -eq "$EXPECTED_H" ] \
+    || fail "startup height $INITIAL_H != $EXPECTED_H (configured row + grid + status)"
+echo "PHASE 1 PASS: top row hot-reloaded 16 -> 60 -> 80px in pid $INITIAL_PID (AE $HEIGHT_DELTA, $PADDING_DELTA)"
+
+# ── Phase 2: startup baseline leaves the full grid and status bar visible ─────
+reload_geometry "$START_TAB_H" "$START_PADDING" "baseline restore"
+shot /output/chrome-bands-00-empty.png
+GRID_Y="$START_BAR_H"
+GRID_H=$(( WIN_H - START_BAR_H - STATUS_BAR_H ))
 [ "$GRID_H" -ge "$GRID_H_MIN" ] \
     || fail "grid viewport $GRID_H px cannot show $ROWS rows (needs $GRID_H_MIN)"
 
-# The whole client area has to be on the screen, not just requested: a window
-# taller than the display would move the status bar off the *screen* instead of
-# off the window, which is the same defect one level up.
 read -r SCREEN_W SCREEN_H <<<"$(xdotool getdisplaygeometry)"
 [ "$WIN_W" -le "$SCREEN_W" ] && [ "$WIN_H" -le "$SCREEN_H" ] \
     || fail "window ${WIN_W}x${WIN_H} does not fit the ${SCREEN_W}x${SCREEN_H} screen"
 scrot -o /output/chrome-bands-screen.png
-read -r FRAME_H <<<"$(convert /output/chrome-bands-screen.png \
-    -bordercolor black -fuzz 1% -trim -format "%h" info:)"
+FRAME_H=$(convert /output/chrome-bands-screen.png \
+    -bordercolor black -fuzz 1% -trim -format "%h" info:)
 [ "${FRAME_H:-0}" -ge "$WIN_H" ] \
     || fail "only ${FRAME_H}px of the ${WIN_H}px window is on screen"
-echo "PHASE 1 PASS: ${WIN_W}x${WIN_H} window, ${GRID_H}px grid viewport, all on screen"
 
-# ── Phase 2: fill the grid, then prove its LAST row is on screen ──────────────
-# `seq 1 40` overflows a 36-row grid, so the bottom rows are guaranteed to hold
-# scrolled-in output rather than blank cells below a short command.
-BAR_Y=$(( WIN_H - BAR_H ))
+BAR_Y=$(( WIN_H - STATUS_BAR_H ))
 LAST_ROW_Y=$(( GRID_Y + (ROWS - 1) * ROW_H_X10 / 10 ))
-
-shot /output/chrome-bands-00-empty.png
 BEFORE_LAST_ROW=$(band_ink /output/chrome-bands-00-empty.png "$LAST_ROW_Y" "$ROW_CROP_H")
-
 scribe-test send "$SESSION" 'clear; seq 1 40; echo GRID_FILL_DONE\n'
 scribe-test wait-output "$SESSION" "GRID_FILL_DONE"
 sleep 1.0
 shot /output/chrome-bands-01-filled.png
-
 LAST_ROW_INK=$(band_ink /output/chrome-bands-01-filled.png "$LAST_ROW_Y" "$ROW_CROP_H")
-echo "  last grid row ink: $BEFORE_LAST_ROW -> $LAST_ROW_INK"
+BAR_INK=$(band_ink /output/chrome-bands-01-filled.png "$BAR_Y" "$STATUS_BAR_H")
 [ "${LAST_ROW_INK:-0}" -ge "$INK_MIN" ] \
-    || fail "grid row $ROWS (y=$LAST_ROW_Y) is blank: the grid is still clipped"
-echo "PHASE 2 PASS: grid row $ROWS renders inside the window"
-
-# ── Phase 3: the status bar carries ink at the window bottom ─────────────────
-BAR_INK=$(band_ink /output/chrome-bands-01-filled.png "$BAR_Y" "$BAR_H")
-echo "  status bar ink: $BAR_INK"
+    || fail "grid row $ROWS is blank after ink $BEFORE_LAST_ROW -> $LAST_ROW_INK"
 [ "${BAR_INK:-0}" -ge "$INK_MIN" ] \
-    || fail "the window status bar (y=$BAR_Y) is not on screen"
-echo "PHASE 3 PASS: status bar renders at the window bottom"
+    || fail "status bar at y=$BAR_Y is not on screen"
+echo "PHASE 2 PASS: ${WIN_W}x${WIN_H} startup shows row $ROWS and the status bar"
 
-# ── Phase 4: a real prompt makes the prompt strip appear, bands survive ───────
-# One prompt row is max(cell_height + 10, 28) = 28 px (prompt_bar.rs). The
-# strip is pane-internal chrome: with `prompt_bar_position` at its default
-# (Top) it renders at the top edge of the pane's grid band and its rows come
-# out of that pane's PTY — the grid band and status bar do not move.
+# ── Phase 3: prompt chrome takes rows from the pane, not from status ──────────
 PROMPT_H=28
 PROMPT_Y="$GRID_Y"
 crop_band /output/chrome-bands-01-filled.png /output/chrome-bands-prompt-before.png \
     "$PROMPT_Y" "$PROMPT_H"
-
 SCRIBE_HOOK_SOCK="$HOOK_SOCK" SCRIBE_SESSION_ID="$SESSION" scribe-hook-helper \
     --provider=claude_code --event=prompt_received --text="$PROMPT_TEXT"
 sleep 1.5
 shot /output/chrome-bands-02-prompt.png
 crop_band /output/chrome-bands-02-prompt.png /output/chrome-bands-prompt-after.png \
     "$PROMPT_Y" "$PROMPT_H"
-
 PROMPT_INK=$(band_ink /output/chrome-bands-02-prompt.png "$PROMPT_Y" "$PROMPT_H")
-PROMPT_DELTA=$(band_delta /output/chrome-bands-prompt-before.png \
-    /output/chrome-bands-prompt-after.png)
-BAR_AFTER=$(band_ink /output/chrome-bands-02-prompt.png "$BAR_Y" "$BAR_H")
-echo "  prompt band ink: $PROMPT_INK   repaint delta: $PROMPT_DELTA"
-echo "  bar ink after prompt: $BAR_AFTER"
-# The band at the top of the grid was terminal rows before the prompt arrived,
-# so ink alone proves nothing: the band has to have REPAINTED into the strip.
-[ "${PROMPT_INK:-0}" -ge "$INK_MIN" ] \
-    || fail "the prompt strip (y=$PROMPT_Y) never rendered"
+PROMPT_DELTA=$(image_delta \
+    /output/chrome-bands-prompt-before.png /output/chrome-bands-prompt-after.png)
+BAR_AFTER=$(band_ink /output/chrome-bands-02-prompt.png "$BAR_Y" "$STATUS_BAR_H")
+[ "${PROMPT_INK:-0}" -ge "$INK_MIN" ] || fail "prompt strip never rendered"
 [ "${PROMPT_DELTA:-0}" -ge "$PROMPT_DELTA_MIN" ] \
-    || fail "the band at y=$PROMPT_Y did not repaint: no prompt strip appeared"
+    || fail "prompt band did not repaint ($PROMPT_DELTA changed pixels)"
 [ "${BAR_AFTER:-0}" -ge "$INK_MIN" ] \
-    || fail "the prompt strip pushed the window status bar off screen"
-echo "PHASE 4 PASS: prompt strip renders inside the pane, status bar undisturbed"
+    || fail "prompt strip pushed the status bar off screen"
+echo "PHASE 3 PASS: prompt strip repainted $PROMPT_DELTA pixels without moving status"
+
+# ── Phase 4: lower bar paints and reserves the same configured 80px ───────────
+reload_geometry 60 20 "lower bar geometry"
+SPLITS_BEFORE=$(count_log "split the window into a new workspace region")
+BARS_BEFORE=$(count_log "lower-region tab bars changed")
+focus
+xdotool key --clearmodifiers ctrl+alt+minus
+wait_for_log_growth "split the window into a new workspace region" "$SPLITS_BEFORE" 15 \
+    || fail "ctrl+alt+- never split the workspace"
+wait_for_log_growth "lower-region tab bars changed" "$BARS_BEFORE" 20 \
+    || fail "stacked workspace never published its lower bar"
+sleep 1.5
+shot /output/chrome-tabs-03-lower-bar.png
+GRID_H=$(( WIN_H - PADDED_BAR_H - STATUS_BAR_H ))
+LOWER_TOP=$(( PADDED_BAR_H + (GRID_H + 1) / 2 ))
+LOWER_H=$(measure_bar_height /output/chrome-tabs-03-lower-bar.png "$LOWER_TOP" 120 lower)
+[ "$LOWER_H" -eq "$PADDED_BAR_H" ] \
+    || fail "lower row measured ${LOWER_H}px, want ${PADDED_BAR_H}px"
+
+echo "PHASE 4 PASS: top and lower rows both paint ${PADDED_BAR_H}px"
+
+# ── Phase 5: lower pane paint and hit testing begin below the row ─────────────
+# The newly split lower workspace is focused. Fill its erased cells red, enable
+# SGR mouse tracking, and block in cat so clicks can be observed in the client
+# log. A split pane has a 1px border, so red content starts one pixel after the
+# placement rect that begins exactly at the bar's bottom.
+focus
+xdotool type --delay 1 "printf '\\033[41m\\033[2J\\033[H\\033[?1000h\\033[?1006h'; stty -icanon -echo min 1 time 0; cat -v"
+xdotool key --clearmodifiers Return
+sleep 1.5
+shot /output/chrome-tabs-04-lower-content.png
+CONTENT_EXPECTED=$(( LOWER_TOP + PADDED_BAR_H ))
+RED_Y=$(first_red_row /output/chrome-tabs-04-lower-content.png \
+    $(( WIN_W / 2 )) "$LOWER_TOP" $(( WIN_H - LOWER_TOP - STATUS_BAR_H )))
+[ "$RED_Y" -ge "$CONTENT_EXPECTED" ] && [ "$RED_Y" -le $(( CONTENT_EXPECTED + 2 )) ] \
+    || fail "lower pane ink began at y=$RED_Y, bar ends at y=$CONTENT_EXPECTED"
+
+MOUSE_BEFORE=$(count_log "mouse input forwarded")
+xdotool mousemove --window "$WID" $(( WIN_W / 2 )) $(( LOWER_TOP + PADDED_BAR_H / 2 ))
+xdotool click 1
+sleep 0.5
+MOUSE_IN_BAR=$(count_log "mouse input forwarded")
+[ "$MOUSE_IN_BAR" -eq "$MOUSE_BEFORE" ] \
+    || fail "lower bar click leaked into the pane hit-test ($MOUSE_BEFORE -> $MOUSE_IN_BAR)"
+xdotool mousemove --window "$WID" $(( WIN_W / 2 )) $(( CONTENT_EXPECTED + 12 ))
+xdotool click 1
+wait_for_log_growth "mouse input forwarded" "$MOUSE_IN_BAR" 10 \
+    || fail "click below the lower bar never reached the pane"
+echo "PHASE 5 PASS: pane ink starts at y=$RED_Y and hit testing starts below y=$CONTENT_EXPECTED"
 
 echo ""
-echo "PASS: window chrome bands are all on screen at the default window size"
-echo "  Inspect screenshots in test-output/:"
-echo "    chrome-bands-00-empty.png   — window at rest"
-echo "    chrome-bands-01-filled.png  — 36-row grid + status bar"
-echo "    chrome-bands-02-prompt.png  — prompt strip added, bar still on screen"
+echo "PASS: live tab geometry, pane reservation, hit testing, and startup sizing agree"

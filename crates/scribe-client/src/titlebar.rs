@@ -23,9 +23,6 @@ use crate::tab_bar::{
 };
 use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
 
-/// Height of the titlebar in pixels.
-pub const TITLEBAR_HEIGHT: f32 = 34.0;
-
 /// Approximate advance width of one label character.
 const CHAR_WIDTH: f32 = 8.0;
 
@@ -169,6 +166,7 @@ pub struct StandaloneBadge {
 /// The custom titlebar view.
 pub struct TitlebarView {
     colors: TabBarColors,
+    height: f32,
     tabs: Vec<TabData>,
     standalone_badges: Vec<StandaloneBadge>,
     show_equalize: bool,
@@ -199,10 +197,11 @@ pub struct TitlebarView {
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
 
 impl TitlebarView {
-    /// Create a titlebar bound to the given chrome colors.
-    pub fn new(colors: TabBarColors, cx: &mut Context<Self>) -> Self {
+    /// Create a titlebar bound to the given chrome colors and resolved row height.
+    pub fn new(colors: TabBarColors, height: f32, cx: &mut Context<Self>) -> Self {
         Self {
             colors,
+            height,
             tabs: Vec::new(),
             standalone_badges: Vec::new(),
             show_equalize: false,
@@ -265,6 +264,20 @@ impl TitlebarView {
     pub fn set_colors(&mut self, colors: TabBarColors, cx: &mut Context<Self>) {
         self.colors = colors;
         cx.notify();
+    }
+
+    /// Apply a live `tab_height + tab_bar_padding` edit to this retained view.
+    pub fn set_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.height - height).abs() <= f32::EPSILON {
+            return;
+        }
+        self.height = height;
+        cx.notify();
+    }
+
+    /// Height this view reserves and paints.
+    pub const fn height(&self) -> f32 {
+        self.height
     }
 
     /// The chrome palette currently painted.
@@ -1170,7 +1183,7 @@ impl Render for TitlebarView {
             // Fixed-height band above the flex-grown terminal grid; see
             // [`crate::window_chrome`] for why none of the bands may shrink.
             .flex_none()
-            .h(px(TITLEBAR_HEIGHT))
+            .h(px(self.height))
             .bg(self.colors.bg)
             .border_b_1()
             .border_color(self.colors.separator)
@@ -1268,6 +1281,8 @@ mod tests {
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
+    const TEST_TAB_BAR_HEIGHT: f32 = 36.0;
+
     /// Create a titlebar seeded with `n` tabs (the first active) and a captured
     /// event log.
     fn titlebar_with_tabs(
@@ -1276,7 +1291,7 @@ mod tests {
     ) -> (Entity<TitlebarView>, Arc<Mutex<Vec<TitlebarEvent>>>) {
         let colors = TabBarColors::from(&minimal_dark().chrome);
         let bar = cx.new(|cx| {
-            let mut bar = TitlebarView::new(colors, cx);
+            let mut bar = TitlebarView::new(colors, TEST_TAB_BAR_HEIGHT, cx);
             let tabs = (0..n)
                 .map(|i| {
                     let mut tab = TabData::new(format!("tab-{i}"));
@@ -1332,7 +1347,7 @@ mod tests {
                 beads: false,
             },
         };
-        let bar = cx.new(|cx| TitlebarView::new(colors, cx));
+        let bar = cx.new(|cx| TitlebarView::new(colors, TEST_TAB_BAR_HEIGHT, cx));
 
         bar.update(cx, |bar, cx| {
             bar.set_standalone_badges(vec![named.clone(), unnamed.clone()], cx);
@@ -1354,13 +1369,20 @@ mod tests {
                 beads: false,
             },
         };
-        let bar = cx.new(|cx| TitlebarView::new(colors, cx));
+        let bar = cx.new(|cx| TitlebarView::new(colors, TEST_TAB_BAR_HEIGHT, cx));
 
         bar.update(cx, |bar, cx| bar.set_standalone_badges(vec![badge.clone()], cx));
         bar.read_with(cx, |bar, _| {
             assert!(bar.tabs.is_empty());
             assert_eq!(bar.standalone_badges, vec![badge]);
         });
+    }
+
+    #[gpui::test]
+    fn live_height_updates_the_retained_view(cx: &mut TestAppContext) {
+        let (bar, _) = titlebar_with_tabs(1, cx);
+        bar.update(cx, |bar, cx| bar.set_height(80.0, cx));
+        bar.read_with(cx, |bar, _| assert!((bar.height() - 80.0).abs() < f32::EPSILON));
     }
 
     #[test]

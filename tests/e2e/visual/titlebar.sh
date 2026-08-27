@@ -5,7 +5,7 @@
 set -euo pipefail
 
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
-TITLEBAR_HEIGHT=34
+TITLEBAR_HEIGHT=36
 STATUS_BAR_HEIGHT=24
 
 fail() {
