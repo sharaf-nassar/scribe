@@ -3,3 +3,10 @@ animations = false
 cursor_blink = false
 tab_height = 16
 tab_bar_padding = 0
+status_bar_height = 8
+
+[terminal.status_bar_stats]
+cpu = false
+gpu = false
+memory = false
+network = false

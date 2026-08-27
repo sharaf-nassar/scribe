@@ -88,7 +88,7 @@ IDLE_WATCH_SECS="${IDLE_WATCH_SECS:-4}"
 # Client chrome layout, mirrored from the client so a drift shows up as a
 # failure here rather than as rows measured against the wrong band:
 #   TITLEBAR_H  titlebar.rs `TITLEBAR_HEIGHT`
-#   BAR_H       window_chrome.rs `STATUS_BAR_HEIGHT`
+#   BAR_H       default `appearance.status_bar_height`
 #   ROW_H_X10   terminal_element.rs `LINE_HEIGHT_RATIO` at the default font
 #               size 14 (14 * 1.35 = 18.9), x10 so row tops stay integral
 TITLEBAR_H=34

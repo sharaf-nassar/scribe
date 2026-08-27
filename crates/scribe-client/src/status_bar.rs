@@ -848,7 +848,13 @@ fn center_cta(
     update_focus: Option<&FocusHandle>,
     on_update: Option<UpdateActionHandler>,
 ) -> gpui::AnyElement {
-    let base = div().px_2().text_color(rgba(span.color)).child(span.text.clone());
+    let base = div()
+        .h_full()
+        .flex()
+        .items_center()
+        .px_2()
+        .text_color(rgba(span.color))
+        .child(span.text.clone());
     match (on_update.filter(|_| clickable), update_focus) {
         (Some(action), Some(focus)) => base
                 .id("status-bar-update-cta")
@@ -871,10 +877,11 @@ fn center_cta(
 
 /// Render the status bar model onto a full-width GPUI flex row.
 ///
-/// The bar is a monospace `height_px`-tall band anchored at the window bottom
-/// with a 1px top hairline. Left and right groups take natural width; the
-/// centred CTA lives in flex-grown space so it stays centred as the window
-/// resizes.
+/// The bar is a monospace `height_px`-tall border-box band anchored at the
+/// window bottom with a 1px top hairline. Its clipping and full-height controls
+/// keep every action hit target inside the configured band. Left and right
+/// groups take natural width; the centred CTA lives in flex-grown space so it
+/// stays centred as the window resizes.
 pub fn render(
     model: &StatusBarModel,
     height_px: f32,
@@ -896,6 +903,7 @@ pub fn render(
         // short window squeeze the bar off screen instead of clipping the grid.
         .flex_none()
         .h(px(height_px))
+        .overflow_hidden()
         .flex()
         .flex_row()
         .items_center()
@@ -907,7 +915,7 @@ pub fn render(
         .text_xs()
         .text_color(rgba(colors.text))
         .child(span_row(&model.left, colors))
-        .child(div().flex_1().flex().flex_row().justify_center().children(center))
+        .child(div().h_full().flex_1().flex().flex_row().justify_center().children(center))
         .child(span_row(&model.right, colors))
         .children(on_equalize.map(|action| equalize_button(colors, action)))
         .children(on_settings.map(|action| settings_gear(colors, action)))

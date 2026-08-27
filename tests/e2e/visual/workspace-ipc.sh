@@ -67,7 +67,7 @@ WS_NAME="WSINFO-RENDER-OK"
 WS_ACCENT="#a78bfa"
 
 # Height of the band at the very bottom of the painted window that the status
-# bar occupies (window_chrome::STATUS_BAR_HEIGHT is 24 px), plus a little slack
+# bar occupies (the default appearance.status_bar_height is 24 px), plus a little slack
 # for whatever border the window manager draws under it.
 STATUS_BAND_H=34
 

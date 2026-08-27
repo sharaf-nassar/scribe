@@ -58,7 +58,7 @@ SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 
 # Chrome bands that are not part of the pane canvas: the titlebar above it
 # (titlebar.rs TITLEBAR_HEIGHT) and the status bar below it
-# (window_chrome.rs STATUS_BAR_HEIGHT). Everything between is the grid area
+# (the default `appearance.status_bar_height`). Everything between is the grid area
 # the pane layout owns, and is the only region these assertions look at.
 TITLEBAR_H=34
 BOTTOM_BANDS_H=24

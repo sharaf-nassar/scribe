@@ -120,6 +120,8 @@ fn reload_with_only_opacity_change_is_scoped(_cx: &mut gpui::TestAppContext) {
     assert!(plan.opacity_changed());
     assert!(!plan.theme_changed());
     assert!(!plan.font_changed());
+    assert!(!plan.tab_geometry_changed());
+    assert!(!plan.status_geometry_changed());
 }
 
 #[gpui::test]
@@ -134,6 +136,22 @@ fn reload_detects_tab_geometry_changes(_cx: &mut gpui::TestAppContext) {
     assert!(!plan.theme_changed());
     assert!(!plan.font_changed());
     assert!(!plan.opacity_changed());
+    assert!(!plan.status_geometry_changed());
+}
+
+#[gpui::test]
+fn reload_detects_status_geometry_changes(_cx: &mut gpui::TestAppContext) {
+    let base = parse("[appearance]\nstatus_bar_height = 8.0\n");
+    let mut client = ClientConfig::from_config(base);
+
+    let taller = parse("[appearance]\nstatus_bar_height = 48.0\n");
+    let plan = client.reload(taller);
+
+    assert!(plan.status_geometry_changed());
+    assert!(!plan.theme_changed());
+    assert!(!plan.font_changed());
+    assert!(!plan.opacity_changed());
+    assert!(!plan.tab_geometry_changed());
 }
 
 #[gpui::test]

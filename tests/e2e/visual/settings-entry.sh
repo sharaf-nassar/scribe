@@ -54,9 +54,9 @@ SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
 SETTINGS_CHANGE_MIN="${SETTINGS_CHANGE_MIN:-100}"
 
 # Status bar geometry, from crates/scribe-client/src/status_bar.rs: the gear
-# moved out of the retired titlebar button into the
-# `window_chrome::STATUS_BAR_HEIGHT`=24px band at the window bottom, the last
-# `flex_col` child of the window root, where `settings_gear` renders as the
+# moved out of the retired titlebar button into the configured
+# `appearance.status_bar_height`=24px default band at the window bottom, the
+# last `flex_col` child of the window root, where `settings_gear` renders as the
 # band row's last child inside its px_2 (8px) edge padding.
 #
 # The gear div's right edge is therefore `width - 8`, and its left edge is

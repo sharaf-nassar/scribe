@@ -3016,7 +3016,7 @@ The integrity oracle counts `moved a session into another workspace region` line
 
 The script screenshots the baseline window, changes only the theme in one save, then asserts three things in order: the client logged a new `config hot-reloaded` line, the client pid is unchanged, and the captured frame is no longer pixel-identical. The settings theme-picker and keybindings suites own their richer live-reload behavior.
 
-Tab geometry has its final-boundary reload oracle in `tests/e2e/visual/window-chrome-bands.sh`: one client changes `tab_height` and `tab_bar_padding` separately, each edit grows the hot-reload and pane-publication logs, and measured top/lower rows follow their effective sum without a restart.
+Tab and status geometry have their final-boundary reload oracle in `tests/e2e/visual/window-chrome-bands.sh`: one client changes `tab_height` and `tab_bar_padding` separately, then changes `status_bar_height` from 8 to 48 in the same process. Each edit grows hot-reload and pane-publication logs; measured tab rows follow their effective sum while the measured status band and published pane rows reflow without a restart.
 
 Asserting on the log rather than on pixels alone is deliberate: the status bar's sparklines resample on a timer, so a screenshot diff on its own could pass without any reload having happened.
 
@@ -3131,7 +3131,7 @@ Every assertion above is about geometry, and geometry is not integrity: a pane c
 
 They seed five marker commands whose "command not found" line is 125 columns wide, then compare the window against `scribe-test snapshot` row for row. The server's snapshot is the oracle for what should be on screen; the window is read back as per-row ink from an `import -window` crop of the grid band, so every row the server calls non-empty has to carry ink at the same row index and at most a slack of two rows may carry ink the server does not have. Phase 5 runs the comparison with **no** resize at all, which is what separates a rest-state corruption from a resize defect. Phase 6 drags the window narrow in eight `xdotool windowsize` steps — a drag's cadence, so each configure event lands while the previous round trip is still in flight — and requires both that the reflow onto two rows per marker reached the screen and that no row was lost. Phase 7 drags back out, replaying rebuilds *wider* than the grid the client is leaving, which wraps in the opposite direction.
 
-The seed length is what makes the comparison sharp. At 178 columns each marker occupies one row and at 107 it occupies two, so a client still painting the shape a rebuild was rendered at keeps the old row profile and fails even though its published `cols`x`rows`, its `stty size` and its pixel diff are all perfect. No keyboard input is sent during any content phase, so nothing but the resize pipeline can be repairing the screen. The row arithmetic mirrors the client's own layout constants (`TITLEBAR_HEIGHT`, `STATUS_BAR_HEIGHT`, and the 1.35 line-height ratio at font size 14), with each band inset by 3 px so the focused pane's 2 px accent border is never mistaken for text.
+The seed length is what makes the comparison sharp. At 178 columns each marker occupies one row and at 107 it occupies two, so a client still painting the shape a rebuild was rendered at keeps the old row profile and fails even though its published `cols`x`rows`, its `stty size` and its pixel diff are all perfect. No keyboard input is sent during any content phase, so nothing but the resize pipeline can be repairing the screen. The row arithmetic mirrors the configured default tab and status bands plus the 1.35 line-height ratio at font size 14, with each band inset by 3 px so the focused pane's 2 px accent border is never mistaken for text.
 
 ### Prompt marks and mark-relative jumps
 
@@ -3373,11 +3373,11 @@ Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` tha
 
 ### Window chrome bands stay on screen
 
-`tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level geometry oracle for the whole tab-height contract, startup window sizing, terminal grid, prompt strip, and status bar.
+`tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level geometry oracle for the tab/status-height contract, startup window sizing, terminal grid, prompt strip, and status controls.
 
-The run starts at `tab_height=16` / `tab_bar_padding=0`, so the fresh 120x36 window must be 1008x721. In the same client process it hot-reloads height 60 and then padding 20, requires both 100px top-band ImageMagick AE comparisons to be nonzero, and measures the painted rows as exactly 16, 60, and 80 px. The pre-fix client produces `tab_height AE=0, tab_bar_padding AE=0`, which is the fail-before signature. Each edit must also republish pane geometry, while the client pid stays fixed.
+The run starts at `tab_height=16` / `tab_bar_padding=0` / `status_bar_height=8`, so the fresh 120x36 window must be 1008x705. In that client process it captures the bottom 100px, hot-reloads only `status_bar_height=48`, captures again, requires a non-zero ImageMagick AE delta, measures exactly 8px then 48px, and requires the published pane rows to decrease. The pre-fix status renderer produces `status_bar_height AE=0`. It restores the 8px band, then hot-reloads tab height 60 and padding 20, requiring non-zero top-band deltas and exact 16, 60, and 80px tab rows. Every edit must republish pane geometry while the client pid stays fixed.
 
-After restoring the 16px startup row, the suite fills the shared pane and proves row 36 plus the bottom status bar remain on screen, then raises a real prompt strip and requires its band to repaint without moving status. It finally restores the 80px row, creates a lower workspace through `ctrl+alt+-`, measures the lower bar at the same 80px, paints the lower pane red to locate its first content row, and enables application mouse tracking: a click inside the bar must emit no mouse report, while a click immediately below must reach the pane. Captures use `import -window`, so every offset is window-relative and no WM decoration can shift the measurement.
+After restoring the 16px tab row and 8px status band, the suite fills the shared pane and proves row 36 plus the bottom status bar remain on screen, then raises a real prompt strip and requires its band to repaint without moving status. It finally restores the 80px tab row, creates a lower workspace through `ctrl+alt+-`, measures the lower bar at the same 80px, paints the lower pane red to locate its first content row, and enables application mouse tracking: a click inside the bar must emit no mouse report, while a click immediately below must reach the pane. Equalize and settings clicks at the compact status band's vertical centre must hit their controls. Captures use `import -window`, so every offset is window-relative and no WM decoration can shift the measurement.
 
 ### Published columns fit one rendered row
 
@@ -5130,9 +5130,9 @@ The test parses the removed-keys TOML into , asserts the live appearance fields 
 
 ### Config live reload
 
-A scripted reload confirms that edits to theme, font, tab geometry, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
+A scripted reload confirms that edits to theme, font, tab/status geometry, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
 
-Building a  from an initial config and calling  with an edited config, the test asserts the returned  flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed  reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed`, a `tab_height` / `tab_bar_padding` edit is scoped to `tab_geometry_changed`, and an identical config reports no change.
+Building a  from an initial config and calling  with an edited config, the test asserts the returned  flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed  reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed`, a `tab_height` / `tab_bar_padding` edit is scoped to `tab_geometry_changed`, a `status_bar_height` edit is scoped to `status_geometry_changed`, and an identical config reports no change.
 
 Those cases prove the plan is computed correctly, but not that a running window ever asks for one. The child cases below cover the runtime path that closes that gap — watcher signal, foreground poll, painted font, and the outbound `ConfigReloaded` — and  drives the whole chain against a real window.
 
@@ -5338,6 +5338,10 @@ These cases cover the derivation only. That the running window really shows its 
 Confirms [[crates/scribe-client/src/window_chrome.rs#tab_bar_height]] resolves both ends of the Settings range: 16 + 0 = 16 and 60 + 20 = 80.
 
 Startup sizing, retained titlebar paint, lower reservations, legacy geometry normalization, and live pane republish consume this value rather than recomputing either field independently.
+
+#### Status band resolves configured height
+
+Confirms [[crates/scribe-client/src/window_chrome.rs#status_bar_height]] returns the 8px and 48px Settings endpoints, and startup sizing grows by the same 40px at a fixed tab row and grid metric.
 
 #### Default window size clears every chrome band
 

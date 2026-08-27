@@ -2009,6 +2009,8 @@ struct TerminalView {
     titlebar: Entity<TitlebarView>,
     /// One resolved top/lower tab-row height from the live appearance config.
     tab_bar_height: f32,
+    /// One resolved window status-band height from the live appearance config.
+    status_bar_height: f32,
     /// Theme chrome, retained to build the overlay palettes on demand.
     chrome: ChromeColors,
     /// Terminal dimensions announced to the server for newly created sessions.
@@ -2688,7 +2690,9 @@ impl TerminalView {
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar = terminal.prompt_bar.clone();
-        let tab_bar_height = window_chrome::tab_bar_height(&config.config().config.appearance);
+        let appearance = &config.config().config.appearance;
+        let tab_bar_height = window_chrome::tab_bar_height(appearance);
+        let status_bar_height = window_chrome::status_bar_height(appearance);
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, tab_bar_height, cx);
         Self {
@@ -2719,6 +2723,7 @@ impl TerminalView {
             reported_trees: VecDeque::new(),
             titlebar,
             tab_bar_height,
+            status_bar_height,
             chrome,
             terminal_size: seed.terminal_size,
             // The strip starts empty and is filled by the reader's first
@@ -3074,7 +3079,7 @@ impl TerminalView {
     }
 
     /// Reapply one reload plan: theme-derived palettes, grid font metrics,
-    /// tab-row geometry, and opacity, then announce the reload to the server.
+    /// tab/status geometry, and opacity, then announce the reload to the server.
     ///
     /// Keybindings need no branch here — [`ConfigRuntime`] re-parses them on
     /// every reload and both `handle_overlay_key` and [`Self::handle_binding`]
@@ -3110,6 +3115,9 @@ impl TerminalView {
 
         if plan.tab_geometry_changed() {
             self.apply_tab_geometry_change(cx);
+        }
+        if plan.status_geometry_changed() {
+            self.apply_status_geometry_change();
         }
 
         // Status-bar stat selection and the prompt-bar toggles are cheap to swap
@@ -3149,6 +3157,7 @@ impl TerminalView {
             font = plan.font_changed(),
             opacity = plan.opacity_changed(),
             tab_geometry = plan.tab_geometry_changed(),
+            status_geometry = plan.status_geometry_changed(),
             "config hot-reloaded"
         );
         cx.notify();
@@ -3197,6 +3206,27 @@ impl TerminalView {
             bounds.set(None);
         }
         tracing::info!(height, "config reload: tab geometry applied");
+    }
+
+    /// Apply a live status-band height edit and invalidate the measured grid.
+    ///
+    /// The flex-grown grid gives exactly this many pixels to the status bar on
+    /// the next frame. Clearing cached measurements ensures that frame measures
+    /// the smaller or larger grid before the existing publish path resizes its
+    /// PTYs, rather than re-announcing the old pane rows.
+    fn apply_status_geometry_change(&mut self) {
+        let height = window_chrome::status_bar_height(&self.config.config().config.appearance);
+        if (self.status_bar_height - height).abs() <= f32::EPSILON {
+            return;
+        }
+        self.status_bar_height = height;
+        self.grid_area.set(None);
+        self.published_grid_area = None;
+        self.pane_sizes.clear();
+        for bounds in self.pane_bounds.values() {
+            bounds.set(None);
+        }
+        tracing::info!(height, "config reload: status geometry applied");
     }
 
     /// Delivery point for the reload plan's `opacity_changed()` signal.
@@ -11252,7 +11282,7 @@ impl TerminalView {
         let on_equalize = equalize_visible.then_some(equalize_action);
         status_bar::render(
             &model,
-            window_chrome::STATUS_BAR_HEIGHT,
+            self.status_bar_height,
             &colors,
             status_bar::StatusBarActions {
                 update_focus: Some(&self.focus.update),
@@ -12845,13 +12875,12 @@ fn default_terminal_size() -> TerminalSize {
 fn startup_window_size(cx: &App) -> Size<Pixels> {
     let appearance = load_config().unwrap_or_default().appearance;
     let font = GridFont::from_appearance(&appearance);
-    let tab_bar_height = window_chrome::tab_bar_height(&appearance);
     let wanted = window_chrome::default_window_size(
         COLUMNS,
         ROWS,
         font.cell_width(),
         font.line_height,
-        tab_bar_height,
+        &appearance,
     );
     let wanted = cx.primary_display().map_or(wanted, |display| {
         let bounds = display.bounds().size;

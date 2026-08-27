@@ -1,5 +1,9 @@
 # Config seeded into the visual container for the update-surface E2E pair.
 #
+# Exercise the update CTA inside the tallest supported status band.
+[appearance]
+status_bar_height = 48
+
 # The status bar's system-stat sparklines resample every 2 s, so leaving them on
 # would make the bottom band differ between any two screenshots and drown the
 # one change under test — the centred update CTA appearing. Turning them off

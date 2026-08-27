@@ -95,6 +95,8 @@ Font family, font size (f32), font weight (u16, 100-900), bold weight, ligatures
 
 One top or lower tab-bar row has the effective height `tab_height + tab_bar_padding`. A Settings save hot-reloads that value into the retained titlebar and every lower-region reservation in the same client process; pane paint, divider and pointer geometry, workspace-drag origins, overlays, published PTY rows, restored legacy insets, and fresh startup sizing all consume the same resolution.
 
+`status_bar_height` is the status band's single border-box metric. A Settings save hot-reloads it into the bottom renderer, reflows the flex-grown terminal grid, and republishes changed pane rows without restarting; startup chrome sizing uses the same resolution. The update CTA, balance button, and settings gear remain clipped to and hit-tested within that configured band.
+
 Tab width is deliberately absent: `TAB_WIDTH` is flex basis and drag-fallback
 geometry, not a saved setting. Legacy `appearance.tab_width` is ignored on load
 and omitted by the next Settings save.
