@@ -5582,9 +5582,12 @@ They pin every corner's normalized nearest-edge result with horizontal tie prece
 [[crates/scribe-client/src/workspace_layout.rs#WindowLayout#rearrange_workspace]] tests pin client-side lowering over the shared tree operations: edge extraction/insertion re-equalizes all region ratios; center swap preserves nested ratios and shape; slot metadata, active tab, pane-owned payload, and source focus stay attached. Directional palette-move tests pin non-wrapping nearest-neighbor selection, no-neighbor feedback/no-op, focused-source movement, and equality with the matching drag edge. [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#rearrange_workspace]] adds the entity boundary assertion that one successful rearrangement emits one report; [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#move_focused_workspace_in_direction]] covers the equivalent palette path. [[crates/scribe-client/src/command_palette.rs#base_entries]] pins all five workspace rows as visible client-local actions. Existing titlebar drag-reorder suites remain the regression oracle for tab marker isolation and window-move behavior.
 
 `tests/e2e/visual/workspace-drag-tearout.sh` drives measured workspace-pill
-drags under X11/Xvfb. Wire/tree oracles cover swap, all edge inserts,
-horizontal corner ties, Escape and disappearance cleanup, PTY isolation,
-standalone-pill rendering, and exact tear-out preservation. The matching
+drags under X11/Xvfb. Before its delayed standalone pill receives a tab, it
+uses that pill's measured span to guard an ink-free post-pill titlebar patch,
+and crosses the native move threshold while asserting and restoring the X11
+window position. Wire/tree oracles cover swap, all edge inserts, horizontal
+corner ties, Escape and disappearance cleanup, PTY isolation, standalone-pill
+rendering, and exact tear-out preservation. The matching
 `tests/e2e/visual/workspace-drag-palette.sh` drives every directional action
 and tear-out from the command palette without pointer input. These scripts and
 `tests/e2e/visual/workspace-ipc.sh` call the checked-in, network-free

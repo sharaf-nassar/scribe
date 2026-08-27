@@ -3,6 +3,8 @@
 # e2e-timeout: 420
 set -euo pipefail
 
+. /tests/visual/tab-geometry-common.bash
+
 # @lat: [[test#GPUI Workspace Drag]]
 # User-reachable X11 oracle for the dedicated workspace-pill drag. Tree and wire
 # state are authoritative; screenshots prove the real overlay/pill surfaces.
@@ -162,22 +164,67 @@ reset_record
 send_keys ctrl+alt+backslash
 ids=$(oracle wait-leaves 2 0) || fail "workspace split never reported two leaves"
 read -r a b <<<"$ids"
+[ "$(oracle leaf-session-count "$b")" -eq 0 ] \
+    || fail "standalone workspace received a flex tab before chrome move"
 shot 00-standalone-pill.png
 right_ink=$(convert /output/00-standalone-pill.png \
     -crop "88x${TITLEBAR_H}+$((WIN_W / 2))+0" +repage \
     -colorspace Gray -threshold 35% -format '%[fx:mean*w*h]' info:)
 right_ink=${right_ink%.*}
 [ "${right_ink:-0}" -ge 20 ] || fail "zero-tab standalone pill has no visible label ($right_ink px)"
+echo "PHASE 0 PASS: neutral standalone pill appeared before its delayed tab"
+
+# Empty titlebar chrome still belongs to compositor window move, not the new
+# pill drag. The pill's measured center fixes its 88px span; capture and guard
+# an ink-free post-pill target patch before pressing it.
+title_y=$((TITLEBAR_H / 2))
+empty_x=$((WIN_W / 2 + PILL_CENTER_X * 2 + 12))
+[ "$empty_x" -lt "$WIN_W" ] || fail "zero-tab pill leaves no blank titlebar target"
+blank_target=/output/00-standalone-blank-target.png
+convert /output/00-standalone-pill.png \
+    -crop "9x9+$((empty_x - 4))+$((title_y - 4))" +repage "$blank_target"
+blank_ink=$(convert "$blank_target" -colorspace Gray -threshold 35% \
+    -format '%[fx:mean*w*h]' info:)
+blank_ink=${blank_ink%.*}
+blank_ink_w=$(band_ink_width "$blank_target")
+blank_ink_w=${blank_ink_w%.*}
+[ "${blank_ink:-0}" -eq 0 ] && [ "${blank_ink_w:-0}" -le 1 ] \
+    || fail "zero-tab blank titlebar target has ${blank_ink:-0}px painted ink"
+old_x=$WIN_X; old_y=$WIN_Y
+xdotool mousemove --sync "$((WIN_X + empty_x))" "$((WIN_Y + title_y))"
+xdotool mousedown 1
+sleep 0.1
+# Cross the titlebar's 4px threshold while still inside its 34px band; only
+# then leave it, after the compositor has accepted the native move request.
+xdotool mousemove --sync "$((WIN_X + empty_x + 8))" "$((WIN_Y + title_y))"
+sleep 0.1
+xdotool mousemove --sync "$((WIN_X + empty_x + 80))" "$((WIN_Y + title_y + 50))"
+xdotool mouseup 1
+sleep 0.2
+info=$(xwininfo -id "$WID")
+new_x=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
+new_y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+[ "$new_x" -ne "$old_x" ] || [ "$new_y" -ne "$old_y" ] \
+    || fail "dragging zero-tab empty chrome did not move the window"
+# Every later target and screenshot uses the original origin, so restore it
+# after proving the native move rather than silently shifting their surface.
+xdotool windowmove --sync "$WID" "$old_x" "$old_y"
+focus_window "$WID"
+xdotool windowmove --sync "$WID" \
+    "$((2 * old_x - WIN_X))" "$((2 * old_y - WIN_Y))"
+focus_window "$WID"
+[ "$WIN_X" -eq "$old_x" ] && [ "$WIN_Y" -eq "$old_y" ] \
+    || fail "zero-tab empty chrome did not restore window origin ($WIN_X,$WIN_Y)"
+echo "PHASE 6 PASS: zero-tab empty chrome moved and restored the window ($old_x,$old_y -> $new_x,$new_y)"
+
 ids=$(oracle wait-leaves 2 1) || fail "split workspaces never received tabs"
 read -r a b <<<"$ids"
 # Let the delayed attach/replay settle before zero-diff gesture windows start.
 sleep 2
 focus_window "$WID"
-echo "PHASE 0 PASS: neutral standalone pill appeared before its delayed tab"
 
 pill_left=$PILL_CENTER_X
 pill_right=$((WIN_W / 2 + PILL_CENTER_X))
-title_y=$((TITLEBAR_H / 2))
 left_center=$((WIN_W / 4))
 right_center=$((3 * WIN_W / 4))
 grid_mid=$((TITLEBAR_H + GRID_H / 2))
@@ -295,25 +342,6 @@ drag_rel "$pill_left" "$title_y" "$((WIN_W / 2))" "$((TITLEBAR_H + GRID_H - 18))
 oracle wait-root Vertical "$b" "$a" >/output/workspace-bottom-tree.json \
     || fail "bottom edge insert did not produce vertical [B,A]"
 echo "PHASE 5 PASS: swap and four edge inserts committed exact wire trees"
-
-# Empty titlebar chrome still belongs to compositor window move, not the new
-# pill drag. Pick a measured blank point after the group's pill+tabs.
-old_x=$WIN_X; old_y=$WIN_Y
-empty_x=$((WIN_W - 250))
-xdotool mousemove --sync "$((WIN_X + empty_x))" "$((WIN_Y + title_y))"
-xdotool mousedown 1
-sleep 0.1
-# Cross the titlebar's 4px threshold while still inside its 34px band; only
-# then leave it, after the compositor has accepted the native move request.
-xdotool mousemove --sync "$((WIN_X + empty_x + 8))" "$((WIN_Y + title_y))"
-sleep 0.1
-xdotool mousemove --sync "$((WIN_X + empty_x + 80))" "$((WIN_Y + title_y + 50))"
-xdotool mouseup 1
-sleep 1
-focus_window "$WID"
-[ "$WIN_X" -ne "$old_x" ] || [ "$WIN_Y" -ne "$old_y" ] \
-    || fail "dragging empty chrome did not move the window"
-echo "PHASE 6 PASS: empty chrome still moved the window ($old_x,$old_y -> $WIN_X,$WIN_Y)"
 
 # Source-disappearance cleanup: a third workspace's shell exits while its pill
 # owns a live drag. The region collapses, release leaves no stuck overlay, and a
