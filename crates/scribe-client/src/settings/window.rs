@@ -8,10 +8,12 @@
 //! cycling, which updates its label at once and coalesces repeated arrow steps;
 //! the file watcher in the running client picks writes up as `ConfigReloaded`.
 //!
-//! Colors open one anchored preset/custom palette; its exact-value field and
-//! general free-text controls share one inline editor. Enter commits through
-//! the same apply path every other control uses and Escape restores the value
-//! the edit opened with. Keybinding rows list every action's combos as key caps
+//! Colors open one anchored preset/custom palette; its exact-value field,
+//! general free-text controls, and a stepper's exact numeric entry share one
+//! inline editor. Enter commits through the same apply path every other control
+//! uses and Escape restores the value the edit opened with — closing the field
+//! for a stepper, which rests on its number rather than on an open editor.
+//! Keybinding rows list every action's combos as key caps
 //! and record a replacement from the keyboard: activating one puts it in
 //! listening state, and the next keystroke is written through the same path.
 //!
@@ -56,10 +58,10 @@ use gpui::{
     AccessibleAction, Anchor, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
     EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, Keystroke,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, Point, ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions,
-    Toggled, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowHandle, WindowOptions, anchored, canvas, div, fill, point, prelude::*,
-    px, rgb, rgba, size,
+    Pixels, Point, ResizeEdge, Rgba, Role, ScrollHandle, Size, Subscription, Text, Tiling,
+    TitlebarOptions, Toggled, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowHandle, WindowOptions, anchored, canvas, div, fill,
+    point, prelude::*, px, rgb, rgba, size,
 };
 use scribe_common::config::{ScribeConfig, SmartSelectionActionKind, load_config};
 use scribe_common::protocol::{
@@ -372,10 +374,12 @@ pub struct SettingsWindow {
     workspace_root_input: String,
     workspace_root_marked_range: Option<Range<usize>>,
     workspace_root_error: Option<String>,
-    /// The one inline text editor, shared by every color and free-text control:
+    /// The one inline text editor, shared by text, color, and numeric controls:
     /// at most one row is in edit at a time, so the field, its opening value
     /// (the Escape target), and its rejection ink are single-slot state.
     edit_handle: FocusHandle,
+    /// Numeric exact-entry commits when its native input loses focus.
+    _edit_blur: Subscription,
     edit_input: String,
     edit_original: String,
     /// The control the open edit belongs to. The whole control rather than its
@@ -530,7 +534,7 @@ enum SettingsFocusTarget {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeInputTarget {
     WorkspaceRoot,
-    /// The shared inline editor behind every color and free-text control row.
+    /// The shared inline editor behind color, free-text, and numeric rows.
     Inline,
     ChoiceFilter,
 }
@@ -803,6 +807,53 @@ fn inline_commit_value(is_color: bool, key: &str, input: &str) -> Result<String,
     }
 }
 
+/// Parse one stepper's exact entry into the JSON number its apply path accepts.
+/// Integer steppers reject a decimal point; decimal steppers accept no more
+/// digits after the point than their displayed precision, and the value has to
+/// be finite and inside the stepper's own bounds before it can be committed.
+fn numeric_inline_value(input: &str, min: f64, max: f64, decimals: u8) -> Result<Value, String> {
+    let input = input.trim();
+    let value = input.parse::<f64>().map_err(|_| "Enter a number.".to_owned())?;
+    if !value.is_finite() {
+        return Err("Enter a finite number.".to_owned());
+    }
+    let unsigned = input.strip_prefix('+').or_else(|| input.strip_prefix('-')).unwrap_or(input);
+    if let Some((_, fraction)) = unsigned.split_once('.')
+        && (decimals == 0 || fraction.len() > usize::from(decimals))
+    {
+        return Err(if decimals == 0 {
+            "Enter a whole number.".to_owned()
+        } else {
+            format!("Enter at most {decimals} decimal places.")
+        });
+    }
+    if !(min..=max).contains(&value) {
+        return Err(format!(
+            "Enter a value from {:.*} to {:.*}.",
+            usize::from(decimals),
+            min,
+            usize::from(decimals),
+            max
+        ));
+    }
+    Ok(stepper_number(value))
+}
+
+/// The JSON shape a stepper commits, shared by stepping and exact entry.
+///
+/// Whole numbers stay integers so serde deserializes into the `u16`/`u32`/`u64`
+/// fields behind most steppers — and so Smart Selection's `Test cursor` reads
+/// as `as_u64` — while a fractional value keeps the two decimals the widest
+/// stepper precision allows. The integer branch formats to a string and
+/// reparses to sidestep a lossy `f64 as i64` cast.
+fn stepper_number(value: f64) -> Value {
+    if value.fract() == 0.0 {
+        json!(format!("{value:.0}").parse::<i64>().unwrap_or_default())
+    } else {
+        json!((value * 100.0).round() / 100.0)
+    }
+}
+
 /// A keystroke that names only a modifier: a recording row waits through it
 /// rather than reading Ctrl-on-its-own as the shortcut.
 fn is_modifier_key(key: &str) -> bool {
@@ -963,11 +1014,19 @@ fn revert_inline_input(
 
 impl SettingsWindow {
     /// Build the view, loading the current config (or defaults on failure).
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config = load_config().unwrap_or_default();
         let theme = scribe_common::config::resolve_theme(&config);
         let theme_presets = build_theme_preset_cache();
         let colors = SettingsColors::resolve(&config);
+        let edit_handle = cx.focus_handle().tab_index(0);
+        // Pointer focus can leave exact entry without passing through the
+        // window's own traversal, so blur is where a stepper's typed value is
+        // committed in that case. Every other inline control rests open and is
+        // unaffected.
+        let edit_blur = cx.on_blur(&edit_handle, window, |this, _window, cx| {
+            this.save_stepper_edit_on_blur(cx);
+        });
         let mut settings = Self {
             config,
             theme,
@@ -995,7 +1054,8 @@ impl SettingsWindow {
             workspace_root_input: String::new(),
             workspace_root_marked_range: None,
             workspace_root_error: None,
-            edit_handle: cx.focus_handle().tab_index(0),
+            edit_handle,
+            _edit_blur: edit_blur,
             edit_input: String::new(),
             edit_original: String::new(),
             edit_control: None,
@@ -1369,7 +1429,9 @@ impl SettingsWindow {
     fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_theme_preset(cx);
         if page != self.page {
-            if self.edit_key().is_some_and(is_smart_control_key) && !self.save_inline_edit(cx) {
+            if (self.edit_key().is_some_and(is_smart_control_key) || self.is_active_stepper_edit())
+                && !self.save_inline_edit(cx)
+            {
                 return;
             }
             let edit_was_focused = self.edit_handle.is_focused(window);
@@ -1656,6 +1718,9 @@ impl SettingsWindow {
 
     fn move_focus(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_theme_preset(cx);
+        if !self.save_stepper_edit_on_blur(cx) {
+            return;
+        }
         let count = self.focus_targets().len();
         if count > 0 {
             self.focus_index = if direction.is_negative() {
@@ -1715,8 +1780,8 @@ impl SettingsWindow {
         true
     }
 
-    /// Open the shared inline editor on a color or free-text control, seeding it
-    /// with the saved value that Escape later restores.
+    /// Open the shared inline editor on a color, free-text, or numeric control,
+    /// seeding it with the saved value that Escape later restores.
     fn begin_inline_edit(&mut self, control: &Control) {
         let target = SettingsFocusTarget::Control(control.clone());
         if let Some(index) = self
@@ -1727,7 +1792,7 @@ impl SettingsWindow {
             self.focus_index = index;
         }
         if self.edit_key() != Some(control.key.as_str()) {
-            let value = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
+            let value = self.inline_edit_value(control);
             self.edit_input.clone_from(&value);
             self.edit_original = value;
             self.edit_control = Some(control.clone());
@@ -1735,11 +1800,43 @@ impl SettingsWindow {
             self.edit_error = None;
         }
         self.active_input = Some(NativeInputTarget::Inline);
-        self.input_selection = if is_smart_control_key(&control.key) {
+        // Exact entry on a stepper replaces rather than appends: the field opens
+        // on the whole current number, which is what the next digit is meant to
+        // stand in for.
+        self.input_selection = if is_smart_control_key(&control.key)
+            || matches!(control.kind, ControlKind::Stepper { .. })
+        {
             NativeInputSelection::All
         } else {
             NativeInputSelection::Caret
         };
+    }
+
+    /// The text an inline edit opens with: a stepper's number at its own
+    /// precision, and the saved string for every other inline control.
+    fn inline_edit_value(&self, control: &Control) -> String {
+        match &control.kind {
+            ControlKind::Stepper { min, decimals, .. } => {
+                let value = self.control_value(&control.key).as_f64().unwrap_or(*min);
+                format!("{value:.*}", usize::from(*decimals))
+            }
+            _ => self.control_value(&control.key).as_str().unwrap_or("").to_owned(),
+        }
+    }
+
+    fn begin_inline_edit_from_pointer(
+        &mut self,
+        target: &SettingsFocusTarget,
+        control: &Control,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_pointer_interaction(target);
+        if !self.switch_inline_edit(control, cx) {
+            return;
+        }
+        window.focus(&self.edit_handle, cx);
+        cx.notify();
     }
 
     /// Start listening for the keystroke that replaces a keybinding.
@@ -1854,16 +1951,13 @@ impl SettingsWindow {
                 ControlKind::Choice(options) => {
                     self.toggle_choice_menu(&control.key, &options, window, cx);
                 }
-                ControlKind::Stepper { min, max, step, .. } => {
-                    self.step(&control.key, (min, max), step, cx);
-                }
-                ControlKind::Action => self.run_action(&control.key, window, cx),
-                ControlKind::Color => self.toggle_color_picker(&control, cx),
-                ControlKind::Text => {
+                ControlKind::Stepper { .. } | ControlKind::Text => {
                     self.begin_inline_edit(&control);
                     window.focus(&self.edit_handle, cx);
                     cx.notify();
                 }
+                ControlKind::Action => self.run_action(&control.key, window, cx),
+                ControlKind::Color => self.toggle_color_picker(&control, cx),
                 ControlKind::Keybinding => self.begin_capture(&control.key, window, cx),
             },
             SettingsFocusTarget::Action(key) => self.run_action(&key, window, cx),
@@ -2135,6 +2229,10 @@ impl SettingsWindow {
             .edit_control
             .as_ref()
             .is_some_and(|control| matches!(control.kind, ControlKind::Color));
+        // A stepper rests closed, so cancelling exact entry also closes it and
+        // hands the row back to −/+ and Left/Right on the saved value. A text
+        // row rests open and only reverts.
+        let closes_exact_entry = self.is_active_stepper_edit();
         revert_inline_input(
             &mut self.edit_input,
             &self.edit_original,
@@ -2142,7 +2240,7 @@ impl SettingsWindow {
             &mut self.edit_error,
         );
         self.input_selection = NativeInputSelection::Caret;
-        if closes_color_picker {
+        if closes_color_picker || closes_exact_entry {
             self.open_color = None;
             self.clear_inline_edit();
             window.focus(&self.focus_handle, cx);
@@ -2248,6 +2346,9 @@ impl SettingsWindow {
                 self.move_focus(-1, window, cx);
                 true
             }
+            // A stepper adjusts with Left/Right only while it is closed. Once
+            // exact entry is open, these keys stay with its native text input.
+            "left" | "right" if self.is_active_stepper_edit() => true,
             // Printable text, including Option/AltGr and IME commits, belongs
             // to the registered `EntityInputHandler`; it must keep propagating
             // or GPUI cannot deliver the platform text event.
@@ -2458,28 +2559,50 @@ impl SettingsWindow {
         let Some(control) = self.edit_control.clone() else {
             return false;
         };
-        let key = control.key;
-        let is_color = matches!(control.kind, ControlKind::Color);
-        if is_smart_control_key(&key)
-            && let Err(error) = validate_smart_inline_value(
-                &self.config.terminal.smart_selection,
-                &key,
-                &self.edit_input,
-            )
-        {
-            self.edit_error = Some(error);
-            cx.notify();
-            return false;
-        }
-        let stored = match inline_commit_value(is_color, &key, &self.edit_input) {
-            Ok(stored) => stored,
-            Err(error) => {
-                self.edit_error = Some(error);
-                cx.notify();
-                return false;
+        let key = control.key.clone();
+        let value = match &control.kind {
+            ControlKind::Stepper { min, max, decimals, .. } => {
+                match numeric_inline_value(&self.edit_input, *min, *max, *decimals) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.edit_error = Some(error);
+                        cx.notify();
+                        return false;
+                    }
+                }
             }
+            ControlKind::Color | ControlKind::Text => {
+                if is_smart_control_key(&key)
+                    && let Err(error) = validate_smart_inline_value(
+                        &self.config.terminal.smart_selection,
+                        &key,
+                        &self.edit_input,
+                    )
+                {
+                    self.edit_error = Some(error);
+                    cx.notify();
+                    return false;
+                }
+                match inline_commit_value(
+                    matches!(&control.kind, ControlKind::Color),
+                    &key,
+                    &self.edit_input,
+                ) {
+                    Ok(stored) => Value::String(stored),
+                    Err(error) => {
+                        self.edit_error = Some(error);
+                        cx.notify();
+                        return false;
+                    }
+                }
+            }
+            ControlKind::Toggle
+            | ControlKind::Choice(_)
+            | ControlKind::Action
+            | ControlKind::Keybinding => return false,
         };
-        if self.commit_control_value(&key, Value::String(stored.clone()), cx) {
+        if self.commit_control_value(&key, value, cx) {
+            let stored = self.inline_edit_value(&control);
             self.edit_input.clone_from(&stored);
             self.edit_original = stored;
             self.edit_marked_range = None;
@@ -2494,6 +2617,30 @@ impl SettingsWindow {
             cx.notify();
             false
         }
+    }
+
+    /// Whether the shared inline editor currently holds a stepper's exact entry.
+    fn is_active_stepper_edit(&self) -> bool {
+        self.active_input == Some(NativeInputTarget::Inline)
+            && self
+                .edit_control
+                .as_ref()
+                .is_some_and(|control| matches!(&control.kind, ControlKind::Stepper { .. }))
+    }
+
+    /// Commit an open exact entry because focus is leaving it, closing the field
+    /// so the stepper rests on the saved number again. Returns `false` when the
+    /// text is still invalid, so the caller leaves focus where it is and the
+    /// rejection stays on screen.
+    fn save_stepper_edit_on_blur(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_active_stepper_edit() {
+            return true;
+        }
+        if !self.save_inline_edit(cx) {
+            return false;
+        }
+        self.clear_inline_edit();
+        true
     }
 
     fn add_workspace_root(
@@ -2840,15 +2987,17 @@ impl SettingsWindow {
         let (min, max) = bounds;
         let current = self.control_value(key).as_f64().unwrap_or(min);
         let next = (current + delta).clamp(min, max);
-        // Preserve integer shape for whole-number steppers so serde deserializes
-        // into the u16/u32/u64 fields the apply path expects. The integer branch
-        // formats to a string and reparses to sidestep a lossy `f64 as i64` cast.
-        let value = if next.fract() == 0.0 {
-            json!(format!("{next:.0}").parse::<i64>().unwrap_or_default())
-        } else {
-            json!((next * 100.0).round() / 100.0)
-        };
-        self.commit_control_value(key, value, cx);
+        if !self.commit_control_value(key, stepper_number(next), cx) {
+            return;
+        }
+        // A −/+ press while exact entry is open re-seeds the field, so the open
+        // editor never shows a number the config no longer holds.
+        if let Some(control) = self.edit_control.clone().filter(|control| control.key == key) {
+            let stored = self.inline_edit_value(&control);
+            self.edit_input.clone_from(&stored);
+            self.edit_original = stored;
+            self.edit_error = None;
+        }
     }
 
     /// Re-read the whole Remote page's runtime surface from the local server:
@@ -6026,9 +6175,7 @@ impl SettingsWindow {
         match &control.kind {
             ControlKind::Toggle => self.render_toggle(control, cx),
             ControlKind::Choice(options) => self.render_choice(control, options, window, cx),
-            ControlKind::Stepper { min, max, step, decimals } => {
-                self.render_stepper(control, (*min, *max, *step), *decimals, cx)
-            }
+            ControlKind::Stepper { .. } => self.render_stepper(control, window, cx),
             ControlKind::Color if is_prompt_bar_color_override(&control.key) => {
                 self.render_prompt_bar_color_control(control, window, cx)
             }
@@ -6771,25 +6918,40 @@ impl SettingsWindow {
     }
 
     /// Render a numeric stepper: a `−`/`+` pair around the current value, each
-    /// committing the clamped step through [`SettingsWindow::step`].
+    /// committing the clamped step through [`SettingsWindow::step`]. Activating
+    /// its value reuses the shared native inline input for exact entry.
     fn render_stepper(
         &self,
         control: &Control,
-        bounds: (f64, f64, f64),
-        decimals: u8,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let ControlKind::Stepper { min, max, step, decimals } = &control.kind else {
+            return div().into_any_element();
+        };
         let colors = self.colors;
         let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
-        let (min, max, step) = bounds;
+        let (min, max, step, decimals) = (*min, *max, *step, *decimals);
         let current = self.control_value(&control.key).as_f64().unwrap_or(min);
-        let display = format!("{current:.*}", decimals as usize);
         let key_a11y_dec = control.key.clone();
         let key_a11y_inc = control.key.clone();
         let state = StepperState { current, min, max, step };
         let minus = self.render_step_adjustment(control, state, StepDirection::Decrease, cx);
         let plus = self.render_step_adjustment(control, state, StepDirection::Increase, cx);
-        div()
+        let value = self.render_stepper_value(control, (min, decimals), window, cx);
+        let error = (self.edit_key() == Some(control.key.as_str()))
+            .then(|| self.edit_error.clone())
+            .flatten()
+            .map(|error| {
+                div()
+                    .id(("settings-stepper-error", key_hash(&control.key)))
+                    .role(Role::Alert)
+                    .aria_label(error.clone())
+                    .text_xs()
+                    .text_color(colors.error)
+                    .child(Text::new_inaccessible(error.into()))
+            });
+        let stepper = div()
             .id(("stepper", key_hash(&control.key)))
             .focusable()
             .tab_stop(true)
@@ -6818,20 +6980,64 @@ impl SettingsWindow {
             // side of it and only come up on approach, so the number never
             // shifts when they appear.
             .child(minus)
-            .child(
-                div()
-                    .id(("stepper-value", key_hash(&control.key)))
-                    .role(Role::Label)
-                    .aria_label(display.clone())
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .font_family(DATA_FONT)
-                    .text_size(px(13.0))
-                    .text_color(colors.text)
-                    .child(Text::new_inaccessible(display.into())),
-            )
-            .child(plus)
+            .child(value)
+            .child(plus);
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_1()
+            .child(stepper)
+            .children(error)
+            .into_any_element()
+    }
+
+    /// The stepper's number: the saved value as a label that opens exact entry
+    /// when activated, or the shared inline field once it is open. `shape` is
+    /// the control's `(min, decimals)`, which formats the resting value.
+    fn render_stepper_value(
+        &self,
+        control: &Control,
+        shape: (f64, u8),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (min, decimals) = shape;
+        if self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window) {
+            // Exact entry is the one place the number does not size itself: a
+            // field that shrank to its text would move the caret on every
+            // keystroke.
+            return div()
+                .w(px(STEPPER_VALUE_WIDTH))
+                .flex_none()
+                .child(self.render_inline_field(control, window, cx))
+                .into_any_element();
+        }
+        let current = self.control_value(&control.key).as_f64().unwrap_or(min);
+        let display = format!("{current:.*}", usize::from(decimals));
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let edit_control = control.clone();
+        div()
+            .id(("stepper-value", key_hash(&control.key)))
+            .role(Role::Label)
+            .aria_label(display.clone())
+            .flex()
+            .items_center()
+            .justify_end()
+            .font_family(DATA_FONT)
+            .text_size(px(13.0))
+            .text_color(self.colors.text)
+            .cursor_text()
+            .on_click(cx.listener(move |this, _, input_window, ctx| {
+                this.begin_inline_edit_from_pointer(
+                    &pointer_target,
+                    &edit_control,
+                    input_window,
+                    ctx,
+                );
+            }))
+            .child(Text::new_inaccessible(display.into()))
             .into_any_element()
     }
 
@@ -7368,6 +7574,11 @@ const VALUE_COLUMN_WIDTH: f32 = 300.0;
 
 /// Width of a choice button and its anchored menu inside the value column.
 const CHOICE_WIDTH: f32 = 240.0;
+
+/// Width of a stepper's open exact-entry field, wide enough for the longest
+/// value any current stepper allows. The resting number still sizes itself, so
+/// only an open edit widens the control.
+const STEPPER_VALUE_WIDTH: f32 = 96.0;
 
 /// The preset menu carries a name and a themed preview line on one row, so it
 /// is wider than a menu that only lists words.
@@ -7990,10 +8201,7 @@ fn a11y_inline_edit_handler(
         weak_settings
             .update(app, move |this, ctx| {
                 this.edit_input = input;
-                this.control_value(&control.key)
-                    .as_str()
-                    .unwrap_or("")
-                    .clone_into(&mut this.edit_original);
+                this.edit_original = this.inline_edit_value(&control);
                 let smart = is_smart_control_key(&control.key);
                 this.edit_control = Some(control);
                 this.edit_marked_range = None;
@@ -8562,7 +8770,7 @@ fn open_settings_window_at(
                     crate::window_state::WindowState::Windowed,
                 );
             }
-            let view = cx.new(SettingsWindow::new);
+            let view = cx.new(|cx| SettingsWindow::new(window, cx));
             if anchored {
                 view.update(cx, |this, _| {
                     this.pending_position = Some((
@@ -8674,13 +8882,13 @@ mod tests {
         color_menu_left_offset, combo_for_capture, commits_pi_integration_enable,
         conflicting_action, content_scroll_offset, control_section, dismiss_choice_or_search,
         filter_choice_options, focus_targets_match, inline_commit_value, inline_placeholder,
-        is_modifier_key, key_combo_text, move_choice_highlight, offset_from_drag,
-        offset_from_track_click, palette_color_at, pending_regex_belongs_to_toggle,
-        pi_integration_enable_status, prompt_bar_reset_change, prompt_bar_theme_swatch,
-        push_control_focus_targets, px, release_inline_input, release_scrollbar_geometry,
-        replace_pending_theme_preset, revert_inline_input, search_display_text, settings_nav_pages,
-        take_pending_theme_preset, theme_preset_preview, utf16_range_to_utf8,
-        workspace_badge_color_controls, workspace_root_controls_match_query,
+        is_modifier_key, key_combo_text, move_choice_highlight, numeric_inline_value,
+        offset_from_drag, offset_from_track_click, palette_color_at,
+        pending_regex_belongs_to_toggle, pi_integration_enable_status, prompt_bar_reset_change,
+        prompt_bar_theme_swatch, push_control_focus_targets, px, release_inline_input,
+        release_scrollbar_geometry, replace_pending_theme_preset, revert_inline_input,
+        search_display_text, settings_nav_pages, take_pending_theme_preset, theme_preset_preview,
+        utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
         workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
         workspace_roots_match_query,
     };
@@ -9239,6 +9447,65 @@ mod tests {
     }
 
     // @lat: [[settings#GPUI Settings Window#Inline editing#Commit routes by control kind]]
+    #[test]
+    fn numeric_inline_entry_parses_finite_bounded_json_numbers() {
+        let integer = numeric_inline_value("23", 6.0, 48.0, 0).expect("integer entry");
+        let decimal = numeric_inline_value("0.25", 0.0, 1.0, 2).expect("decimal entry");
+
+        // A whole number stays an integer: most steppers deserialize into
+        // u16/u32/u64 config fields, and Smart Selection's Test cursor reads
+        // its value back through `as_u64`.
+        assert_eq!(integer.as_i64(), Some(23));
+        assert_eq!(decimal.as_f64(), Some(0.25));
+        assert_eq!(
+            numeric_inline_value("4", 0.0, 27.0, 0).ok().and_then(|value| value.as_u64()),
+            Some(4)
+        );
+        // Both bounds are inclusive, and surrounding space is not an error.
+        assert_eq!(
+            numeric_inline_value(" 6 ", 6.0, 48.0, 0).ok().and_then(|value| value.as_i64()),
+            Some(6)
+        );
+        assert_eq!(
+            numeric_inline_value("48", 6.0, 48.0, 0).ok().and_then(|value| value.as_i64()),
+            Some(48)
+        );
+        assert!(numeric_inline_value("", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("not a number", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("NaN", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("inf", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("5", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("49", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("23.5", 6.0, 48.0, 0).is_err());
+        assert!(numeric_inline_value("0.123", 0.0, 1.0, 2).is_err());
+    }
+
+    // @lat: [[settings#GPUI Settings Window#Inline editing#Commit routes by control kind]]
+    #[test]
+    fn numeric_inline_entry_applies_to_integer_and_float_settings() {
+        let mut config = ScribeConfig::default();
+        let size = numeric_inline_value("23", 6.0, 48.0, 0).expect("font size entry");
+        let weight = numeric_inline_value("500", 100.0, 900.0, 0).expect("font weight entry");
+        let timeout = numeric_inline_value("2.5", 0.0, 120.0, 1).expect("AI state timeout entry");
+
+        crate::settings::apply::apply_config_key(&mut config, "appearance.font_size", &size)
+            .expect("font size applies");
+        crate::settings::apply::apply_config_key(&mut config, "appearance.font_weight", &weight)
+            .expect("font weight applies");
+        crate::settings::apply::apply_config_key(
+            &mut config,
+            "ai_states.error.timeout_secs",
+            &timeout,
+        )
+        .expect("AI state timeout applies");
+
+        assert!((config.appearance.font_size - 23.0).abs() < f32::EPSILON);
+        assert_eq!(config.appearance.font_weight, 500);
+        assert!(
+            (config.terminal.ai_session.ai_states.error.timeout_secs - 2.5).abs() < f32::EPSILON
+        );
+    }
+
     #[test]
     fn inline_commit_routes_color_and_free_text_differently() {
         assert_eq!(

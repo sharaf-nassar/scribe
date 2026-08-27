@@ -2828,6 +2828,22 @@ The settings window was complete and unreachable for the whole rebuild — `KeyA
 
 Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin and size, so a frame-relative gear click would be offset by the decoration and miss the band. The gear offset is derived from the bottom status bar's fixed 24px band and the 8px `px_2` edge padding that fixes the gear div's right edge at `width - 8` — the gear moved there when the titlebar button was retired during the status-bar consolidation. Because the gear div also carries an 8px `pl_2`, any inset between 1 and 15 from that right edge is inside its hit rect whatever advance the container's font gives `⚙`, so the phase fails on a real status-bar layout change rather than on font metrics.
 
+#### Numeric steppers accept exact entry
+
+The Appearance > Font size phase stores exact entry `23`, not the step-only
+result `16.0` the same keystrokes produced when the number was an inert label.
+
+It also proves Tab out of the field commits `22` and reloads the server,
+non-numeric and out-of-range text leave config at `23` with visible inline
+rejection, Escape drops the rejected text and repaints the saved number, and
+Left steps the reclosed stepper — the arrow the open field swallows. The
+`numeric_inline_entry_parses_finite_bounded_json_numbers` window unit test
+covers integer and decimal conversion, non-numeric and non-finite input, both
+bounds, and precision, and
+`numeric_inline_entry_applies_to_integer_and_float_settings` pushes converted
+values through `apply_config_key` so a float-shaped number cannot reach a
+`u16` setting.
+
 #### Workspace roots edit and apply live
 
 The live regression keeps rejected input editable, proves typed roots persist and remove live, maps the native directory chooser, and verifies cancellation changes neither config nor server reload count.

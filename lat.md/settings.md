@@ -347,6 +347,12 @@ knob, steppers are a bare monospace value whose `−`/`+` are revealed by the
 row's own hover group so the number column never shifts, choices are the
 value plus a chevron, text and hex fields are an underline that appears on
 hover and turns accent on focus, and actions are text with a rule under them.
+Activating a stepper value opens the shared native exact-entry field seeded
+from its formatted number; Enter or blur commits only finite in-range values
+at the control's integer/decimal precision, while Escape closes the field on
+the saved number and a rejected value stays in the open field with its inline
+error. Only the open field is a fixed width — the resting number still sizes
+itself, so the `−`/`+` gutter is unchanged until an edit starts.
 A gated row mutes to `quiet_text` and appends `· off` rather than dropping to
 an opacity that would push its explanation below 4.5:1. Keybinding and
 read-only values render as plain right-aligned quiet monospace — the missing
@@ -450,23 +456,32 @@ instead of every resolved theme.
 
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_control]]
 renders that model generically: toggles flip, choices cycle, and numeric
-steppers increment. Other controls commit immediately like the old live-apply
-webview. Closed `theme.preset` Left/Right cycling updates its pending label on
-every step and restarts one 250 ms `cx.spawn` timer; settle or focus movement
-sends only the final token through the existing apply path, while Escape
-cancels the task and reveals the saved value without a write. Current values
-come from [[crates/scribe-client/src/settings/values.rs#current_value]]. Shared
-colour controls open the selector below, general free-text controls edit inline,
+steppers step through their `−`/`+` controls or closed Left/Right keys.
+Enter/Space or a pointer activation on a stepper value opens exact entry using
+the shared native input state, which is why every `ControlKind::Stepper` — the
+28 declarative ones and Smart Selection's `Test cursor` — inherits typing
+without its own editor. Its finite, precision-shaped, in-range value is
+committed as a JSON number through
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#commit_control_value]],
+never as text through the config apply path. Other controls commit immediately
+like the old live-apply webview. Closed `theme.preset` Left/Right cycling
+updates its pending label on every step and restarts one 250 ms `cx.spawn`
+timer; settle or focus movement sends only the final token through the existing
+apply path, while Escape cancels the task and reveals the saved value without a
+write. Current values come from
+[[crates/scribe-client/src/settings/values.rs#current_value]]. Shared colour
+controls open the selector below, general free-text controls edit inline,
 keybinding rows list every action's combos, and Workspaces owns its path editor
 and dynamic badge-colour controls.
 
-The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, color selector, or action; Left/Right adjust toggles, closed choices, steppers, and color presets. An open color selector sends Tab into its exact-value field. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
+The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, color selector, or action; Left/Right adjust toggles, closed choices, closed steppers, and color presets. A stepper whose exact entry is open keeps Left/Right in its text field instead, and Tab or an arrow that leaves the row commits the typed value first — a rejected one holds focus where it is. An open color selector sends Tab into its exact-value field. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
 A closed choice opens with Enter or Space. While its menu is open, Up/Down move a neutral-wash highlight through the filtered rows, Enter applies that row, Left/Right and forward or reverse Tab stay inside the menu, and Escape unwinds without applying. AccessKit reports the highlighted row as the active descendant while `aria-selected` continues to name the applied value.
 
 The root takes focus when the window opens, so Ctrl+K and traversal work before
 any click. Escape unwinds the innermost state first: an exact color edit restores
-its opening value and closes its picker; otherwise
+its opening value and closes its picker, and a stepper's exact entry closes on
+the saved number because a stepper rests closed; otherwise
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#dismiss_transient_state]]
 discards a pending closed-preset step, closes a color picker, clears a preset
 filter, closes its menu, then clears page search. Titlebar window controls claim
@@ -498,26 +513,41 @@ commits an empty value so the optional TOML key is omitted and derivation resume
 
 ### Inline editing
 
-The color selector's exact-value field and general free-text rows share one
-inline editor, so there is a single native-input target and commit path rather
-than one editor per control kind.
+The color selector's exact-value field, general free-text rows, and numeric
+stepper values share one inline editor, so there is a single native-input
+target and commit path rather than one editor per control kind.
 
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#begin_inline_edit]]
-opens it from a free-text row or the color palette's exact-value action,
-seeding the field from the saved value and retaining the whole
-[[crates/scribe-client/src/settings/model.rs#Control]], because the commit
-needs its kind. Enter commits through
+opens it from a free-text row, the color palette's exact-value action, or a
+stepper activation, seeding the field from the saved value and retaining the
+whole [[crates/scribe-client/src/settings/model.rs#Control]], because the
+commit needs its kind. Enter commits through
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#save_inline_edit]],
-which routes the typed text into the same `{key, value}` apply path every
-other control uses; there is no parallel persistence route. Escape cancels.
-For a color exact-value edit, Escape also closes the picker and restores focus
-to its selector; Tab or Shift-Tab closes it before continuing traversal.
-Free-text rows are therefore focusable and tab-stop, where they previously
-rendered read-only.
+which routes the typed value into the same `{key, value}` apply path every
+other control uses; there is no parallel persistence route. Losing focus runs
+the same helper for a stepper, through
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#save_stepper_edit_on_blur]]
+on traversal and on the `edit_handle` blur subscription that catches pointer
+focus changes. Escape cancels. For a color exact-value edit, Escape
+also closes the picker and restores focus to its selector; Tab or Shift-Tab
+closes it before continuing traversal. Free-text rows are therefore focusable
+and tab-stop, where they previously rendered read-only.
 
 #### Commit routes by control kind
 
 [[crates/scribe-client/src/settings/window.rs#inline_commit_value]] canonicalizes a colour through the apply path's own hex/ansi validator, so a rejected colour never reaches the config writer, and commits general free text verbatim.
+
+[[crates/scribe-client/src/settings/window.rs#numeric_inline_value]] parses a
+stepper's finite integer or decimal shape, checks its bounds and displayed
+precision, and produces a JSON number before
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#commit_control_value]]
+reaches the config or Smart Selection consumer. It shapes that number through
+[[crates/scribe-client/src/settings/window.rs#stepper_number]], the same helper
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#step]] commits with:
+a whole number stays a JSON integer because most steppers deserialize into
+`u16`/`u32`/`u64` config fields and `Test cursor` reads its value back as
+`as_u64`, and a fractional one keeps two decimals. Invalid or out-of-range
+numeric text stays editable with a `Role::Alert` error and never changes config.
 
 The apply path stays the single authority on what each key accepts, so no second validator exists here.
 

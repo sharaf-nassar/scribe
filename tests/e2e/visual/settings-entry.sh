@@ -262,6 +262,25 @@ click_settings_at() {
     sleep 0.6
 }
 
+assert_font_size() {
+    python3 - "$CONFIG_FILE" "$1" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as config_file:
+        config = tomllib.load(config_file)
+except FileNotFoundError:
+    config = {}
+
+actual = config.get("appearance", {}).get("font_size", 14)
+expected = float(sys.argv[2])
+if actual != expected:
+    print(f"font size mismatch: expected {expected!r}, got {actual!r}")
+    raise SystemExit(1)
+PY
+}
+
 assert_workspace_roots() {
     python3 - "$CONFIG_FILE" "$@" <<'PY'
 import sys
@@ -429,6 +448,102 @@ if [ "$INK" -lt "$SETTINGS_INK_MIN" ]; then
     fail "PHASE 1 FAIL: the settings window painted $INK px (min $SETTINGS_INK_MIN)"
 fi
 echo "PHASE 1 PASS: ctrl+, opened the compact $SETTINGS_SIZE settings window (ink $INK)"
+
+# @lat: [[test#Visual E2E Tests#In-app settings entry points#Numeric steppers accept exact entry]]
+# ── Phase 1A: Font size accepts exact numeric entry ───────────────
+# Appearance is page 0. Eleven tabs reach Font family; one more reaches Font
+# size. Enter opens exact entry rather than stepping, so this is the original
+# regression flow that saved 16.0 on the old step-only stepper.
+for _ in {1..12}; do
+    send_keys Tab
+done
+send_keys Return
+send_keys ctrl+a
+type_text "23"
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Return
+if ! assert_font_size 23; then
+    fail "PHASE 1A FAIL: exact Font size entry did not persist 23"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 1A FAIL: exact Font size entry triggered no server live reload"
+fi
+shot /output/01a-font-size-23.png
+
+# Leaving exact entry commits the valid value, then the same focused stepper
+# reopens for the requested final value. This keeps blur on the native input
+# path rather than creating a second numeric editor.
+send_keys ctrl+a
+type_text "22"
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Tab
+if ! assert_font_size 22; then
+    fail "PHASE 1A FAIL: blurring Font size did not persist 22"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 1A FAIL: blurred Font size triggered no server live reload"
+fi
+send_keys Up
+send_keys Return
+send_keys ctrl+a
+type_text "23"
+send_keys Return
+if ! assert_font_size 23; then
+    fail "PHASE 1A FAIL: reopening Font size did not restore 23"
+fi
+
+# Rejected text remains visible with its inline error and cannot write config.
+send_keys ctrl+a
+type_text "abc"
+shot /output/01a-font-size-nonnumeric-before.png
+send_keys Return
+if ! assert_font_size 23; then
+    fail "PHASE 1A FAIL: non-numeric Font size changed config"
+fi
+shot /output/01a-font-size-nonnumeric-error.png
+CHANGED=$(settings_changed_pixels \
+    /output/01a-font-size-nonnumeric-before.png /output/01a-font-size-nonnumeric-error.png)
+if [ "$CHANGED" -lt "$SETTINGS_CHANGE_MIN" ]; then
+    fail "PHASE 1A FAIL: non-numeric Font size showed no inline error"
+fi
+
+send_keys ctrl+a
+type_text "49"
+send_keys Return
+if ! assert_font_size 23; then
+    fail "PHASE 1A FAIL: out-of-range Font size changed config"
+fi
+shot /output/01a-font-size-out-of-range.png
+
+# Escape drops the rejected text and restores the saved number on screen.
+send_keys Escape
+shot /output/01a-font-size-escape.png
+if ! assert_font_size 23; then
+    fail "PHASE 1A FAIL: Escape changed config"
+fi
+CHANGED=$(settings_changed_pixels \
+    /output/01a-font-size-out-of-range.png /output/01a-font-size-escape.png)
+if [ "$CHANGED" -lt "$SETTINGS_CHANGE_MIN" ]; then
+    fail "PHASE 1A FAIL: Escape left the rejected Font size on screen"
+fi
+
+# Escape closed exact entry, so the stepper answers Left again — the closed
+# arrow adjustment the typed field deliberately swallows while it is open.
+send_keys Left
+if ! assert_font_size 22; then
+    fail "PHASE 1A FAIL: Left did not step the closed Font size stepper"
+fi
+
+# Put the fixture default back so later phases see the terminal they expect.
+send_keys Return
+send_keys ctrl+a
+type_text "14"
+send_keys Return
+send_keys Escape
+if ! assert_font_size 14; then
+    fail "PHASE 1A FAIL: Font size did not return to the fixture default"
+fi
+echo "PHASE 1A PASS: exact and blurred Font size saved, rejected values stayed editable"
 
 # @lat: [[test#Visual E2E Tests#In-app settings entry points#Workspace roots edit and apply live]]
 # ── Phase 2: workspace roots reject, persist, and remove live ─────
@@ -710,6 +825,10 @@ echo "PASS: visual settings-entry test"
 echo "  Inspect screenshots in test-output/:"
 echo "    00-terminal-only.png          — the client before any settings entry"
 echo "    01-settings-open.png          — the settings window opened by ctrl+,"
+echo "    01a-font-size-23.png          — exact Font size persisted as a number"
+echo "    01a-font-size-nonnumeric-error.png — rejected numeric text retained inline"
+echo "    01a-font-size-out-of-range.png — rejected bounds retained inline"
+echo "    01a-font-size-escape.png      — Escape restored the saved number"
 echo "    02-search-focused-empty.png   — focused empty search without visual placeholder"
 echo "    02-workspace-bare-tilde.png   — rejected root before inline validation"
 echo "    02-workspace-invalid.png      — rejected root retained with inline error"

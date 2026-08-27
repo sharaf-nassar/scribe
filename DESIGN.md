@@ -226,7 +226,7 @@ being touched.
 - **Control row** 52px: 13px label (12px quiet description below) left, control right-aligned on the shared spine. Long labels wrap; they never push the control off the edge.
 - **Toggle** 32×18: OFF = 9% white track with a `knob-off` knob; ON = white track, ground-colored knob. Hit area extends to 40×28 without changing the visual.
 - **Inline options**: text separated by 14px, unselected in quiet, selected in white with a 1px underline. `role="radiogroup"` with a group name — they are exclusive, and assistive tech has to know that.
-- **Stepper**: mono value holding the column, `−`/`+` at 50% opacity in the gutter, full on row hover, invisible at a bound.
+- **Stepper**: mono value holding the column, `−`/`+` at 50% opacity in the gutter, full on row hover, invisible at a bound. The number is also the entry point: activating it opens exact entry in the same inline field every other typed value uses, seeded with the current number selected. Enter or moving focus away commits a finite in-range value at the shown precision and closes the field; Escape closes it on the saved number. A rejected value stays in the open field with the reason on the row's second line, and the setting does not change.
 - **Field / hex**: transparent at rest, hairline underline on hover, accent underline plus a 3px accent glow on focus. Hex adds a 14px swatch immediately left of the value. The visible row label IS the field's `<label for>`.
 - **Choice**: value text plus a chevron, no box; anchored menu on `raised`, 28px rows, selected option marked with a 5px accent dot.
 - **Action**: text with a hairline under it; the rule brightens on hover. No filled buttons except a genuine primary.
