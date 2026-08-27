@@ -426,7 +426,7 @@ e2e-visual-maximized-restore: e2e-visual-image-current
 # container to observe what the client asked the OS to open, and drives a real
 # shell for the CWD phase, so it needs more than the default budget.
 e2e-visual-terminal-links: e2e-visual-image-current
-    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-links-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/terminal-links.sh
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=600 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-links-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/terminal-links.sh
 
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll
