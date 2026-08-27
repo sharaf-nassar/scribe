@@ -6117,6 +6117,14 @@ that nothing committed.
 
 Unit tests for , the ported window-status-bar segment model, proving connection/pane feedback and every parity segment (command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds correctly without a live window.
 
+### OSC 8 hover replaces and restores the live left group
+
+[[crates/scribe-client/src/status_bar.rs#build_model]] is covered by `osc8_hover_replaces_and_restores_the_live_left_group`, proving OSC 8 hover replaces the complete left model and unhover rebuilds it from current live inputs rather than a snapshot.
+
+The same model test pins muted-arrow and primary-URI tones, the full URI in the status label, and changed workspace content after unhover. Narrow budgets from zero through three columns never overflow.
+
+[[crates/scribe-client/src/status_bar.rs#truncate_url]] is covered by narrow/wide and ASCII head/tail fixtures measured with `unicode-width`, including zero-width bars, the three-column head cut, and wide non-ASCII URI glyphs. [[crates/scribe-client/src/main.rs#TerminalView#refresh_osc8_hover]] is covered by a cache test proving one unchanged cell resolves once and a changed published content snapshot re-resolves without pointer motion.
+
 ### Connection dot reflects connection state
 
  paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.

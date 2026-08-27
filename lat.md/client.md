@@ -891,6 +891,14 @@ The sparklines are fed by , which ports the winit CPU/memory/network/GPU sampler
 
  fills the metadata segments from the attached pane's entry in : workspace name, CWD, git branch, the env-degraded `⚠` glyph, the `tmux:` label, and the host label, which a remote-flagged session context overrides and a local pane leaves at the placeholder until the hostname surface lands. The workspace id and the session count both come from the tab strip — the only place the attached pane's workspace and the window's live sessions are known — and are resolved before the metadata lock is taken so the two are never held at once. The count is the number of open tabs in this window, matching the legacy client's pane count, not a boolean of whether a pane is attached. The centred update CTA comes from  instead; command status stays `None` until its own bead lands.
 
+### OSC 8 hover previews use the status bar
+
+[[crates/scribe-client/src/main.rs#TerminalView#refresh_osc8_hover]] resolves bare pointer hover against explicit OSC 8 spans in any visible pane and keeps its status-bar preview current as pane content changes.
+
+Its cache key is the pane, viewport cell, and published `Content` snapshot; empty cells are cached too. A stationary pointer therefore re-resolves after output, scroll, or resize instead of keeping a stale URI, while motion inside one unchanged cell repeats no URL scan.
+
+Ctrl-hover still uses the existing per-cell foreground underline. Bare OSC 8 hover supplies [[crates/scribe-client/src/terminal_element.rs#LinkUnderlineStyle]] with the terminal theme foreground at 50% alpha and a 1px rule, then replaces the status bar's complete left group with a muted `→` plus the primary-tone URI. [[crates/scribe-client/src/status_bar.rs#measure_left_budget_cols]] measures the bar against the live right group, centred CTA, action glyphs, and GPUI paddings; [[crates/scribe-client/src/status_bar.rs#truncate_url]] spends that budget in Unicode display columns without splitting grapheme clusters. Removing the pointer or holding a modifier rebuilds the ordinary left model from live chrome data, and the stable AccessKit status label includes the full URI while hovered.
+
 ### Status-Bar Stats Sample Off The UI Thread
 
 The status-bar sampler runs on its own thread and publishes snapshots the UI copies, because the underlying probes are slow enough to dominate startup-to-first-frame if the window waits on them.

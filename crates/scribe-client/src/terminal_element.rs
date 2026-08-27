@@ -333,9 +333,12 @@ pub struct TerminalElement {
     /// Mouse-selection runs for this frame, already projected onto the visible
     /// viewport. Empty whenever the pane holds no selection.
     selection: Vec<SelectionSpan>,
-    /// Rows of the Ctrl-hovered link for this frame. Empty on every frame with
-    /// no link under the pointer, which is almost all of them.
+    /// Rows of the hovered link for this frame. Empty on every frame with no
+    /// link under the pointer, which is almost all of them.
     link_underline: Vec<SelectionSpan>,
+    /// Optional bare-hover override; `None` preserves the Ctrl-hover rule's
+    /// resolved cell foreground and normal decoration thickness.
+    link_underline_style: Option<LinkUnderlineStyle>,
     /// Failed-link annotation paint inputs. `None` keeps its paint layer out
     /// of the idle frame entirely.
     annotation: Option<AnnotationPaint>,
@@ -354,6 +357,13 @@ pub struct TerminalElement {
     /// Immutable CPU scene plus the window-local cache shared by all panes.
     images: Option<TerminalImagesPaint>,
     bounds_sink: GridBounds,
+}
+
+/// Optional style override for a hovered-link underline.
+#[derive(Clone, Copy)]
+pub struct LinkUnderlineStyle {
+    pub color: Rgba,
+    pub thickness: Pixels,
 }
 
 /// One failed-link annotation painted over a terminal grid.
@@ -402,6 +412,7 @@ impl TerminalElement {
             highlight_colors,
             selection: Vec::new(),
             link_underline: Vec::new(),
+            link_underline_style: None,
             annotation: None,
             ime: None,
             cursor: None,
@@ -480,13 +491,19 @@ impl TerminalElement {
         self
     }
 
-    /// Rule the cells of the link the pointer is over while Ctrl is held.
+    /// Rule the cells of the link the pointer is over.
     ///
     /// One span per viewport row, because a wrapped or hard-break-joined link
     /// is not a rectangle: its continuation rows start at their own indent.
+    /// `None` preserves the existing Ctrl-hover color and thickness.
     #[must_use]
-    pub fn with_link_underline(mut self, rows: Vec<SelectionSpan>) -> Self {
+    pub fn with_link_underline(
+        mut self,
+        rows: Vec<SelectionSpan>,
+        style: Option<LinkUnderlineStyle>,
+    ) -> Self {
         self.link_underline = rows;
+        self.link_underline_style = style;
         self
     }
 
@@ -801,21 +818,19 @@ impl TerminalElement {
         .paint(window, cx);
     }
 
-    /// Rule the Ctrl-hovered link, one quad per row segment.
+    /// Rule the hovered link, one quad per row segment.
     ///
     /// Drawn after the selection overlay so a link inside a selection still
-    /// shows its rule, and in each cell's own resolved foreground so the rule
-    /// reads as an underline of that text rather than as separate chrome —
-    /// which is also why it is a quad rather than a `TextRun` underline: the
-    /// cells were already shaped and painted by phase 4, and the hover must not
-    /// reshape them.
+    /// shows its rule. Ctrl-hover keeps each cell's resolved foreground and
+    /// normal decoration thickness; OSC 8 bare-hover supplies its theme-level
+    /// preview style. A quad avoids reshaping cells already painted in phase 4.
     fn paint_link_underline(
         &self,
         overlay: OverlayGeometry,
         cells: &SelectionOverlayPaint<'_>,
         window: &mut Window,
     ) {
-        let thickness = cells.thickness;
+        let thickness = self.link_underline_style.map_or(cells.thickness, |style| style.thickness);
         for span in &self.link_underline {
             let Some(resolved) = cells.resolved_rows.get(span.row) else { continue };
             let end = span.end_col.min(resolved.len().saturating_sub(1));
@@ -842,7 +857,8 @@ impl TerminalElement {
                 let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
                 let width = px(overlay.cell_width * f32::from(columns));
                 let rule = Bounds::new(point(left, top), size(width, thickness));
-                window.paint_quad(fill(rule, cell.fg));
+                let color = self.link_underline_style.map_or(cell.fg, |style| style.color);
+                window.paint_quad(fill(rule, color));
             }
         }
     }

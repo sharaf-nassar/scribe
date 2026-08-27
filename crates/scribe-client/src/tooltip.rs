@@ -2,12 +2,9 @@
 //!
 //! The winit client painted tooltips as GPU quads (a border quad, a
 //! background quad, then glyphs) centred on an anchor rect and clamped to the
-//! viewport, plus a dedicated OSC 8 hover-tooltip that head+tail-truncated a long
-//! URI so it fit the box. This port keeps that geometry as pure, testable
-//! functions — [`clamp_tooltip_x`] (centre-on-anchor, clamp to the viewport) and
-//! [`truncate_url`] (the `head…tail` URL elision) — and lowers the paint onto a
-//! GPUI [`tooltip_element`] with rounded corners and a drop shadow instead of the
-//! hand-placed quads.
+//! viewport. This port keeps that geometry as pure, testable functions and
+//! lowers the paint onto a GPUI [`tooltip_element`] with rounded corners and a
+//! drop shadow instead of the hand-placed quads.
 
 use gpui::{AnyElement, Rgba, div, prelude::*, px};
 use scribe_common::theme::ChromeColors;
@@ -66,31 +63,6 @@ pub fn tooltip_y(anchor: Rect, tooltip_height: f32, position: TooltipPosition) -
         TooltipPosition::Above => anchor.y - tooltip_height,
         TooltipPosition::Below => anchor.y + anchor.height,
     }
-}
-
-/// Head+tail-truncate `uri` to at most `max_cols` display columns, inserting an
-/// `...` ellipsis in the middle so both the scheme/host head and the path tail
-/// stay visible. Ported verbatim from the winit client's `osc8_tooltip_truncate`
-/// (spec 009 FR-006): URIs at or under the budget are returned unchanged, a
-/// budget of three columns or fewer falls back to a plain head cut, and the
-/// remaining budget is split head-heavy (`div_ceil`) so an odd column favours the
-/// head. Char-based so a multibyte URI never splits mid-codepoint.
-#[must_use]
-pub fn truncate_url(uri: &str, max_cols: usize) -> String {
-    let chars: Vec<char> = uri.chars().collect();
-    if chars.len() <= max_cols {
-        return uri.to_owned();
-    }
-    if max_cols <= 3 {
-        return chars.into_iter().take(max_cols).collect();
-    }
-    let budget = max_cols.saturating_sub(3);
-    let head_chars = budget.div_ceil(2);
-    let tail_chars = budget - head_chars;
-    let mut out: String = chars.iter().take(head_chars).collect();
-    out.push_str("...");
-    out.extend(chars.iter().skip(chars.len() - tail_chars));
-    out
 }
 
 /// Resolved GPUI colours for the tooltip box, derived from the theme chrome.

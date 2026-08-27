@@ -17,10 +17,12 @@
 
 use std::path::Path;
 
-use gpui::{App, FocusHandle, Rgba, Role, Window, div, prelude::*, px};
+use gpui::{App, FocusHandle, Font, Rgba, Role, TextRun, Window, div, prelude::*, px};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::sys_stats::SystemStats;
 use crate::{button::stop_activation_key, opacity::scale_slot};
@@ -103,6 +105,11 @@ pub struct StatusBarData<'a> {
     pub update_progress: Option<&'a UpdateProgressState>,
     pub sys_stats: Option<&'a SystemStats>,
     pub stats_config: Option<&'a StatusBarStatsConfig>,
+    /// Bare-hovered OSC 8 target, replacing the complete left group while set.
+    pub hover_uri: Option<&'a str>,
+    /// Display columns available to the replacement left group after measured
+    /// right/centre/action widths and horizontal paddings are reserved.
+    pub left_budget_cols: usize,
 }
 
 /// sRGB colours for the status bar, derived from the theme's [`ChromeColors`]
@@ -230,6 +237,9 @@ fn accessibility_label(data: &StatusBarData<'_>) -> String {
     if matches!(data.env_status, Some(EnvStatusState::Degraded { .. })) {
         states.push("Environment capture degraded".to_owned());
     }
+    if let Some(uri) = data.hover_uri {
+        states.push(format!("Link target {uri}"));
+    }
     match data.update_progress {
         Some(UpdateProgressState::Downloading) => states.push("Downloading update".to_owned()),
         Some(UpdateProgressState::Verifying) => states.push("Verifying update".to_owned()),
@@ -255,6 +265,10 @@ fn accessibility_label(data: &StatusBarData<'_>) -> String {
 /// Left side: connection dot, important status copy, command status, env
 /// warning, remote/share surfaces, workspace name, CWD.
 fn build_left(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
+    if let Some(uri) = data.hover_uri {
+        return build_hover_left(uri, data.left_budget_cols, colors);
+    }
+
     let mut spans = Vec::new();
     spans.push(Span::new(" ", colors.text));
 
@@ -276,6 +290,17 @@ fn build_left(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
     }
 
     spans
+}
+
+fn build_hover_left(uri: &str, budget_cols: usize, colors: &StatusBarColors) -> Vec<Span> {
+    match budget_cols {
+        0 => Vec::new(),
+        1 => vec![Span::new("\u{2192}", colors.label)],
+        _ => vec![
+            Span::new("\u{2192} ", colors.label),
+            Span::new(truncate_url(uri, budget_cols - 2), colors.text),
+        ],
+    }
 }
 
 /// Command outcome glyph. The distinct glyph is the accessible cue (FR-009);
@@ -510,6 +535,65 @@ fn push_gpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors
 // Pure helpers (ported verbatim from the legacy renderer)
 // ---------------------------------------------------------------------------
 
+/// Head+tail-truncate `uri` to at most `max_cols` display columns.
+///
+/// ASCII retains the legacy head-heavy split. Grapheme boundaries keep wide
+/// and combining characters intact, while `unicode-width` budgets their actual
+/// terminal columns rather than bytes or scalar count.
+#[must_use]
+pub fn truncate_url(uri: &str, max_cols: usize) -> String {
+    if UnicodeWidthStr::width(uri) <= max_cols {
+        return uri.to_owned();
+    }
+    if max_cols <= 3 {
+        return prefix_within(uri, max_cols).0.to_owned();
+    }
+
+    let text_budget = max_cols - 3;
+    let head_budget = text_budget.div_ceil(2);
+    let (head, head_cols) = prefix_within(uri, head_budget);
+    let tail_budget = text_budget.saturating_sub(head_cols);
+    let tail = suffix_within(uri, head.len(), tail_budget);
+    format!("{head}...{tail}")
+}
+
+fn prefix_within(text: &str, budget_cols: usize) -> (&str, usize) {
+    if budget_cols == 0 {
+        return ("", 0);
+    }
+    let mut end = 0;
+    let mut used: usize = 0;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(width) > budget_cols {
+            break;
+        }
+        used += width;
+        end = start + grapheme.len();
+    }
+    (&text[..end], used)
+}
+
+fn suffix_within(text: &str, min_start: usize, budget_cols: usize) -> &str {
+    if budget_cols == 0 {
+        return "";
+    }
+    let mut start = text.len();
+    let mut used: usize = 0;
+    for (grapheme_start, grapheme) in text.grapheme_indices(true).rev() {
+        if grapheme_start < min_start {
+            break;
+        }
+        let width = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(width) > budget_cols {
+            break;
+        }
+        used += width;
+        start = grapheme_start;
+    }
+    &text[start..]
+}
+
 /// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).
 fn sparkline_char(pct: f32) -> char {
     const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -625,6 +709,64 @@ fn shorten_cwd_with_home(path: &Path, home: Option<&Path>) -> String {
 /// Read the home directory from `$HOME`.
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Measure the display-column budget left after the current right group,
+/// centred CTA, action glyphs, and their GPUI paddings reserve their space.
+#[must_use]
+pub fn measure_left_budget_cols(
+    model: &StatusBarModel,
+    action_glyphs: &str,
+    window: &Window,
+) -> usize {
+    let right: String = model.right.iter().map(|span| span.text.as_str()).collect();
+    let center = model.center.as_ref().map_or("", |span| span.text.as_str());
+    let cell_width = status_text_width("0", window).max(1.0);
+    let text_width = status_text_width(&right, window)
+        + status_text_width(center, window)
+        + status_text_width(action_glyphs, window);
+    // `.px_2()` is 0.5rem per side; the CTA has the same padding, and each
+    // action contributes one `.pl_2()`.
+    let action_padding_rems = action_glyphs.graphemes(true).fold(0.0, |sum, _| sum + 0.5);
+    let center_padding_rems = if model.center.is_some() { 1.0 } else { 0.0 };
+    let padding_rems = 1.0 + center_padding_rems + action_padding_rems;
+    let available_px = (f32::from(window.bounds().size.width)
+        - text_width
+        - padding_rems * f32::from(window.rem_size()))
+    .max(0.0);
+    display_cols_in_px(available_px, cell_width)
+}
+
+fn display_cols_in_px(extent: f32, cell_width: f32) -> usize {
+    if !extent.is_finite() || extent <= 0.0 || !cell_width.is_finite() || cell_width <= 0.0 {
+        return 0;
+    }
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if f32::from(mid) * cell_width <= extent {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    usize::from(low)
+}
+
+fn status_text_width(text: &str, window: &Window) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: Font { family: "monospace".into(), ..Font::default() },
+        ..TextRun::default()
+    };
+    let font_size = px(f32::from(window.rem_size()) * 0.75);
+    f32::from(
+        window.text_system().shape_line(text.to_owned().into(), font_size, &[run], None).width,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -869,11 +1011,75 @@ mod tests {
             update_progress: None,
             sys_stats: None,
             stats_config: None,
+            hover_uri: None,
+            left_budget_cols: 0,
         }
     }
 
     fn joined(spans: &[Span]) -> String {
         spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn truncate_url_preserves_head_and_tail_within_display_budget() {
+        assert_eq!(truncate_url("https://x.dev", 40), "https://x.dev");
+        let uri = "https://example.com/very/long/path/segment/that/overflows";
+        let out = truncate_url(uri, 20);
+
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 20);
+        assert!(out.starts_with("https://e"));
+        assert!(out.ends_with("flows"));
+    }
+
+    #[test]
+    fn truncate_url_handles_narrow_and_wide_character_budgets() {
+        assert_eq!(truncate_url("https://example.com", 0), "");
+        assert_eq!(truncate_url("https://example.com", 3), "htt");
+
+        let uri = "https://例え.example/セグメント/終わり";
+        let out = truncate_url(uri, 18);
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 18);
+        assert!(out.contains("..."));
+        assert!(out.ends_with("終わり"));
+    }
+
+    // @lat: [[test#GPUI Status Bar#OSC 8 hover replaces and restores the live left group]]
+    #[test]
+    fn osc8_hover_replaces_and_restores_the_live_left_group() {
+        let colors = colors();
+        let mut d = data();
+        d.workspace_name = Some("before");
+        d.hover_uri = Some("https://例え.example/very/long/target/終わり");
+        d.left_budget_cols = 20;
+
+        let hovered = build_model(&d, &colors);
+        assert!(joined(&hovered.left).starts_with("\u{2192} https://"));
+        assert!(UnicodeWidthStr::width(joined(&hovered.left).as_str()) <= 20);
+        assert!(!joined(&hovered.left).contains("before"));
+        assert!(
+            hovered.accessibility_label.contains("https://例え.example/very/long/target/終わり")
+        );
+        crate::assert_rgba_eq(hovered.left[0].color, colors.label);
+        crate::assert_rgba_eq(hovered.left[1].color, colors.text);
+
+        d.hover_uri = None;
+        d.workspace_name = Some("live");
+        let restored = build_model(&d, &colors);
+        assert!(joined(&restored.left).contains("live"));
+        assert!(!restored.accessibility_label.contains("Link target"));
+    }
+
+    #[test]
+    fn osc8_hover_never_exceeds_a_narrow_left_budget() {
+        let colors = colors();
+        let mut d = data();
+        d.hover_uri = Some("https://example.com");
+
+        for budget in 0..=3 {
+            d.left_budget_cols = budget;
+            let left = joined(&build_left(&d, &colors));
+            assert!(UnicodeWidthStr::width(left.as_str()) <= budget, "budget {budget}: {left}");
+        }
     }
 
     // @lat: [[test#GPUI Status Bar#Connection dot reflects connection state]]

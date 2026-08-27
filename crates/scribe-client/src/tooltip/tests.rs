@@ -1,7 +1,7 @@
-//! Unit tests for the tooltip geometry and URL truncation ports.
+//! Unit tests for the tooltip geometry port.
 
 use crate::layout::Rect;
-use crate::tooltip::{TooltipPosition, clamp_tooltip_x, tooltip_width, tooltip_y, truncate_url};
+use crate::tooltip::{TooltipPosition, clamp_tooltip_x, tooltip_width, tooltip_y};
 
 fn anchor(x: f32, width: f32) -> Rect {
     Rect { x, y: 100.0, width, height: 18.0 }
@@ -42,37 +42,4 @@ fn tooltip_y_tracks_above_and_below() {
     let a = anchor(0.0, 10.0);
     assert!((tooltip_y(a, 18.0, TooltipPosition::Above) - (100.0 - 18.0)).abs() < f32::EPSILON);
     assert!((tooltip_y(a, 18.0, TooltipPosition::Below) - (100.0 + 18.0)).abs() < f32::EPSILON);
-}
-
-#[test]
-fn short_url_is_returned_unchanged() {
-    assert_eq!(truncate_url("https://x.dev", 40), "https://x.dev");
-}
-
-// @lat: [[client#GPUI Overlays#Tooltip truncates a long URL head and tail]]
-#[test]
-fn long_url_keeps_head_and_tail_with_ellipsis() {
-    let uri = "https://example.com/very/long/path/segment/that/overflows";
-    let out = truncate_url(uri, 20);
-    assert_eq!(out.chars().count(), 20);
-    assert!(out.contains("..."));
-    assert!(out.starts_with("https"));
-    assert!(out.ends_with("flows"));
-    // Head-heavy split: budget 17 -> head 9, tail 8.
-    assert!(out.starts_with("https://e"));
-}
-
-#[test]
-fn tiny_budget_falls_back_to_head_cut() {
-    assert_eq!(truncate_url("https://example.com", 3), "htt");
-    assert_eq!(truncate_url("https://example.com", 0), "");
-}
-
-#[test]
-fn truncation_never_splits_a_multibyte_codepoint() {
-    let uri = "https://例え.example.com/セグメント/長いパスの終わり";
-    let out = truncate_url(uri, 15);
-    // Round-trips as valid UTF-8 with exactly the budgeted char count.
-    assert_eq!(out.chars().count(), 15);
-    assert!(out.contains("..."));
 }

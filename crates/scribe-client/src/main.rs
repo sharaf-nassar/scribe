@@ -222,8 +222,9 @@ use crate::{
         PaneStream, Scroll,
     },
     terminal_element::{
-        AnnotationPaint, CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint,
-        TerminalElement, TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
+        AnnotationPaint, CursorPaint, GridBounds, GridColors, GridFont, ImePaint,
+        LinkUnderlineStyle, ScrollbarPaint, TerminalElement, TerminalImagesPaint, cell_at,
+        hits_jump_chip, record_grid_area,
     },
 };
 
@@ -1034,6 +1035,56 @@ struct PendingOsc8Open {
     origin: Osc8ActivationOrigin,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Osc8HoverCell {
+    session_id: SessionId,
+    row: usize,
+    col: usize,
+    content_id: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Osc8HoverPreview {
+    session_id: SessionId,
+    uri: String,
+    rows: Vec<SelectionSpan>,
+}
+
+/// Bare OSC 8 hover cache. Empty cells are cached too, and the published
+/// content snapshot is part of the key so a stationary pointer never keeps
+/// stale data.
+#[derive(Default)]
+struct Osc8Hover {
+    cell: Option<Osc8HoverCell>,
+    content: Option<Arc<Content>>,
+    preview: Option<Osc8HoverPreview>,
+}
+
+impl Osc8Hover {
+    fn refresh(
+        &mut self,
+        cell: Option<Osc8HoverCell>,
+        content: Option<Arc<Content>>,
+        resolve: impl FnOnce() -> Option<Osc8HoverPreview>,
+    ) -> bool {
+        if self.cell == cell {
+            return false;
+        }
+        self.cell = cell;
+        self.content = content;
+        let next = cell.and_then(|_| resolve());
+        let changed = self.preview != next;
+        self.preview = next;
+        changed
+    }
+
+    fn clear(&mut self) -> bool {
+        self.cell = None;
+        self.content = None;
+        self.preview.take().is_some()
+    }
+}
+
 fn hover_focus_target(
     enabled: bool,
     pressed_button: Option<MouseButton>,
@@ -1058,17 +1109,21 @@ fn prepare_pane_bounds(
 
 /// Everything the *focused* pane alone gets for one frame.
 ///
-/// The four travel together because they share one reason: each is driven by
-/// something the window resolves against exactly one pane — the split-scroll
-/// pin, the platform's single input-method slot, the shell cursor, and the
-/// pointer. Every other pane paints its own untouched grid.
+/// The three travel together because each is driven by something the window
+/// resolves against exactly one pane — the split-scroll pin, the platform's
+/// single input-method slot, and the shell cursor. Every other pane paints its
+/// own untouched grid.
 struct FocusedPanePaint {
     /// The snapshot [`TerminalView::sync_split_scroll`] already pinned.
     content: Arc<Content>,
     ime: ImePaint,
     cursor: CursorPaint,
-    /// The link under a Ctrl-held pointer, if any.
-    link: Option<HoveredLink>,
+}
+
+struct LinkUnderlinePaint {
+    session_id: SessionId,
+    rows: Vec<SelectionSpan>,
+    style: Option<LinkUnderlineStyle>,
 }
 
 /// What this process claimed out of the restore store before opening a window.
@@ -1964,6 +2019,8 @@ struct TerminalView {
     pending_osc8_open: Option<PendingOsc8Open>,
     /// Per-pane observed opener waits and failed-open annotations.
     link_feedback: LinkFeedback,
+    /// Cell-granularity bare-hover preview for explicit OSC 8 spans.
+    osc8_hover: Osc8Hover,
     /// `request_id` of the LAN device approval the open modal is answering, so
     /// the resolved choice can be correlated back to the held connection. The
     /// dialog owns its own copy for display; this is the reply copy.
@@ -2630,6 +2687,7 @@ impl TerminalView {
             update_dialog_kind: None,
             pending_osc8_open: None,
             link_feedback: LinkFeedback::default(),
+            osc8_hover: Osc8Hover::default(),
             pending_lan_approval: None,
             pending_agent_prompt: None,
             clipboard: ClipboardSurfaces::new(gate),
@@ -7593,9 +7651,10 @@ impl TerminalView {
     fn render_panes(
         &mut self,
         focused: FocusedPanePaint,
+        link: Option<LinkUnderlinePaint>,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let FocusedPanePaint { content: focused, ime, cursor, link } = focused;
+        let FocusedPanePaint { content: focused, ime, cursor } = focused;
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
@@ -7609,8 +7668,7 @@ impl TerminalView {
         // the element only borrows a handle.
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
-        let (mut ime, mut link_rows, opacity) =
-            (Some(ime), link.map(|link| link.rows), self.opacity);
+        let (mut ime, mut link, opacity) = (Some(ime), link, self.opacity);
         // Identical for every pane, so it is built once and cloned in: the
         // clone is an `Rgba`, an `Arc` bump, and an `f32`.
         let colors = GridColors {
@@ -7644,24 +7702,22 @@ impl TerminalView {
                     pane = pane.border_1().border_color(border);
                 }
                 let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
-                // These three belong to the focused pane alone, for one reason:
-                // each is driven by something this window resolves against
-                // exactly one pane — the overlay's matches, the mouse
-                // selection, and the Ctrl-hovered link rule. Taken rather than
-                // cloned, the way the snapshot above is.
-                let (highlights, selection, underline) = if placement.focused {
-                    (
-                        self.find_highlights(&content, cx),
-                        selection_spans.clone(),
-                        link_rows.take().unwrap_or_default(),
-                    )
+                // Find and selection follow keyboard focus; pointer hover may
+                // rule any visible pane without moving that focus.
+                let (highlights, selection) = if placement.focused {
+                    (self.find_highlights(&content, cx), selection_spans.clone())
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new())
                 };
+                let underline = (session_id == link.as_ref().map(|paint| paint.session_id))
+                    .then(|| link.take())
+                    .flatten();
                 let bounds = self.pane_bounds_sink(session_id);
-                if !underline.is_empty() {
+                if underline.is_some() {
                     pane = pane.cursor_pointer();
                 }
+                let (underline_rows, underline_style) =
+                    underline.map_or_else(|| (Vec::new(), None), |paint| (paint.rows, paint.style));
                 let element = TerminalElement::new(
                     content,
                     self.font.clone(),
@@ -7671,7 +7727,7 @@ impl TerminalView {
                 )
                 .with_highlights(highlights)
                 .with_selection(selection)
-                .with_link_underline(underline)
+                .with_link_underline(underline_rows, underline_style)
                 .with_annotation(annotations.get(&placement.pane_id).cloned())
                 .with_terminal_images(image_paint)
                 .with_cursor(placement.focused.then_some(cursor))
@@ -8832,9 +8888,12 @@ impl TerminalView {
         &mut self,
         _event: &MouseExitEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.pointer.last_position = None;
+        if self.osc8_hover.clear() {
+            cx.notify();
+        }
     }
 
     fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -8861,11 +8920,11 @@ impl TerminalView {
             cx.notify();
             return;
         }
-        // The link rule follows the pointer, and it is read off the window at
-        // paint time rather than tracked here — so the move only has to ask for
-        // the repaint that will re-read it. Gated on Ctrl so an ordinary mouse
-        // move over the grid still costs nothing.
-        if event.modifiers.control {
+        // Ctrl-hover is resolved from the live window during paint. Bare OSC 8
+        // hover updates its cell cache here so non-link motion needs no repaint.
+        if event.modifiers.control
+            || !event.modifiers.modified() && self.refresh_osc8_hover(event.position)
+        {
             cx.notify();
         }
         if self.forward_mouse_motion(event) {
@@ -9630,6 +9689,52 @@ impl TerminalView {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Refresh the explicit OSC 8 span under a bare pointer.
+    ///
+    /// The cache key includes the hovered session, viewport cell, and published
+    /// content snapshot. Repaints therefore re-resolve a stationary pointer
+    /// after output, scroll, or resize, while ordinary motion inside one cell
+    /// never repeats the URL scan.
+    fn refresh_osc8_hover(&mut self, position: Point<Pixels>) -> bool {
+        let Some(session_id) = self.pane_at(position) else {
+            return self.osc8_hover.clear();
+        };
+        let Some(bounds) = self.pane_grid_bounds(session_id) else {
+            return self.osc8_hover.clear();
+        };
+        let Some(cell) = cell_at(bounds, &self.font, position) else {
+            return self.osc8_hover.clear();
+        };
+        let Some(content) = self.pane_frame(session_id).map(|frame| Arc::clone(&frame.content))
+        else {
+            return self.osc8_hover.clear();
+        };
+        let key = Osc8HoverCell {
+            session_id,
+            row: cell.row,
+            col: cell.col,
+            content_id: Arc::as_ptr(&content) as usize,
+        };
+        let Some(pane) = self.pane_for(session_id) else {
+            return self.osc8_hover.clear();
+        };
+        self.osc8_hover.refresh(Some(key), Some(content), || {
+            pane.with_terminal(|terminal| terminal.link_at(cell)).flatten().and_then(|link| {
+                matches!(link.kind, SpanKind::Osc8Hyperlink).then_some(Osc8HoverPreview {
+                    session_id,
+                    uri: link.target,
+                    rows: link.rows,
+                })
+            })
+        })
+    }
+
+    fn osc8_hover_underline_style(&self) -> LinkUnderlineStyle {
+        let mut color = opaque_slot(self.config.config().theme.foreground);
+        color.a = 0.5;
+        LinkUnderlineStyle { color, thickness: px(1.0) }
     }
 
     /// The link under a window-space pointer position, if any.
@@ -10929,7 +11034,11 @@ impl TerminalView {
     /// fills from `CwdChanged` / `GitBranch` / `SessionContextChanged` /
     /// `EnvStatus` / `WorkspaceNamed` and the `SessionList` snapshot, so a
     /// segment is absent only when the server has nothing to report.
-    fn build_status_model(&mut self) -> status_bar::StatusBarModel {
+    fn build_status_model(
+        &mut self,
+        hover_uri: Option<&str>,
+        left_budget_cols: usize,
+    ) -> status_bar::StatusBarModel {
         let connected = self.shared.connected.load(Ordering::Acquire);
         let active_session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         // The tab strip is the only place the window's live session count and
@@ -10991,6 +11100,8 @@ impl TerminalView {
                 update_progress,
                 sys_stats: Some(sys_stats),
                 stats_config: Some(&self.stats_config),
+                hover_uri,
+                left_budget_cols,
             },
             &self.status_colors,
         )
@@ -11001,8 +11112,20 @@ impl TerminalView {
     ///
     /// The palette is cached across renders, so the live opacity is folded into
     /// the filled band here rather than at theme-reload time.
-    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut model = self.build_status_model();
+    fn render_status_bar(
+        &mut self,
+        hover_uri: Option<&str>,
+        status_window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let equalize_visible = self.shell.pane_count(cx) >= 2;
+        let action_glyphs = if equalize_visible { "\u{229E}\u{2699}" } else { "\u{2699}" };
+        let mut model = self.build_status_model(None, 0);
+        if let Some(uri) = hover_uri {
+            let left_budget_cols =
+                status_bar::measure_left_budget_cols(&model, action_glyphs, status_window);
+            model = self.build_status_model(Some(uri), left_budget_cols);
+        }
         for message in &self.link_feedback.visible_messages {
             model.accessibility_label.push_str("; ");
             model.accessibility_label.push_str(message);
@@ -11032,7 +11155,7 @@ impl TerminalView {
                     tracing::debug!(?error, "balance button activation dropped with its view");
                 }
             });
-        let on_equalize = (self.shell.pane_count(cx) >= 2).then_some(equalize_action);
+        let on_equalize = equalize_visible.then_some(equalize_action);
         status_bar::render(
             &model,
             window_chrome::STATUS_BAR_HEIGHT,
@@ -11235,7 +11358,7 @@ impl TerminalView {
     fn render_grid(
         &mut self,
         ime: ImePaint,
-        link: Option<HoveredLink>,
+        link: Option<LinkUnderlinePaint>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         self.link_feedback.visible_messages.clear();
@@ -11246,7 +11369,7 @@ impl TerminalView {
                 && (!appearance.cursor_blink || self.focus.cursor_blink.visible),
             shape: appearance.cursor_shape,
         };
-        let panes = self.render_panes(FocusedPanePaint { content, ime, cursor, link }, cx);
+        let panes = self.render_panes(FocusedPanePaint { content, ime, cursor }, link, cx);
         let dividers = self.render_dividers(cx);
         let region_bars = self.render_region_tab_bars(cx);
         let ci_bars = self.render_ci_run_bars(cx);
@@ -12100,7 +12223,7 @@ impl TerminalView {
         self.tooltip_demo.then(|| {
             let colors = TooltipColors::from(&self.chrome);
             let anchor = Rect { x: 780.0, y: 120.0, width: 120.0, height: 18.0 };
-            let display = scribe_client::tooltip::truncate_url(
+            let display = status_bar::truncate_url(
                 "https://example.com/very/long/path/that/overflows/the/box",
                 48,
             );
@@ -12324,14 +12447,27 @@ impl Render for TerminalView {
         // Per-session no-change checks inside make this idempotent.
         self.publish_pane_sizes(cx);
         let ime = self.sync_ime(cx);
-        // The hovered link is read straight off the window rather than tracked
-        // across events: the pointer position and the modifier state are both
-        // already live there, so a hover that survives a repaint needs no state
-        // of its own to survive with it.
-        let link =
-            window.modifiers().control.then(|| self.link_at(window.mouse_position())).flatten();
+        let modifiers = window.modifiers();
+        let pointer = window.mouse_position();
+        let bare_hover = !modifiers.modified();
+        if bare_hover {
+            self.refresh_osc8_hover(pointer);
+        }
+        let hover = bare_hover.then(|| self.osc8_hover.preview.clone()).flatten();
+        let link = if modifiers.control {
+            self.focused_session().zip(self.link_at(pointer)).map(|(session_id, link)| {
+                LinkUnderlinePaint { session_id, rows: link.rows, style: None }
+            })
+        } else {
+            hover.as_ref().map(|preview| LinkUnderlinePaint {
+                session_id: preview.session_id,
+                rows: preview.rows.clone(),
+                style: Some(self.osc8_hover_underline_style()),
+            })
+        };
         let grid = self.render_grid(ime, link, cx);
-        let status_bar = self.render_status_bar(cx);
+        let status_bar =
+            self.render_status_bar(hover.as_ref().map(|preview| preview.uri.as_str()), window, cx);
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
         let remote_picker = self.build_remote_picker_overlay();
@@ -17328,6 +17464,38 @@ mod tests {
         assert!(feedback.visible_messages.is_empty());
         assert_eq!(feedback.pending.len(), 1);
         assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    // @lat: [[test#GPUI Status Bar#OSC 8 hover replaces and restores the live left group]]
+    #[test]
+    fn osc8_hover_cache_resolves_once_per_cell_and_content_snapshot() {
+        let session_id = SessionId::new();
+        let first = Osc8HoverCell { session_id, row: 1, col: 2, content_id: 7 };
+        let changed_content = Osc8HoverCell { content_id: 8, ..first };
+        let preview = Osc8HoverPreview {
+            session_id,
+            uri: "https://example.com/target".to_owned(),
+            rows: vec![SelectionSpan { row: 1, start_col: 2, end_col: 8 }],
+        };
+        let mut hover = Osc8Hover::default();
+        let content = Arc::new(Content::default());
+        let mut resolves = 0;
+
+        assert!(hover.refresh(Some(first), Some(Arc::clone(&content)), || {
+            resolves += 1;
+            Some(preview.clone())
+        }));
+        assert!(!hover.refresh(Some(first), Some(Arc::clone(&content)), || {
+            resolves += 1;
+            None
+        }));
+        assert!(!hover.refresh(Some(changed_content), Some(content), || {
+            resolves += 1;
+            Some(preview.clone())
+        }));
+        assert_eq!(resolves, 2);
+        assert!(hover.clear());
+        assert!(hover.preview.is_none());
     }
 
     #[test]
