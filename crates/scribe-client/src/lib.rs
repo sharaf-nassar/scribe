@@ -87,6 +87,7 @@ pub mod lan;
 pub mod lan_approval;
 pub mod lan_dial;
 pub mod layout;
+pub mod link_feedback;
 pub mod lost_control;
 pub mod monitor;
 pub mod mouse_reporting;

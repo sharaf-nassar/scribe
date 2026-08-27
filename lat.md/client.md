@@ -3650,6 +3650,12 @@ Two repaints have to be asked for, because an idle pane bumps no generation and 
 
 [[crates/scribe-client/src/main.rs#TerminalView#press_opens_link]] keeps the three kinds apart: an OSC 8 URI is program-supplied and goes through the scheme-allowlist gate that can raise the confirmation dialog, a heuristic URL keeps the silent non-allowlisted drop, and a path is not a URI at all. The same detector fills the right-click menu's open rows through [[crates/scribe-client/src/main.rs#TerminalView#open_context_menu]], which used to hand `ContextMenuRequest` a hardcoded `https://example.com/spec` for every cell — so every right-click offered to open it. Those rows now appear only over a cell that carries a link, which is why `overlay-actions.sh` addresses its target row two rows higher than it used to.
 
+### Failed link opens
+
+[[crates/scribe-client/src/link_feedback.rs#classify_open_failure]] maps typed outcomes and target metadata to a safe failure message without reading child stdout or stderr.
+
+Its ordered table names a missing opener first, then `mailto:`, a stat-missing path or `file:` target, a bounded ASCII scheme, an exit code, or a code-less failure. `OpenTarget` carries only the source kind, scheme, and resolved path needed for that decision.
+
 ### Resolving a Path Link
 
 What a relative link in a pane is relative *to*: that pane's shell, never the client process. [[crates/scribe-client/src/url_detect.rs#resolve_path]] is the pure half of [[crates/scribe-client/src/url_detect.rs#open_path]], split out so the rule is unit-tested without spawning anything.
