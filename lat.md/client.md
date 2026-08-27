@@ -3656,6 +3656,10 @@ Two repaints have to be asked for, because an idle pane bumps no generation and 
 
 Its ordered table names a missing opener first, then `mailto:`, a stat-missing path or `file:` target, a bounded ASCII scheme, an exit code, or a code-less failure. `OpenTarget` carries only the source kind, scheme, and resolved path needed for that decision.
 
+[[crates/scribe-client/src/link_feedback.rs#AnnotationLayout]] owns the cell grammar shared by annotation painters: above the clicked run with a head corner, tail-anchored when that form crosses the right edge, and below only for viewport row zero. It head-truncates with a single ellipsis and suppresses panes below 12 columns or without an adjacent row.
+
+[[crates/scribe-client/src/link_feedback.rs#AnnotationColors#from_theme]] derives the opaque band by an 8% per-channel sRGB mix toward ANSI red, lightens red by ten HSL lightness points while enforcing 4.5:1 text contrast, and gives joinery the same red at 60% alpha.
+
 ### Resolving a Path Link
 
 What a relative link in a pane is relative *to*: that pane's shell, never the client process. [[crates/scribe-client/src/url_detect.rs#resolve_path]] is the pure half of [[crates/scribe-client/src/url_detect.rs#open_path]], split out so the rule is unit-tested without spawning anything.
