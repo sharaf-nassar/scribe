@@ -10,11 +10,25 @@
 //! of imported from `selection` — the selection port lands in a separate bead,
 //! and these helpers carry no state.
 
+use std::{
+    ffi::OsStr,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    process::Child,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
 use alacritty_terminal_gpui::event::VoidListener;
 use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Column, Line, Point};
 use alacritty_terminal_gpui::term::Term;
 use alacritty_terminal_gpui::term::cell::{Cell, Flags, Hyperlink};
+
+use crate::link_feedback::{OpenOutcome, OpenTarget, OpenTargetKind};
 
 /// Read a single cell from the terminal grid.
 ///
@@ -1069,6 +1083,240 @@ fn detect_path_prefix(chars: &[char], pos: usize) -> Option<(usize, bool)> {
     None
 }
 
+/// Display name of the finally-spawned opener command.
+pub type Cmd = &'static str;
+
+/// Typed spawn result for an observed opener.
+pub type OpenSpawnResult = Result<(Child, Cmd), (ErrorKind, Cmd)>;
+
+/// Completed result from the bounded opener wait worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenObservation {
+    /// Typed process outcome consumed by the failure classifier.
+    pub outcome: OpenOutcome,
+    /// Finally-spawned command (`code`, `xdg-open`, or `open`).
+    pub cmd: Cmd,
+    /// Target metadata captured before spawning.
+    pub target: OpenTarget,
+}
+
+const OPEN_WAIT_TIMEOUT: Duration = Duration::from_mins(1);
+const OPEN_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OPEN_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct WaitTiming {
+    timeout: Duration,
+    poll_interval: Duration,
+}
+
+/// Observe a spawned opener without an unbounded blocking wait.
+///
+/// This is a worker body: callers run it off the GPUI thread. Cancellation and
+/// the 60-second deadline both kill and reap the child, then return `None` so
+/// no user-facing failure is produced for a superseded or timed-out click.
+#[must_use]
+pub fn wait_for_open(
+    child: Child,
+    cmd: Cmd,
+    target: OpenTarget,
+    cancel: Arc<AtomicBool>,
+) -> Option<OpenObservation> {
+    let observation = wait_for_open_with_timing(
+        child,
+        cmd,
+        target,
+        &cancel,
+        WaitTiming { timeout: OPEN_WAIT_TIMEOUT, poll_interval: OPEN_WAIT_POLL_INTERVAL },
+    );
+    drop(cancel);
+    observation
+}
+
+fn wait_for_open_with_timing(
+    mut child: Child,
+    cmd: Cmd,
+    target: OpenTarget,
+    cancel: &AtomicBool,
+    timing: WaitTiming,
+) -> Option<OpenObservation> {
+    let deadline = Instant::now() + timing.timeout;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            terminate_and_reap(&mut child, timing.poll_interval);
+            tracing::trace!(command = cmd, "link opener result dropped after supersede");
+            return None;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Some(OpenObservation {
+                    outcome: OpenOutcome::Exited { code: status.code() },
+                    cmd,
+                    target,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::trace!(command = cmd, %error, "failed to poll link opener");
+                terminate_and_reap(&mut child, timing.poll_interval);
+                return Some(OpenObservation {
+                    outcome: OpenOutcome::Exited { code: None },
+                    cmd,
+                    target,
+                });
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate_and_reap(&mut child, timing.poll_interval);
+            tracing::trace!(command = cmd, "link opener result dropped after timeout");
+            return None;
+        }
+        std::thread::sleep(remaining.min(timing.poll_interval));
+    }
+}
+
+/// Kill and reap without calling the unbounded `Child::wait` API.
+fn terminate_and_reap(child: &mut Child, poll_interval: Duration) {
+    if let Err(error) = child.kill() {
+        tracing::trace!(%error, "failed to kill dropped link opener");
+    }
+
+    let deadline = Instant::now() + OPEN_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::trace!(%error, "failed to reap dropped link opener");
+                return;
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::trace!("dropped link opener did not reap before deadline");
+            return;
+        }
+        std::thread::sleep(remaining.min(poll_interval));
+    }
+}
+
+fn system_open_cmd() -> Cmd {
+    #[cfg(target_os = "linux")]
+    return "xdg-open";
+    #[cfg(target_os = "macos")]
+    return "open";
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return "xdg-open";
+}
+
+/// Spawn a file-path opener whose exit status will be observed by the caller.
+///
+/// A missing `code` binary falls through to the platform opener. Once `code`
+/// spawns successfully, its child is final even if it later exits non-zero.
+pub fn open_path_observed(raw: &str, cwd: Option<&Path>) -> (OpenSpawnResult, OpenTarget) {
+    let open_cmd = system_open_cmd();
+    open_path_observed_with_commands(raw, cwd, OsStr::new("code"), OsStr::new(open_cmd), open_cmd)
+}
+
+fn open_path_observed_with_commands(
+    raw: &str,
+    cwd: Option<&Path>,
+    code_program: &OsStr,
+    open_program: &OsStr,
+    open_cmd: Cmd,
+) -> (OpenSpawnResult, OpenTarget) {
+    let (path_str, line_num) = parse_path_line_suffix(raw);
+    let resolved = resolve_path(path_str, cwd);
+    let target = target_for_path(&resolved);
+
+    if let Some(line) = line_num {
+        let goto_arg = format!("{resolved}:{line}");
+        match std::process::Command::new(code_program)
+            .args([OsStr::new("--goto"), OsStr::new(&goto_arg)])
+            .spawn()
+        {
+            Ok(child) => return (Ok((child, "code")), target),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return (Err((error.kind(), "code")), target),
+        }
+    }
+
+    let result = std::process::Command::new(open_program)
+        .arg(&resolved)
+        .spawn()
+        .map(|child| (child, open_cmd))
+        .map_err(|error| (error.kind(), open_cmd));
+    (result, target)
+}
+
+/// Spawn a recognized URL opener whose exit status will be observed.
+pub fn open_url_observed(url: &str) -> (OpenSpawnResult, OpenTarget) {
+    let target = target_for_uri(url, OpenTargetKind::Url);
+    let cmd = system_open_cmd();
+    if !PREFIXES.iter().any(|prefix| url.starts_with(prefix)) {
+        tracing::warn!("open_url_observed: refusing to open unsupported URL scheme");
+        return (Err((ErrorKind::InvalidInput, cmd)), target);
+    }
+    (spawn_uri_observed(url, OsStr::new(cmd), cmd), target)
+}
+
+/// Spawn an unguarded OSC 8 URI opener whose exit status will be observed.
+pub fn open_uri_unguarded_observed(uri: &str) -> (OpenSpawnResult, OpenTarget) {
+    let cmd = system_open_cmd();
+    let target = target_for_uri(uri, OpenTargetKind::Osc8);
+    (spawn_uri_observed(uri, OsStr::new(cmd), cmd), target)
+}
+
+fn spawn_uri_observed(uri: &str, program: &OsStr, cmd: Cmd) -> OpenSpawnResult {
+    std::process::Command::new(program)
+        .arg(uri)
+        .spawn()
+        .map(|child| (child, cmd))
+        .map_err(|error| (error.kind(), cmd))
+}
+
+fn target_for_path(resolved: &str) -> OpenTarget {
+    let resolved_path = PathBuf::from(resolved);
+    OpenTarget {
+        kind: OpenTargetKind::Path,
+        scheme: None,
+        resolved_path: resolved_path.is_absolute().then_some(resolved_path),
+    }
+}
+
+fn target_for_uri(uri: &str, kind: OpenTargetKind) -> OpenTarget {
+    OpenTarget { kind, scheme: extract_scheme(uri), resolved_path: resolved_file_uri_path(uri) }
+}
+
+fn resolved_file_uri_path(uri: &str) -> Option<PathBuf> {
+    let colon = uri.find(':')?;
+    if !uri.get(..colon)?.eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let rest = uri.get(colon + 1..)?;
+    let path = if let Some(authority_and_path) = rest.strip_prefix("//") {
+        if authority_and_path.starts_with('/') {
+            authority_and_path
+        } else if authority_and_path
+            .get(..9)
+            .is_some_and(|authority| authority.eq_ignore_ascii_case("localhost"))
+            && authority_and_path.as_bytes().get(9) == Some(&b'/')
+        {
+            authority_and_path.get(9..)?
+        } else {
+            return None;
+        }
+    } else {
+        rest
+    };
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
 /// Open a file path with the system default application, optionally jumping
 /// to a line number with VS Code when a `:N` suffix is present.
 ///
@@ -1230,15 +1478,32 @@ pub fn open_uri_unguarded(uri: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        path::{Path, PathBuf},
+        process::{Child, Command},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
     use alacritty_terminal_gpui::event::VoidListener;
     use alacritty_terminal_gpui::grid::Dimensions;
     use alacritty_terminal_gpui::term::Config;
     use alacritty_terminal_gpui::term::Term;
     use vte::ansi::Processor;
 
+    use crate::link_feedback::{OpenOutcome, OpenTarget, OpenTargetKind, classify_open_failure};
+
     use super::{
-        HardBreakContext, LogicalCell, Osc8CellRange, PaneUrlCache, RowSegment, SpanKind,
-        hard_break_continuation_start, resolve_path, segments_from_cells,
+        HardBreakContext, LogicalCell, OpenObservation, Osc8CellRange, PaneUrlCache, RowSegment,
+        SpanKind, WaitTiming, hard_break_continuation_start, open_path_observed_with_commands,
+        resolve_path, segments_from_cells, spawn_uri_observed, target_for_path, target_for_uri,
+        wait_for_open_with_timing,
     };
 
     #[derive(Clone, Copy)]
@@ -1290,6 +1555,188 @@ mod tests {
             .filter(|span| matches!(span.kind, SpanKind::Url))
             .map(|span| span.url.clone())
             .collect()
+    }
+
+    static TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("scribe-observed-opener-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).expect("create observed-opener test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write opener stand-in");
+            let mut permissions = fs::metadata(&path).expect("stand-in metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).expect("make opener stand-in executable");
+            path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn url_target() -> OpenTarget {
+        OpenTarget {
+            kind: OpenTargetKind::Url,
+            scheme: Some("https".to_owned()),
+            resolved_path: None,
+        }
+    }
+
+    fn sleep_child() -> Child {
+        Command::new("/bin/sleep").arg("30").spawn().expect("spawn controlled hung child")
+    }
+
+    fn wait_worker(
+        child: Child,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    ) -> thread::JoinHandle<Option<OpenObservation>> {
+        thread::spawn(move || {
+            wait_for_open_with_timing(
+                child,
+                "xdg-open",
+                url_target(),
+                &cancel,
+                WaitTiming { timeout, poll_interval: Duration::from_millis(5) },
+            )
+        })
+    }
+
+    fn assert_reaped(pid: u32) {
+        use nix::{errno::Errno, sys::wait::WaitPidFlag, sys::wait::waitpid, unistd::Pid};
+
+        let pid = Pid::from_raw(i32::try_from(pid).expect("test child pid fits i32"));
+        assert_eq!(waitpid(pid, Some(WaitPidFlag::WNOHANG)), Err(Errno::ECHILD));
+    }
+
+    // @lat: [[test#GPUI URL Detection#Observed opener lifecycle]]
+    #[test]
+    fn cancelled_hung_opener_is_killed_reaped_and_joinable() {
+        let child = sleep_child();
+        let pid = child.id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = wait_worker(child, Arc::clone(&cancel), Duration::from_secs(5));
+
+        thread::sleep(Duration::from_millis(20));
+        cancel.store(true, Ordering::Release);
+
+        assert_eq!(worker.join().expect("wait worker joins"), None);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn timed_out_opener_is_killed_reaped_and_dropped() {
+        let child = sleep_child();
+        let pid = child.id();
+        let worker =
+            wait_worker(child, Arc::new(AtomicBool::new(false)), Duration::from_millis(25));
+
+        assert_eq!(worker.join().expect("timeout worker joins"), None);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn new_open_supersedes_hung_worker_without_blocking_the_new_result() {
+        let first = sleep_child();
+        let first_pid = first.id();
+        let first_cancel = Arc::new(AtomicBool::new(false));
+        let first_worker = wait_worker(first, Arc::clone(&first_cancel), Duration::from_secs(5));
+
+        let second = Command::new("/bin/true").spawn().expect("spawn succeeding second opener");
+        let second_worker =
+            wait_worker(second, Arc::new(AtomicBool::new(false)), Duration::from_secs(5));
+        first_cancel.store(true, Ordering::Release);
+
+        assert_eq!(first_worker.join().expect("superseded worker joins"), None);
+        assert_reaped(first_pid);
+        assert_eq!(
+            second_worker.join().expect("new worker joins").map(|result| result.outcome),
+            Some(OpenOutcome::Exited { code: Some(0) })
+        );
+    }
+
+    #[test]
+    fn code_nonzero_is_final_and_classified_with_code() {
+        let fixture = TestDir::new();
+        let code = fixture.script("code", "exit 7");
+        let fallback_marker = fixture.path().join("fallback-ran");
+        let opener = fixture
+            .script("xdg-open", &format!("printf invoked > '{}'", fallback_marker.display()));
+        let existing = std::env::current_exe().expect("test executable exists");
+        let raw = format!("{}:19", existing.display());
+        let (spawn, target) = open_path_observed_with_commands(
+            &raw,
+            None,
+            code.as_os_str(),
+            opener.as_os_str(),
+            "xdg-open",
+        );
+        let (child, cmd) = spawn.expect("code stand-in spawns");
+
+        let observation = wait_for_open_with_timing(
+            child,
+            cmd,
+            target,
+            &AtomicBool::new(false),
+            WaitTiming { timeout: Duration::from_secs(2), poll_interval: Duration::from_millis(5) },
+        )
+        .expect("non-zero exit is observed");
+
+        assert_eq!(observation.cmd, "code");
+        assert_eq!(observation.outcome, OpenOutcome::Exited { code: Some(7) });
+        assert_eq!(
+            classify_open_failure(observation.cmd, observation.outcome, &observation.target),
+            Some("code exited 7".to_owned())
+        );
+        assert!(!fallback_marker.exists(), "platform opener must not be attempted");
+    }
+
+    #[test]
+    fn spawn_errors_keep_the_final_command_and_target_metadata() {
+        let fixture = TestDir::new();
+        let missing = fixture.path().join("missing-opener");
+        let result = spawn_uri_observed("ssh://example.test", missing.as_os_str(), "xdg-open");
+        match result {
+            Err((kind, cmd)) => {
+                assert_eq!(kind, std::io::ErrorKind::NotFound);
+                assert_eq!(cmd, "xdg-open");
+            }
+            Ok(_) => panic!("missing opener unexpectedly spawned"),
+        }
+
+        assert_eq!(
+            target_for_uri("file:///tmp/example.txt", OpenTargetKind::Url),
+            OpenTarget {
+                kind: OpenTargetKind::Url,
+                scheme: Some("file".to_owned()),
+                resolved_path: Some(PathBuf::from("/tmp/example.txt")),
+            }
+        );
+        assert_eq!(
+            target_for_path("/tmp/example.txt"),
+            OpenTarget {
+                kind: OpenTargetKind::Path,
+                scheme: None,
+                resolved_path: Some(PathBuf::from("/tmp/example.txt")),
+            }
+        );
+        assert_eq!(target_for_path("relative/example.txt").resolved_path, None);
     }
 
     // @lat: [[test#GPUI URL Detection#Delimited absolute paths retain their root]]

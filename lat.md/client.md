@@ -3656,6 +3656,10 @@ Two repaints have to be asked for, because an idle pane bumps no generation and 
 
 Its ordered table names a missing opener first, then `mailto:`, a stat-missing path or `file:` target, a bounded ASCII scheme, an exit code, or a code-less failure. `OpenTarget` carries only the source kind, scheme, and resolved path needed for that decision.
 
+[[crates/scribe-client/src/url_detect.rs#open_url_observed]], [[crates/scribe-client/src/url_detect.rs#open_path_observed]], and [[crates/scribe-client/src/url_detect.rs#open_uri_unguarded_observed]] preserve the spawned child and finally-spawned command beside that target metadata. A missing `code --goto` binary falls through to the platform opener, while a successfully spawned `code` child is final even when it later exits non-zero. The original fire-and-forget functions remain separate for non-Ctrl+click callers.
+
+[[crates/scribe-client/src/url_detect.rs#wait_for_open]] is the bounded worker body for those children. It polls `try_wait` every 100 ms for at most 60 seconds; cancellation or expiry kills and reaps through another bounded `try_wait` loop and returns no report, while a completed child produces an `OpenObservation` for the classifier. No `Child::wait` call exists on this path.
+
 [[crates/scribe-client/src/link_feedback.rs#AnnotationLayout]] owns the cell grammar shared by annotation painters: above the clicked run with a head corner, tail-anchored when that form crosses the right edge, and below only for viewport row zero. It head-truncates with a single ellipsis and suppresses panes below 12 columns or without an adjacent row.
 
 [[crates/scribe-client/src/link_feedback.rs#AnnotationColors#from_theme]] derives the opaque band by an 8% per-channel sRGB mix toward ANSI red, lightens red by ten HSL lightness points while enforcing 4.5:1 text contrast, and gives joinery the same red at 60% alpha.

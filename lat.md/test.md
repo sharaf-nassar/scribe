@@ -3607,6 +3607,12 @@ Driving a four-way-split synchronized frame through the queue into a real  rende
 
 Unit tests for the GPUI client's ported  scanner —  over Zed's Alacritty fork — proving byte-for-byte parity with the winit detector across hard-break joins and OSC 8 handling.
 
+### Observed opener lifecycle
+
+Controlled children prove [[crates/scribe-client/src/url_detect.rs#wait_for_open]] stays bounded: cancellation and a short injected deadline both kill, reap, and join a hung `sleep`.
+
+Starting a succeeding child before cancelling the hung one proves latest-click supersession does not block the new result. Executable stand-in scripts prove a spawned `code --goto` child that exits 7 stays the final command and never invokes the fallback opener. A missing stand-in preserves `ErrorKind::NotFound` and the final command name, while target fixtures retain URL scheme, absolute file URI path, and resolved absolute path metadata for the classifier's stat gate.
+
 ### Explicit hyperlink segment geometry
 
  collapses a multi-row OSC 8 run into exact per-row s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.

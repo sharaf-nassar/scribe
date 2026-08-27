@@ -25,7 +25,7 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 79
-counts modules-wired 78
+counts modules-wired 79
 counts server-messages-total 73
 counts server-messages-handled 67
 counts layout-actions-total 38
@@ -39,9 +39,6 @@ counts layout-actions-handled 38
 
 # scribe-07xb.7 wires workspace_drag into the in-window pill gesture.
 
-# scribe-4gv9.1 adds the pure link-failure classifier; scribe-4gv9.4 will
-# import it from the observed opener path.
-unwired-module link_feedback
 unhandled-server-message AgentResponse
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
