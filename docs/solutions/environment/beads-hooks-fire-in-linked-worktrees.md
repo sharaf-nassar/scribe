@@ -87,8 +87,45 @@ proposing the shim campaign was filed and then closed as superseded
 sync from a linked worktree — with the thin-shim design, one bd release
 would cover every install.
 
+## Downstream (2026-08-27): a deleted child makes its epic close vacuously
+
+Lost beads do not stop being harmful once the deletion is over. On
+2026-08-27 an `implement-ready` run reached its epic-closing step and
+`bd epic close-eligible` closed `scribe-99uj` — an open **P1** epic,
+"Fully support Kitty keyboard input in GPUI" — with the reason
+`All children completed`.
+
+It had no completed children. It had *no children at all*:
+
+```bash
+bd list --parent scribe-99uj   # Issue 'scribe-99uj' has no children
+```
+
+Its child `scribe-99uj.3` is simply gone from the DB (`bd show` finds
+nothing), while the worktree branch that child produced still sits on
+disk from the 2026-08-25 run. That is this incident's signature exactly.
+The close is vacuous: "every child is closed" is trivially true over an
+empty set, so a childless epic satisfies the eligibility rule for the
+worst possible reason.
+
+In that instance the epic's work had genuinely landed — the production
+path at `crates/scribe-client/src/main.rs:10626` passes the live
+negotiated mode rather than `TerminalMode::legacy()`, and
+`production_shift_enter_uses_the_live_mode` asserts `\x1b[13;2u` — so
+the close was substantively right and was left standing. That is luck,
+not correctness. The same rule would have closed an epic whose children
+were deleted before their work was done, and the closure reason would
+have read identically.
+
+Check a childless epic against the code before accepting its closure,
+and treat `All children completed` on an epic with zero children as an
+alarm rather than a result.
+
 ## Prevention
 
+- Treat "epic has zero children" as ineligible for auto-close, not
+  trivially eligible. An epic that never had children needs refinement;
+  an epic that lost them needs recovery. Neither wants a close.
 - Never let a hook that syncs shared mutable state run from a linked
   worktree: the worktree's tracked snapshot is stale by construction.
   Guard on `git rev-parse --git-dir` ≠ `git rev-parse --git-common-dir`.
