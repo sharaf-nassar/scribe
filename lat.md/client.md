@@ -2310,7 +2310,7 @@ former fixed 22-column reservation cut every title short of the space it had —
 a tab in a wide window showed twelve characters and an ellipsis with half its
 own width empty. Both bars render `tab.title` directly and let the layout end
 it, so the two cannot drift apart again. `TAB_WIDTH` survives as the flex basis
-and as the drag geometry's fallback.
+and as the drag geometry's fallback, never as an appearance setting.
 
 Drag-reorder follows the painted width rather than the basis: `TitlebarView`
 measures the first tab from the frame and feeds that width to

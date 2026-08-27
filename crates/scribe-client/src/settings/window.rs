@@ -8454,7 +8454,6 @@ fn appearance_section(key: &str) -> &'static str {
         "appearance.opacity"
             | "appearance.scrollbar_width"
             | "appearance.tab_bar_padding"
-            | "appearance.tab_width"
             | "appearance.status_bar_height"
             | "appearance.tab_height"
     ) {

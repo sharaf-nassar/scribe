@@ -6179,6 +6179,11 @@ Every settings page exposes controls, and each config-backed control routes thro
 
 Window-placement coverage converts the live terminal bounds into a launcher anchor and proves the settings rectangle is centered over that anchor before display clamping. Updates additionally proves release navigation stops at both ends, HTTP(S) link targets survive parsing, sanitized HTML becomes readable typed note blocks without duplicate version chrome, and the persistent nested scrollbar tracks scroll progress only when notes overflow.
 
+### Retired tab width stays retired
+
+The Appearance control inventory excludes `appearance.tab_width`. Legacy TOML
+still parses, and the serializer used by Settings saves omits the retired key.
+
 ### Theme preset cache
 
 The settings window caches all 192 presets, gives each menu row background, foreground, and ANSI 0–7 chips, previews active `Custom` colors, keeps `Custom` last, and opens with the selected row visible.

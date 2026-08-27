@@ -101,7 +101,6 @@ fn apply_appearance_key(
         | "appearance.opacity" => apply_appearance_typography_key(config, key, value),
         "appearance.scrollbar_width"
         | "appearance.tab_bar_padding"
-        | "appearance.tab_width"
         | "appearance.status_bar_height"
         | "appearance.tab_height" => apply_appearance_size_key(config, key, value),
         "appearance.focus_border_width" => apply_appearance_focus_width_key(config, value),
@@ -181,10 +180,6 @@ fn apply_appearance_size_key(
         "appearance.tab_bar_padding" => {
             let v: f32 = parse_number(value, "tab_bar_padding")?;
             config.appearance.tab_bar_padding = v.clamp(0.0, 20.0);
-        }
-        "appearance.tab_width" => {
-            let v: u16 = parse_number(value, "tab_width")?;
-            config.appearance.tab_width = v.clamp(8, 50);
         }
         "appearance.status_bar_height" => {
             let v: f32 = parse_number(value, "status_bar_height")?;

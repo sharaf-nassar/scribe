@@ -60,7 +60,6 @@ fn appearance_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "appearance.opacity" => json!(a.opacity),
         "appearance.scrollbar_width" => json!(a.scrollbar_width),
         "appearance.tab_bar_padding" => json!(a.tab_bar_padding),
-        "appearance.tab_width" => json!(a.tab_width),
         "appearance.status_bar_height" => json!(a.status_bar_height),
         "appearance.tab_height" => json!(a.tab_height),
         "appearance.focus_border_width" => json!(a.focus_border_width),

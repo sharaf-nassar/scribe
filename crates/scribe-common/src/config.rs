@@ -160,8 +160,6 @@ pub struct AppearanceConfig {
     /// Vertical padding added to `tab_height` for the effective tab bar row height.
     #[serde(default = "default_tab_bar_padding")]
     pub tab_bar_padding: f32,
-    #[serde(default = "default_tab_width")]
-    pub tab_width: u16,
     #[serde(default = "default_status_bar_height")]
     pub status_bar_height: f32,
     #[serde(default = "default_tab_height")]
@@ -202,7 +200,6 @@ impl Default for AppearanceConfig {
             focus_border_color: None,
             focus_border_width: default_focus_border_width(),
             tab_bar_padding: default_tab_bar_padding(),
-            tab_width: default_tab_width(),
             status_bar_height: default_status_bar_height(),
             tab_height: default_tab_height(),
             prompt_bar_second_row_bg: None,
@@ -256,10 +253,6 @@ fn default_focus_border_width() -> f32 {
 
 fn default_tab_bar_padding() -> f32 {
     8.0
-}
-
-fn default_tab_width() -> u16 {
-    20
 }
 
 fn default_status_bar_height() -> f32 {
@@ -2639,6 +2632,17 @@ danger_color = "#ff0000"
         let written = toml::to_string_pretty(&parsed).expect("config serializes");
         let round_trip: super::ScribeConfig = toml::from_str(&written).expect("config reparses");
         assert!(round_trip.terminal.focus.focus_follows_mouse);
+    }
+
+    // @lat: [[test#GPUI Settings Window#Retired tab width stays retired]]
+    #[test]
+    fn legacy_tab_width_parses_and_is_dropped_on_save() {
+        let parsed: super::ScribeConfig =
+            toml::from_str("[appearance]\ntab_width = 8\ntab_height = 32.0\n")
+                .expect("legacy tab width must parse");
+        // Settings saves with this serializer, so a normal save retires the key.
+        let written = toml::to_string_pretty(&parsed).expect("config serializes");
+        assert!(!written.contains("tab_width"), "retired key was saved: {written}");
     }
 }
 

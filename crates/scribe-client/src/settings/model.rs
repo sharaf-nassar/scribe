@@ -264,7 +264,6 @@ fn appearance_controls() -> Vec<Control> {
         stepper("appearance.opacity", "Opacity", (0.0, 1.0, 0.05, 2)),
         stepper("appearance.scrollbar_width", "Scrollbar width", (2.0, 20.0, 1.0, 0)),
         stepper("appearance.tab_bar_padding", "Tab bar padding", (0.0, 20.0, 1.0, 0)),
-        stepper("appearance.tab_width", "Tab width", (8.0, 50.0, 1.0, 0)),
         stepper("appearance.status_bar_height", "Status bar height", (8.0, 48.0, 1.0, 0)),
         stepper("appearance.tab_height", "Tab height", (16.0, 60.0, 1.0, 0)),
         stepper("appearance.focus_border_width", "Focus border width", (1.0, 10.0, 1.0, 0)),
@@ -539,6 +538,16 @@ mod tests {
 
         assert_eq!(control.label, "Focus follows mouse");
         assert!(matches!(control.kind, ControlKind::Toggle));
+    }
+
+    // @lat: [[test#GPUI Settings Window#Retired tab width stays retired]]
+    #[test]
+    fn appearance_page_does_not_expose_tab_width() {
+        assert!(
+            page_controls(SettingsPage::Appearance)
+                .iter()
+                .all(|control| control.key != "appearance.tab_width")
+        );
     }
 
     #[test]
