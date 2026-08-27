@@ -78,6 +78,9 @@ use scribe_client::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
 use scribe_client::lan_approval::{LanApprovalAction, LanApprovalDialog};
 use scribe_client::lan_dial::{self, LanDialer};
 use scribe_client::layout::{FocusDirection, PaneId, Rect, SplitDirection};
+use scribe_client::link_feedback::{
+    AnnotationColors, AnnotationLayout, OpenOutcome, OpenTarget, classify_open_failure,
+};
 use scribe_client::lost_control::{
     LostControlColors, LostControlState, ReclaimKey, lost_control_overlay,
 };
@@ -133,7 +136,7 @@ use scribe_client::terminal_image_scene::{
 };
 use scribe_client::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client::update::UpdateState;
-use scribe_client::url_detect::{self, SpanKind};
+use scribe_client::url_detect::{self, OpenObservation, OpenSpawnResult, SpanKind};
 use scribe_client::vi_mode::ViMotion;
 use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
@@ -197,6 +200,7 @@ use tokio::{
     sync::{
         Notify,
         mpsc::{UnboundedSender, unbounded_channel},
+        oneshot,
     },
 };
 
@@ -213,12 +217,12 @@ use crate::{
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::present_next_burst,
     terminal::{
-        Content, DisplayOnlyTerminal, HoveredLink, PaneFrame, PaneGrid, PaneGrids, PaneStream,
-        Scroll,
+        Content, ContentAnchor, DisplayOnlyTerminal, HoveredLink, PaneFrame, PaneGrid, PaneGrids,
+        PaneStream, Scroll,
     },
     terminal_element::{
-        CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
-        TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
+        AnnotationPaint, CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint,
+        TerminalElement, TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
     },
 };
 
@@ -950,6 +954,83 @@ enum GridDrag {
     /// A jump-to-bottom press is held until release so the terminal control
     /// can paint its pressed state without forwarding a mouse report.
     JumpButton(SessionId),
+}
+
+/// Revision-guarded click geometry retained across the opener wait.
+#[derive(Clone)]
+struct LinkOpenAnchor {
+    session_id: SessionId,
+    content: ContentAnchor,
+    clicked_run: SelectionSpan,
+    run_segments: Vec<SelectionSpan>,
+}
+
+/// One observed opener per pane. Dropping it cancels its bounded wait worker.
+struct PendingOpen {
+    generation: u64,
+    anchor: LinkOpenAnchor,
+    target: OpenTarget,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// A failed opener result whose anchor still names unchanged pane content.
+#[derive(Clone)]
+struct LinkAnnotation {
+    anchor: LinkOpenAnchor,
+    message: String,
+    layout: AnnotationLayout,
+}
+
+/// Per-pane observed opener and visible annotation lifecycle.
+#[derive(Default)]
+struct LinkFeedback {
+    next_generation: u64,
+    pending: HashMap<PaneId, PendingOpen>,
+    annotations: HashMap<PaneId, LinkAnnotation>,
+    visible_messages: Vec<String>,
+}
+
+impl LinkFeedback {
+    fn start_pending(
+        &mut self,
+        pane: PaneId,
+        anchor: LinkOpenAnchor,
+        target: OpenTarget,
+    ) -> (u64, Arc<AtomicBool>) {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.pending
+            .insert(pane, PendingOpen { generation, anchor, target, cancel: Arc::clone(&cancel) });
+        (generation, cancel)
+    }
+
+    fn dismiss_annotations(&mut self) -> bool {
+        self.visible_messages.clear();
+        if self.annotations.is_empty() {
+            return false;
+        }
+        self.annotations.clear();
+        true
+    }
+}
+
+/// Whether an OSC 8 activation should report opener failure to its click pane.
+enum Osc8ActivationOrigin {
+    FireAndForget,
+    Observed { pane: PaneId, anchor: LinkOpenAnchor },
+}
+
+/// URI and origin retained while the disallowed-scheme modal is visible.
+struct PendingOsc8Open {
+    uri: String,
+    origin: Osc8ActivationOrigin,
 }
 
 fn hover_focus_target(
@@ -1876,11 +1957,12 @@ struct TerminalView {
     /// [`UpdateAction`] routes to install-vs-restart. `None` whenever the open
     /// modal is not an update confirmation.
     update_dialog_kind: Option<UpdateDialogKind>,
-    /// OSC 8 URI held while the disallowed-scheme dialog is up, so an "Open
-    /// Anyway" choice can activate the verbatim URI (spec 009 FR-015). The
-    /// dialog view owns its own copy for display; this is the activation copy
-    /// the shell needs after the modal resolves.
-    pending_osc8_uri: Option<String>,
+    /// OSC 8 URI and activation origin held while the disallowed-scheme dialog
+    /// is up. Ctrl+click retains its grid anchor so "Open Anyway" stays on the
+    /// observed path; context-menu activation remains fire-and-forget.
+    pending_osc8_open: Option<PendingOsc8Open>,
+    /// Per-pane observed opener waits and failed-open annotations.
+    link_feedback: LinkFeedback,
     /// `request_id` of the LAN device approval the open modal is answering, so
     /// the resolved choice can be correlated back to the held connection. The
     /// dialog owns its own copy for display; this is the reply copy.
@@ -2545,7 +2627,8 @@ impl TerminalView {
             context_menu: None,
             dialog: None,
             update_dialog_kind: None,
-            pending_osc8_uri: None,
+            pending_osc8_open: None,
+            link_feedback: LinkFeedback::default(),
             pending_lan_approval: None,
             pending_agent_prompt: None,
             clipboard: ClipboardSurfaces::new(gate),
@@ -4111,18 +4194,41 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Route an OSC 8 activation through the scheme-allowlist gate.
-    ///
-    /// An allowlisted scheme opens straight away with no added latency; any
-    /// other scheme raises the disallowed-scheme confirmation and parks the
-    /// verbatim URI on [`Self::pending_osc8_uri`] until the modal resolves.
+    /// Route a fire-and-forget OSC 8 activation through the scheme gate.
     fn route_osc8_activation(&mut self, uri: String, cx: &mut Context<Self>) {
+        self.route_osc8_activation_from(uri, Osc8ActivationOrigin::FireAndForget, cx);
+    }
+
+    /// Route a Ctrl+clicked OSC 8 activation without losing its click anchor.
+    fn route_observed_osc8_activation(
+        &mut self,
+        uri: String,
+        pane: PaneId,
+        anchor: LinkOpenAnchor,
+        cx: &mut Context<Self>,
+    ) {
+        self.route_osc8_activation_from(uri, Osc8ActivationOrigin::Observed { pane, anchor }, cx);
+    }
+
+    /// Preserve the activation origin across the disallowed-scheme dialog.
+    fn route_osc8_activation_from(
+        &mut self,
+        uri: String,
+        origin: Osc8ActivationOrigin,
+        cx: &mut Context<Self>,
+    ) {
         if url_detect::is_allowed_scheme(&uri) {
-            url_detect::open_url(&uri);
+            match origin {
+                Osc8ActivationOrigin::FireAndForget => url_detect::open_url(&uri),
+                Osc8ActivationOrigin::Observed { pane, anchor } => {
+                    let open = url_detect::open_uri_unguarded_observed(&uri);
+                    self.observe_link_open(pane, anchor, open, cx);
+                }
+            }
             return;
         }
         let scheme = url_detect::extract_scheme(&uri).unwrap_or_default();
-        self.pending_osc8_uri = Some(uri.clone());
+        self.pending_osc8_open = Some(PendingOsc8Open { uri: uri.clone(), origin });
         self.open_dialog(AnyDialog::DisallowedScheme(DisallowedSchemeDialog::new(uri, scheme)), cx);
     }
 
@@ -4143,7 +4249,7 @@ impl TerminalView {
         // pending URI, the pending approval id and the pending clipboard prompt
         // up front and clear the update kind only once the update route (which
         // reads it) has run.
-        let pending = self.pending_osc8_uri.take();
+        let pending = self.pending_osc8_open.take();
         let approval = self.pending_lan_approval.take();
         let clipboard_prompt = self.clipboard.pending_prompt.take();
         let agent_prompt = self.pending_agent_prompt.take();
@@ -4154,9 +4260,7 @@ impl TerminalView {
                 self.route_lan_approval_action(approval, action);
             }
             DialogOutcome::DisallowedScheme(DisallowedSchemeAction::OpenAnyway) => {
-                if let Some(uri) = pending {
-                    url_detect::open_uri_unguarded(&uri);
-                }
+                self.open_pending_osc8(pending, cx);
             }
             // The gate still holds the exact bytes, so confirming resumes on
             // them rather than on anything re-read from the clipboard since.
@@ -4177,6 +4281,17 @@ impl TerminalView {
         }
         // The dialog is gone either way, so its kind must not outlive it.
         self.update_dialog_kind = None;
+    }
+
+    fn open_pending_osc8(&mut self, pending: Option<PendingOsc8Open>, cx: &mut Context<Self>) {
+        let Some(PendingOsc8Open { uri, origin }) = pending else { return };
+        match origin {
+            Osc8ActivationOrigin::FireAndForget => url_detect::open_uri_unguarded(&uri),
+            Osc8ActivationOrigin::Observed { pane, anchor } => {
+                let open = url_detect::open_uri_unguarded_observed(&uri);
+                self.observe_link_open(pane, anchor, open, cx);
+            }
+        }
     }
 
     /// Copy the focused pane's selection to the host clipboard.
@@ -7293,6 +7408,104 @@ impl TerminalView {
         Rc::new(sessions)
     }
 
+    /// Retire closed/stale feedback and build paint inputs for visible panes.
+    fn sync_link_feedback_for_panes(
+        &mut self,
+        placements: &[PanePlacement],
+    ) -> HashMap<PaneId, AnnotationPaint> {
+        if self.link_feedback.pending.is_empty() && self.link_feedback.annotations.is_empty() {
+            return HashMap::new();
+        }
+        let live_panes: HashSet<_> = placements.iter().map(|placement| placement.pane_id).collect();
+        let live_sessions: HashSet<_> = self
+            .shared
+            .tabs
+            .lock()
+            .map(|tabs| tabs.entries().map(|entry| entry.session_id).collect())
+            .unwrap_or_default();
+        let stale_pending: Vec<_> = self
+            .link_feedback
+            .pending
+            .iter()
+            .filter_map(|(pane, pending)| {
+                (!live_panes.contains(pane) || !live_sessions.contains(&pending.anchor.session_id))
+                    .then_some(*pane)
+            })
+            .collect();
+        for pane in stale_pending {
+            self.link_feedback.pending.remove(&pane);
+            tracing::trace!(%pane, "pending link opener cancelled after pane retirement");
+        }
+        if self.link_feedback.annotations.is_empty() {
+            return HashMap::new();
+        }
+
+        let theme = &self.config.config().theme;
+        let ansi_red = theme.ansi_colors.get(1).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]);
+        let colors = AnnotationColors::from_theme(theme.background, ansi_red);
+        let entries: Vec<_> = self
+            .link_feedback
+            .annotations
+            .iter()
+            .map(|(pane, annotation)| (*pane, annotation.clone()))
+            .collect();
+        let mut paints = HashMap::new();
+        let mut stale = Vec::new();
+        let mut visible = Vec::new();
+        for (pane, annotation) in entries {
+            if !live_panes.contains(&pane) || !live_sessions.contains(&annotation.anchor.session_id)
+            {
+                stale.push(pane);
+                continue;
+            }
+            let shown = placements
+                .iter()
+                .find(|placement| placement.pane_id == pane)
+                .and_then(|placement| placement.session_id);
+            if shown != Some(annotation.anchor.session_id) {
+                continue;
+            }
+            let current = self.pane_for(annotation.anchor.session_id).is_some_and(|terminal| {
+                terminal
+                    .with_terminal(|terminal| terminal.revalidate_anchor(annotation.anchor.content))
+                    .flatten()
+                    .is_some()
+            });
+            if !current {
+                stale.push(pane);
+                tracing::trace!(%pane, "link annotation dismissed after pane content changed");
+                continue;
+            }
+            visible.push((pane.raw(), annotation.message.clone()));
+            paints.insert(
+                pane,
+                AnnotationPaint {
+                    layout: annotation.layout,
+                    colors,
+                    ansi_red: opaque_slot(ansi_red),
+                    run_segments: annotation.anchor.run_segments,
+                },
+            );
+        }
+        for pane in stale {
+            self.link_feedback.annotations.remove(&pane);
+        }
+        visible.sort_unstable_by_key(|(pane, _)| *pane);
+        self.link_feedback.visible_messages =
+            visible.into_iter().map(|(_, message)| message).collect();
+        paints
+    }
+
+    fn prepare_pane_paint(
+        &mut self,
+        placements: &[PanePlacement],
+        cx: &Context<Self>,
+    ) -> (Rc<HashSet<SessionId>>, HashMap<PaneId, AnnotationPaint>) {
+        let active = self.prepare_pane_surfaces(placements, cx);
+        let annotations = self.sync_link_feedback_for_panes(placements);
+        (active, annotations)
+    }
+
     /// Lower the pane layout onto absolutely positioned grid elements.
     ///
     /// Positions are fractions of the grid area, so the split ratios the pure
@@ -7318,7 +7531,7 @@ impl TerminalView {
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, cx);
-        let active_sessions = self.prepare_pane_surfaces(&placements, cx);
+        let (active_sessions, annotations) = self.prepare_pane_paint(&placements, cx);
         let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
         // borrows `self` immutably. The state has to outlive the element (the
@@ -7326,8 +7539,8 @@ impl TerminalView {
         // the element only borrows a handle.
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
-        let (mut ime, mut link_rows) = (Some(ime), link.map(|link| link.rows));
-        let opacity = self.opacity;
+        let (mut ime, mut link_rows, opacity) =
+            (Some(ime), link.map(|link| link.rows), self.opacity);
         // Identical for every pane, so it is built once and cloned in: the
         // clone is an `Rgba`, an `Arc` bump, and an `f32`.
         let colors = GridColors {
@@ -7388,8 +7601,8 @@ impl TerminalView {
                 )
                 .with_highlights(highlights)
                 .with_selection(selection)
-                .with_link_underline(underline) // scribe-4gv9.6 supplies annotation state.
-                .with_annotation(None)
+                .with_link_underline(underline)
+                .with_annotation(annotations.get(&placement.pane_id).cloned())
                 .with_terminal_images(image_paint)
                 .with_cursor(placement.focused.then_some(cursor))
                 .with_scrollbar(placement.session_id.and_then(|s| self.scrollbar_paint(s)))
@@ -8491,6 +8704,14 @@ impl TerminalView {
         self.begin_selection(event.position, cx);
     }
 
+    /// Clear visible annotations without claiming the triggering input event.
+    fn dismiss_link_annotations(&mut self, cx: &mut Context<Self>) {
+        if self.link_feedback.dismiss_annotations() {
+            tracing::trace!("link annotations dismissed by user input");
+            cx.notify();
+        }
+    }
+
     /// Focus the unfocused pane under a press, so clicking into any visible
     /// terminal focuses it directly instead of requiring its tab first.
     ///
@@ -9361,24 +9582,167 @@ impl TerminalView {
     /// falls straight through to the application, so Ctrl+click keeps working
     /// for programs that use it.
     ///
-    /// The three kinds are deliberately not collapsed: an OSC 8 URI is
-    /// program-supplied and goes through the scheme-allowlist gate that can
-    /// raise the confirmation dialog, a heuristic URL keeps the silent
-    /// non-allowlisted drop, and a path is not a URI at all — it is resolved
-    /// against the pane's CWD and handed to the OS file handler.
+    /// All three routes retain the clicked pane and revision-guarded run while
+    /// their opener is observed. OSC 8 keeps that origin through its scheme
+    /// confirmation; non-Ctrl callers remain fire-and-forget.
     fn press_opens_link(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
         if !event.modifiers.control {
             return false;
         }
         let Some(link) = self.link_at(event.position) else { return false };
+        let Some((pane, anchor)) = self.link_open_anchor(event.position, &link, cx) else {
+            tracing::trace!("Ctrl+clicked link had no stable pane anchor");
+            return false;
+        };
         self.pointer.drag = GridDrag::Link;
         tracing::info!(target = %link.target, "opening a Ctrl+clicked link");
         match link.kind {
-            SpanKind::Osc8Hyperlink => self.route_osc8_activation(link.target, cx),
-            SpanKind::Url => url_detect::open_url(&link.target),
-            SpanKind::Path => url_detect::open_path(&link.target, self.focused_cwd().as_deref()),
+            SpanKind::Osc8Hyperlink => {
+                self.route_observed_osc8_activation(link.target, pane, anchor, cx);
+            }
+            SpanKind::Url => {
+                let open = url_detect::open_url_observed(&link.target);
+                self.observe_link_open(pane, anchor, open, cx);
+            }
+            SpanKind::Path => {
+                let cwd = self.focused_cwd();
+                let open = url_detect::open_path_observed(&link.target, cwd.as_deref());
+                self.observe_link_open(pane, anchor, open, cx);
+            }
         }
         true
+    }
+
+    /// Capture the clicked segment and the content revision it belongs to.
+    fn link_open_anchor(
+        &self,
+        position: Point<Pixels>,
+        link: &HoveredLink,
+        cx: &App,
+    ) -> Option<(PaneId, LinkOpenAnchor)> {
+        let bounds = self.focused_grid_bounds()?;
+        let cell = cell_at(bounds, &self.font, position)?;
+        let clicked_run = *link.rows.iter().find(|span| {
+            span.row == cell.row && cell.col >= span.start_col && cell.col <= span.end_col
+        })?;
+        let content = self.with_focused_grid(|terminal| terminal.anchor_at(cell))??;
+        let pane = self.shell.focused_pane(cx)?;
+        let session_id = self.focused_session()?;
+        Some((
+            pane,
+            LinkOpenAnchor { session_id, content, clicked_run, run_segments: link.rows.clone() },
+        ))
+    }
+
+    /// Start or replace one pane's bounded opener observation.
+    fn observe_link_open(
+        &mut self,
+        pane: PaneId,
+        anchor: LinkOpenAnchor,
+        open: (OpenSpawnResult, OpenTarget),
+        cx: &mut Context<Self>,
+    ) {
+        let (spawn, target) = open;
+        let (generation, cancel) = self.link_feedback.start_pending(pane, anchor, target.clone());
+        let (child, cmd) = match spawn {
+            Ok(spawned) => spawned,
+            Err((kind, cmd)) => {
+                let observation =
+                    OpenObservation { outcome: OpenOutcome::SpawnError(kind), cmd, target };
+                self.finish_link_open(pane, generation, Some(observation), cx);
+                return;
+            }
+        };
+        let (send, receive) = oneshot::channel();
+        drop(std::thread::spawn(move || {
+            let observation = url_detect::wait_for_open(child, cmd, target, cancel);
+            drop(send.send(observation));
+        }));
+        cx.spawn(async move |view, app| {
+            let observation = receive.await.unwrap_or(None);
+            view.update(app, move |view, ctx| {
+                view.finish_link_open(pane, generation, observation, ctx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Apply only the newest result for a still-valid clicked pane anchor.
+    fn finish_link_open(
+        &mut self,
+        pane: PaneId,
+        generation: u64,
+        observation: Option<OpenObservation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self
+            .link_feedback
+            .pending
+            .get(&pane)
+            .filter(|pending| pending.generation == generation)
+        else {
+            tracing::trace!(%pane, generation, "stale link opener result ignored");
+            return;
+        };
+        let (anchor, target) = (pending.anchor.clone(), pending.target.clone());
+        let Some(OpenObservation { outcome, cmd, target: _target }) = observation else {
+            self.link_feedback.pending.remove(&pane);
+            return;
+        };
+        let message = classify_open_failure(cmd, outcome, &target);
+        self.link_feedback.pending.remove(&pane);
+        let Some(message) = message else { return };
+        let layout = match self.link_annotation_layout(pane, &anchor, &message, cx) {
+            Ok(layout) => layout,
+            Err(reason) => {
+                tracing::trace!(%pane, generation, reason, "link opener result dropped");
+                return;
+            }
+        };
+        self.link_feedback.annotations.insert(pane, LinkAnnotation { anchor, message, layout });
+        cx.notify();
+    }
+
+    /// Revalidate one click and lay out its annotation against the same grid.
+    fn link_annotation_layout(
+        &self,
+        pane: PaneId,
+        anchor: &LinkOpenAnchor,
+        message: &str,
+        cx: &App,
+    ) -> Result<AnnotationLayout, &'static str> {
+        if self.shell.region_for_pane(pane, cx).is_none() {
+            return Err("pane closed");
+        }
+        if !self.session_is_live(anchor.session_id) {
+            return Err("session closed");
+        }
+        let terminal = self.pane_for(anchor.session_id).ok_or("pane grid missing")?;
+        let Some((point, rows, cols)) = terminal
+            .with_terminal(|terminal| {
+                let point = terminal.revalidate_anchor(anchor.content)?;
+                let content = terminal.content();
+                let rows = content.rows.len();
+                let cols = content.rows.first().map_or(0, Vec::len);
+                Some((point, rows, cols))
+            })
+            .flatten()
+        else {
+            return Err("anchor revision changed");
+        };
+        AnnotationLayout::compute(
+            cols,
+            rows,
+            point.row,
+            anchor.clicked_run.start_col..=anchor.clicked_run.end_col,
+            message,
+        )
+        .ok_or("pane too small for annotation")
+    }
+
+    fn session_is_live(&self, session_id: SessionId) -> bool {
+        self.shared.tabs.lock().is_ok_and(|tabs| tabs.workspace_of(session_id).is_some())
     }
 
     /// The focused pane's OSC 7 working directory, which is what a relative
@@ -10568,7 +10932,11 @@ impl TerminalView {
     /// The palette is cached across renders, so the live opacity is folded into
     /// the filled band here rather than at theme-reload time.
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let model = self.build_status_model();
+        let mut model = self.build_status_model();
+        for message in &self.link_feedback.visible_messages {
+            model.accessibility_label.push_str("; ");
+            model.accessibility_label.push_str(message);
+        }
         let colors = self.status_colors.with_opacity(self.opacity);
         let update_view = cx.entity().downgrade();
         let on_update = Box::new(move |_window: &mut Window, app: &mut App| {
@@ -10800,6 +11168,7 @@ impl TerminalView {
         link: Option<HoveredLink>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        self.link_feedback.visible_messages.clear();
         let content = self.sync_split_scroll();
         let appearance = &self.config.config().config.appearance;
         let cursor = CursorPaint {
@@ -11772,7 +12141,16 @@ impl TerminalView {
     }
 
     fn attach_root_interactions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
-        root.on_modifiers_changed(
+        root.capture_key_down(
+            cx.listener(|view, _: &KeyDownEvent, _window, ctx| view.dismiss_link_annotations(ctx)),
+        )
+        .capture_any_mouse_down(cx.listener(|view, _: &MouseDownEvent, _window, ctx| {
+            view.dismiss_link_annotations(ctx);
+        }))
+        .on_scroll_wheel(cx.listener(|view, _: &ScrollWheelEvent, _window, ctx| {
+            view.dismiss_link_annotations(ctx);
+        }))
+        .on_modifiers_changed(
             cx.listener(|_view, _: &ModifiersChangedEvent, _win, ctx| ctx.notify()),
         )
         .on_action(cx.listener(|view, _: &CloseWindow, _window, ctx| {
@@ -16782,6 +17160,68 @@ mod tests {
         let anchor = settings_anchor_from_bounds(bounds).expect("sane terminal bounds");
 
         assert_eq!((anchor.x, anchor.y, anchor.width, anchor.height), (120, 80, 1440, 900));
+    }
+
+    fn test_link_anchor(session_id: SessionId) -> LinkOpenAnchor {
+        let terminal = DisplayOnlyTerminal::new(20, 2);
+        let content = terminal
+            .anchor_at(crate::terminal::ViewportPoint { row: 1, col: 2 })
+            .expect("test cell has a content anchor");
+        let clicked_run = SelectionSpan { row: 1, start_col: 2, end_col: 6 };
+        LinkOpenAnchor { session_id, content, clicked_run, run_segments: vec![clicked_run] }
+    }
+
+    fn test_open_target() -> OpenTarget {
+        OpenTarget {
+            kind: scribe_client::link_feedback::OpenTargetKind::Url,
+            scheme: Some("https".to_owned()),
+            resolved_path: None,
+        }
+    }
+
+    #[test]
+    fn latest_observed_link_click_wins_per_pane() {
+        let pane = PaneId::from_raw(1);
+        let other_pane = PaneId::from_raw(2);
+        let mut feedback = LinkFeedback::default();
+        let (first_generation, first_cancel) =
+            feedback.start_pending(pane, test_link_anchor(SessionId::new()), test_open_target());
+        let (_, other_cancel) = feedback.start_pending(
+            other_pane,
+            test_link_anchor(SessionId::new()),
+            test_open_target(),
+        );
+        let (latest_generation, latest_cancel) =
+            feedback.start_pending(pane, test_link_anchor(SessionId::new()), test_open_target());
+
+        assert_ne!(first_generation, latest_generation);
+        assert!(first_cancel.load(Ordering::Acquire));
+        assert!(!other_cancel.load(Ordering::Acquire));
+        assert!(!latest_cancel.load(Ordering::Acquire));
+        assert_eq!(feedback.pending.len(), 2);
+        assert_eq!(feedback.pending[&pane].generation, latest_generation);
+    }
+
+    #[test]
+    fn dismissing_annotations_leaves_pending_opens_running() {
+        let pane = PaneId::from_raw(1);
+        let session_id = SessionId::new();
+        let mut feedback = LinkFeedback::default();
+        let (_, cancel) =
+            feedback.start_pending(pane, test_link_anchor(session_id), test_open_target());
+        let anchor = test_link_anchor(session_id);
+        let layout = AnnotationLayout::compute(20, 2, 1, 2..=6, "xdg-open failed")
+            .expect("test pane holds an annotation");
+        feedback
+            .annotations
+            .insert(pane, LinkAnnotation { anchor, message: "xdg-open failed".to_owned(), layout });
+        feedback.visible_messages.push("xdg-open failed".to_owned());
+
+        assert!(feedback.dismiss_annotations());
+        assert!(feedback.annotations.is_empty());
+        assert!(feedback.visible_messages.is_empty());
+        assert_eq!(feedback.pending.len(), 1);
+        assert!(!cancel.load(Ordering::Acquire));
     }
 
     #[test]
