@@ -18,18 +18,20 @@
 # xdotool, python3.
 set -e
 
+. /tests/visual/tab-geometry-common.bash
+
 # @lat: [[test#Test Harness#Visual E2E Tests#Tab drag reorders in every bar]]
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 
-# Titlebar geometry from crates/scribe-client/src/titlebar.rs: a 34 px band of
-# fixed 176 px tabs. Single-workspace rig, so no badge offsets the strip.
+# The titlebar and lower-region tab bands are 34 px tall. Drag centres are
+# measured from each painted strip; TAB_WIDTH is only the layout's flex basis.
 TITLEBAR_HEIGHT=34
-TAB_WIDTH=176
 TITLEBAR_Y=$(( TITLEBAR_HEIGHT / 2 ))
 
 TERM_X=0
 TERM_Y=0
+TERM_WIDTH=0
 WID=""
 
 fail() {
@@ -54,9 +56,27 @@ focus_terminal() {
     info=$(xwininfo -id "$WID")
     TERM_X=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
     TERM_Y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+    TERM_WIDTH=$(printf '%s\n' "$info" | awk '/Width:/ { print $2; exit }')
 }
 
-tab_center_x() { echo $(( $1 * TAB_WIDTH + TAB_WIDTH / 2 )); }
+tab_center_x() {
+    local index="$1" painted_width="$2" tab_count="$3"
+    local tab_width=$(( painted_width / tab_count ))
+    echo $(( index * tab_width + tab_width / 2 ))
+}
+
+capture_painted_band_width() {
+    local output="$1" offset_y="$2" height="$3" width
+    focus_terminal
+    scrot -o "$output"
+    convert "$output" \
+        -crop "${TERM_WIDTH}x${height}+${TERM_X}+$(( TERM_Y + offset_y ))" \
+        +repage "$output"
+    width=$(band_ink_width "$output")
+    width=${width%.*}
+    [ "$width" -gt 0 ] || fail "could not measure painted tab band in $output"
+    printf '%s\n' "$width"
+}
 
 # The newest `ReportWorkspaceTree` the client put on the wire, as one line per
 # region leaf (left to right) of that leaf's session ids in tab order. `$1`
@@ -169,8 +189,13 @@ FIRST=$(echo "$BEFORE" | cut -d' ' -f1)
 SECOND=$(echo "$BEFORE" | cut -d' ' -f2)
 THIRD=$(echo "$BEFORE" | cut -d' ' -f3)
 EXPECTED="$SECOND $THIRD $FIRST"
+TOP_TAB_COUNT=$(wc -w <<<"$BEFORE")
+TOP_BAND_WIDTH=$(capture_painted_band_width \
+    /output/tab-drag-reorder-top-band.png 0 44)
 
-drag_tab "$(tab_center_x 0)" "$(tab_center_x 2)"
+drag_tab \
+    "$(tab_center_x 0 "$TOP_BAND_WIDTH" "$TOP_TAB_COUNT")" \
+    "$(tab_center_x 2 "$TOP_BAND_WIDTH" "$TOP_TAB_COUNT")"
 
 AFTER=""
 for _ in $(seq 1 25); do
@@ -256,8 +281,14 @@ L_SECOND=$(echo "$LOWER_BEFORE" | cut -d' ' -f2)
 L_THIRD=$(echo "$LOWER_BEFORE" | cut -d' ' -f3)
 LOWER_EXPECTED="$L_SECOND $L_THIRD $L_FIRST"
 
+LOWER_TAB_COUNT=$(wc -w <<<"$LOWER_BEFORE")
+LOWER_BAND_WIDTH=$(capture_painted_band_width \
+    /output/tab-drag-reorder-lower-band.png "$(( CLIENT_H / 2 ))" "$TITLEBAR_HEIGHT")
+
 TITLEBAR_Y=$LOWER_BAR_Y
-drag_tab "$(tab_center_x 0)" "$(tab_center_x 2)"
+drag_tab \
+    "$(tab_center_x 0 "$LOWER_BAND_WIDTH" "$LOWER_TAB_COUNT")" \
+    "$(tab_center_x 2 "$LOWER_BAND_WIDTH" "$LOWER_TAB_COUNT")"
 
 LOWER_AFTER=""
 for _ in $(seq 1 25); do

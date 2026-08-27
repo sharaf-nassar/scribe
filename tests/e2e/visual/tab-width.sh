@@ -6,6 +6,8 @@
 # has room. Both are visible in the strip, neither is visible to a unit test.
 set -uo pipefail
 
+. /tests/visual/tab-geometry-common.bash
+
 OUT=/output
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -38,10 +40,6 @@ shot() {
 # Width of the painted tab chrome: threshold the band away from the window
 # background and trim to what is left. A fixed-width strip trims to ~176px per
 # tab; a strip that fills the band trims to nearly the window width.
-band_ink_width() {
-    convert "$1" -colorspace Gray -threshold 12% -fuzz 5% -trim +repage -format "%w" info: 2>/dev/null
-}
-
 shot tabs-01-one-tab.png
 ONE=$(band_ink_width "$OUT/tabs-01-one-tab.png")
 echo "one tab: lit band columns ${ONE%.*}"

@@ -37,6 +37,8 @@
 # Requires: visual container with SCRIBE_SHARED_PANE=1 and SCRIBE_SHARE_TAP=1.
 set -euo pipefail
 
+. /tests/visual/tab-geometry-common.bash
+
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
@@ -46,15 +48,11 @@ SCROLLBACK_MARKER="TAB_SCROLLBACK_READY"
 # Minimal Dark's 50%-alpha prompt text over its first-row background.
 PROMPT_TEXT_COLOR='rgb(118,118,121)'
 
-# Titlebar geometry from crates/scribe-client/src/titlebar.rs: the client band
-# is 34 px tall and each tab is a fixed 176 px wide. This shared-pane rig runs
-# in single-workspace mode, so no workspace badge offsets the strip; the first
-# two tab centres are therefore 88 px and 264 px from the client origin.
+# The client band is 34 px tall. Plain single-workspace tab centres are measured
+# from the painted strip after the second tab appears; TAB_WIDTH is only a flex
+# basis and is not the width users actually click.
 TITLEBAR_HEIGHT=34
-TAB_WIDTH=176
 TITLEBAR_Y=$(( TITLEBAR_HEIGHT / 2 ))
-FIRST_TAB_X=$(( TAB_WIDTH / 2 ))
-SECOND_TAB_X=$(( TAB_WIDTH + TAB_WIDTH / 2 ))
 
 # `COLUMNS` in crates/scribe-client/src/main.rs — the fixed `WindowSeed`
 # startup grid. Named here only so phase 3 can refuse to run its size
@@ -63,6 +61,7 @@ SEED_COLUMNS=120
 
 TERM_X=0
 TERM_Y=0
+TERM_WIDTH=0
 
 # Every chord this suite presses is the shipped Linux default except the two
 # workspace-focus ones. Their defaults are Ctrl+Alt+Left/Right, which openbox —
@@ -391,6 +390,7 @@ focus_terminal() {
     info=$(xwininfo -id "$wid")
     TERM_X=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
     TERM_Y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+    TERM_WIDTH=$(printf '%s\n' "$info" | awk '/Width:/ { print $2; exit }')
 }
 
 send_keys() {
@@ -663,6 +663,22 @@ if [ "$NEW_COLS" != "$PANE_COLS" ]; then
 fi
 echo "PHASE 3 PASS: ctrl+Next attached $NEW_SESSION at the pane's own $NEW_COLS columns"
 echo "PHASE 3 PASS: plain-tab first replay reclaimed prompt rows ($AI_ATTACH_ROWS -> $PLAIN_ATTACH_ROWS)"
+
+# Crop the current plain titlebar to the same painted-band detector used by
+# tab-width.sh. The two observed session ids are the strip's tab count; dividing
+# the painted width by that count lands phases 4 and 5 in the equal-share tabs.
+PLAIN_BAND_SHOT=/output/03-tab-switching-painted-band.png
+convert /output/03-tab-switching-key-next.png \
+    -crop "${TERM_WIDTH}x44+${TERM_X}+${TERM_Y}" +repage "$PLAIN_BAND_SHOT"
+PAINTED_STRIP_WIDTH=$(band_ink_width "$PLAIN_BAND_SHOT")
+PAINTED_STRIP_WIDTH=${PAINTED_STRIP_WIDTH%.*}
+OBSERVED_TAB_COUNT=$(printf '%s\n' "$SESSION" "$NEW_SESSION" | sort -u | wc -l)
+if [ "$PAINTED_STRIP_WIDTH" -le 0 ] || [ "$OBSERVED_TAB_COUNT" -le 0 ]; then
+    fail "phase 3: could not measure tab targets (band=$PAINTED_STRIP_WIDTH, tabs=$OBSERVED_TAB_COUNT)"
+fi
+PAINTED_TAB_WIDTH=$(( PAINTED_STRIP_WIDTH / OBSERVED_TAB_COUNT ))
+FIRST_TAB_X=$(( PAINTED_TAB_WIDTH / 2 ))
+SECOND_TAB_X=$(( PAINTED_TAB_WIDTH + PAINTED_TAB_WIDTH / 2 ))
 
 # ── Phase 4: clicking the first titlebar tab switches back ────────
 ATTACH_ORIGINAL_CLICK_BEFORE=$(count_attach_to "$SESSION")
