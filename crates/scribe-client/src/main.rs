@@ -12079,17 +12079,49 @@ fn spawn_remote_picker_client(
     }
 }
 
-/// Install the `tracing` subscriber, mirroring the legacy client's setup so the
-/// GPUI client's diagnostics (config hot-reload, dropped IPC sends, watcher
-/// failures) actually reach stderr instead of being discarded. `RUST_LOG`
+/// Install the standard-stream and state-dir `tracing` layers. `RUST_LOG`
 /// overrides the default `info` filter.
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let log_file = open_client_log_file();
+    let log_path = log_file.as_ref().map(|(_, path)| path.clone());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let registry =
+        tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer());
+
+    match log_file {
+        Some((file, _)) => registry
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(Arc::new(file)))
+            .init(),
+        None => registry.init(),
+    }
+
+    if let Some(path) = log_path {
+        tracing::info!(path = %path.display(), "client logs mirrored to state-dir file");
+    } else {
+        tracing::warn!(
+            "could not open state-dir client log; diagnostics go to standard streams only"
+        );
+    }
+}
+
+/// Open a fresh `client.log` in the state dir, rotating an oversized previous
+/// log and truncating smaller stale output from the retired client.
+fn open_client_log_file() -> Option<(std::fs::File, PathBuf)> {
+    let state_dir = scribe_common::app::current_state_dir()?;
+    open_client_log_file_in(&state_dir, scribe_common::app::STATE_LOG_MAX_BYTES)
+}
+
+fn open_client_log_file_in(state_dir: &Path, max_bytes: u64) -> Option<(std::fs::File, PathBuf)> {
+    std::fs::create_dir_all(state_dir).ok()?;
+    let path = state_dir.join("client.log");
+    scribe_common::app::rotate_log_if_oversized(&path, max_bytes);
+    let file =
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path).ok()?;
+    Some((file, path))
 }
 
 /// The startup grid geometry every terminal window is created with.
@@ -16699,6 +16731,50 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn client_tracing_mirrors_to_a_fresh_state_log() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("scribe-client-log-test-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("client.log");
+        std::fs::write(&log_path, "stale legacy output\n").unwrap();
+
+        let (file, path) = open_client_log_file_in(&dir, 16).expect("open state-dir client log");
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("client tracing regression test");
+        });
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("client tracing regression test"));
+        assert!(!log.contains("stale legacy output"));
+
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn client_log_rotates_oversized_previous_output() {
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-client-log-rotation-test-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("client.log");
+        std::fs::write(&log_path, vec![b'x'; 17]).unwrap();
+
+        let (_, path) = open_client_log_file_in(&dir, 16).expect("open state-dir client log");
+        assert!(path.exists());
+        assert_eq!(std::fs::read(dir.join("client.log.1")).unwrap().len(), 17);
+
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     #[test]
     fn settings_anchor_uses_the_live_terminal_bounds() {

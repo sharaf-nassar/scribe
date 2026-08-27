@@ -183,6 +183,19 @@ pub fn current_state_dir() -> Option<PathBuf> {
     current_identity().state_dir()
 }
 
+/// Shared size cap for state-directory diagnostic logs.
+pub const STATE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Rename an oversized state-directory log to its single `.log.1` rotation.
+///
+/// Best-effort by design: callers can still open a fresh log when rotation
+/// cannot preserve the previous one.
+pub fn rotate_log_if_oversized(path: &Path, max_bytes: u64) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > max_bytes) {
+        drop(std::fs::rename(path, path.with_extension("log.1")));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

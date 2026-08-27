@@ -3782,6 +3782,12 @@ AI panes persist `conversation_id` via hook events that include provider convers
 
 Prompt bar state rides the same [[crates/scribe-client/src/restore_state.rs#LaunchRecord]] rather than a separate store: `LaunchRecord` flattens the pane's [[crates/scribe-common/src/protocol.rs#SessionPromptState]] (`first_prompt`, `latest_prompt`, `latest_prompt_at`, `latest_prompt_finished_at`, `prompt_count`) so each field defaults individually for snapshots written before it existed. [[crates/scribe-client/src/restore_replay.rs#queue_from_launch_record]] carries that state into the replayed [[crates/scribe-client/src/restore_replay.rs#PaneRestore]] via [[crates/scribe-client/src/prompt_bar.rs#PromptBarData]] so the bar appears immediately after a cold restart, with the timer read back as a frozen or still-ticking value depending on whether `latest_prompt_finished_at` was set. The replayed pane's conversation tracking is seeded from the same record: `queue_from_launch_record` reads the launch's `conversation_id` (present only for an `Ai` launch kind) into `PaneRestore::last_conversation_id`, so [[crates/scribe-client/src/main.rs#AiChrome#note_conversation]] sees the resumed provider re-announce the id it was already given rather than reading it as a conversation switch that would retire the just-restored prompt history. Hot-restart reattach against a surviving server does not go through this path — it seeds prompts and the conversation id straight from `SessionList` via [[crates/scribe-client/src/main.rs#AiChrome#seed_from_session_list]] instead.
 
+## Client Diagnostic Logging
+
+At startup the client mirrors diagnostics to `$XDG_STATE_HOME/{flavor}/client.log`, writing a `client logs mirrored to state-dir file` line that names the live path.
+
+A prior bounded file is truncated; an oversized one rotates to `client.log.1` with the server's 8 MiB policy. The existing standard-stream layer remains for E2E capture.
+
 ## Config Watching
 
 A file watcher in  monitors the active install flavor's config root.
