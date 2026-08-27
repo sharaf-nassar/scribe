@@ -970,7 +970,6 @@ struct LinkOpenAnchor {
 struct PendingOpen {
     generation: u64,
     anchor: LinkOpenAnchor,
-    target: OpenTarget,
     cancel: Arc<AtomicBool>,
 }
 
@@ -1049,17 +1048,11 @@ struct LinkFeedback {
 }
 
 impl LinkFeedback {
-    fn start_pending(
-        &mut self,
-        pane: PaneId,
-        anchor: LinkOpenAnchor,
-        target: OpenTarget,
-    ) -> (u64, Arc<AtomicBool>) {
+    fn start_pending(&mut self, pane: PaneId, anchor: LinkOpenAnchor) -> (u64, Arc<AtomicBool>) {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.pending
-            .insert(pane, PendingOpen { generation, anchor, target, cancel: Arc::clone(&cancel) });
+        self.pending.insert(pane, PendingOpen { generation, anchor, cancel: Arc::clone(&cancel) });
         (generation, cancel)
     }
 
@@ -2692,7 +2685,7 @@ impl TerminalView {
         let prompt_bar = terminal.prompt_bar.clone();
         let appearance = &config.config().config.appearance;
         let tab_bar_height = window_chrome::tab_bar_height(appearance);
-        let status_bar_height = window_chrome::status_bar_height(appearance);
+        let status_bar_height = appearance.status_bar_height;
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, tab_bar_height, cx);
         Self {
@@ -3079,7 +3072,7 @@ impl TerminalView {
     }
 
     /// Reapply one reload plan: theme-derived palettes, grid font metrics,
-    /// tab/status geometry, and opacity, then announce the reload to the server.
+    /// chrome geometry, and opacity, then announce the reload to the server.
     ///
     /// Keybindings need no branch here — [`ConfigRuntime`] re-parses them on
     /// every reload and both `handle_overlay_key` and [`Self::handle_binding`]
@@ -3113,11 +3106,8 @@ impl TerminalView {
             self.apply_opacity_change(cx);
         }
 
-        if plan.tab_geometry_changed() {
-            self.apply_tab_geometry_change(cx);
-        }
-        if plan.status_geometry_changed() {
-            self.apply_status_geometry_change();
+        if plan.chrome_geometry_changed() {
+            self.apply_chrome_geometry_change(cx);
         }
 
         // Status-bar stat selection and the prompt-bar toggles are cheap to swap
@@ -3156,8 +3146,7 @@ impl TerminalView {
             theme = plan.theme_changed(),
             font = plan.font_changed(),
             opacity = plan.opacity_changed(),
-            tab_geometry = plan.tab_geometry_changed(),
-            status_geometry = plan.status_geometry_changed(),
+            chrome_geometry = plan.chrome_geometry_changed(),
             "config hot-reloaded"
         );
         cx.notify();
@@ -3184,49 +3173,35 @@ impl TerminalView {
         self.publish_pane_sizes(cx);
     }
 
-    /// Apply the live top/lower tab-row height and invalidate every measured
-    /// pane geometry cache before the next frame.
+    /// Apply live tab-row and status-band height edits and invalidate every
+    /// measured pane geometry cache before the next frame.
     ///
     /// Clearing the measured area avoids publishing the old terminal height in
     /// the render that schedules the new layout. The new grid canvas records
     /// its actual bounds during prepaint, then the existing deferred geometry
     /// path republishes and requests authoritative snapshots for every pane
     /// whose row count changed.
-    fn apply_tab_geometry_change(&mut self, cx: &mut Context<Self>) {
-        let height = window_chrome::tab_bar_height(&self.config.config().config.appearance);
-        if (self.tab_bar_height - height).abs() <= f32::EPSILON {
+    fn apply_chrome_geometry_change(&mut self, cx: &mut Context<Self>) {
+        let appearance = &self.config.config().config.appearance;
+        let tab_bar_height = window_chrome::tab_bar_height(appearance);
+        let status_bar_height = appearance.status_bar_height;
+        let tab_changed = (self.tab_bar_height - tab_bar_height).abs() > f32::EPSILON;
+        let status_changed = (self.status_bar_height - status_bar_height).abs() > f32::EPSILON;
+        if !tab_changed && !status_changed {
             return;
         }
-        self.tab_bar_height = height;
-        self.titlebar.update(cx, |bar, ctx| bar.set_height(height, ctx));
+        self.tab_bar_height = tab_bar_height;
+        self.status_bar_height = status_bar_height;
+        if tab_changed {
+            self.titlebar.update(cx, |bar, ctx| bar.set_height(tab_bar_height, ctx));
+        }
         self.grid_area.set(None);
         self.published_grid_area = None;
         self.pane_sizes.clear();
         for bounds in self.pane_bounds.values() {
             bounds.set(None);
         }
-        tracing::info!(height, "config reload: tab geometry applied");
-    }
-
-    /// Apply a live status-band height edit and invalidate the measured grid.
-    ///
-    /// The flex-grown grid gives exactly this many pixels to the status bar on
-    /// the next frame. Clearing cached measurements ensures that frame measures
-    /// the smaller or larger grid before the existing publish path resizes its
-    /// PTYs, rather than re-announcing the old pane rows.
-    fn apply_status_geometry_change(&mut self) {
-        let height = window_chrome::status_bar_height(&self.config.config().config.appearance);
-        if (self.status_bar_height - height).abs() <= f32::EPSILON {
-            return;
-        }
-        self.status_bar_height = height;
-        self.grid_area.set(None);
-        self.published_grid_area = None;
-        self.pane_sizes.clear();
-        for bounds in self.pane_bounds.values() {
-            bounds.set(None);
-        }
-        tracing::info!(height, "config reload: status geometry applied");
+        tracing::info!(tab_bar_height, status_bar_height, "config reload: chrome geometry applied");
     }
 
     /// Delivery point for the reload plan's `opacity_changed()` signal.
@@ -9945,7 +9920,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let (spawn, target) = open;
-        let (generation, cancel) = self.link_feedback.start_pending(pane, anchor, target.clone());
+        let (generation, cancel) = self.link_feedback.start_pending(pane, anchor);
         let (child, cmd) = match spawn {
             Ok(spawned) => spawned,
             Err((kind, cmd)) => {
@@ -9987,8 +9962,8 @@ impl TerminalView {
             tracing::trace!(%pane, generation, "stale link opener result ignored");
             return;
         };
-        let (anchor, target) = (pending.anchor.clone(), pending.target.clone());
-        let Some(OpenObservation { outcome, cmd, target: _target }) = observation else {
+        let anchor = pending.anchor.clone();
+        let Some(OpenObservation { outcome, cmd, target }) = observation else {
             self.link_feedback.pending.remove(&pane);
             return;
         };
@@ -17566,28 +17541,17 @@ mod tests {
         LinkOpenAnchor { session_id, content, clicked_run, run_segments: vec![clicked_run] }
     }
 
-    fn test_open_target() -> OpenTarget {
-        OpenTarget {
-            kind: scribe_client::link_feedback::OpenTargetKind::Url,
-            scheme: Some("https".to_owned()),
-            resolved_path: None,
-        }
-    }
-
     #[test]
     fn latest_observed_link_click_wins_per_pane() {
         let pane = PaneId::from_raw(1);
         let other_pane = PaneId::from_raw(2);
         let mut feedback = LinkFeedback::default();
         let (first_generation, first_cancel) =
-            feedback.start_pending(pane, test_link_anchor(SessionId::new()), test_open_target());
-        let (_, other_cancel) = feedback.start_pending(
-            other_pane,
-            test_link_anchor(SessionId::new()),
-            test_open_target(),
-        );
+            feedback.start_pending(pane, test_link_anchor(SessionId::new()));
+        let (_, other_cancel) =
+            feedback.start_pending(other_pane, test_link_anchor(SessionId::new()));
         let (latest_generation, latest_cancel) =
-            feedback.start_pending(pane, test_link_anchor(SessionId::new()), test_open_target());
+            feedback.start_pending(pane, test_link_anchor(SessionId::new()));
 
         assert_ne!(first_generation, latest_generation);
         assert!(first_cancel.load(Ordering::Acquire));
@@ -17610,8 +17574,7 @@ mod tests {
         let pane = PaneId::from_raw(1);
         let session_id = SessionId::new();
         let mut feedback = LinkFeedback::default();
-        let (_, cancel) =
-            feedback.start_pending(pane, test_link_anchor(session_id), test_open_target());
+        let (_, cancel) = feedback.start_pending(pane, test_link_anchor(session_id));
         let anchor = test_link_anchor(session_id);
         let layout = AnnotationLayout::compute(20, 2, 1, 2..=6, "xdg-open failed")
             .expect("test pane holds an annotation");

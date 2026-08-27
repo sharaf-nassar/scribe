@@ -11,7 +11,7 @@
 //! The [`ClientConfig`] snapshot bundles the parsed config, resolved
 //! [`Theme`]/[`ChromeColors`], and parsed [`Bindings`]. [`ClientConfig::reload`]
 //! swaps in a freshly loaded config and returns a [`ConfigReloadPlan`] naming
-//! which live surfaces (theme, font metrics, opacity, tab/status geometry)
+//! which live surfaces (theme, font metrics, opacity, chrome geometry)
 //! must be reapplied — so a saved edit takes effect without a restart.
 //!
 //! [`ConfigRuntime`] is the piece the terminal window actually owns: it holds
@@ -93,7 +93,7 @@ where
 /// Mirrors the legacy `ConfigReloadPlan`, narrowed to the surfaces the GPUI
 /// spike consumes directly: the resolved terminal/chrome theme, the font
 /// metrics that drive cell-grid layout, the root-background opacity, and the
-/// tab-row and status-band geometry. Any keybinding edit is always reapplied
+/// chrome geometry. Any keybinding edit is always reapplied
 /// (the [`Bindings`] are re-parsed unconditionally), so it needs no flag here.
 ///
 /// The flags are stored as a small bitfield rather than separate `bool`
@@ -112,10 +112,8 @@ impl ConfigReloadPlan {
     const FONT_CHANGED: u8 = 1 << 1;
     /// The root-background opacity changed.
     const OPACITY_CHANGED: u8 = 1 << 2;
-    /// `tab_height` or `tab_bar_padding` changed.
-    const TAB_GEOMETRY_CHANGED: u8 = 1 << 3;
-    /// `status_bar_height` changed.
-    const STATUS_GEOMETRY_CHANGED: u8 = 1 << 4;
+    /// A tab-row or status-band height input changed.
+    const CHROME_GEOMETRY_CHANGED: u8 = 1 << 3;
 
     fn analyze(old: &ScribeConfig, new: &ScribeConfig) -> Self {
         let mut bits = 0;
@@ -131,13 +129,10 @@ impl ConfigReloadPlan {
         if (old.appearance.tab_height - new.appearance.tab_height).abs() > f32::EPSILON
             || (old.appearance.tab_bar_padding - new.appearance.tab_bar_padding).abs()
                 > f32::EPSILON
+            || (old.appearance.status_bar_height - new.appearance.status_bar_height).abs()
+                > f32::EPSILON
         {
-            bits |= Self::TAB_GEOMETRY_CHANGED;
-        }
-        if (old.appearance.status_bar_height - new.appearance.status_bar_height).abs()
-            > f32::EPSILON
-        {
-            bits |= Self::STATUS_GEOMETRY_CHANGED;
+            bits |= Self::CHROME_GEOMETRY_CHANGED;
         }
         Self { bits }
     }
@@ -162,16 +157,10 @@ impl ConfigReloadPlan {
         self.bits & Self::OPACITY_CHANGED != 0
     }
 
-    /// `true` when the effective top/lower tab-row inputs changed.
+    /// `true` when a tab-row or status-band height input changed.
     #[must_use]
-    pub const fn tab_geometry_changed(self) -> bool {
-        self.bits & Self::TAB_GEOMETRY_CHANGED != 0
-    }
-
-    /// `true` when the window status-band height changed.
-    #[must_use]
-    pub const fn status_geometry_changed(self) -> bool {
-        self.bits & Self::STATUS_GEOMETRY_CHANGED != 0
+    pub const fn chrome_geometry_changed(self) -> bool {
+        self.bits & Self::CHROME_GEOMETRY_CHANGED != 0
     }
 
     /// `true` when any live surface changed and a repaint is warranted.
@@ -251,8 +240,8 @@ impl ClientConfig {
     ///
     /// The theme, chrome colors, and keybindings are always recomputed so a
     /// saved edit reapplies without a restart; the returned [`ConfigReloadPlan`]
-    /// tells the caller which surfaces (theme, font, opacity, tab/status
-    /// geometry) actually differ so it can skip redundant reapply work.
+    /// tells the caller which surfaces (theme, font, opacity, chrome geometry)
+    /// actually differ so it can skip redundant reapply work.
     pub fn reload(&mut self, new_config: ScribeConfig) -> ConfigReloadPlan {
         let plan = ConfigReloadPlan::analyze(&self.config, &new_config);
         *self = Self::from_config(new_config);

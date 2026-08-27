@@ -19,22 +19,9 @@ pub enum OpenOutcome {
     Exited { code: Option<i32> },
 }
 
-/// Origin of the target sent to the system opener.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenTargetKind {
-    /// A URL found by heuristic detection.
-    Url,
-    /// A file-system path found by heuristic detection.
-    Path,
-    /// A URI supplied by an OSC 8 hyperlink.
-    Osc8,
-}
-
 /// Target metadata available to the failed-open classifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenTarget {
-    /// Whether the target came from a URL, path, or OSC 8 span.
-    pub kind: OpenTargetKind,
     /// URI scheme, when the target has one.
     pub scheme: Option<String>,
     /// Resolved file-system path for path and `file:` targets.
@@ -350,11 +337,12 @@ fn classify_exit_failure(command: &str, code: Option<i32>, target: &OpenTarget) 
     if target.is_mailto() {
         return "no mail client configured".to_owned();
     }
-    if target.is_path_or_file() {
-        if target.resolved_path.as_deref().is_some_and(path_is_missing) {
-            return "file no longer exists".to_owned();
-        }
-    } else if let Some(scheme) = safe_scheme(target.scheme.as_deref()) {
+    if target.resolved_path.as_deref().is_some_and(path_is_missing) {
+        return "file no longer exists".to_owned();
+    }
+    if !target.scheme.as_deref().is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+        && let Some(scheme) = safe_scheme(target.scheme.as_deref())
+    {
         return format!("no application handles {scheme} links");
     }
     format!("{command} exited {code}")
@@ -363,11 +351,6 @@ fn classify_exit_failure(command: &str, code: Option<i32>, target: &OpenTarget) 
 impl OpenTarget {
     fn is_mailto(&self) -> bool {
         self.scheme.as_deref().is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto"))
-    }
-
-    fn is_path_or_file(&self) -> bool {
-        self.kind == OpenTargetKind::Path
-            || self.scheme.as_deref().is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
     }
 }
 
@@ -396,19 +379,15 @@ mod tests {
 
     use super::{
         AnnotationAnchor, AnnotationColors, AnnotationLayout, AnnotationSide, OpenOutcome,
-        OpenTarget, OpenTargetKind, classify_open_failure, contrast_ratio, rgb,
+        OpenTarget, classify_open_failure, contrast_ratio, rgb,
     };
 
-    fn target(
-        kind: OpenTargetKind,
-        scheme: Option<&str>,
-        resolved_path: Option<PathBuf>,
-    ) -> OpenTarget {
-        OpenTarget { kind, scheme: scheme.map(str::to_owned), resolved_path }
+    fn target(scheme: Option<&str>, resolved_path: Option<PathBuf>) -> OpenTarget {
+        OpenTarget { scheme: scheme.map(str::to_owned), resolved_path }
     }
 
     fn uri(scheme: &str) -> OpenTarget {
-        target(OpenTargetKind::Url, Some(scheme), None)
+        target(Some(scheme), None)
     }
 
     // @lat: [[client#Client#URL Detection#Failed link opens]]
@@ -432,7 +411,7 @@ mod tests {
             (
                 "xdg-open",
                 OpenOutcome::Exited { code: Some(4) },
-                target(OpenTargetKind::Path, None, Some(missing_path)),
+                target(None, Some(missing_path)),
                 "file no longer exists",
             ),
             (
@@ -444,7 +423,7 @@ mod tests {
             (
                 "code",
                 OpenOutcome::Exited { code: Some(6) },
-                target(OpenTargetKind::Path, None, Some(existing_path)),
+                target(None, Some(existing_path)),
                 "code exited 6",
             ),
             ("open", OpenOutcome::Exited { code: None }, uri("https"), "open failed"),
@@ -458,7 +437,6 @@ mod tests {
     #[test]
     fn classifier_preserves_precedence_and_stats_file_targets() {
         let missing_file_uri = target(
-            OpenTargetKind::Url,
             Some("file"),
             Some(PathBuf::from("/scribe-link-feedback-file-uri-does-not-exist")),
         );
@@ -471,11 +449,8 @@ mod tests {
             Some("file no longer exists".to_owned())
         );
 
-        let existing_file_uri = target(
-            OpenTargetKind::Url,
-            Some("file"),
-            Some(std::env::current_exe().expect("test executable exists")),
-        );
+        let existing_file_uri =
+            target(Some("file"), Some(std::env::current_exe().expect("test executable exists")));
         assert_eq!(
             classify_open_failure(
                 "xdg-open",
@@ -527,7 +502,7 @@ mod tests {
 
     #[test]
     fn classifier_templates_the_final_command_name() {
-        let no_scheme = target(OpenTargetKind::Url, None, None);
+        let no_scheme = target(None, None);
         assert_eq!(
             classify_open_failure("code", OpenOutcome::SpawnError(ErrorKind::NotFound), &no_scheme),
             Some("code is not installed".to_owned())

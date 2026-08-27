@@ -91,9 +91,6 @@ mod handoff_tests;
 /// env-store writes — that could otherwise park exit indefinitely.
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Size cap for the state-dir server log. On overflow at startup the file is
-/// rotated once to `server.log.1`, so disk use stays bounded at ~2x the cap.
-const SERVER_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SERVER_USAGE: &str = "Usage: scribe-server [--upgrade] [--launchd-slot=primary|alternate]";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -237,18 +234,9 @@ fn open_server_log_file() -> Option<(std::fs::File, std::path::PathBuf)> {
     let dir = scribe_common::app::current_state_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("server.log");
-    rotate_if_oversized(&path, SERVER_LOG_MAX_BYTES);
+    scribe_common::app::rotate_log_if_oversized(&path, scribe_common::app::STATE_LOG_MAX_BYTES);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
     Some((file, path))
-}
-
-/// Startup-time size cap: rename `server.log` to `server.log.1` (replacing
-/// any previous rotation) once it exceeds `max_bytes`. Best-effort — a failed
-/// rename just keeps appending to the oversized file.
-fn rotate_if_oversized(path: &Path, max_bytes: u64) {
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
-        drop(std::fs::rename(path, path.with_extension("log.1")));
-    }
 }
 
 /// Normal server mode: start IPC server + handoff listener, run until shutdown.
@@ -744,9 +732,9 @@ fn load_env_persistence_seed() -> bool {
 
 #[cfg(test)]
 mod server_log_tests {
-    use scribe_common::macos_launchd::LaunchdSlot;
+    use scribe_common::{app::rotate_log_if_oversized, macos_launchd::LaunchdSlot};
 
-    use super::{ServerAction, parse_args, rotate_if_oversized};
+    use super::{ServerAction, parse_args};
 
     #[test]
     fn parser_stops_non_startup_arguments_before_server_setup() {
@@ -770,13 +758,13 @@ mod server_log_tests {
 
         // Under the cap: untouched, no rotation file appears.
         std::fs::write(&path, b"small").unwrap();
-        rotate_if_oversized(&path, 16);
+        rotate_log_if_oversized(&path, 16);
         assert!(path.exists());
         assert!(!rotated.exists());
 
         // Over the cap: renamed aside, replacing any prior rotation.
         std::fs::write(&path, vec![b'x'; 32]).unwrap();
-        rotate_if_oversized(&path, 16);
+        rotate_log_if_oversized(&path, 16);
         assert!(!path.exists());
         assert_eq!(std::fs::read(&rotated).unwrap().len(), 32);
 

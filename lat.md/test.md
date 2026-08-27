@@ -5337,7 +5337,7 @@ Startup sizing, retained titlebar paint, lower reservations, legacy geometry nor
 
 #### Status band resolves configured height
 
-Confirms [[crates/scribe-client/src/window_chrome.rs#status_bar_height]] returns the 8px and 48px Settings endpoints, and startup sizing grows by the same 40px at a fixed tab row and grid metric.
+Confirms `appearance.status_bar_height` accepts the 8px and 48px Settings endpoints, and startup sizing grows by the same 40px at a fixed tab row and grid metric.
 
 #### Default window size clears every chrome band
 

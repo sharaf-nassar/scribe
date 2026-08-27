@@ -28,7 +28,7 @@ use alacritty_terminal_gpui::index::{Column, Line, Point};
 use alacritty_terminal_gpui::term::Term;
 use alacritty_terminal_gpui::term::cell::{Cell, Flags, Hyperlink};
 
-use crate::link_feedback::{OpenOutcome, OpenTarget, OpenTargetKind};
+use crate::link_feedback::{OpenOutcome, OpenTarget};
 
 /// Read a single cell from the terminal grid.
 ///
@@ -1255,7 +1255,7 @@ fn open_path_observed_with_commands(
 
 /// Spawn a recognized URL opener whose exit status will be observed.
 pub fn open_url_observed(url: &str) -> (OpenSpawnResult, OpenTarget) {
-    let target = target_for_uri(url, OpenTargetKind::Url);
+    let target = target_for_uri(url);
     let cmd = system_open_cmd();
     if !PREFIXES.iter().any(|prefix| url.starts_with(prefix)) {
         tracing::warn!("open_url_observed: refusing to open unsupported URL scheme");
@@ -1267,7 +1267,7 @@ pub fn open_url_observed(url: &str) -> (OpenSpawnResult, OpenTarget) {
 /// Spawn an unguarded OSC 8 URI opener whose exit status will be observed.
 pub fn open_uri_unguarded_observed(uri: &str) -> (OpenSpawnResult, OpenTarget) {
     let cmd = system_open_cmd();
-    let target = target_for_uri(uri, OpenTargetKind::Osc8);
+    let target = target_for_uri(uri);
     (spawn_uri_observed(uri, OsStr::new(cmd), cmd), target)
 }
 
@@ -1281,15 +1281,11 @@ fn spawn_uri_observed(uri: &str, program: &OsStr, cmd: Cmd) -> OpenSpawnResult {
 
 fn target_for_path(resolved: &str) -> OpenTarget {
     let resolved_path = PathBuf::from(resolved);
-    OpenTarget {
-        kind: OpenTargetKind::Path,
-        scheme: None,
-        resolved_path: resolved_path.is_absolute().then_some(resolved_path),
-    }
+    OpenTarget { scheme: None, resolved_path: resolved_path.is_absolute().then_some(resolved_path) }
 }
 
-fn target_for_uri(uri: &str, kind: OpenTargetKind) -> OpenTarget {
-    OpenTarget { kind, scheme: extract_scheme(uri), resolved_path: resolved_file_uri_path(uri) }
+fn target_for_uri(uri: &str) -> OpenTarget {
+    OpenTarget { scheme: extract_scheme(uri), resolved_path: resolved_file_uri_path(uri) }
 }
 
 fn resolved_file_uri_path(uri: &str) -> Option<PathBuf> {
@@ -1497,7 +1493,7 @@ mod tests {
     use alacritty_terminal_gpui::term::Term;
     use vte::ansi::Processor;
 
-    use crate::link_feedback::{OpenOutcome, OpenTarget, OpenTargetKind, classify_open_failure};
+    use crate::link_feedback::{OpenOutcome, OpenTarget, classify_open_failure};
 
     use super::{
         HardBreakContext, LogicalCell, OpenObservation, Osc8CellRange, PaneUrlCache, RowSegment,
@@ -1591,11 +1587,7 @@ mod tests {
     }
 
     fn url_target() -> OpenTarget {
-        OpenTarget {
-            kind: OpenTargetKind::Url,
-            scheme: Some("https".to_owned()),
-            resolved_path: None,
-        }
+        OpenTarget { scheme: Some("https".to_owned()), resolved_path: None }
     }
 
     fn sleep_child() -> Child {
@@ -1721,20 +1713,15 @@ mod tests {
         }
 
         assert_eq!(
-            target_for_uri("file:///tmp/example.txt", OpenTargetKind::Url),
+            target_for_uri("file:///tmp/example.txt"),
             OpenTarget {
-                kind: OpenTargetKind::Url,
                 scheme: Some("file".to_owned()),
                 resolved_path: Some(PathBuf::from("/tmp/example.txt")),
             }
         );
         assert_eq!(
             target_for_path("/tmp/example.txt"),
-            OpenTarget {
-                kind: OpenTargetKind::Path,
-                scheme: None,
-                resolved_path: Some(PathBuf::from("/tmp/example.txt")),
-            }
+            OpenTarget { scheme: None, resolved_path: Some(PathBuf::from("/tmp/example.txt")) }
         );
         assert_eq!(target_for_path("relative/example.txt").resolved_path, None);
     }

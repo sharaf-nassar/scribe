@@ -50,28 +50,6 @@ pub fn tab_bar_height(appearance: &AppearanceConfig) -> f32 {
     appearance.tab_height + appearance.tab_bar_padding
 }
 
-/// Height of the window status-bar band, including its 1px top hairline.
-///
-/// GPUI lays divs out border-box, so the border is inside this configured
-/// number. Resolving it beside [`tab_bar_height`] keeps startup sizing and the
-/// live status renderer on the same metric.
-#[must_use]
-pub fn status_bar_height(appearance: &AppearanceConfig) -> f32 {
-    appearance.status_bar_height
-}
-
-/// Total height of the chrome bands that are always present.
-///
-/// The prompt bar is deliberately excluded: it exists only while the attached
-/// pane has prompts, so reserving its rows up front would leave a permanent
-/// dead band under the grid. When it does appear it takes its rows from the
-/// flex-grown grid, and the bands below it stay on screen because each one is
-/// laid out `flex_none`.
-#[must_use]
-pub fn chrome_height(tab_bar_height: f32, status_bar_height: f32) -> f32 {
-    tab_bar_height + status_bar_height
-}
-
 /// The startup window's inner size: the whole `cols`x`rows` grid at these cell
 /// metrics, plus every always-present chrome band.
 ///
@@ -89,7 +67,8 @@ pub fn default_window_size(
 ) -> WindowSize {
     let width = ceil_pixels(f32::from(cols) * cell_width.max(0.0));
     let height = ceil_pixels(f32::from(rows) * line_height.max(0.0))
-        + chrome_height(tab_bar_height(appearance), status_bar_height(appearance));
+        + tab_bar_height(appearance)
+        + appearance.status_bar_height;
     WindowSize { width: width.max(MIN_WINDOW_EDGE), height: height.max(MIN_WINDOW_EDGE) }
 }
 
@@ -109,8 +88,7 @@ pub fn clamp_to_display(size: WindowSize, display: WindowSize) -> WindowSize {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_WINDOW_EDGE, WindowSize, chrome_height, clamp_to_display, default_window_size,
-        status_bar_height, tab_bar_height,
+        MIN_WINDOW_EDGE, WindowSize, clamp_to_display, default_window_size, tab_bar_height,
     };
     use scribe_common::config::AppearanceConfig;
 
@@ -142,13 +120,9 @@ mod tests {
             ..AppearanceConfig::default()
         };
         let tall = AppearanceConfig { status_bar_height: 48.0, ..compact.clone() };
-        let compact_height = status_bar_height(&compact);
-        let tall_height = status_bar_height(&tall);
         let compact_window = default_window_size(120, 36, 8.4, 18.9, &compact);
         let tall_window = default_window_size(120, 36, 8.4, 18.9, &tall);
 
-        assert!((compact_height - 8.0).abs() < f32::EPSILON);
-        assert!((tall_height - 48.0).abs() < f32::EPSILON);
         assert!((tall_window.height - compact_window.height - 40.0).abs() < f32::EPSILON);
     }
 
@@ -158,21 +132,15 @@ mod tests {
         // The shipped defaults: a 120x36 grid at font size 14 (line height
         // 14 * 1.35 = 18.9, cell width 14 * 0.6 = 8.4).
         let appearance = AppearanceConfig::default();
-        let tab_height = tab_bar_height(&appearance);
-        let status_height = status_bar_height(&appearance);
+        let chrome_height = tab_bar_height(&appearance) + appearance.status_bar_height;
         let size = default_window_size(120, 36, 8.4, 18.9, &appearance);
-        let grid_height = size.height - chrome_height(tab_height, status_height);
+        let grid_height = size.height - chrome_height;
         assert!(
             grid_height >= 36.0 * 18.9,
             "all 36 rows must fit above the chrome: {grid_height} < {}",
             36.0 * 18.9
         );
         assert!(size.width >= 120.0 * 8.4, "all 120 columns must fit: {}", size.width);
-        // The bands themselves are what the grid has to clear.
-        assert!(
-            (chrome_height(tab_height, status_height) - (tab_height + status_height)).abs()
-                < f32::EPSILON
-        );
         // Float noise must not buy a whole extra pixel: the shipped metrics are
         // 14 * 0.6 and 14 * 1.35, whose products land just either side of a
         // whole pixel in f32.
@@ -180,8 +148,7 @@ mod tests {
             default_window_size(120, 36, 14.0 * 0.6, 14.0f32.mul_add(1.35, 0.0), &appearance);
         assert!((shipped.width - 1008.0).abs() < f32::EPSILON, "width was {}", shipped.width);
         assert!(
-            (shipped.height - (681.0 + chrome_height(tab_height, status_height))).abs()
-                < f32::EPSILON,
+            (shipped.height - (681.0 + chrome_height)).abs() < f32::EPSILON,
             "height was {}",
             shipped.height
         );
