@@ -26,6 +26,7 @@ use scribe_client::{
     },
     kitty_placeholder::kitty_placeholder_diacritic_index,
     layout::Rect,
+    link_feedback::{ANNOTATION_MARK, AnnotationColors, AnnotationLayout},
     opacity::{opaque_slot, scale_alpha},
     preedit::{Ime, PreeditGeometry, PreeditOverlay, PreeditState, compute_overlay},
     restore_replay::round_positive_f32_to_u16,
@@ -230,6 +231,10 @@ pub struct GridColors {
     pub opacity: f32,
 }
 
+fn annotation_rgba([red, green, blue, alpha]: [f32; 4]) -> Rgba {
+    Rgba { r: red, g: green, b: blue, a: alpha }
+}
+
 /// Where the last painted frame put the terminal grid, in window coordinates.
 ///
 /// The shell needs this to answer a mouse event: a right-click resolves to a
@@ -331,6 +336,9 @@ pub struct TerminalElement {
     /// Rows of the Ctrl-hovered link for this frame. Empty on every frame with
     /// no link under the pointer, which is almost all of them.
     link_underline: Vec<SelectionSpan>,
+    /// Failed-link annotation paint inputs. `None` keeps its paint layer out
+    /// of the idle frame entirely.
+    annotation: Option<AnnotationPaint>,
     /// IME plumbing for this frame. `None` on every unfocused pane: only one
     /// pane composes, and registering two handlers would race for the platform
     /// slot.
@@ -346,6 +354,23 @@ pub struct TerminalElement {
     /// Immutable CPU scene plus the window-local cache shared by all panes.
     images: Option<TerminalImagesPaint>,
     bounds_sink: GridBounds,
+}
+
+/// One failed-link annotation painted over a terminal grid.
+///
+/// The caller supplies placement and derived colours from
+/// [`crate::link_feedback`]; this paint input deliberately carries no grid
+/// cells, so showing and dismissing it cannot mutate terminal state.
+#[derive(Clone)]
+pub struct AnnotationPaint {
+    /// Precomputed one-row band and joinery placement.
+    pub layout: AnnotationLayout,
+    /// Precomputed band, message, and joinery colours.
+    pub colors: AnnotationColors,
+    /// Pure ANSI red for the upright mark and failed-run underline.
+    pub ansi_red: Rgba,
+    /// One visible-row segment per part of the failed link run.
+    pub run_segments: Vec<SelectionSpan>,
 }
 
 /// One pane's terminal-image scene and its window-local upload cache.
@@ -377,6 +402,7 @@ impl TerminalElement {
             highlight_colors,
             selection: Vec::new(),
             link_underline: Vec::new(),
+            annotation: None,
             ime: None,
             cursor: None,
             scrollbar: None,
@@ -461,6 +487,20 @@ impl TerminalElement {
     #[must_use]
     pub fn with_link_underline(mut self, rows: Vec<SelectionSpan>) -> Self {
         self.link_underline = rows;
+        self
+    }
+
+    /// Paint a failed-link annotation over this grid when one is visible.
+    ///
+    /// `None` returns before storing any annotation state, leaving no
+    /// annotation work in the idle frame. The caller owns lifecycle and anchor
+    /// validity; this builder only paints the precomputed input.
+    #[must_use]
+    pub fn with_annotation(mut self, annotation: Option<AnnotationPaint>) -> Self {
+        let Some(annotation) = annotation else {
+            return self;
+        };
+        self.annotation = Some(annotation);
         self
     }
 
@@ -581,6 +621,11 @@ impl TerminalElement {
         );
         paint_line_cursor(cursor, overlay, window);
         self.paint_vi_cursor(overlay, window);
+        // An absent annotation does not enter a paint helper, allocate an
+        // element, or reshape text on the terminal's idle path.
+        if self.annotation.is_some() {
+            self.paint_annotation(overlay, &cells, window, cx);
+        }
         self.paint_split_scroll(overlay, window);
         self.paint_jump_button(overlay, window);
         // Last of the grid overlays: the scrollbar floats over the cells (it
@@ -729,6 +774,31 @@ impl TerminalElement {
                 note_renderer_failure(&images.cache, &error, session_id, window);
             }
         }
+    }
+
+    /// Paint the transient failed-link cells over the finished grid.
+    ///
+    /// This is paint-only: the opaque band is a quad over the existing row,
+    /// never a write to [`Content`], so removing this input reveals the same
+    /// snapshot on the next frame.
+    fn paint_annotation(
+        &self,
+        overlay: OverlayGeometry,
+        cells: &SelectionOverlayPaint<'_>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(annotation) = self.annotation.as_ref() else {
+            return;
+        };
+        AnnotationPainter {
+            annotation,
+            overlay,
+            font: &self.font,
+            variants: cells.variants,
+            resolved_rows: cells.resolved_rows,
+        }
+        .paint(window, cx);
     }
 
     /// Rule the Ctrl-hovered link, one quad per row segment.
@@ -1758,6 +1828,143 @@ struct SelectionOverlayPaint<'a> {
     thickness: Pixels,
 }
 
+/// Inputs for the one paint-only failed-link annotation pass.
+struct AnnotationPainter<'a> {
+    annotation: &'a AnnotationPaint,
+    overlay: OverlayGeometry,
+    font: &'a GridFont,
+    variants: &'a FontVariants,
+    resolved_rows: &'a [Vec<ResolvedCell>],
+}
+
+impl AnnotationPainter<'_> {
+    fn paint(&self, window: &mut Window, cx: &mut App) {
+        let layout = &self.annotation.layout;
+        let Some(row) = self.resolved_rows.get(layout.row) else {
+            return;
+        };
+        let band_cols = layout.band_cols();
+        if band_cols == 0 || layout.band_col > row.len().saturating_sub(band_cols) {
+            return;
+        }
+
+        let band_origin = point(
+            self.overlay.bounds.left() + px(self.overlay.cell_width * grid_f32(layout.band_col)),
+            self.overlay.bounds.top() + self.overlay.line_height * grid_f32(layout.row),
+        );
+        let band = Bounds::new(
+            band_origin,
+            size(px(self.overlay.cell_width * grid_f32(band_cols)), self.overlay.line_height),
+        );
+        // AnnotationColors always supplies alpha 1 here. Do not apply window
+        // opacity: this quad must fully hide the cells it replaces.
+        window.paint_quad(fill(band, annotation_rgba(self.annotation.colors.band)));
+
+        self.paint_joinery(row.len(), window);
+        self.paint_text(band_origin, window, cx);
+        self.paint_underline(window);
+    }
+
+    /// Draw dimmed box-drawing joinery beside, never inside, the opaque band.
+    fn paint_joinery(&self, row_cols: usize, window: &mut Window) {
+        let layout = &self.annotation.layout;
+        let joinery: Vec<_> =
+            layout.joinery().chars().map(|c| Cell { c, ..Cell::default() }).collect();
+        let joinery_end = layout.joinery_col.saturating_add(joinery.len());
+        let band_end = layout.band_col.saturating_add(layout.band_cols());
+        if layout.joinery_col > row_cols.saturating_sub(joinery.len())
+            || (layout.joinery_col < band_end && layout.band_col < joinery_end)
+        {
+            return;
+        }
+        let resolved = vec![
+            ResolvedCell {
+                fg: annotation_rgba(self.annotation.colors.joinery),
+                bg: None,
+                flags: Flags::empty(),
+            };
+            joinery.len()
+        ];
+        paint_box_drawing(
+            &joinery,
+            &resolved,
+            CellGeometry {
+                left: self.overlay.bounds.left()
+                    + px(self.overlay.cell_width * grid_f32(layout.joinery_col)),
+                top: self.overlay.bounds.top() + self.overlay.line_height * grid_f32(layout.row),
+                width: self.overlay.cell_width,
+                height: self.overlay.line_height,
+            },
+            window,
+        );
+    }
+
+    /// Shape the upright mark separately from the synthetic-italic message.
+    fn paint_text(&self, origin: gpui::Point<Pixels>, window: &mut Window, cx: &mut App) {
+        let message = &self.annotation.layout.message;
+        let mut text = String::with_capacity(ANNOTATION_MARK.len_utf8() + 1 + message.len());
+        text.push(ANNOTATION_MARK);
+        text.push(' ');
+        text.push_str(message);
+        let mark = TextRun {
+            len: ANNOTATION_MARK.len_utf8() + 1,
+            font: self.variants.regular.clone(),
+            color: self.annotation.ansi_red.into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let mut runs = vec![mark];
+        if !message.is_empty() {
+            runs.push(TextRun {
+                len: message.len(),
+                font: self.variants.italic.clone(),
+                color: annotation_rgba(self.annotation.colors.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+        window
+            .text_system()
+            .shape_line(text.into(), px(self.font.size), &runs, Some(px(self.overlay.cell_width)))
+            .paint(origin, self.overlay.line_height, TextAlign::Left, None, window, cx)
+            .ok();
+    }
+
+    /// Rule every wrapped segment of the failed run with a fixed 2px red line.
+    fn paint_underline(&self, window: &mut Window) {
+        let thickness = px(2.0);
+        for span in &self.annotation.run_segments {
+            let Some(resolved) = self.resolved_rows.get(span.row) else { continue };
+            let end = span.end_col.min(resolved.len().saturating_sub(1));
+            if span.start_col > end {
+                continue;
+            }
+            let top = self.overlay.bounds.top()
+                + self.overlay.line_height * grid_f32(span.row)
+                + self.overlay.line_height
+                - thickness * 2.0;
+            for (offset, cell) in resolved
+                .get(span.start_col..=end)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            {
+                let left = self.overlay.bounds.left()
+                    + px(self.overlay.cell_width * grid_f32(span.start_col.saturating_add(offset)));
+                let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
+                let rule = Bounds::new(
+                    point(left, top),
+                    size(px(self.overlay.cell_width * f32::from(columns)), thickness),
+                );
+                window.paint_quad(fill(rule, self.annotation.ansi_red));
+            }
+        }
+    }
+}
+
 struct BlockCursorPaint<'a> {
     default_bg: [f32; 4],
     content: &'a Content,
@@ -2056,13 +2263,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridBounds, GridColors, GridFont,
-        JumpButtonState, MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at, hits_jump_chip,
-        is_painted_cell, jump_button_paint, record_grid_area, shaped_char,
+        AnnotationPaint, CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridBounds, GridColors,
+        GridFont, JumpButtonState, MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at,
+        hits_jump_chip, is_painted_cell, jump_button_paint, record_grid_area, shaped_char,
     };
     use gpui::{Bounds, FontStyle, FontWeight, Rgba, point, px, size};
     use scribe_client::color::TerminalColors;
+    use scribe_client::link_feedback::{
+        AnnotationAnchor, AnnotationColors, AnnotationLayout, AnnotationSide,
+    };
     use scribe_client::search::{MatchHighlight, MatchHighlightColors};
+    use scribe_client::selection::SelectionSpan;
     use scribe_common::config::AppearanceConfig;
     use scribe_common::theme::minimal_dark;
 
@@ -2300,6 +2511,35 @@ mod tests {
             GridBounds::default(),
         )
         .with_highlights(highlights)
+    }
+
+    // @lat: [[client#Client#URL Detection#Failed link opens]]
+    #[test]
+    fn absent_annotations_leave_the_paint_element_idle() {
+        let idle = element_with_highlights(Vec::new()).with_annotation(None);
+        assert!(idle.annotation.is_none());
+
+        let active = element_with_highlights(Vec::new()).with_annotation(Some(AnnotationPaint {
+            layout: AnnotationLayout {
+                row: 0,
+                joinery_col: 0,
+                band_col: 2,
+                side: AnnotationSide::Above,
+                anchor: AnnotationAnchor::Head,
+                message: "opener failed".to_owned(),
+            },
+            colors: AnnotationColors {
+                band: [0.1, 0.1, 0.1, 1.0],
+                text: [0.9, 0.4, 0.4, 1.0],
+                joinery: [0.8, 0.2, 0.2, 0.6],
+            },
+            ansi_red: Rgba { r: 0.8, g: 0.2, b: 0.2, a: 1.0 },
+            run_segments: vec![SelectionSpan { row: 1, start_col: 2, end_col: 7 }],
+        }));
+        assert_eq!(
+            active.annotation.as_ref().expect("annotation retained").layout.message,
+            "opener failed"
+        );
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#Matches recolour the cells they cover]]

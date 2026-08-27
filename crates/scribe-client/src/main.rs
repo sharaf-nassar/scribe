@@ -7323,11 +7323,10 @@ impl TerminalView {
         // Mint any missing scrollbar state before the render closure below
         // borrows `self` immutably. The state has to outlive the element (the
         // fade is a wall-clock animation across frames), so it lives here and
-        // the element only borrows a handle to it.
+        // the element only borrows a handle.
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
-        let mut ime = Some(ime);
-        let mut link_rows = link.map(|link| link.rows);
+        let (mut ime, mut link_rows) = (Some(ime), link.map(|link| link.rows));
         let opacity = self.opacity;
         // Identical for every pane, so it is built once and cloned in: the
         // clone is an `Rgba`, an `Arc` bump, and an `f32`.
@@ -7389,7 +7388,8 @@ impl TerminalView {
                 )
                 .with_highlights(highlights)
                 .with_selection(selection)
-                .with_link_underline(underline)
+                .with_link_underline(underline) // scribe-4gv9.6 supplies annotation state.
+                .with_annotation(None)
                 .with_terminal_images(image_paint)
                 .with_cursor(placement.focused.then_some(cursor))
                 .with_scrollbar(placement.session_id.and_then(|s| self.scrollbar_paint(s)))

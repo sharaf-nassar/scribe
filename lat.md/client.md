@@ -3664,6 +3664,8 @@ Its ordered table names a missing opener first, then `mailto:`, a stat-missing p
 
 [[crates/scribe-client/src/link_feedback.rs#AnnotationColors#from_theme]] derives the opaque band by an 8% per-channel sRGB mix toward ANSI red, lightens red by ten HSL lightness points while enforcing 4.5:1 text contrast, and gives joinery the same red at 60% alpha.
 
+[[crates/scribe-client/src/terminal_element.rs#TerminalElement#with_annotation]] accepts an optional [[crates/scribe-client/src/terminal_element.rs#AnnotationPaint]] without redoing placement or colour math. A visible paint pass overlays opaque band cells, synthetic-italic message glyphs beside an upright ANSI-red mark, and dimmed box joinery outside the band; it never mutates the `Content` snapshot, so dismissing it repaints the original cells. It also draws a fixed 2px ANSI-red rule for every wrapped failed-link segment. `None` leaves the pass out of idle frames; `scribe-4gv9.6` replaces the temporary no-state call with its visible per-pane state.
+
 ### Resolving a Path Link
 
 What a relative link in a pane is relative *to*: that pane's shell, never the client process. [[crates/scribe-client/src/url_detect.rs#resolve_path]] is the pure half of [[crates/scribe-client/src/url_detect.rs#open_path]], split out so the rule is unit-tested without spawning anything.
