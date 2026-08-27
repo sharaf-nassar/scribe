@@ -97,6 +97,49 @@ budget, so the attempt was arithmetically impossible before it started.
 Read acceptance criteria for a repetition count before choosing `timeoutMs`,
 and multiply.
 
+## Recurrence: run `run-20260827T221244.lFRcOi`
+
+A third time, on `scribe-whn1.2`, with the same signature:
+
+```text
+Subagent timed out after 1800000ms.
+```
+
+This one is worth recording because it defeats the qualifier above. The bead
+changed **only shell** under `tests/e2e`, so by this file's own carve-out it
+skipped the image build entirely and each suite run was fast. There was no
+Docker build, no release build, and no repetition count in the acceptance
+criteria. Thirty minutes still was not enough.
+
+What consumed the budget was **supervisor round-trips**. The worker escalated
+twice via `contact_supervisor`, and both escalations were correct — the first
+surfaced a genuine pre-existing failure, the second refused to attest to a
+diagnosis it could not verify. But each round-trip is followed by a *full
+re-verification cycle*, because the reply changes the code and the suite must
+run again from the top. Three suite runs at ~10 minutes each, plus reasoning,
+exceeded the budget.
+
+So the sharper rule is not only about repetition in the acceptance criteria:
+
+> Budget `timeoutMs` as (expected supervisor round-trips + 1) x suite runtime.
+> Every escalation costs another full verification pass, not just the latency
+> of the reply.
+
+Note this cuts *against* the earlier advice to prefer `status: "failed"` over
+blocking `contact_supervisor`. Both escalations here were the right call and
+returning `failed` would have thrown away a correct, nearly-complete
+implementation. Escalation is not the problem; an escalation budget of zero is.
+Raise `timeoutMs` instead of discouraging the question.
+
+Recovery differed too. The worker had **staged** its work (`git status
+--porcelain` showed `M ` in the index, not merely dirty files) and the
+orchestrator had already re-verified the suite and `lat check` independently.
+Resuming would have paid for another full suite cycle to reach a commit that
+was already earned, so the orchestrator committed the staged tree unchanged
+from the task worktree and recorded it as an orchestrator edit. Resume-first is
+the right default; it is not the right move when the remaining work is a commit
+and the verification is already in hand.
+
 ## Prevention
 
 A worker's commit is the only durable artifact of its run. Treat "has it
