@@ -124,6 +124,21 @@ pub struct ViewportPoint {
     pub col: usize,
 }
 
+/// A viewport cell captured for asynchronous work.
+///
+/// The absolute row identifies the cell's grid line from the oldest surviving
+/// scrollback line. Re-resolve this anchor through
+/// [`DisplayOnlyTerminal::revalidate_anchor`] before applying an asynchronous
+/// result, so changed content cannot receive an annotation for an old click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ContentAnchor {
+    /// Grid line counted from the oldest surviving scrollback line.
+    pub abs_row: usize,
+    /// Column within [`Self::abs_row`].
+    pub col: usize,
+    revision: u64,
+}
+
 /// Shape requested by the terminal application for the live shell cursor.
 ///
 /// `Block` remains the default-config sentinel, matching the legacy renderer:
@@ -255,6 +270,8 @@ pub struct DisplayOnlyTerminal {
     /// Shared rather than owned so republishing the render projection after a
     /// parse is a refcount bump instead of a copy of every painted row.
     content: Arc<Content>,
+    /// Monotonic epoch for work captured against this pane's visible content.
+    content_revision: u64,
     /// Whether an advance changed grid state [`Self::content`] has not been
     /// rebuilt for yet. Set by [`Self::advance_output`] and cleared by every
     /// rebuild, so the pacer can drain through a backlog and pay for one
@@ -298,6 +315,7 @@ impl DisplayOnlyTerminal {
             term,
             output_processor: vte::ansi::Processor::new(),
             content: Arc::default(),
+            content_revision: 0,
             content_stale: false,
             scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
@@ -330,6 +348,9 @@ impl DisplayOnlyTerminal {
     /// the highlight would otherwise keep painting whatever now occupies those
     /// rows instead of disappearing with the content it described.
     pub fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
+        if !bytes.is_empty() {
+            self.bump_content_revision();
+        }
         self.output_processor.advance(&mut self.term, bytes);
         let needs_redraw = self.output_processor.sync_bytes_count() < bytes.len();
         self.content_stale |= needs_redraw;
@@ -366,6 +387,7 @@ impl DisplayOnlyTerminal {
         let reshaped = columns > 0 && lines > 0 && self.dimensions() != (columns, lines);
         if reshaped {
             self.term.resize(TerminalDimensions { columns, lines });
+            self.bump_content_revision();
         }
         let rebuilt = self.advance_output(bytes).needs_redraw;
         let trimmed = self.trim_history_without_publish(kept_rows) > 0;
@@ -413,6 +435,39 @@ impl DisplayOnlyTerminal {
     /// Returns the content captured after the most recent output frame.
     pub fn content(&self) -> Arc<Content> {
         Arc::clone(&self.content)
+    }
+
+    /// Current content epoch for this pane.
+    #[must_use]
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    /// Capture a visible cell as a revision-guarded absolute grid anchor.
+    #[must_use]
+    pub fn anchor_at(&self, at: ViewportPoint) -> Option<ContentAnchor> {
+        self.content.rows.get(at.row)?.get(at.col)?;
+        Some(ContentAnchor {
+            abs_row: self.absolute_line_for_viewport_row(at.row)?,
+            col: at.col,
+            revision: self.content_revision,
+        })
+    }
+
+    /// Resolve an anchor only when no content-changing event has intervened.
+    ///
+    /// Call this at asynchronous-result delivery time. `None` means the
+    /// clicked content moved or the anchor is no longer visible.
+    #[must_use]
+    pub fn revalidate_anchor(&self, anchor: ContentAnchor) -> Option<ViewportPoint> {
+        if anchor.revision != self.content_revision() {
+            return None;
+        }
+        (0..self.content.rows.len()).find_map(|row| {
+            (self.absolute_line_for_viewport_row(row) == Some(anchor.abs_row)
+                && self.content.rows.get(row).is_some_and(|cells| cells.get(anchor.col).is_some()))
+            .then_some(ViewportPoint { row, col: anchor.col })
+        })
     }
 
     /// Apply one ordered live image record beside the text parser.
@@ -510,6 +565,7 @@ impl DisplayOnlyTerminal {
             return;
         }
         self.term.resize(TerminalDimensions { columns, lines });
+        self.bump_content_revision();
         self.make_content();
     }
 
@@ -534,7 +590,11 @@ impl DisplayOnlyTerminal {
     fn scroll_without_publish(&mut self, scroll: Scroll) -> bool {
         let before = self.term.grid().display_offset();
         self.term.scroll_display(scroll);
-        self.term.grid().display_offset() != before
+        let changed = self.term.grid().display_offset() != before;
+        if changed {
+            self.bump_content_revision();
+        }
+        changed
     }
 
     /// How far the viewport is scrolled into the scrollback, in rows.
@@ -900,6 +960,8 @@ impl DisplayOnlyTerminal {
         if self.content.pin_rows > 0 {
             return None;
         }
+        let anchor = self.anchor_at(at)?;
+        debug_assert_eq!(self.revalidate_anchor(anchor), Some(at));
         self.urls.refresh(&self.term);
         let display_offset = grid_i32(self.display_offset());
         let span = self.urls.url_at(grid_i32(at.row) - display_offset, at.col)?;
@@ -916,6 +978,19 @@ impl DisplayOnlyTerminal {
             })
             .collect();
         Some(HoveredLink { kind: span.kind, target: span.url.clone(), rows })
+    }
+
+    /// Convert a viewport row to its absolute scrollback row.
+    fn absolute_line_for_viewport_row(&self, row: usize) -> Option<usize> {
+        if row >= self.content.rows.len() {
+            return None;
+        }
+        let line = self.grid_line_for_viewport_row(row);
+        if line < 0 {
+            self.history_size().checked_sub(usize::try_from(line.unsigned_abs()).ok()?)
+        } else {
+            self.history_size().checked_add(usize::try_from(line).ok()?)
+        }
     }
 
     /// The grid line a viewport row reads from.
@@ -954,6 +1029,10 @@ impl DisplayOnlyTerminal {
         let pin_rows = compute_pin_rows(screen_lines);
         align_pin_rows_to_logical_lines(&self.term, pin_rows, self.cursor_line(), screen_lines)
             .min(screen_lines)
+    }
+
+    fn bump_content_revision(&mut self) {
+        self.content_revision = self.content_revision.wrapping_add(1);
     }
 
     /// Converts the Alacritty display viewport into fixed-width display rows,
@@ -1528,6 +1607,57 @@ mod tests {
             terminal.link_at(ViewportPoint { row: 0, col: 6 }).expect("path after the scroll");
         assert_eq!(scrolled.target, "./build.sh");
         assert_eq!(scrolled.rows, vec![SelectionSpan { row: 0, start_col: 4, end_col: 13 }]);
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Content anchors expire after a content change]]
+    #[test]
+    fn content_revision_bumps_for_feed_scroll_and_resize() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 5);
+
+        let after_setup = terminal.content_revision();
+        terminal.feed_output(b"\r\nl06");
+        assert_eq!(terminal.content_revision(), after_setup + 1);
+
+        let after_feed = terminal.content_revision();
+        assert!(terminal.scroll(Scroll::Delta(1)));
+        assert_eq!(terminal.content_revision(), after_feed + 1);
+
+        let after_scroll = terminal.content_revision();
+        terminal.resize(21, 3);
+        assert_eq!(terminal.content_revision(), after_scroll + 1);
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Content anchors expire after a content change]]
+    #[test]
+    fn content_revision_stays_stable_without_a_content_change() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 5);
+        let revision = terminal.content_revision();
+
+        let _ = terminal.content();
+        assert_eq!(terminal.dimensions(), (20, 3));
+        terminal.begin_selection(ViewportPoint { row: 0, col: 0 }, SelectionMode::Cell);
+        terminal.end_selection_drag();
+        terminal.clear_selection();
+        terminal.set_split_scroll_eligibility(pinned());
+
+        assert_eq!(terminal.content_revision(), revision);
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Content anchors expire after a content change]]
+    #[test]
+    fn content_anchor_round_trips_until_the_content_revision_changes() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 5);
+        assert!(terminal.scroll(Scroll::Delta(2)));
+        let clicked = ViewportPoint { row: 1, col: 1 };
+
+        let anchor = terminal.anchor_at(clicked).expect("visible click becomes an anchor");
+        assert_eq!(anchor.abs_row, 1);
+        assert_eq!(terminal.revalidate_anchor(anchor), Some(clicked));
+
+        let revision = terminal.content_revision();
+        terminal.feed_output(b"\r\nl06");
+        assert_ne!(terminal.content_revision(), revision);
+        assert_eq!(terminal.revalidate_anchor(anchor), None);
     }
 
     // @lat: [[test#GPUI Terminal Viewport#Scrolling paints scrollback and returns to the live bottom]]

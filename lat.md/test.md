@@ -5645,6 +5645,12 @@ Unit tests for the live client's terminal viewport —  and the pointer mapping 
 
 These are the reachability tests for : the pure modules already had unit tests, so what is asserted here is that the *running* client's snapshot and pointer path actually consume them.
 
+### Content anchors expire after a content change
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#content_revision]] advances when PTY bytes are fed, a viewport scroll moves, or the grid resizes; reads and selection-only state stay stable.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#anchor_at]] stores a clicked cell as an absolute row and column at that revision, and [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#revalidate_anchor]] maps it back only while the revision still matches. Focused unit tests prove every trigger, stable non-content operations, a valid round trip, and stale delivery refusal.
+
 ### Scrolling paints scrollback and returns to the live bottom
 
  moves the display offset and rebuilds the snapshot from it, so a paged-up viewport paints scrollback rows; scrolling past the oldest row reports no movement, and `Scroll::Bottom` restores the live tail.
