@@ -256,7 +256,11 @@ echo "PHASE 3 PASS: the client was killed and the server cold-restarted"
 CLAIMS_BEFORE=$(count_log "claimed a cold-restart snapshot")
 REPLAYS_BEFORE=$(count_log "replaying a cold-restart snapshot")
 REQUESTS_BEFORE=$(count_log "requested a restored session")
-CREATED_BEFORE=$(count_log "opened a new tab")
+# Every created session is adopted, tab or pane; only a tab also reaches the
+# strip. The saved layout is one split tab plus one plain tab, so the replay
+# must create three sessions and open exactly two tabs.
+CREATED_BEFORE=$(count_log "adopting a freshly created session")
+TABS_BEFORE=$(count_log "opened a new tab")
 MOVES_BEFORE_REPLAY=$(count_log "moved a session into another workspace region")
 launch_client
 wait_for_log_growth "claimed a cold-restart snapshot" "$CLAIMS_BEFORE" 20 \
@@ -273,12 +277,15 @@ while [ "$(count_log "requested a restored session")" -lt $(( REQUESTS_BEFORE + 
     fi
     sleep 0.3
 done
-while [ "$(count_log "opened a new tab")" -lt $(( CREATED_BEFORE + 3 )) ]; do
+while [ "$(count_log "adopting a freshly created session")" -lt $(( CREATED_BEFORE + 3 )) ]; do
     if [ $(( "$(date +%s)" - started )) -ge 25 ]; then
         fail "PHASE 4: the replay created fewer than three sessions"
     fi
     sleep 0.3
 done
+REPLAY_TABS=$(( $(count_log "opened a new tab") - TABS_BEFORE ))
+[ "$REPLAY_TABS" -eq 2 ] \
+    || fail "PHASE 4: the replay opened $REPLAY_TABS tabs for two saved tabs"
 # The server's own account of the same event: three brand-new PTYs after the
 # restart, which is the replay actually reaching it rather than the client
 # merely logging its intent.
@@ -289,7 +296,7 @@ while [ "$(count_server_log "created new PTY session")" -lt $(( PTYS_BEFORE + 3 
     fi
     sleep 0.3
 done
-echo "PHASE 4 PASS: the snapshot was claimed and all three saved panes were relaunched"
+echo "PHASE 4 PASS: three saved panes relaunched as $REPLAY_TABS tabs and one split pane"
 
 # ── Phase 5: geometry and pane tree came back ─────────────────────
 focus
@@ -307,8 +314,8 @@ MOVES_AFTER_REPLAY=$(count_log "moved a session into another workspace region")
 # each restored pane takes the session its own launch created, in launch order.
 mapfile -t REQUESTED_PANES < <(plain_log | grep "requested a restored session" \
     | tail -n "$REPLAY_PANES" | sed -n 's/.*pane=\([0-9]*\).*/\1/p')
-mapfile -t CREATED_SESSIONS < <(plain_log | grep "opened a new tab" \
-    | tail -n "$REPLAY_PANES" | sed -n 's/.*session=\([^ ]*\).*/\1/p')
+mapfile -t CREATED_SESSIONS < <(plain_log | grep "adopting a freshly created session" \
+    | tail -n "$REPLAY_PANES" | sed -n 's/.*session_id=\([^ ]*\).*/\1/p')
 mapfile -t ADOPTED_PAIRS < <(plain_log | grep "pane adopted a session" \
     | tail -n "$REPLAY_PANES" \
     | sed -n 's/.*session_id=\([^ ]*\).*pane=\([0-9]*\).*/\1 \2/p')

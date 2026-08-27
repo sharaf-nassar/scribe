@@ -142,6 +142,13 @@ pub struct TabAddress {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TabSessions {
     regions: Vec<WorkspaceTabs>,
+    /// Sessions inside a tab's pane tree. They are live sessions, but never
+    /// strip entries: only the tab's root session appears in `regions`.
+    pane_sessions: std::collections::HashMap<SessionId, WorkspaceId>,
+    /// Arrival order for all live sessions. Restore bindings use the same FIFO
+    /// order as `CreateSession` answers, so a split pane cannot be reordered
+    /// behind a later strip tab by the region-partitioned render model.
+    live_order: Vec<SessionId>,
 }
 
 impl TabSessions {
@@ -178,7 +185,7 @@ impl TabSessions {
     /// empty strip is an empty region list.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
+        self.regions.is_empty() && self.pane_sessions.is_empty()
     }
 
     /// Borrow one region's tabs.
@@ -193,10 +200,55 @@ impl TabSessions {
         self.region(workspace_id).and_then(WorkspaceTabs::active_session)
     }
 
-    /// The workspace a session's tab is filed under, if the session is open.
+    /// The workspace a session is filed under, tab or pane, if it is open.
     #[must_use]
     pub fn workspace_of(&self, session_id: SessionId) -> Option<WorkspaceId> {
+        self.region_of_tab(session_id).or_else(|| self.pane_sessions.get(&session_id).copied())
+    }
+
+    /// The workspace `session_id` holds a *strip tab* in, if it holds one.
+    ///
+    /// The narrow half of [`Self::workspace_of`]: a session inside a tab's pane
+    /// tree is open and has a workspace, but no tab of its own.
+    #[must_use]
+    pub fn region_of_tab(&self, session_id: SessionId) -> Option<WorkspaceId> {
         self.entries().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
+    }
+
+    /// Every live session, including panes that belong to a strip tab.
+    #[must_use]
+    pub fn live_session_ids(&self) -> Vec<SessionId> {
+        self.live_order
+            .iter()
+            .copied()
+            .filter(|session_id| self.workspace_of(*session_id).is_some())
+            .collect()
+    }
+
+    /// Record a session that belongs inside a tab's pane tree rather than in
+    /// the strip. The IPC reader calls this for a FIFO-matched pane create and
+    /// reconnect seeds it from the server's per-tab pane trees.
+    ///
+    /// The pane trees are authoritative: a session they name gives up any strip
+    /// entry it had, so a `SessionList` that arrived before the tree cannot
+    /// leave the same session showing as both a tab and a pane.
+    pub fn insert_pane(&mut self, session_id: SessionId, workspace_id: WorkspaceId) {
+        if !self.pane_sessions.contains_key(&session_id) {
+            self.remove(session_id);
+        }
+        self.pane_sessions.insert(session_id, workspace_id);
+        self.record_live_session(session_id);
+    }
+
+    /// Turn a pane session into its region's newest strip tab.
+    ///
+    /// The reverse of [`Self::insert_pane`], for the one case that needs it: the
+    /// session a tab was keyed by exits while its split panes keep running, so a
+    /// survivor has to become the tab or the strip loses every one of them.
+    pub fn promote_pane(&mut self, session_id: SessionId, shell_name: String) -> bool {
+        let Some(workspace_id) = self.pane_sessions.remove(&session_id) else { return false };
+        self.push(TabEntry::new(session_id, workspace_id, shell_name));
+        true
     }
 
     /// Fold an authoritative `SessionList` into the strip, keeping the order the
@@ -244,12 +296,23 @@ impl TabSessions {
         for region in &mut self.regions {
             region.tabs = region.tabs.iter().filter_map(refreshed).collect();
         }
+        self.pane_sessions
+            .retain(|session_id, _| incoming.iter().any(|fresh| fresh.session_id == *session_id));
         for fresh in incoming {
-            if self.entries().any(|tab| tab.session_id == fresh.session_id) {
+            if self.pane_sessions.contains_key(&fresh.session_id)
+                || self.entries().any(|tab| tab.session_id == fresh.session_id)
+            {
                 continue;
             }
+            self.record_live_session(fresh.session_id);
             self.push(fresh);
         }
+        let live: std::collections::HashSet<SessionId> = self
+            .entries()
+            .map(|tab| tab.session_id)
+            .chain(self.pane_sessions.keys().copied())
+            .collect();
+        self.live_order.retain(|session_id| live.contains(session_id));
         // Every region is re-pointed, not just the ones that already existed:
         // the append pass shows each tab it pushes (correct for a user opening
         // one, wrong for a rebuild), so a region the list introduces has to fall
@@ -263,7 +326,10 @@ impl TabSessions {
         }
         self.prune_empty();
         attached
-            .filter(|id| self.entries().any(|tab| tab.session_id == *id))
+            .filter(|id| {
+                self.entries().any(|tab| tab.session_id == *id)
+                    || self.pane_sessions.contains_key(id)
+            })
             .or_else(|| self.regions.first().and_then(WorkspaceTabs::active_session))
     }
 
@@ -271,14 +337,19 @@ impl TabSessions {
     /// legacy client's behaviour of switching to a freshly created tab.
     ///
     /// Returns `false` — leaving the strip untouched — when the session is
-    /// already open. The server re-announces `SessionCreated` as its
-    /// acknowledgement of every `AttachSessions`, so a caller that attached on
-    /// each announcement would loop forever; this makes the insert the only
-    /// event that means "a new tab appeared".
+    /// already open, as a tab *or* as a pane inside one. The server re-announces
+    /// `SessionCreated` as its acknowledgement of every `AttachSessions`, so a
+    /// caller that attached on each announcement would loop forever; this makes
+    /// the insert the only event that means "a new tab appeared". Focusing a
+    /// split pane attaches it, so without the pane half of that guard the echo
+    /// would promote the split back into the strip the frame after it was made.
     pub fn insert_active(&mut self, entry: TabEntry) -> bool {
-        if self.entries().any(|tab| tab.session_id == entry.session_id) {
+        if self.pane_sessions.contains_key(&entry.session_id)
+            || self.entries().any(|tab| tab.session_id == entry.session_id)
+        {
             return false;
         }
+        self.record_live_session(entry.session_id);
         self.push(entry);
         true
     }
@@ -303,6 +374,10 @@ impl TabSessions {
     /// wins, else the previous one" rule is just a clamp inside that region and
     /// no strip-adjacent tab from another region is reachable.
     pub fn remove(&mut self, session_id: SessionId) -> Option<SessionId> {
+        if self.pane_sessions.remove(&session_id).is_some() {
+            self.live_order.retain(|id| *id != session_id);
+            return None;
+        }
         let region = self
             .regions
             .iter_mut()
@@ -310,6 +385,7 @@ impl TabSessions {
         let index = region.tabs.iter().position(|tab| tab.session_id == session_id)?;
         let was_active = index == region.active;
         region.tabs.remove(index);
+        self.live_order.retain(|id| *id != session_id);
         if region.tabs.is_empty() {
             self.prune_empty();
             return None;
@@ -450,6 +526,13 @@ impl TabSessions {
     /// only thing that moves a session between regions is a pane in the target
     /// adopting it. A source region left empty is dropped.
     pub fn set_workspace(&mut self, session_id: SessionId, workspace_id: WorkspaceId) -> bool {
+        if let Some(source) = self.pane_sessions.get_mut(&session_id) {
+            if *source == workspace_id {
+                return false;
+            }
+            *source = workspace_id;
+            return true;
+        }
         let Some(source) = self
             .regions
             .iter_mut()
@@ -536,6 +619,12 @@ impl TabSessions {
             .iter_mut()
             .flat_map(|region| region.tabs.iter_mut())
             .find(|tab| tab.session_id == session_id)
+    }
+
+    fn record_live_session(&mut self, session_id: SessionId) {
+        if !self.live_order.contains(&session_id) {
+            self.live_order.push(session_id);
+        }
     }
 
     /// Drop regions that have run out of tabs, so an empty region can never be

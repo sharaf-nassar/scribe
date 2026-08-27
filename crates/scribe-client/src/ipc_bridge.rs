@@ -1110,8 +1110,10 @@ impl ActionCompletion {
 /// One `CreateSession` reply the IPC reader can claim from the ordered FIFO.
 #[derive(Debug, Clone)]
 pub enum PendingCreate {
-    Uncorrelated,
-    Correlated(ActionCompletion),
+    /// A new strip tab, optionally completing an agent action.
+    Tab(Option<ActionCompletion>),
+    /// A pane inside the active tab, never a strip tab.
+    Pane(Option<ActionCompletion>),
 }
 
 /// Outbound half of the bridge: the GPUI-side replacement for Zed's
@@ -1199,16 +1201,30 @@ impl IpcSink {
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
     /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn create_session(&self, launch: SessionLaunch) -> Result<(), SinkError> {
-        self.enqueue_create_session(launch, PendingCreate::Uncorrelated)
+        self.enqueue_create_session(launch, PendingCreate::Tab(None))
     }
 
-    /// Enqueue a session creation whose reply completes a correlated action.
+    /// Enqueue a strip-tab creation whose reply completes a correlated action.
     pub fn create_session_for_action(
         &self,
         launch: SessionLaunch,
         completion: ActionCompletion,
     ) -> Result<(), SinkError> {
-        self.enqueue_create_session(launch, PendingCreate::Correlated(completion))
+        self.enqueue_create_session(launch, PendingCreate::Tab(Some(completion)))
+    }
+
+    /// Enqueue a pane creation inside the active tab.
+    pub fn create_pane_session(&self, launch: SessionLaunch) -> Result<(), SinkError> {
+        self.enqueue_create_session(launch, PendingCreate::Pane(None))
+    }
+
+    /// Enqueue a pane creation whose reply completes a correlated action.
+    pub fn create_pane_session_for_action(
+        &self,
+        launch: SessionLaunch,
+        completion: ActionCompletion,
+    ) -> Result<(), SinkError> {
+        self.enqueue_create_session(launch, PendingCreate::Pane(Some(completion)))
     }
 
     fn enqueue_create_session(
@@ -2141,13 +2157,15 @@ mod tests {
         assert!(sink.claim_pending_create().is_none(), "no create is outstanding yet");
 
         sink.create_session(sample_launch()).unwrap();
+        sink.create_pane_session(sample_launch()).unwrap();
         sink.create_session_for_action(sample_launch(), sink.action_completion(41)).unwrap();
         // A clone shares the FIFO: the reader holds one, the GPUI view another.
         let reader = sink.clone();
-        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Uncorrelated)));
+        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Tab(None))));
+        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Pane(None))));
         assert!(matches!(
             reader.claim_pending_create(),
-            Some(PendingCreate::Correlated(completion)) if completion.correlation_id() == 41
+            Some(PendingCreate::Tab(Some(completion))) if completion.correlation_id() == 41
         ));
         assert!(reader.claim_pending_create().is_none(), "an attach echo must not claim a create");
     }

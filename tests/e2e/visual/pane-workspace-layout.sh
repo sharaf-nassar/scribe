@@ -239,6 +239,7 @@ echo "PHASE 0 PASS: client attached to session $SESSION (left-half ink $BASE_LEF
 # asks the server for and adopts, and a repaint of the window.
 SPLITS_BEFORE=$(count_log "split the focused pane")
 ADOPTS_BEFORE=$(count_log "pane adopted a session")
+TABS_BEFORE=$(count_log "opened a new tab")
 focus
 shot /output/01-before-split.png
 send_keys ctrl+shift+backslash
@@ -247,6 +248,9 @@ if ! wait_for_log_growth "split the focused pane" "$SPLITS_BEFORE" 15; then
 fi
 if ! wait_for_log_growth "pane adopted a session" "$ADOPTS_BEFORE" 20; then
     fail "PHASE 1 FAIL: the new pane never got a session from the server"
+fi
+if [ "$(count_log "opened a new tab")" -ne "$TABS_BEFORE" ]; then
+    fail "PHASE 1 FAIL: pane split inserted a strip tab"
 fi
 sleep 1.5
 focus
@@ -264,7 +268,7 @@ if [ "${HALVED:-0}" -lt 2 ]; then
     plain_client_log | grep -F "published a pane's grid size" | tail -10 || true
     fail "PHASE 1 FAIL: $HALVED panes were resized to half the window's columns (want 2)"
 fi
-echo "PHASE 1 PASS: ctrl+shift+backslash split the pane (+$SPLIT_DIFF px, both panes resized)"
+echo "PHASE 1 PASS: ctrl+shift+backslash split the pane without adding a strip tab (+$SPLIT_DIFF px, both panes resized)"
 
 # ── Phase 2: the new pane is focused and is its own terminal ──────
 # The split focuses the pane it created, which is the right-hand one, so the

@@ -100,19 +100,27 @@ log_count() {
     grep -cE "$1" "$CLIENT_LOG" 2>/dev/null || true
 }
 
-# Count differing pixels in one half of the terminal grid, excluding window
+# Count differing pixels on one side of the workspace divider, excluding window
 # chrome, pane borders, and the caller's bottom inset. The right pane body is
 # byte-identical across a background exit; routing checks keep the prompt rows.
+#
+# `$5` is where the vertical divider sits as a percentage of the window width,
+# because "half" only names the regions while the tree is one split. Stacking a
+# second region into the left column re-equalizes by leaf count, so the divider
+# moves to two thirds and a 50% crop reaches across it into the *left* column's
+# in-region tab bar — which repaints whenever that region loses a tab, and is
+# not what any of these assertions are about.
 grid_half_diff() {
-    local before="$1" after="$2" half="$3" bottom_inset="${4:-8}"
-    local half_w=$((WIN_W / 2))
+    local before="$1" after="$2" half="$3" bottom_inset="${4:-8}" divider_pct="${5:-50}"
+    local divider=$((WIN_W * divider_pct / 100))
     local crop_x=$((WIN_X + 8))
     local crop_y=$((WIN_Y + TITLEBAR_H + 8))
-    local crop_w=$((half_w - 16))
+    local crop_w=$((divider - 16))
     local crop_h=$((WIN_H - TITLEBAR_H - BOTTOM_BANDS_H - 8 - bottom_inset))
     local value
     if [ "$half" = "right" ]; then
-        crop_x=$((crop_x + half_w))
+        crop_x=$((WIN_X + divider + 8))
+        crop_w=$((WIN_W - divider - 16))
     fi
     value=$(compare -metric AE \
         \( "$before" -crop "${crop_w}x${crop_h}+${crop_x}+${crop_y}" +repage \) \
@@ -136,8 +144,11 @@ xdotool key Return
 sleep 0.8
 
 focus_window
+seed_tabs_before=$(log_count "opened a new tab")
 xdotool key --clearmodifiers ctrl+alt+backslash
 sleep 1.5
+[ "$(log_count "opened a new tab")" -gt "$seed_tabs_before" ] \
+    || fail "workspace split seed session did not create a strip tab"
 focus_window
 xdotool type --delay 30 "echo WORKSPACE-B"
 xdotool key Return
@@ -159,7 +170,7 @@ sleep 0.3
 xdotool key --clearmodifiers ctrl+alt+minus
 sleep 1.5
 wait_bar_state "ws-[0-9a-f]+:1"
-echo "PHASE 1 PASS: horizontal split created a lower region with a 1-tab bar"
+echo "PHASE 1 PASS: horizontal split created a lower region with a seeded strip tab"
 
 # Type into the bottom-left workspace before asserting tab growth.
 focus_window
@@ -197,8 +208,8 @@ echo "PHASE 3 PASS: clicking the lower bar's tab reached its session"
 # ── Phase 4: a background tab exit cannot steal window focus ───────
 # Give the right region a static, cursor-free frame, then schedule the selected
 # lower-region tab to exit and move focus right before its shell ends. The
-# focused half must remain pixel-identical while the lower region refocuses its
-# surviving sibling exactly once.
+# focused region must remain pixel-identical while the lower region falls back
+# onto its surviving sibling without any re-adoption loop.
 focus_window
 click_at "$((WIN_W * 3 / 4))" "$((WIN_H / 2))"
 xdotool type --delay 10 "printf '\\033[?25l'; clear; echo FOCUSED-RIGHT-STABLE"
@@ -216,19 +227,24 @@ capture_window /output/08b-focused-after-background-exit.png
 wait_bar_state "ws-[0-9a-f]+:1"
 focused_diff=$(grid_half_diff \
     /output/08a-focused-before-background-exit.png \
-    /output/08b-focused-after-background-exit.png right 64)
+    /output/08b-focused-after-background-exit.png right 64 67)
 [ "$focused_diff" -eq 0 ] \
     || fail "background exit changed $focused_diff pixels in the focused region"
 adopts_after=$(log_count "pane adopted a session")
-[ $((adopts_after - adopts_before)) -eq 1 ] \
-    || fail "background exit adopted $((adopts_after - adopts_before)) panes instead of one"
+# Every tab owns its own pane tree, so the region swaps onto the surviving
+# tab's already-populated tree instead of adopting that session into a shared
+# pane; a sibling whose tree has never been shown takes exactly one adoption.
+# What must never happen is a re-adoption loop, which is the signature of the
+# exit path leaving a dead session as the one reconciliation keeps placing.
+[ $((adopts_after - adopts_before)) -le 1 ] \
+    || fail "background exit adopted $((adopts_after - adopts_before)) panes, want at most one"
 sleep 2
 [ "$(log_count "pane adopted a session")" -eq "$adopts_after" ] \
     || fail "background exit kept re-adopting a pane after reconciliation"
 moves_now=$(log_count "$MOVE_RE")
 [ "$moves_now" -eq "$moves_after_splits" ] \
     || fail "a background tab exit re-filed a session across workspaces ($moves_after_splits -> $moves_now)"
-echo "PHASE 4 PASS: background exit kept $focused_diff focused-pixel changes and adopted its sibling once"
+echo "PHASE 4 PASS: background exit kept $focused_diff focused-pixel changes and fell back to its sibling"
 
 # ── Phase 5: attached last-tab collapse adopts no dead session ─────
 # Focus the lower region and exit its last tab. Region collapse must clear the

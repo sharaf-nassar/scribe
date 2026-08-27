@@ -212,7 +212,8 @@ use crate::{
         write_or_tear,
     },
     pane_shell::{
-        BoardReservation, ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome,
+        BoardReservation, ClosedPane, PanePlacement, PaneShell, SnapshotSources, WorkspaceInfo,
+        WorkspaceInfoOutcome,
     },
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::present_next_burst,
@@ -2894,7 +2895,7 @@ impl TerminalView {
             }
             TitlebarEvent::CloseTab(index) => {
                 if let Some(slot) = this.titlebar_slot(*index) {
-                    this.close_session(slot.session_id, "tab close dropped");
+                    this.close_tab(slot.session_id, ctx);
                 }
             }
             TitlebarEvent::Equalize => this.equalize_layout(ctx),
@@ -3432,7 +3433,7 @@ impl TerminalView {
                 let workspace_id = self.shell.focused_workspace_id(cx);
                 self.switch_tab(move |tabs| tabs.select(workspace_id, index), cx);
             }
-            LayoutAction::CloseTab => self.close_active_tab(),
+            LayoutAction::CloseTab => self.close_active_tab(cx),
             LayoutAction::NewWindow => {
                 self.open_new_window(None, cx);
             }
@@ -5635,7 +5636,7 @@ impl TerminalView {
     /// launch identity.
     fn sync_launch_bindings(&mut self) {
         let Ok(tabs) = self.shared.tabs.lock() else { return };
-        let live: Vec<SessionId> = tabs.entries().map(|tab| tab.session_id).collect();
+        let live = tabs.live_session_ids();
         drop(tabs);
         let retained: HashMap<SessionId, RetainedSessionMetadata> = {
             let ai = self.shared.ai.lock().ok();
@@ -5794,7 +5795,7 @@ impl TerminalView {
             self.restore.requested.push_back(binding.clone());
         }
         let size = sizes.get(&launch.pane_id).copied().unwrap_or(self.terminal_size);
-        let result = self.sink.create_session(SessionLaunch {
+        let session_launch = SessionLaunch {
             workspace_id: launch.workspace_id,
             size,
             cwd: launch.cwd.clone(),
@@ -5802,7 +5803,12 @@ impl TerminalView {
             ai_launch: launch.session_launch.ai_launch.clone(),
             shell_tool: launch.session_launch.shell_tool,
             launch_id: launch.launch_id.clone(),
-        });
+        };
+        let result = if launch.is_tab {
+            self.sink.create_session(session_launch)
+        } else {
+            self.sink.create_pane_session(session_launch)
+        };
         match result {
             Ok(()) => tracing::info!(
                 pane = launch.pane_id.raw(),
@@ -5854,7 +5860,12 @@ impl TerminalView {
         // holding the lock across it would stall the reader. A poisoned mutex
         // costs this snapshot its prompt rows, never the snapshot itself.
         let prompts = self.shared.ai.lock().map(|ai| ai.prompts.clone()).unwrap_or_default();
-        let snapshot = self.shell.restore_snapshot(window_id, &self.restore.bindings, &prompts, cx);
+        let tabs = self.shared.tabs.lock().map(|tabs| tabs.clone()).unwrap_or_default();
+        let snapshot = self.shell.restore_snapshot(
+            window_id,
+            &SnapshotSources { tabs: &tabs, bindings: &self.restore.bindings, prompts: &prompts },
+            cx,
+        );
         if !snapshot.is_replayable() {
             self.forget_restore_entry(window_id);
             return;
@@ -6170,24 +6181,20 @@ impl TerminalView {
     ) {
         let Ok(mut tabs) = self.shared.tabs.lock() else { return };
         let Some(session_id) = move_selection(&mut tabs) else { return };
+        let Some(workspace_id) = tabs.workspace_of(session_id) else { return };
         drop(tabs);
-        let mut adopted = false;
-        if let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx) {
-            self.shell.focus_pane(workspace_id, pane, cx);
-        } else if let Some((workspace_id, pane)) = self.tab_adoption_pane(session_id, cx) {
-            self.adopt_session(pane, session_id);
-            self.shell.focus_pane(workspace_id, pane, cx);
-            adopted = true;
+        // Tabs own whole pane trees. Switching never adopts one tab into the
+        // outgoing tab's focused pane: it swaps to the selected tree and
+        // streams every pane in it.
+        let sessions = self.shell.show_tab(workspace_id, session_id, cx);
+        let focused = self.shell.focused_session(cx);
+        for pane_session in sessions.iter().copied().filter(|id| Some(*id) != focused) {
+            self.stream_session(pane_session, cx);
         }
-        // Resolve the incoming session's grid only after it occupies its pane:
-        // prompt chrome is per tab, so the outgoing pane size is not a valid
-        // attach fallback. Attach still precedes the publish below, so any
-        // remaining Resize + RequestSnapshot stays authorised on the ordered
-        // channel.
-        self.attach(session_id, cx);
-        if adopted {
-            self.publish_pane_sizes(cx);
+        if let Some(focused) = focused {
+            self.attach(focused, cx);
         }
+        self.publish_pane_sizes(cx);
         // A tab switch moves the focused pane, which the server relays to PTY
         // applications as a CSI focus event — reported here rather than on the
         // next tick so the switched-to pane learns about it immediately.
@@ -6221,7 +6228,7 @@ impl TerminalView {
             self.shared.tabs.lock().ok().and_then(|tabs| tabs.workspace_of(session_id));
         match tab_adoption_target(
             workspace_id,
-            workspace_id.is_some_and(|workspace_id| self.shell.has_region(workspace_id)),
+            workspace_id.is_some_and(|workspace_id| self.shell.has_region(workspace_id, cx)),
         )? {
             TabAdoptionTarget::Own(workspace_id) => {
                 Some((workspace_id, self.shell.region_focused_pane(workspace_id)?))
@@ -6318,12 +6325,17 @@ impl TerminalView {
     /// to answer this from its own window-global cursor, which is a second copy
     /// of the same fact and could name a tab in a region the window had since
     /// focused away from.
-    fn close_active_tab(&self) {
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
-            return;
-        };
-        self.close_session(session_id, "close tab dropped");
+    fn close_active_tab(&self, cx: &App) {
+        let workspace_id = self.shell.focused_workspace_id(cx);
+        let Some(tab) = self.shell.region_shown_session(workspace_id) else { return };
+        self.close_tab(tab, cx);
+    }
+
+    /// Close every pane session owned by one strip tab.
+    fn close_tab(&self, tab: SessionId, cx: &App) {
+        for session_id in self.shell.close_tab_sessions(tab, cx) {
+            self.close_session(session_id, "close tab dropped");
+        }
     }
 
     /// Close `session_id`, logging the request so UI and shortcut paths share
@@ -6503,7 +6515,7 @@ impl TerminalView {
             return false;
         }
         tracing::info!(?direction, panes = self.shell.pane_count(cx), "split the focused pane");
-        let requested = self.request_pane_session(cwd, action_completion, cx);
+        let requested = self.request_pane_session(cwd, action_completion, true, cx);
         self.after_layout_change(cx);
         requested
     }
@@ -6529,7 +6541,7 @@ impl TerminalView {
             }
             ClosedPane::LastPane => {
                 tracing::info!("close pane fell through to closing the last tab");
-                self.close_active_tab();
+                self.close_active_tab(cx);
             }
         }
     }
@@ -6615,7 +6627,7 @@ impl TerminalView {
         );
         // A new region is a fresh context, not a continuation of the source
         // pane, so it sends no CWD and the server's home fallback wins.
-        self.request_pane_session(None, None, cx);
+        self.request_pane_session(None, None, false, cx);
         self.after_layout_change(cx);
     }
 
@@ -6669,6 +6681,7 @@ impl TerminalView {
         &mut self,
         cwd: Option<PathBuf>,
         action_completion: Option<ActionCompletion>,
+        as_pane: bool,
         cx: &App,
     ) -> bool {
         let Some(workspace_id) = self.creating_workspace(cx) else {
@@ -6687,9 +6700,15 @@ impl TerminalView {
             shell_tool: None,
             launch_id,
         };
-        let result = match action_completion {
-            Some(completion) => self.sink.create_session_for_action(session_launch, completion),
-            None => self.sink.create_session(session_launch),
+        let result = match (as_pane, action_completion) {
+            (true, Some(completion)) => {
+                self.sink.create_pane_session_for_action(session_launch, completion)
+            }
+            (true, None) => self.sink.create_pane_session(session_launch),
+            (false, Some(completion)) => {
+                self.sink.create_session_for_action(session_launch, completion)
+            }
+            (false, None) => self.sink.create_session(session_launch),
         };
         match result {
             Ok(()) => true,
@@ -6710,8 +6729,10 @@ impl TerminalView {
             cx.notify();
             return;
         };
-        if let Ok(mut tabs) = self.shared.tabs.lock() {
-            tabs.show(session_id);
+        if let Some(tab) = self.shell.region_shown_session(self.shell.focused_workspace_id(cx))
+            && let Ok(mut tabs) = self.shared.tabs.lock()
+        {
+            tabs.show(tab);
         }
         self.attach(session_id, cx);
         self.report_focus();
@@ -7020,10 +7041,16 @@ impl TerminalView {
         // the reader happened to attach first: each region came back showing the
         // tab its `active_tab_index` named, and the strip has to agree or the
         // titlebar would highlight a tab that is not the one on screen.
-        if let Some(session_id) = self.shell.focused_session(cx)
-            && let Ok(mut tabs) = self.shared.tabs.lock()
-        {
-            tabs.show(session_id);
+        let shown: Vec<SessionId> = self
+            .shell
+            .region_workspaces(cx)
+            .into_iter()
+            .filter_map(|workspace_id| self.shell.region_shown_session(workspace_id))
+            .collect();
+        if let Ok(mut tabs) = self.shared.tabs.lock() {
+            for tab in shown {
+                tabs.show(tab);
+            }
         }
         // The pane holding the window's attached session keeps focus, so the
         // reader's own reattach and this rebuild agree on the active pane.
@@ -7094,11 +7121,19 @@ impl TerminalView {
         // answering `CreateWorkspace` therefore re-keys the split region before
         // its session is adopted below and moved into that server workspace.
         changed |= self.adopt_workspace_info(cx);
+        // A workspace split has one provisional pane waiting for its seed tab.
+        // Bind that FIFO answer before normal tab synchronization can create a
+        // tree in the source workspace it is about to leave.
+        if !self.shell.has_pending()
+            && let Ok(tabs) = self.shared.tabs.lock()
+        {
+            changed |= self.shell.sync_tabs(&tabs, cx);
+        }
         let (live, workspaces_with_tabs) = self.shared.tabs.lock().map_or_else(
             |_| (HashSet::new(), HashSet::new()),
             |tabs| {
                 (
-                    tabs.entries().map(|tab| tab.session_id).collect::<HashSet<SessionId>>(),
+                    tabs.live_session_ids().into_iter().collect::<HashSet<SessionId>>(),
                     tabs.regions()
                         .iter()
                         .map(|region| region.workspace_id)
@@ -7117,6 +7152,7 @@ impl TerminalView {
             for workspace_id in retired.closed_regions {
                 self.close_workspace(workspace_id);
             }
+            self.promote_pane_tabs(&retired.promoted_tabs);
             changed |= retired.changed;
         }
         // An attached region's last tab clears the reader-owned pointer before
@@ -7138,20 +7174,23 @@ impl TerminalView {
         // Let `fill_pending_panes` pair the FIFO launches and panes instead.
         if !self.restore.replaying
             && let Some(session_id) =
-                active.filter(|session| !self.shell.shown_sessions().contains(session))
+                active.filter(|session| !self.shell.shown_sessions(cx).contains(session))
         {
             // A split queued the pane that asked for this session; anything
             // else (a new tab, a reattach, a refocus after an exit) belongs in
             // the pane the user is looking at.
             if let Some(pane) = self.shell.take_pending(cx) {
-                self.adopt_session(pane, session_id);
+                self.adopt_session(pane, session_id, cx);
                 self.follow_session_to_region(pane, session_id, cx);
                 changed = true;
             } else if let Some((_, pane)) = self.tab_adoption_pane(session_id, cx) {
-                self.adopt_session(pane, session_id);
+                self.adopt_session(pane, session_id, cx);
                 self.follow_session_to_region(pane, session_id, cx);
                 changed = true;
             }
+        }
+        if let Ok(tabs) = self.shared.tabs.lock() {
+            changed |= self.shell.sync_tabs(&tabs, cx);
         }
         changed |= self.fill_empty_region_panes(cx);
         changed |= self.fill_pending_panes(cx);
@@ -7161,37 +7200,68 @@ impl TerminalView {
         }
     }
 
-    /// Hand each surviving empty pane an unshown tab of its own workspace.
+    /// Hand each empty pane the session of the tab whose tree it belongs to.
     ///
-    /// A region whose only pane's session exited keeps that pane when its
-    /// workspace still has tabs ([`PaneShell::retain_sessions`]); this is the
-    /// pass that fills it back in, strictly workspace-scoped so a refill can
-    /// never move a tab between regions. Streaming (attach + subscribe) is
-    /// done without touching the active session, because the refilled region
-    /// may not be the one the user is typing in.
+    /// A tab's tree exists as soon as the strip names the tab, one frame before
+    /// its session is placed, and a region whose shown tab's session exited
+    /// swaps onto a sibling tab whose tree is likewise still empty
+    /// ([`PaneShell::sync_tabs`]). Both are filled here, tab-scoped so a refill
+    /// can never paint one tab's session into another tab's pane. Streaming
+    /// (attach + subscribe) is done without touching the active session,
+    /// because the refilled region may not be the one the user is typing in.
     fn fill_empty_region_panes(&mut self, cx: &mut Context<Self>) -> bool {
         let empties = self.shell.empty_unpending_panes(cx);
         if empties.is_empty() {
             return false;
         }
-        let entries: Vec<(WorkspaceId, SessionId)> = self.shared.tabs.lock().map_or_else(
-            |_| Vec::new(),
-            |tabs| tabs.entries().map(|tab| (tab.workspace_id, tab.session_id)).collect(),
-        );
+        let live: HashSet<SessionId> = self
+            .shared
+            .tabs
+            .lock()
+            .map_or_else(|_| HashSet::new(), |tabs| tabs.live_session_ids().into_iter().collect());
         let mut changed = false;
-        for (workspace_id, pane) in empties {
-            let shown = self.shell.shown_sessions();
-            let refill = entries
-                .iter()
-                .find(|(tab_ws, session)| *tab_ws == workspace_id && !shown.contains(session))
-                .map(|(_, session)| *session);
-            let Some(session_id) = refill else { continue };
-            self.adopt_session(pane, session_id);
-            self.stream_session(session_id, cx);
-            tracing::info!(%session_id, %workspace_id, "refilled an emptied pane from its workspace's tabs");
+        for (workspace_id, tab, pane) in empties {
+            if !live.contains(&tab) || self.shell.shown_sessions(cx).contains(&tab) {
+                continue;
+            }
+            self.adopt_session(pane, tab, cx);
+            self.stream_session(tab, cx);
+            tracing::info!(session = %tab, %workspace_id, "refilled an emptied pane from its own tab");
             changed = true;
         }
         changed
+    }
+
+    /// Give a re-anchored tab its strip entry back.
+    ///
+    /// A tab is keyed by the session it opened with; when that session exits
+    /// while its splits keep running, [`PaneShell::retain_sessions`] re-anchors
+    /// the tab onto a surviving pane and the strip has to show that pane as the
+    /// tab, or every session in that tree becomes unreachable.
+    fn promote_pane_tabs(&self, promoted: &[SessionId]) {
+        if promoted.is_empty() {
+            return;
+        }
+        let named: Vec<(SessionId, String)> = self.shared.chrome_metadata.lock().map_or_else(
+            |_| Vec::new(),
+            |metadata| {
+                promoted
+                    .iter()
+                    .map(|session_id| {
+                        (
+                            *session_id,
+                            metadata.shell_name(*session_id).unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            },
+        );
+        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
+        for (session_id, shell_name) in named {
+            if tabs.promote_pane(session_id, shell_name) {
+                tracing::info!(session = %session_id, "a split pane took over its tab");
+            }
+        }
     }
 
     /// Hand every still-queued pane one of the sessions that has arrived but is
@@ -7214,13 +7284,13 @@ impl TerminalView {
         }
         let mut changed = false;
         loop {
-            let shown = self.shell.shown_sessions();
+            let assigned = self.shell.assigned_sessions();
             let unshown = self.shared.tabs.lock().ok().and_then(|tabs| {
-                tabs.entries().map(|tab| tab.session_id).find(|id| !shown.contains(id))
+                tabs.live_session_ids().into_iter().find(|id| !assigned.contains(id))
             });
             let Some(session_id) = unshown else { break };
             let Some(pane) = self.shell.take_pending(cx) else { break };
-            self.adopt_session(pane, session_id);
+            self.adopt_session(pane, session_id, cx);
             self.follow_session_to_region(pane, session_id, cx);
             changed = true;
         }
@@ -7264,8 +7334,8 @@ impl TerminalView {
     }
 
     /// Show `session_id` in `pane`, streaming it from now on.
-    fn adopt_session(&mut self, pane: PaneId, session_id: SessionId) {
-        if let Some(displaced) = self.shell.assign_session(pane, session_id) {
+    fn adopt_session(&mut self, pane: PaneId, session_id: SessionId, cx: &App) {
+        if let Some(displaced) = self.shell.assign_session(pane, session_id, cx) {
             tracing::debug!(%displaced, pane = pane.raw(), "pane switched session");
         }
         if let Ok(mut attached) = self.shared.attached.lock() {
@@ -7747,7 +7817,7 @@ impl TerminalView {
 
     /// Arm a workspace-pill press without changing focus or selection.
     fn arm_workspace_drag(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
-        if !self.shell.has_region(workspace_id) {
+        if !self.shell.has_region(workspace_id, cx) {
             if self.workspace_drag_probe.enabled() {
                 tracing::warn!(
                     target: "scribe::drag_probe",
@@ -8124,7 +8194,7 @@ impl TerminalView {
         let Some(travel) = self.workspace_drag_motion.ghost_travel() else {
             return Vec::new();
         };
-        if !self.shell.has_region(travel.workspace_id) {
+        if !self.shell.has_region(travel.workspace_id, cx) {
             self.workspace_drag_motion.clear();
             return Vec::new();
         }
@@ -8173,7 +8243,7 @@ impl TerminalView {
             }
             return layers;
         };
-        if !self.shell.has_region(source_workspace_id) {
+        if !self.shell.has_region(source_workspace_id, cx) {
             self.workspace_drag.cancel();
             self.workspace_drag_bounds = None;
             self.workspace_drag_motion.clear();
@@ -15484,6 +15554,9 @@ async fn dispatch_server_message(
     match message {
         welcome @ ServerMessage::Welcome { .. } => on_welcome(ctx, registry, welcome),
         ServerMessage::SessionList { sessions, workspaces, workspace_tree } => {
+            if let Some(tree) = workspace_tree.as_ref() {
+                file_tree_pane_sessions(ctx, tree);
+            }
             park_server_topology(ctx, &sessions, workspace_tree, first_session_list);
             on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
         }
@@ -15766,6 +15839,23 @@ fn on_session_list(
     let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
     sync_tab_strip(ctx, sessions, attached)?;
     request_initial_session(ctx, sessions.len(), first_on_connection)
+}
+
+/// File every session the server's tree keeps inside a tab's pane split as a
+/// pane of that tab rather than a strip tab of its own.
+///
+/// Runs before the list rebuilds the strip, so a reconnect never resurfaces a
+/// split's session as a tab: the tree is the only record of which sessions the
+/// user put in panes, and `SessionList` cannot tell the two apart.
+fn file_tree_pane_sessions(ctx: &ReaderCtx, tree: &WorkspaceTreeNode) {
+    let panes = pane_shell::wire_tree_pane_sessions(tree);
+    if panes.is_empty() {
+        return;
+    }
+    let Ok(mut tabs) = ctx.tabs.lock() else { return };
+    for (session_id, workspace_id) in panes {
+        tabs.insert_pane(session_id, workspace_id);
+    }
 }
 
 /// Seed [`AiChrome`] from the server's view of every listed session.
@@ -16918,30 +17008,46 @@ fn open_created_tab(
     update_chrome_metadata(ctx, |metadata| {
         metadata.set_shell_name(session_id, shell_name.clone());
     });
-    let entry = TabEntry::new(session_id, workspace_id, shell_name);
-    let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
-    if added {
-        match ctx.sink.claim_pending_create() {
-            Some(PendingCreate::Uncorrelated) => adopt_created_session(ctx, session_id)?,
-            Some(PendingCreate::Correlated(completion)) => {
-                adopt_created_session(ctx, session_id)?;
-                if let Err(error) =
-                    completion.report(AgentActionOutcome::Completed, Some(session_id))
-                {
-                    tracing::warn!(
-                        %error,
-                        correlation_id = completion.correlation_id(),
-                        "session action completion dropped: IPC writer closed"
-                    );
-                }
-            }
-            None => attach_session(ctx, session_id)?,
+    let pending = ctx.sink.claim_pending_create();
+    // A split's answer is a pane inside the tab that asked for it, never a tab
+    // of its own: it is filed in the strip's pane set and adopted straight into
+    // the pending pane, and the "opened a new tab" insert below is skipped.
+    if let Some(PendingCreate::Pane(completion)) = pending {
+        if let Ok(mut tabs) = ctx.tabs.lock() {
+            tabs.insert_pane(session_id, workspace_id);
         }
-        // The tab strip is pixels only; log the insert so a scripted E2E can
-        // assert that an action really produced a session round trip.
-        tracing::info!(session = %session_id, "opened a new tab");
+        adopt_created_session(ctx, session_id)?;
+        report_created_session_completion(completion, session_id);
+        return Ok(());
     }
+    let entry = TabEntry::new(session_id, workspace_id, shell_name);
+    if !ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry)) {
+        return Ok(());
+    }
+    match pending {
+        Some(PendingCreate::Tab(completion)) => {
+            adopt_created_session(ctx, session_id)?;
+            report_created_session_completion(completion, session_id);
+        }
+        // An attach echo claims no create; the session is one this client did
+        // not ask for and has to attach to explicitly.
+        Some(PendingCreate::Pane(_)) | None => attach_session(ctx, session_id)?,
+    }
+    // The tab strip is pixels only; log the insert so a scripted E2E can prove
+    // a split's session never reached this path.
+    tracing::info!(session = %session_id, "opened a new tab");
     Ok(())
+}
+
+fn report_created_session_completion(completion: Option<ActionCompletion>, session_id: SessionId) {
+    let Some(completion) = completion else { return };
+    if let Err(error) = completion.report(AgentActionOutcome::Completed, Some(session_id)) {
+        tracing::warn!(
+            %error,
+            correlation_id = completion.correlation_id(),
+            "session action completion dropped: IPC writer closed"
+        );
+    }
 }
 
 /// Rebuild the tab strip from an authoritative `SessionList` and attach

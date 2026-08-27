@@ -48,6 +48,22 @@ xdotool windowfocus --sync "$WID" 2>/dev/null || true
 import -window "$WID" +repage /output/titlebar-compact.png
 assert_compact_centered_title /output/titlebar-compact.png 0 titlebar
 
+# A pane split changes the active tab's content tree, never the titlebar's tab
+# count. Keep this smoke in the titlebar path because an accidental strip insert
+# is visible here before any lower-region bar is created.
+tabs_before=$(grep -c "opened a new tab" "$CLIENT_LOG" 2>/dev/null || true)
+adopts_before=$(grep -c "pane adopted a session" "$CLIENT_LOG" 2>/dev/null || true)
+xdotool key --clearmodifiers ctrl+shift+backslash
+for _ in $(seq 1 40); do
+    adopts_now=$(grep -c "pane adopted a session" "$CLIENT_LOG" 2>/dev/null || true)
+    [ "$adopts_now" -gt "$adopts_before" ] && break
+    sleep 0.25
+done
+[ "${adopts_now:-0}" -gt "$adopts_before" ] || fail "pane split never adopted its session"
+sleep 0.5
+[ "$(grep -c "opened a new tab" "$CLIENT_LOG" 2>/dev/null || true)" -eq "$tabs_before" ] \
+    || fail "pane split inserted a titlebar tab"
+
 xdotool key --clearmodifiers ctrl+alt+minus
 for _ in $(seq 1 40); do
     grep -q "lower-region tab bars changed" "$CLIENT_LOG" 2>/dev/null && break

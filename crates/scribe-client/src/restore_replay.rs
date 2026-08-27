@@ -67,6 +67,9 @@ pub struct SessionLaunchValues {
 #[derive(Debug, Clone)]
 pub struct ReplayLaunch {
     pub placeholder_session_id: SessionId,
+    /// `true` for the root session that creates this restored strip tab;
+    /// remaining launches fill panes inside that tab.
+    pub is_tab: bool,
     pub workspace_id: WorkspaceId,
     pub pane_id: PaneId,
     pub cwd: Option<PathBuf>,
@@ -517,9 +520,12 @@ fn restore_tab_snapshot(
                 focused_pane_id = Some(pane_id);
             }
             queue_from_launch_record(
-                workspace.workspace_id,
-                placeholder_session_id,
-                pane_id,
+                ReplaySlot {
+                    workspace_id: workspace.workspace_id,
+                    placeholder_session_id,
+                    pane_id,
+                    is_tab: Some(placeholder_session_id) == tab_placeholder_session_id,
+                },
                 record,
                 context,
             );
@@ -551,13 +557,23 @@ fn restore_pane_tree(snapshot: &PaneSnapshot) -> PaneTreeNode {
     }
 }
 
-fn queue_from_launch_record(
+/// Where one replayed launch lands: the region and pane it rebuilds, the
+/// placeholder session id its `CreateSession` answer replaces, and whether it
+/// is the root that recreates its tab rather than a pane inside one.
+#[derive(Clone, Copy)]
+struct ReplaySlot {
     workspace_id: WorkspaceId,
     placeholder_session_id: SessionId,
     pane_id: PaneId,
+    is_tab: bool,
+}
+
+fn queue_from_launch_record(
+    slot: ReplaySlot,
     record: &LaunchRecord,
     context: &mut ReplayRebuildContext<'_>,
 ) {
+    let ReplaySlot { workspace_id, placeholder_session_id, pane_id, is_tab } = slot;
     let binding = LaunchBinding {
         launch_id: record.launch_id.clone(),
         kind: record.kind.clone(),
@@ -582,6 +598,7 @@ fn queue_from_launch_record(
     let session_launch = replay_launch_values(&command);
     context.launches.push_back(ReplayLaunch {
         placeholder_session_id,
+        is_tab,
         workspace_id,
         pane_id,
         cwd: binding.fallback_cwd.clone(),
@@ -805,6 +822,56 @@ mod tests {
         assert_eq!(reserialised.launches.len(), 1);
         assert_eq!(reserialised.launches[0].launch_id, "launch-a");
         assert!(reserialised.is_replayable());
+    }
+
+    #[test]
+    fn replay_marks_one_root_per_tab_and_panes_as_non_tabs() {
+        let window_id = WindowId::new();
+        let workspace_id = WorkspaceId::new();
+        let snapshot = WindowRestoreState {
+            version: 1,
+            window_id,
+            focused_workspace_id: workspace_id,
+            root: WorkspaceLayoutSnapshot::Leaf { workspace_id },
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id,
+                name: None,
+                accent_color: [0.0; 4],
+                active_tab_index: 1,
+                tabs: vec![
+                    TabSnapshot {
+                        focused_launch_id: "launch-b".to_owned(),
+                        pane_tree: PaneSnapshot::Split {
+                            direction: LayoutDirection::Horizontal,
+                            ratio: 0.5,
+                            first: Box::new(PaneSnapshot::Leaf {
+                                launch_id: "launch-a".to_owned(),
+                            }),
+                            second: Box::new(PaneSnapshot::Leaf {
+                                launch_id: "launch-b".to_owned(),
+                            }),
+                        },
+                    },
+                    TabSnapshot {
+                        focused_launch_id: "launch-c".to_owned(),
+                        pane_tree: PaneSnapshot::Leaf { launch_id: "launch-c".to_owned() },
+                    },
+                ],
+            }],
+            launches: vec![
+                shell_record("launch-a", "/tmp/a"),
+                shell_record("launch-b", "/tmp/b"),
+                shell_record("launch-c", "/tmp/c"),
+            ],
+        };
+
+        let rebuilt = prepare_replay(&snapshot);
+        assert_eq!(rebuilt.launches.len(), 3);
+        assert_eq!(
+            rebuilt.launches.iter().map(|launch| launch.is_tab).collect::<Vec<_>>(),
+            [true, false, true],
+            "only each tab root creates a strip entry during replay"
+        );
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Prompt state survives the snapshot round trip]]

@@ -3,10 +3,18 @@
 //! This is the seam that turns the ported split-tree models into something the
 //! shipped binary reaches. The window owns exactly one
 //! [`WorkspaceTree`] — the window-level split of the grid area into workspace
-//! regions — and one [`PaneTree`] per region, which splits that region into
-//! panes. Every pane hosts at most one session, and the focused pane of the
-//! focused region is the pane keystrokes, the status bar, and the tab strip
-//! follow.
+//! regions — and one [`PaneTree`] per *strip tab*, keyed by the session that
+//! tab was opened with. A region renders only its active tab's tree; the other
+//! tabs' trees stay dormant until they are selected. Every pane hosts at most
+//! one session, and the focused pane of the focused region is the pane
+//! keystrokes, the status bar, and the tab strip follow.
+//!
+//! Tabs owning trees is what makes the invariant *a pane split never adds a
+//! strip tab* hold: a split adds a pane to the tab's own tree and the session it
+//! asks for is filed in [`TabSessions::insert_pane`], never in the strip. It is
+//! also the shape the wire has always had — `WorkspaceTreeNode::Leaf` carries
+//! one `pane_trees` entry per `session_ids` entry — so a report and an adoption
+//! round-trip to the same layout.
 //!
 //! Two layers rather than one, because Scribe's chrome has always had two: a
 //! workspace region is a project-scoped column of the window with its own
@@ -31,10 +39,10 @@ use scribe_client::restore_replay::{
     PaneRestore, RebuiltWindow, ReplayLaunch, new_shell_binding, snapshot_window_restore,
 };
 use scribe_client::restore_state::{LaunchBinding, WindowRestoreState};
-use scribe_client::tab_session::TabSessions;
+use scribe_client::tab_session::{TabEntry, TabSessions};
 use scribe_client::workspace_drag::WorkspaceDropZone;
 use scribe_client::workspace_layout::{
-    WindowLayout, WorkspaceDivider, WorkspaceSlot, pane_tree_to_layout_node,
+    TabState, WindowLayout, WorkspaceDivider, WorkspaceSlot, pane_tree_to_layout_node,
 };
 use scribe_client::workspace_tree::WorkspaceTree;
 use scribe_common::{
@@ -120,16 +128,6 @@ pub enum WorkspaceInfoOutcome {
     Unclaimed,
 }
 
-/// What one call to `PaneShell::retire_pane` removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Retired {
-    /// A pane went away; the payload names the server-minted region that
-    /// collapsed with it, if any.
-    Pane(Option<WorkspaceId>),
-    /// Nothing could be removed — one pane in one region.
-    Nothing,
-}
-
 /// The result of dropping panes whose sessions have exited.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetiredPanes {
@@ -137,6 +135,9 @@ pub struct RetiredPanes {
     pub changed: bool,
     /// Server-minted regions that collapsed because their last pane went away.
     pub closed_regions: Vec<WorkspaceId>,
+    /// Pane sessions that became their tab's new anchor because the session the
+    /// tab was keyed by exited. The caller gives each one a strip entry.
+    pub promoted_tabs: Vec<SessionId>,
 }
 
 /// The scratch layout a restore snapshot is assembled into, plus the per-pane
@@ -149,14 +150,95 @@ struct SnapshotTarget<'a> {
     panes: &'a mut HashMap<PaneId, PaneRestore>,
 }
 
-/// The live per-session state a restore snapshot reads, keyed by session id.
+/// The live state a restore snapshot reads but the shell does not own: the
+/// window's tab strip, the restore runtime's launch bindings, and the
+/// IPC-written prompt history. All three are handed in together rather than
+/// looked up per pane.
+pub struct SnapshotSources<'a> {
+    pub tabs: &'a TabSessions,
+    pub bindings: &'a HashMap<SessionId, LaunchBinding>,
+    pub prompts: &'a HashMap<SessionId, PromptBarData>,
+}
+
+/// The per-tab tables a whole-shell rebuild assembles before installing them.
 ///
-/// Neither map lives on the shell — launch bindings sit on the restore runtime
-/// and prompt history in the IPC-written `AiChrome` — so both are handed in
-/// together rather than looked up per pane.
-struct SnapshotSources<'a> {
-    bindings: &'a HashMap<SessionId, LaunchBinding>,
-    prompts: &'a HashMap<SessionId, PromptBarData>,
+/// Both rebuild paths — the cold-restart replay and the hot-reconnect tree
+/// adoption — fill exactly these four, so they travel as one value rather than
+/// as four parallel locals threaded through two nested loops.
+#[derive(Default)]
+struct TabTrees {
+    trees: HashMap<SessionId, Entity<PaneTree>>,
+    tab_regions: HashMap<SessionId, WorkspaceId>,
+    shown_tabs: HashMap<WorkspaceId, SessionId>,
+    focused: HashMap<SessionId, PaneId>,
+}
+
+impl TabTrees {
+    fn insert(
+        &mut self,
+        workspace_id: WorkspaceId,
+        tab: SessionId,
+        tree: Entity<PaneTree>,
+        focused_pane: PaneId,
+    ) {
+        self.tab_regions.insert(tab, workspace_id);
+        self.focused.insert(tab, focused_pane);
+        self.trees.insert(tab, tree);
+    }
+
+    /// Mark `tab` as the tree `workspace_id`'s region renders.
+    fn show(&mut self, workspace_id: WorkspaceId, tab: SessionId) {
+        self.shown_tabs.insert(workspace_id, tab);
+    }
+
+    /// Rebuild one saved tab's tree, keyed by the placeholder session id its
+    /// replayed `CreateSession` answer replaces.
+    fn restore_tab(
+        &mut self,
+        workspace_id: WorkspaceId,
+        tab: &mut TabState,
+        shown: bool,
+        cx: &mut App,
+    ) {
+        let placeholder = tab.session_id;
+        let wanted_focus = tab.focused_pane;
+        let pane_layout = std::mem::replace(&mut tab.pane_layout, LayoutTree::new());
+        let tree = cx.new(|_| PaneTree::from_tree(pane_layout));
+        let panes = tree.read(cx);
+        let focused_pane = if panes.all_pane_ids().contains(&wanted_focus) {
+            wanted_focus
+        } else {
+            panes.initial_pane_id()
+        };
+        self.insert(workspace_id, placeholder, tree, focused_pane);
+        if shown {
+            self.show(workspace_id, placeholder);
+        }
+    }
+
+    /// Rebuild one tab's tree from the server's wire split, returning its
+    /// `(session, pane)` pairs in layout order.
+    ///
+    /// Focus lands on the pane showing the tab's own session, so a restored
+    /// split comes back typed-into where the user left it rather than always in
+    /// its leftmost pane.
+    fn adopt_tab(
+        &mut self,
+        workspace_id: WorkspaceId,
+        tab: SessionId,
+        pane_tree: &PaneTreeNode,
+        cx: &mut App,
+    ) -> Vec<(SessionId, PaneId)> {
+        let (root, pairs) = pane_tree_to_layout_node(pane_tree);
+        let Some(&(_, first_pane)) = pairs.first() else { return Vec::new() };
+        let focused_pane = pairs
+            .iter()
+            .find_map(|(session_id, pane)| (*session_id == tab).then_some(*pane))
+            .unwrap_or(first_pane);
+        let tree = cx.new(|_| PaneTree::from_root(root, focused_pane));
+        self.insert(workspace_id, tab, tree, focused_pane);
+        pairs
+    }
 }
 
 /// Build the slot edit that reapplies a restored region's name and accent.
@@ -179,11 +261,19 @@ pub struct BoardReservation {
 pub struct PaneShell {
     /// Window-level split into workspace regions.
     workspace: Entity<WorkspaceTree>,
-    /// One pane split tree per workspace region.
-    trees: HashMap<WorkspaceId, Entity<PaneTree>>,
-    /// The focused pane inside each region, so moving between regions restores
-    /// the pane the user was last in rather than jumping to the root.
-    focused: HashMap<WorkspaceId, PaneId>,
+    /// One pane split tree per strip tab, anchored by that tab's session.
+    trees: HashMap<SessionId, Entity<PaneTree>>,
+    /// The workspace each tab tree belongs to.
+    tab_regions: HashMap<SessionId, WorkspaceId>,
+    /// The tab each region is currently rendering.
+    shown_tabs: HashMap<WorkspaceId, SessionId>,
+    /// The focused pane in each tab tree, so switching tabs restores its own
+    /// pane focus rather than inheriting the tab it replaced.
+    focused: HashMap<SessionId, PaneId>,
+    /// A region that has not received its first strip-tab session yet.
+    pending_regions: HashMap<WorkspaceId, Entity<PaneTree>>,
+    /// Restored tab roots waiting for their FIFO `CreateSession` answers.
+    pending_tab_roots: HashMap<WorkspaceId, VecDeque<SessionId>>,
     /// Which session each live pane is showing.
     sessions: HashMap<PaneId, SessionId>,
     /// Panes waiting for a session. A split (or a new tab) asks the server to
@@ -218,11 +308,14 @@ impl PaneShell {
         let workspace_id = WorkspaceId::new();
         let workspace = cx.new(|_| WorkspaceTree::new(workspace_id, Some(accent)));
         let tree = cx.new(|_| PaneTree::new());
-        let root = tree.read(cx).initial_pane_id();
         Self {
             workspace,
-            trees: HashMap::from([(workspace_id, tree)]),
-            focused: HashMap::from([(workspace_id, root)]),
+            trees: HashMap::new(),
+            tab_regions: HashMap::new(),
+            shown_tabs: HashMap::new(),
+            focused: HashMap::new(),
+            pending_regions: HashMap::from([(workspace_id, tree)]),
+            pending_tab_roots: HashMap::new(),
             sessions: HashMap::new(),
             pending: VecDeque::new(),
             adopted_server_workspace: false,
@@ -308,24 +401,34 @@ impl PaneShell {
     /// are discarded rather than re-created.
     fn adopt_pending_workspace(&mut self, server_id: WorkspaceId, cx: &mut App) -> bool {
         while let Some(local_id) = self.pending_workspaces.pop_front() {
-            if self.trees.contains_key(&local_id) && self.rename_region(local_id, server_id, cx) {
+            if self.pending_regions.contains_key(&local_id)
+                && self.rename_region(local_id, server_id, cx)
+            {
                 return true;
             }
         }
         false
     }
 
-    /// Move a region — its slot, its pane tree, and its focused pane — from
-    /// `old_id` onto `new_id`, keeping the server-known set in step.
+    /// Move a region — its slot and every tab tree it owns — from `old_id` to
+    /// `new_id`, keeping server-known state in step.
     fn rename_region(&mut self, old_id: WorkspaceId, new_id: WorkspaceId, cx: &mut App) -> bool {
         if !self.workspace.update(cx, |tree, ctx| tree.set_workspace_id(old_id, new_id, ctx)) {
             return false;
         }
-        if let Some(tree) = self.trees.remove(&old_id) {
-            self.trees.insert(new_id, tree);
+        if let Some(tree) = self.pending_regions.remove(&old_id) {
+            self.pending_regions.insert(new_id, tree);
         }
-        if let Some(pane) = self.focused.remove(&old_id) {
-            self.focused.insert(new_id, pane);
+        if let Some(tab) = self.shown_tabs.remove(&old_id) {
+            self.shown_tabs.insert(new_id, tab);
+        }
+        if let Some(roots) = self.pending_tab_roots.remove(&old_id) {
+            self.pending_tab_roots.insert(new_id, roots);
+        }
+        for workspace_id in self.tab_regions.values_mut() {
+            if *workspace_id == old_id {
+                *workspace_id = new_id;
+            }
         }
         self.server_workspaces.remove(&old_id);
         self.server_workspaces.insert(new_id);
@@ -338,8 +441,8 @@ impl PaneShell {
     }
 
     /// Whether this window shows a region for `workspace_id`.
-    pub fn has_region(&self, workspace_id: WorkspaceId) -> bool {
-        self.trees.contains_key(&workspace_id)
+    pub fn has_region(&self, workspace_id: WorkspaceId, cx: &App) -> bool {
+        self.workspace.read(cx).find_workspace(workspace_id).is_some()
     }
 
     /// The region containing `pane`, or `None` once the pane has been closed.
@@ -382,15 +485,11 @@ impl PaneShell {
     ) -> WorkspaceTreeNode {
         match node {
             WorkspaceTreeNode::Leaf { workspace_id, .. } => {
-                let displayed = self.trees.get(&workspace_id).and_then(|tree| {
-                    pane_node_to_wire(tree.read(cx).tree().root(), &self.sessions)
-                });
-                let active = self
-                    .focused
-                    .get(&workspace_id)
-                    .and_then(|pane| self.sessions.get(pane))
-                    .copied();
-                let region = region_tab_payload(workspace_id, tabs, displayed, active);
+                let region = region_tab_payload(
+                    workspace_id,
+                    tabs,
+                    self.tab_pane_trees(workspace_id, tabs, cx),
+                );
                 WorkspaceTreeNode::Leaf {
                     workspace_id,
                     session_ids: region.session_ids,
@@ -407,6 +506,25 @@ impl PaneShell {
                 }
             }
         }
+    }
+
+    /// Serialize one region's tabs, in strip order, as each tab's own pane
+    /// split. A tab whose tree holds a single session serializes to a bare leaf.
+    fn tab_pane_trees(
+        &self,
+        workspace_id: WorkspaceId,
+        tabs: &TabSessions,
+        cx: &App,
+    ) -> Vec<Option<PaneTreeNode>> {
+        let Some(region) = tabs.region(workspace_id) else { return Vec::new() };
+        region
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let tree = self.trees.get(&tab.session_id)?;
+                pane_node_to_wire(tree.read(cx).tree().root(), &self.sessions)
+            })
+            .collect()
     }
 
     /// The focused workspace region's ID.
@@ -626,11 +744,81 @@ impl PaneShell {
             .collect()
     }
 
-    /// The session `workspace_id`'s region currently shows: its focused pane's
-    /// session. This is the tab an in-region bar highlights, independent of
-    /// which region owns the window's focus.
+    /// The strip tab `workspace_id`'s region is rendering.
     pub fn region_shown_session(&self, workspace_id: WorkspaceId) -> Option<SessionId> {
-        self.focused.get(&workspace_id).and_then(|pane| self.sessions.get(pane)).copied()
+        self.shown_tabs.get(&workspace_id).copied()
+    }
+
+    /// Synchronize the dormant per-tab trees with the reader-owned strip.
+    ///
+    /// A fresh tab claims the region's provisional root tree; every later tab
+    /// starts with its own one-pane tree. A restored tab root is re-keyed from
+    /// its placeholder to the FIFO-created session when the strip first sees it.
+    pub fn sync_tabs(&mut self, tabs: &TabSessions, cx: &mut App) -> bool {
+        let mut changed = false;
+        for region in tabs.regions() {
+            // A strip legitimately holds tabs for workspaces this window shows
+            // no region for — a reattach after reconnect, a strip that outlived
+            // its region — and those tabs own no tree here.
+            if self.workspace.read(cx).find_workspace(region.workspace_id).is_none() {
+                continue;
+            }
+            for tab in region.tabs() {
+                changed |= self.ensure_tab_tree(region.workspace_id, tab.session_id, cx);
+            }
+            if let Some(active) = region.active_session()
+                && self.tab_regions.get(&active) == Some(&region.workspace_id)
+                && self.shown_tabs.insert(region.workspace_id, active) != Some(active)
+            {
+                changed = true;
+            }
+        }
+        self.shown_tabs.retain(|workspace_id, tab| self.tab_regions.get(tab) == Some(workspace_id));
+        changed |= self.drop_closed_tab_trees(tabs, cx);
+        changed
+    }
+
+    /// Forget the tree of a tab the strip has dropped and whose panes have all
+    /// exited, so a closed tab cannot be rendered or reported again.
+    ///
+    /// A tab the strip has not caught up with yet keeps its tree: a fresh tab's
+    /// root pane has no session for a frame, and a restored tab's tree is still
+    /// keyed by the placeholder its `CreateSession` answer will replace.
+    fn drop_closed_tab_trees(&mut self, tabs: &TabSessions, cx: &App) -> bool {
+        let restoring: HashSet<SessionId> =
+            self.pending_tab_roots.values().flatten().copied().collect();
+        let stale: Vec<SessionId> = self
+            .trees
+            .keys()
+            .copied()
+            .filter(|tab| {
+                !restoring.contains(tab)
+                    && tabs.region_of_tab(*tab).is_none()
+                    && self.tree_sessions(*tab, cx).is_empty()
+            })
+            .collect();
+        for tab in &stale {
+            self.trees.remove(tab);
+            self.focused.remove(tab);
+            self.tab_regions.remove(tab);
+        }
+        self.shown_tabs.retain(|_, tab| self.tab_regions.contains_key(tab));
+        !stale.is_empty()
+    }
+
+    /// Show one tab's complete pane tree and return every pane session it owns.
+    pub fn show_tab(
+        &mut self,
+        workspace_id: WorkspaceId,
+        tab: SessionId,
+        cx: &mut App,
+    ) -> Vec<SessionId> {
+        self.ensure_tab_tree(workspace_id, tab, cx);
+        self.shown_tabs.insert(workspace_id, tab);
+        if self.focused_workspace_id(cx) != workspace_id {
+            self.workspace.update(cx, |tree, ctx| tree.set_focused_workspace(workspace_id, ctx));
+        }
+        self.tree_sessions(tab, cx)
     }
 
     /// `workspace_id`'s region accent, for the strip's per-workspace badges.
@@ -641,16 +829,14 @@ impl PaneShell {
             .map_or(FALLBACK_PANE_ACCENT, |slot| slot.accent_color)
     }
 
-    /// The focused pane of the focused region.
+    /// The focused pane of the focused region's active tab.
     pub fn focused_pane(&self, cx: &App) -> Option<PaneId> {
-        self.focused.get(&self.focused_workspace_id(cx)).copied()
+        self.region_focused_pane(self.focused_workspace_id(cx))
     }
 
-    /// The focused pane of `workspace_id`'s region, independent of which region
-    /// owns the window's focus. This is the pane one of that region's tabs
-    /// belongs in.
+    /// The focused pane of `workspace_id`'s active tab.
     pub fn region_focused_pane(&self, workspace_id: WorkspaceId) -> Option<PaneId> {
-        self.focused.get(&workspace_id).copied()
+        self.shown_tabs.get(&workspace_id).and_then(|tab| self.focused.get(tab)).copied()
     }
 
     /// The session the focused pane is showing.
@@ -658,12 +844,17 @@ impl PaneShell {
         self.focused_pane(cx).and_then(|pane| self.sessions.get(&pane).copied())
     }
 
-    /// Every session currently shown in a pane.
-    pub fn shown_sessions(&self) -> HashSet<SessionId> {
+    /// Every session in the trees the regions are currently rendering.
+    pub fn shown_sessions(&self, cx: &App) -> HashSet<SessionId> {
+        self.shown_tabs.values().flat_map(|tab| self.tree_sessions(*tab, cx)).collect()
+    }
+
+    /// Every session currently assigned to any tab tree, including dormant tabs.
+    pub fn assigned_sessions(&self) -> HashSet<SessionId> {
         self.sessions.values().copied().collect()
     }
 
-    /// The `(region, pane)` showing `session_id`, if any.
+    /// The `(region, pane)` showing `session_id`, if it is in an active tree.
     pub fn pane_for_session(
         &self,
         session_id: SessionId,
@@ -671,18 +862,39 @@ impl PaneShell {
     ) -> Option<(WorkspaceId, PaneId)> {
         let pane =
             self.sessions.iter().find_map(|(pane, sid)| (*sid == session_id).then_some(*pane))?;
-        let workspace = self.region_of(pane, cx)?;
-        Some((workspace, pane))
+        let tab = self.tab_for_pane(pane, cx)?;
+        let workspace = self.tab_regions.get(&tab).copied()?;
+        (self.shown_tabs.get(&workspace) == Some(&tab)).then_some((workspace, pane))
     }
 
     /// Point `pane` at `session_id`, returning the session it displaced.
-    pub fn assign_session(&mut self, pane: PaneId, session_id: SessionId) -> Option<SessionId> {
+    pub fn assign_session(
+        &mut self,
+        pane: PaneId,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Option<SessionId> {
+        if self.tab_for_pane(pane, cx).is_none()
+            && let Some(workspace_id) =
+                self.pending_regions.iter().find_map(|(workspace_id, tree)| {
+                    tree.read(cx).all_pane_ids().contains(&pane).then_some(*workspace_id)
+                })
+            && let Some(tree) = self.pending_regions.remove(&workspace_id)
+        {
+            self.trees.insert(session_id, tree);
+            self.tab_regions.insert(session_id, workspace_id);
+            self.shown_tabs.insert(workspace_id, session_id);
+            self.focused.entry(session_id).or_insert(pane);
+        }
         self.sessions.insert(pane, session_id).filter(|prev| *prev != session_id)
     }
 
     /// Focus `pane` inside `workspace_id`, making that region focused too.
     pub fn focus_pane(&mut self, workspace_id: WorkspaceId, pane: PaneId, cx: &mut App) {
-        self.focused.insert(workspace_id, pane);
+        if let Some(tab) = self.tab_for_pane(pane, cx) {
+            self.shown_tabs.insert(workspace_id, tab);
+            self.focused.insert(tab, pane);
+        }
         if self.focused_workspace_id(cx) != workspace_id {
             self.workspace.update(cx, |tree, ctx| tree.set_focused_workspace(workspace_id, ctx));
         }
@@ -697,96 +909,72 @@ impl PaneShell {
     /// been closed while their session was in flight.
     pub fn take_pending(&mut self, cx: &App) -> Option<PaneId> {
         while let Some(pane) = self.pending.pop_front() {
-            if self.region_of(pane, cx).is_some() {
+            if self.tab_for_pane(pane, cx).is_some()
+                || self
+                    .pending_regions
+                    .values()
+                    .any(|tree| tree.read(cx).all_pane_ids().contains(&pane))
+            {
                 return Some(pane);
             }
         }
         None
     }
 
-    /// Split the focused pane, moving focus onto the new one and queueing it for
-    /// the session the caller is about to request.
+    /// Split the focused pane in its active tab and queue the new pane.
     pub fn split_focused_pane(
         &mut self,
         direction: SplitDirection,
         cx: &mut App,
     ) -> Option<PaneId> {
         let workspace_id = self.focused_workspace_id(cx);
-        let focused = self.focused.get(&workspace_id).copied()?;
-        let tree = self.trees.get(&workspace_id)?.clone();
+        let tab = *self.shown_tabs.get(&workspace_id)?;
+        let focused = *self.focused.get(&tab)?;
+        let tree = self.trees.get(&tab)?.clone();
         let new_pane =
             tree.update(cx, |pane_tree, ctx| pane_tree.split(focused, direction, ctx))?;
-        self.focused.insert(workspace_id, new_pane);
+        self.focused.insert(tab, new_pane);
         self.pending.push_back(new_pane);
         Some(new_pane)
     }
 
-    /// Close the focused pane, or the whole region when it was the region's last
-    /// pane and other regions remain.
+    /// Close a focused pane. A tab's sole pane falls through to close-tab.
     pub fn close_focused_pane(&mut self, cx: &mut App) -> ClosedPane {
-        let Some(focused) = self.focused_pane(cx) else {
+        let Some(focused) = self.focused_pane(cx) else { return ClosedPane::LastPane };
+        let Some(tab) = self.tab_for_pane(focused, cx) else { return ClosedPane::LastPane };
+        let Some(tree) = self.trees.get(&tab).cloned() else { return ClosedPane::LastPane };
+        if tree.read(cx).all_pane_ids().len() <= 1 {
             return ClosedPane::LastPane;
-        };
-        let Retired::Pane(closed_region) = self.retire_pane(focused, cx) else {
-            return ClosedPane::LastPane;
-        };
+        }
+        let next = tree.read(cx).next_pane(focused);
+        tree.update(cx, |panes, ctx| panes.close(focused, ctx));
+        self.focused.insert(tab, next);
         ClosedPane::Removed {
             sessions: self.sessions.remove(&focused).into_iter().collect(),
-            closed_region,
+            closed_region: None,
         }
     }
 
-    /// Remove `pane` from the layout, collapsing its region when it was the
-    /// region's last pane and other regions remain.
-    ///
-    /// Returns [`Retired::Nothing`] when nothing could be removed — the window
-    /// is down to one pane in one region — which is the case both callers
-    /// translate into "close the tab instead".
-    fn retire_pane(&mut self, pane: PaneId, cx: &mut App) -> Retired {
-        let Some(workspace_id) = self.region_of(pane, cx) else { return Retired::Nothing };
-        let Some(pane_tree) = self.trees.get(&workspace_id).cloned() else {
-            return Retired::Nothing;
-        };
-        if pane_tree.read(cx).all_pane_ids().len() > 1 {
-            let next = pane_tree.read(cx).next_pane(pane);
-            pane_tree.update(cx, |panes, ctx| panes.close(pane, ctx));
-            self.refocus_after_close(workspace_id, pane, next);
-            return Retired::Pane(None);
-        }
-        if self.workspace.read(cx).layout().workspace_count() <= 1 {
-            return Retired::Nothing;
-        }
-        self.trees.remove(&workspace_id);
-        self.focused.remove(&workspace_id);
-        self.workspace.update(cx, |window, ctx| window.remove_workspace(workspace_id, ctx));
-        self.pending_workspaces.retain(|id| *id != workspace_id);
-        // Only a region the server minted can be closed on the server; one that
-        // is still waiting for its `WorkspaceInfo` names an id the server has
-        // never seen.
-        Retired::Pane(self.server_workspaces.take(&workspace_id))
+    /// Return every session in the tab that `session_id` identifies.
+    pub fn close_tab_sessions(&self, session_id: SessionId, cx: &App) -> Vec<SessionId> {
+        self.tree_sessions(session_id, cx)
     }
 
-    /// Move a region's focus off a pane that has just been closed.
-    fn refocus_after_close(&mut self, workspace_id: WorkspaceId, closed: PaneId, next: PaneId) {
-        if self.focused.get(&workspace_id) == Some(&closed) {
-            self.focused.insert(workspace_id, next);
-        }
-    }
-
-    /// Cycle focus to the next pane of the focused region in depth-first order.
+    /// Cycle focus inside the focused region's active tab.
     pub fn focus_next_pane(&mut self, cx: &mut App) -> Option<PaneId> {
         let workspace_id = self.focused_workspace_id(cx);
-        let focused = self.focused.get(&workspace_id).copied()?;
-        let tree = self.trees.get(&workspace_id)?;
+        let tab = *self.shown_tabs.get(&workspace_id)?;
+        let focused = *self.focused.get(&tab)?;
+        let tree = self.trees.get(&tab)?;
         let next = tree.read(cx).next_pane(focused);
         if next == focused {
             return None;
         }
-        self.focused.insert(workspace_id, next);
+        self.focused.insert(tab, next);
         Some(next)
     }
 
-    /// Move pane focus spatially inside the focused region.
+    /// Move pane focus spatially inside the focused region's active tab.
     pub fn focus_pane_in_direction(
         &mut self,
         direction: FocusDirection,
@@ -794,27 +982,21 @@ impl PaneShell {
         cx: &mut App,
     ) -> Option<PaneId> {
         let workspace_id = self.focused_workspace_id(cx);
-        let focused = self.focused.get(&workspace_id).copied()?;
+        let tab = *self.shown_tabs.get(&workspace_id)?;
+        let focused = *self.focused.get(&tab)?;
         let region = self.region_rect(workspace_id, viewport, cx)?;
-        let tree = self.trees.get(&workspace_id)?;
+        let tree = self.trees.get(&tab)?;
         let pane_tree = tree.read(cx);
         let rects = pane_tree.compute_rects(region);
         let next = pane_tree.find_pane_in_direction(focused, direction, &rects)?;
         if next == focused {
             return None;
         }
-        self.focused.insert(workspace_id, next);
+        self.focused.insert(tab, next);
         Some(next)
     }
 
-    /// Split the window into a new workspace region, focus it, and queue its
-    /// root pane for the session the caller is about to request.
-    ///
-    /// The region is minted client-local and immediately queued as awaiting a
-    /// server workspace, so the caller's `CreateWorkspace` and the answering
-    /// `WorkspaceInfo` re-key it through [`Self::apply_workspace_info`]. The
-    /// accent passed here is therefore a placeholder the server's own palette
-    /// colour replaces one round trip later.
+    /// Split the window into a new workspace region and reserve its first tab.
     pub fn split_workspace(
         &mut self,
         direction: SplitDirection,
@@ -825,12 +1007,86 @@ impl PaneShell {
             .workspace
             .update(cx, |tree, ctx| tree.split_workspace(direction, Some(accent), ctx))?;
         let tree = cx.new(|_| PaneTree::new());
-        let root = tree.read(cx).initial_pane_id();
-        self.trees.insert(new_id, tree);
-        self.focused.insert(new_id, root);
-        self.pending.push_back(root);
+        self.pending.push_back(tree.read(cx).initial_pane_id());
+        self.pending_regions.insert(new_id, tree);
         self.expect_server_workspace(new_id);
         Some(new_id)
+    }
+
+    /// Ensure `tab` owns a tree, claiming a provisional or restored root when
+    /// the reader has just learned the server session ID.
+    ///
+    /// Three sources, in order: a restored tab's tree, still keyed by the
+    /// placeholder its `CreateSession` answer replaces; the provisional tree a
+    /// fresh region reserved before it had a tab; else a new one-pane tree. The
+    /// tree's panes are left session-less — every pane takes its session through
+    /// [`PaneShell::assign_session`] so the caller can stream it and hand it any
+    /// restored prompt history.
+    fn ensure_tab_tree(&mut self, workspace_id: WorkspaceId, tab: SessionId, cx: &mut App) -> bool {
+        if self.trees.contains_key(&tab) {
+            return false;
+        }
+        let tree = self
+            .pending_tab_roots
+            .get_mut(&workspace_id)
+            .and_then(VecDeque::pop_front)
+            .and_then(|placeholder| {
+                self.tab_regions.remove(&placeholder);
+                let focus = self.focused.remove(&placeholder);
+                let tree = self.trees.remove(&placeholder)?;
+                if let Some(focus) = focus {
+                    self.focused.insert(tab, focus);
+                }
+                Some(tree)
+            })
+            .or_else(|| self.pending_regions.remove(&workspace_id))
+            .unwrap_or_else(|| cx.new(|_| PaneTree::new()));
+        let root = tree.read(cx).initial_pane_id();
+        self.focused.entry(tab).or_insert(root);
+        self.tab_regions.insert(tab, workspace_id);
+        self.trees.insert(tab, tree);
+        true
+    }
+
+    /// Install the per-tab tables a whole-shell rebuild assembled.
+    fn install_tab_trees(&mut self, tab_trees: TabTrees) {
+        self.trees = tab_trees.trees;
+        self.tab_regions = tab_trees.tab_regions;
+        self.shown_tabs = tab_trees.shown_tabs;
+        self.focused = tab_trees.focused;
+    }
+
+    /// Move a tab's tree, focus, and region from `old` onto `new`.
+    fn rekey_tab(&mut self, old: SessionId, new: SessionId) {
+        if let Some(tree) = self.trees.remove(&old) {
+            self.trees.insert(new, tree);
+        }
+        if let Some(focus) = self.focused.remove(&old) {
+            self.focused.insert(new, focus);
+        }
+        if let Some(workspace_id) = self.tab_regions.remove(&old) {
+            self.tab_regions.insert(new, workspace_id);
+        }
+        for tab in self.shown_tabs.values_mut() {
+            if *tab == old {
+                *tab = new;
+            }
+        }
+    }
+
+    fn tab_for_pane(&self, pane: PaneId, cx: &App) -> Option<SessionId> {
+        self.trees
+            .iter()
+            .find_map(|(tab, tree)| tree.read(cx).all_pane_ids().contains(&pane).then_some(*tab))
+    }
+
+    fn tree_sessions(&self, tab: SessionId, cx: &App) -> Vec<SessionId> {
+        self.trees
+            .get(&tab)
+            .into_iter()
+            .flat_map(|tree| tree.read(cx).all_pane_ids())
+            .filter_map(|pane| self.sessions.get(&pane).copied())
+            .collect()
     }
 
     /// Move focus to the neighbouring workspace region.
@@ -858,9 +1114,10 @@ impl PaneShell {
     ///
     /// `workspaces_with_tabs` names the workspaces the strip still holds tabs
     /// for. A region whose last pane dies while its workspace still has tabs
-    /// keeps that pane empty instead of collapsing — the reconcile refill
-    /// hands it the workspace's refocused tab — so a hidden tab can never be
-    /// orphaned by its shown sibling's exit.
+    /// keeps that tree empty instead of collapsing, so the region survives long
+    /// enough for [`Self::sync_tabs`] to swap it onto the tab the strip
+    /// refocused and a hidden tab can never be orphaned by its shown sibling's
+    /// exit.
     pub fn retain_sessions(
         &mut self,
         live: &HashSet<SessionId>,
@@ -874,42 +1131,82 @@ impl PaneShell {
             .collect();
         let mut retired = RetiredPanes::default();
         for pane in dead {
-            self.sessions.remove(&pane);
-            let survives = self.region_of(pane, cx).is_some_and(|workspace_id| {
-                workspaces_with_tabs.contains(&workspace_id)
-                    && self
-                        .trees
-                        .get(&workspace_id)
-                        .is_some_and(|tree| tree.read(cx).all_pane_ids().len() == 1)
-            });
-            if survives {
-                retired.changed = true;
-                continue;
-            }
-            // A sole pane in a sole region survives its session: the window
-            // keeps its empty pane and the next attach fills it back in.
-            if let Retired::Pane(Some(region)) = self.retire_pane(pane, cx) {
-                retired.closed_regions.push(region);
-            }
-            retired.changed = true;
+            self.retire_pane(pane, workspaces_with_tabs, &mut retired, cx);
         }
         retired
     }
 
-    /// Every pane with no session that is not already queued for one — the
-    /// panes the reconcile refill may hand an unshown tab of their region's
-    /// workspace.
-    pub fn empty_unpending_panes(&self, cx: &App) -> Vec<(WorkspaceId, PaneId)> {
-        self.trees
+    /// Drop one pane whose session exited, re-anchoring or emptying its tab.
+    fn retire_pane(
+        &mut self,
+        pane: PaneId,
+        workspaces_with_tabs: &HashSet<WorkspaceId>,
+        retired: &mut RetiredPanes,
+        cx: &mut App,
+    ) {
+        let Some(tab) = self.tab_for_pane(pane, cx) else { return };
+        let workspace_id = self.tab_regions.get(&tab).copied();
+        let exited = self.sessions.remove(&pane);
+        let Some(tree) = self.trees.get(&tab).cloned() else { return };
+        if tree.read(cx).all_pane_ids().len() > 1 {
+            let next = tree.read(cx).next_pane(pane);
+            tree.update(cx, |panes, ctx| panes.close(pane, ctx));
+            if self.focused.get(&tab) == Some(&pane) {
+                self.focused.insert(tab, next);
+            }
+        }
+        // A tab is keyed by the session it was opened with. When that session
+        // exits while the splits it made are still running, the tab re-anchors
+        // onto a surviving pane rather than stranding live sessions in a tree
+        // the strip can no longer reach — the same rule `prune_workspace_node`
+        // applies to the persisted tree.
+        let tab = match self.tree_sessions(tab, cx).first().copied() {
+            Some(anchor) if exited == Some(tab) => {
+                self.rekey_tab(tab, anchor);
+                retired.promoted_tabs.push(anchor);
+                anchor
+            }
+            _ => tab,
+        };
+        retired.changed = true;
+        let Some(workspace_id) = workspace_id else { return };
+        if workspaces_with_tabs.contains(&workspace_id) || !self.tree_sessions(tab, cx).is_empty() {
+            return;
+        }
+        self.trees.remove(&tab);
+        self.focused.remove(&tab);
+        self.tab_regions.remove(&tab);
+        self.shown_tabs.remove(&workspace_id);
+        if self.tab_regions.values().any(|region| *region == workspace_id)
+            || self.workspace.read(cx).layout().workspace_count() <= 1
+        {
+            return;
+        }
+        self.workspace.update(cx, |window, ctx| window.remove_workspace(workspace_id, ctx));
+        self.pending_workspaces.retain(|id| *id != workspace_id);
+        // Only a region the server minted can be closed on the server; one that
+        // is still waiting for its `WorkspaceInfo` names an id the server has
+        // never seen.
+        if let Some(region) = self.server_workspaces.take(&workspace_id) {
+            retired.closed_regions.push(region);
+        }
+    }
+
+    /// Every rendered pane with no session that is not already queued for one,
+    /// paired with the region and the tab that owns it — the panes the reconcile
+    /// refill hands their own tab's session.
+    pub fn empty_unpending_panes(&self, cx: &App) -> Vec<(WorkspaceId, SessionId, PaneId)> {
+        self.shown_tabs
             .iter()
-            .flat_map(|(workspace_id, tree)| {
-                tree.read(cx)
-                    .all_pane_ids()
+            .flat_map(|(workspace_id, tab)| {
+                self.trees
+                    .get(tab)
                     .into_iter()
+                    .flat_map(|tree| tree.read(cx).all_pane_ids())
                     .filter(|pane| {
                         !self.sessions.contains_key(pane) && !self.pending.contains(pane)
                     })
-                    .map(|pane| (*workspace_id, pane))
+                    .map(|pane| (*workspace_id, *tab, pane))
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -926,11 +1223,12 @@ impl PaneShell {
                 self.ci_strip(workspace_id),
                 self.board_strip(workspace_id),
             );
-            let Some(tree) = self.trees.get(&workspace_id) else { continue };
+            let Some(tab) = self.shown_tabs.get(&workspace_id) else { continue };
+            let Some(tree) = self.trees.get(tab) else { continue };
             let accent = workspace
                 .find_workspace(workspace_id)
                 .map_or(FALLBACK_PANE_ACCENT, |slot: &WorkspaceSlot| slot.accent_color);
-            let focused_pane = self.focused.get(&workspace_id).copied();
+            let focused_pane = self.focused.get(tab).copied();
             for (pane_id, rect, _edges) in tree.read(cx).compute_rects(region) {
                 out.push(PanePlacement {
                     workspace_id,
@@ -962,9 +1260,13 @@ impl PaneShell {
                     self.ci_strip(workspace_id),
                     self.board_strip(workspace_id),
                 );
-                self.trees.get(&workspace_id).into_iter().flat_map(move |tree| {
-                    divider::collect_dividers(tree.read(cx).tree().root(), region)
-                })
+                self.shown_tabs
+                    .get(&workspace_id)
+                    .and_then(|tab| self.trees.get(tab))
+                    .into_iter()
+                    .flat_map(move |tree| {
+                        divider::collect_dividers(tree.read(cx).tree().root(), region)
+                    })
             })
             .collect()
     }
@@ -1015,8 +1317,8 @@ impl PaneShell {
 
     /// Set the split ratio containing `pane_id` and report whether it changed.
     pub fn set_pane_ratio(&mut self, pane_id: PaneId, ratio: f32, cx: &mut App) -> bool {
-        let Some(workspace_id) = self.region_of(pane_id, cx) else { return false };
-        let Some(tree) = self.trees.get(&workspace_id).cloned() else { return false };
+        let Some(tab) = self.tab_for_pane(pane_id, cx) else { return false };
+        let Some(tree) = self.trees.get(&tab).cloned() else { return false };
         tree.update(cx, |pane_tree, ctx| pane_tree.set_ratio(pane_id, ratio, ctx))
     }
 
@@ -1032,13 +1334,18 @@ impl PaneShell {
 
     /// Total number of live panes across every region.
     pub fn pane_count(&self, cx: &App) -> usize {
-        self.trees.values().map(|tree| tree.read(cx).all_pane_ids().len()).sum()
+        self.shown_tabs
+            .values()
+            .filter_map(|tab| self.trees.get(tab))
+            .map(|tree| tree.read(cx).all_pane_ids().len())
+            .sum()
     }
 
     /// Number of panes in the focused region's active tab.
     pub fn focused_region_pane_count(&self, cx: &App) -> usize {
-        self.trees
+        self.shown_tabs
             .get(&self.focused_workspace_id(cx))
+            .and_then(|tab| self.trees.get(tab))
             .map_or(0, |tree| tree.read(cx).all_pane_ids().len())
     }
 
@@ -1080,8 +1387,7 @@ impl PaneShell {
     pub fn restore_snapshot(
         &self,
         window_id: WindowId,
-        bindings: &HashMap<SessionId, LaunchBinding>,
-        prompts: &HashMap<SessionId, PromptBarData>,
+        sources: &SnapshotSources<'_>,
         cx: &App,
     ) -> WindowRestoreState {
         let workspace = self.workspace.read(cx);
@@ -1097,7 +1403,7 @@ impl PaneShell {
             self.snapshot_region(
                 workspace_id,
                 &mut SnapshotTarget { layout: &mut layout, panes: &mut panes },
-                &SnapshotSources { bindings, prompts },
+                sources,
                 cx,
             );
         }
@@ -1105,8 +1411,7 @@ impl PaneShell {
         snapshot_window_restore(window_id, &layout, &panes)
     }
 
-    /// Copy one region's pane split into the scratch layout as a single tab and
-    /// record a [`PaneRestore`] for every pane that has a session.
+    /// Copy every tab's pane tree into the scratch layout and record its panes.
     fn snapshot_region(
         &self,
         workspace_id: WorkspaceId,
@@ -1114,17 +1419,36 @@ impl PaneShell {
         sources: &SnapshotSources<'_>,
         cx: &App,
     ) {
+        let Some(region) = sources.tabs.region(workspace_id) else { return };
+        for tab in region.tabs() {
+            self.snapshot_tab(tab, target, sources, cx);
+        }
+        target.layout.set_active_tab(
+            workspace_id,
+            region
+                .active_session()
+                .and_then(|tab| region.tabs().iter().position(|entry| entry.session_id == tab))
+                .unwrap_or(0),
+        );
+    }
+
+    /// Copy one tab's pane tree into the scratch layout as its own saved tab.
+    fn snapshot_tab(
+        &self,
+        entry: &TabEntry,
+        target: &mut SnapshotTarget<'_>,
+        sources: &SnapshotSources<'_>,
+        cx: &App,
+    ) {
+        let (workspace_id, tab) = (entry.workspace_id, entry.session_id);
         let SnapshotTarget { layout, panes } = target;
-        let Some(tree) = self.trees.get(&workspace_id) else { return };
+        let Some(tree) = self.trees.get(&tab) else { return };
         let Some(wire) = pane_node_to_wire(tree.read(cx).tree().root(), &self.sessions) else {
             return;
         };
-        let Some(pairs) = layout.add_tab_with_pane_tree(workspace_id, first_session(&wire), &wire)
-        else {
-            return;
-        };
+        let Some(pairs) = layout.add_tab_with_pane_tree(workspace_id, tab, &wire) else { return };
         let focused_session =
-            self.focused.get(&workspace_id).and_then(|pane| self.sessions.get(pane)).copied();
+            self.focused.get(&tab).and_then(|pane| self.sessions.get(pane)).copied();
         let mut focused_pane = None;
         for (session_id, pane_id) in pairs {
             if Some(session_id) == focused_session {
@@ -1147,10 +1471,10 @@ impl PaneShell {
                 },
             );
         }
-        if let (Some(pane), Some(tab)) =
+        if let (Some(pane), Some(saved_tab)) =
             (focused_pane, layout.active_tab_for_workspace_mut(workspace_id))
         {
-            tab.focused_pane = pane;
+            saved_tab.focused_pane = pane;
         }
     }
 
@@ -1171,26 +1495,20 @@ impl PaneShell {
         let topology = rebuilt.layout.to_tree(&HashMap::new());
         let focused_workspace = rebuilt.layout.focused_workspace_id();
         let region_ids = rebuilt.layout.workspace_ids_in_order();
-        let mut trees = HashMap::new();
-        let mut focused = HashMap::new();
+        let mut tab_trees = TabTrees::default();
+        let mut pending_tab_roots: HashMap<WorkspaceId, VecDeque<SessionId>> = HashMap::new();
         let mut slots = Vec::new();
         for workspace_id in &region_ids {
             let Some(slot) = rebuilt.layout.find_workspace_mut(*workspace_id) else { continue };
             slots.push((*workspace_id, slot.name.clone(), slot.accent_color));
             let active = slot.active_tab;
-            let restored = slot.tabs.get_mut(active).map(|tab| {
-                (std::mem::replace(&mut tab.pane_layout, LayoutTree::new()), tab.focused_pane)
-            });
-            let (pane_layout, wanted_focus) = match restored {
-                Some((pane_layout, pane)) => (pane_layout, Some(pane)),
-                None => (LayoutTree::new(), None),
-            };
-            let tree = cx.new(|_| PaneTree::from_tree(pane_layout));
-            let focused_pane = wanted_focus
-                .filter(|pane| tree.read(cx).all_pane_ids().contains(pane))
-                .unwrap_or_else(|| tree.read(cx).initial_pane_id());
-            focused.insert(*workspace_id, focused_pane);
-            trees.insert(*workspace_id, tree);
+            for (index, tab) in slot.tabs.iter_mut().enumerate() {
+                // The snapshot's session ids are placeholders the replay's own
+                // `CreateSession` answers replace; each tab's tree is keyed by
+                // one until `sync_tabs` sees that tab in the strip.
+                pending_tab_roots.entry(*workspace_id).or_default().push_back(tab.session_id);
+                tab_trees.restore_tab(*workspace_id, tab, index == active, cx);
+            }
         }
 
         self.workspace = cx.new(|_| WorkspaceTree::from_tree(&topology));
@@ -1200,8 +1518,9 @@ impl PaneShell {
             }
             tree.set_focused_workspace(focused_workspace, ctx);
         });
-        self.trees = trees;
-        self.focused = focused;
+        self.install_tab_trees(tab_trees);
+        self.pending_regions.clear();
+        self.pending_tab_roots = pending_tab_roots;
         self.sessions.clear();
         self.pending = rebuilt.launches.iter().map(|launch| launch.pane_id).collect();
         // The snapshot's regions are the ids the replay's own `CreateSession`
@@ -1235,9 +1554,9 @@ impl PaneShell {
     /// directly instead of queueing placeholder launches. Sessions named in
     /// the tree but absent from `live` are pruned the way the cold path prunes
     /// panes without sessions; a tree that prunes away entirely leaves the
-    /// shell untouched. Each region shows its displayed tab's pane split — the
-    /// GPUI shell keeps one pane tree per region — and any other tab sessions
-    /// stay reachable through the flat tab strip.
+    /// shell untouched. Every tab of every region comes back with its own pane
+    /// split; only the tab each region reported as active is rendered, and its
+    /// sessions are the ones returned for the caller to attach.
     pub fn adopt_server_tree(
         &mut self,
         tree: &WorkspaceTreeNode,
@@ -1247,34 +1566,27 @@ impl PaneShell {
         let Some(pruned) = prune_workspace_node(tree, live) else { return Vec::new() };
         let mut leaves = Vec::new();
         wire_leaf_display_tabs(&pruned, &mut leaves);
-        let mut trees = HashMap::new();
-        let mut focused = HashMap::new();
+        let mut tab_trees = TabTrees::default();
         let mut sessions = HashMap::new();
         let mut visible = Vec::new();
-        for (workspace_id, displayed, active) in &leaves {
-            let (root, pairs) = pane_tree_to_layout_node(displayed);
-            let Some(&(_, first_pane)) = pairs.first() else { continue };
-            // Focus the pane showing the tab this region reported as active, so
-            // a restored split comes back typed-into where the user left it
-            // rather than always in its leftmost pane.
-            let active_pane = active
-                .and_then(|session_id| {
-                    pairs.iter().find(|(id, _)| *id == session_id).map(|(_, pane)| *pane)
-                })
-                .unwrap_or(first_pane);
-            trees.insert(*workspace_id, cx.new(|_| PaneTree::from_root(root, active_pane)));
-            focused.insert(*workspace_id, active_pane);
-            for (session_id, pane_id) in pairs {
-                sessions.insert(pane_id, session_id);
-                visible.push(session_id);
+        for (workspace_id, tabs, active) in &leaves {
+            for (tab, pane_tree) in tabs {
+                let shown = *tab == *active;
+                let placed = tab_trees.adopt_tab(*workspace_id, *tab, pane_tree, cx);
+                sessions.extend(placed.iter().copied().map(|(session, pane)| (pane, session)));
+                // Only the tab a region is rendering is attached; the rest stay
+                // dormant until the user selects them.
+                visible.extend(placed.into_iter().filter(|_| shown).map(|(session, _)| session));
+                tab_trees.shown_tabs.extend(shown.then_some((*workspace_id, *tab)));
             }
         }
-        if trees.is_empty() {
+        if tab_trees.trees.is_empty() {
             return Vec::new();
         }
         self.workspace = cx.new(|_| WorkspaceTree::from_tree(&pruned));
-        self.trees = trees;
-        self.focused = focused;
+        self.install_tab_trees(tab_trees);
+        self.pending_regions.clear();
+        self.pending_tab_roots.clear();
         self.sessions = sessions;
         self.pending.clear();
         self.pending_workspaces.clear();
@@ -1288,9 +1600,7 @@ impl PaneShell {
 
     /// The region containing `pane`, or `None` once the pane has been closed.
     fn region_of(&self, pane: PaneId, cx: &App) -> Option<WorkspaceId> {
-        self.trees
-            .iter()
-            .find_map(|(id, tree)| tree.read(cx).all_pane_ids().contains(&pane).then_some(*id))
+        self.tab_for_pane(pane, cx).and_then(|tab| self.tab_regions.get(&tab).copied())
     }
 
     /// The content rect `workspace_id` occupies inside `viewport`, minus a
@@ -1366,68 +1676,29 @@ pub struct RegionTabs {
     pub active_tab_index: usize,
 }
 
-/// Build one region's tab payload from the window's strip and the region's live
-/// pane split.
-///
-/// The GPUI shell holds ONE pane split per region and shows a tab by adopting it
-/// into the focused pane, so the wire's "pane tree per tab" is expressed as: the
-/// live split sits at the active tab's index and every other tab is a plain leaf
-/// (`None`). [`wire_tab_pane_tree`] reads exactly that back, so a report and an
-/// adopt round-trip to the same layout.
-///
-/// Every session the split shows is also a tab, so any that the strip has not
-/// caught up with yet is appended rather than dropped — the report is the only
-/// record the server keeps, and a session missing from it is a tab the next
-/// connect will not restore.
+/// Build one region's wire payload from its strip tabs and their own pane
+/// trees. Pane sessions stay only inside `pane_trees`; they never become tabs.
 fn region_tab_payload(
     workspace_id: WorkspaceId,
     tabs: &TabSessions,
-    displayed: Option<PaneTreeNode>,
-    active: Option<SessionId>,
+    trees: Vec<Option<PaneTreeNode>>,
 ) -> RegionTabs {
-    let mut session_ids: Vec<SessionId> = tabs
-        .region(workspace_id)
-        .map(|region| region.tabs().iter().map(|tab| tab.session_id).collect())
-        .unwrap_or_default();
-    if let Some(displayed) = displayed.as_ref() {
-        let mut shown = Vec::new();
-        collect_pane_sessions(displayed, &mut shown);
-        for session_id in shown {
-            if !session_ids.contains(&session_id) {
-                session_ids.push(session_id);
-            }
-        }
-    }
-    if session_ids.is_empty() {
-        return RegionTabs { session_ids, pane_trees: Vec::new(), active_tab_index: 0 };
-    }
-    // The active tab is the one in the region's focused pane. A region whose
-    // focus has not settled yet falls back to the split's first session, and
-    // then to the first tab, so the index is always in range.
-    let active_tab_index = active
-        .or_else(|| displayed.as_ref().map(first_session))
-        .and_then(|session_id| session_ids.iter().position(|id| *id == session_id))
+    let Some(region) = tabs.region(workspace_id) else {
+        return RegionTabs { session_ids: Vec::new(), pane_trees: Vec::new(), active_tab_index: 0 };
+    };
+    let session_ids: Vec<SessionId> = region.tabs().iter().map(|tab| tab.session_id).collect();
+    let pane_trees = trees
+        .into_iter()
+        .map(|tree| match tree {
+            Some(PaneTreeNode::Split { .. }) => tree,
+            Some(PaneTreeNode::Leaf { .. }) | None => None,
+        })
+        .collect();
+    let active_tab_index = region
+        .active_session()
+        .and_then(|active| session_ids.iter().position(|session_id| *session_id == active))
         .unwrap_or(0);
-    let mut pane_trees = vec![None; session_ids.len()];
-    // A single-pane region needs no tree of its own: `wire_tab_pane_tree`
-    // rebuilds a lone leaf from the tab's own session id.
-    if matches!(displayed, Some(PaneTreeNode::Split { .. }))
-        && let Some(slot) = pane_trees.get_mut(active_tab_index)
-    {
-        *slot = displayed;
-    }
     RegionTabs { session_ids, pane_trees, active_tab_index }
-}
-
-/// Every session in a serialized pane split, left to right.
-fn collect_pane_sessions(node: &PaneTreeNode, out: &mut Vec<SessionId>) {
-    match node {
-        PaneTreeNode::Leaf { session_id } => out.push(*session_id),
-        PaneTreeNode::Split { first, second, .. } => {
-            collect_pane_sessions(first, out);
-            collect_pane_sessions(second, out);
-        }
-    }
 }
 
 /// Every tab of every region of a wire tree, in left-to-right region order.
@@ -1460,22 +1731,79 @@ fn wire_tab_pane_tree(
     Some(pane_trees.get(index).cloned().flatten().unwrap_or(PaneTreeNode::Leaf { session_id }))
 }
 
-/// Collect `(workspace, displayed tab's pane split)` for every leaf of a
-/// pruned workspace tree, left to right.
-fn wire_leaf_display_tabs(
-    node: &WorkspaceTreeNode,
-    out: &mut Vec<(WorkspaceId, PaneTreeNode, Option<SessionId>)>,
-) {
+/// One region of a wire tree, lowered for adoption: every tab paired with its
+/// own pane split, plus the tab the region reported as active.
+type WireRegionTabs = (WorkspaceId, Vec<(SessionId, PaneTreeNode)>, SessionId);
+
+/// Collect every tab's pane tree and its active tab for each leaf, left to
+/// right. Inactive trees remain dormant until their strip tab is selected.
+fn wire_leaf_display_tabs(node: &WorkspaceTreeNode, out: &mut Vec<WireRegionTabs>) {
     match node {
         WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, active_tab_index } => {
-            let index = (*active_tab_index).min(session_ids.len().saturating_sub(1));
-            if let Some(displayed) = wire_tab_pane_tree(session_ids, pane_trees, index) {
-                out.push((*workspace_id, displayed, session_ids.get(index).copied()));
+            let tabs = session_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(index, session_id)| {
+                    wire_tab_pane_tree(session_ids, pane_trees, index)
+                        .map(|tree| (*session_id, tree))
+                })
+                .collect::<Vec<_>>();
+            let index = (*active_tab_index).min(tabs.len().saturating_sub(1));
+            let active = tabs.get(index).map(|(active, _)| *active);
+            if let Some(active) = active {
+                out.push((*workspace_id, tabs, active));
             }
         }
         WorkspaceTreeNode::Split { first, second, .. } => {
             wire_leaf_display_tabs(first, out);
             wire_leaf_display_tabs(second, out);
+        }
+    }
+}
+
+/// Sessions that occur only inside a pane tree, paired with their workspace.
+/// Reader-side tab reconciliation uses these to keep reconnects from promoting
+/// split panes into strip tabs.
+#[must_use]
+pub fn wire_tree_pane_sessions(node: &WorkspaceTreeNode) -> Vec<(SessionId, WorkspaceId)> {
+    let mut panes = Vec::new();
+    collect_wire_tree_pane_sessions(node, &mut panes);
+    panes
+}
+
+fn collect_wire_tree_pane_sessions(
+    node: &WorkspaceTreeNode,
+    panes: &mut Vec<(SessionId, WorkspaceId)>,
+) {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, .. } => {
+            for (index, tab) in session_ids.iter().enumerate() {
+                let Some(tree) = wire_tab_pane_tree(session_ids, pane_trees, index) else {
+                    continue;
+                };
+                let mut sessions = Vec::new();
+                collect_pane_sessions(&tree, &mut sessions);
+                panes.extend(
+                    sessions
+                        .into_iter()
+                        .filter(|session_id| session_id != tab)
+                        .map(|session_id| (session_id, *workspace_id)),
+                );
+            }
+        }
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            collect_wire_tree_pane_sessions(first, panes);
+            collect_wire_tree_pane_sessions(second, panes);
+        }
+    }
+}
+
+fn collect_pane_sessions(node: &PaneTreeNode, out: &mut Vec<SessionId>) {
+    match node {
+        PaneTreeNode::Leaf { session_id } => out.push(*session_id),
+        PaneTreeNode::Split { first, second, .. } => {
+            collect_pane_sessions(first, out);
+            collect_pane_sessions(second, out);
         }
     }
 }
@@ -1590,6 +1918,145 @@ mod tests {
             pane_trees: vec![None],
             active_tab_index: 0,
         }
+    }
+
+    /// The two per-frame reconcile steps the running view runs, in its order:
+    /// give every strip tab its own tree, then hand each tab's still-empty root
+    /// pane that tab's own session.
+    fn settle(shell: &mut PaneShell, strip: &TabSessions, cx: &mut App) {
+        shell.sync_tabs(strip, cx);
+        for (_, tab, pane) in shell.empty_unpending_panes(cx) {
+            shell.assign_session(pane, tab, cx);
+        }
+    }
+
+    /// A one-region shell whose single strip tab is on screen.
+    fn seeded_shell(cx: &mut App) -> (PaneShell, TabSessions, WorkspaceId, SessionId) {
+        let workspace_id = WorkspaceId::new();
+        let tab = SessionId::new();
+        let mut strip = TabSessions::new();
+        strip.insert_active(TabEntry::new(tab, workspace_id, "bash".to_owned()));
+        let mut shell = PaneShell::new([0.1, 0.2, 0.3, 1.0], cx);
+        shell.adopt_server_workspace(workspace_id, cx);
+        settle(&mut shell, &strip, cx);
+        (shell, strip, workspace_id, tab)
+    }
+
+    /// Split the shown tab and place the session the server answers with, the
+    /// way the reader's FIFO pane create and the reconcile pass do together.
+    fn split_shown_tab(
+        shell: &mut PaneShell,
+        strip: &mut TabSessions,
+        workspace_id: WorkspaceId,
+        cx: &mut App,
+    ) -> SessionId {
+        let pane = shell
+            .split_focused_pane(SplitDirection::Vertical, cx)
+            .expect("the shown tab has a focused pane to split");
+        let session_id = SessionId::new();
+        strip.insert_pane(session_id, workspace_id);
+        assert_eq!(shell.take_pending(cx), Some(pane), "the split's own pane claims the answer");
+        shell.assign_session(pane, session_id, cx);
+        settle(shell, strip, cx);
+        session_id
+    }
+
+    /// The bug this shell shape exists to fix: `ctrl+shift+\` must add a pane to
+    /// the active tab's own tree and nothing at all to the strip.
+    // @lat: [[test#GPUI Client Headless Suites#A pane split never adds a strip tab]]
+    #[gpui::test]
+    fn a_pane_split_never_adds_a_strip_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let (mut shell, mut strip, workspace_id, tab) = seeded_shell(cx);
+            assert_eq!(shell.pane_count(cx), 1, "the tab starts as one pane");
+
+            let split = split_shown_tab(&mut shell, &mut strip, workspace_id, cx);
+
+            assert_eq!(strip.len(), 1, "a split leaves the region's tab count unchanged");
+            assert_eq!(shell.pane_count(cx), 2, "both panes render");
+            let WorkspaceTreeNode::Leaf { session_ids, pane_trees, active_tab_index, .. } =
+                shell.wire_tree(&strip, cx)
+            else {
+                panic!("a one-region window reports one leaf")
+            };
+            assert_eq!(session_ids, [tab], "the split's session is a pane, never a tab");
+            assert_eq!(active_tab_index, 0);
+            assert!(
+                matches!(pane_trees.first(), Some(Some(PaneTreeNode::Split { .. }))),
+                "the active tab's own pane tree carries the split"
+            );
+            assert_eq!(
+                shell.close_tab_sessions(tab, cx),
+                vec![tab, split],
+                "closing the tab closes every session in its tree"
+            );
+        });
+    }
+
+    /// Tabs own whole trees: selecting one swaps the region's entire layout, and
+    /// the split panes inside a tab are never selectable positions of their own.
+    // @lat: [[test#GPUI Client Headless Suites#Tab switch swaps the whole per-tab tree]]
+    #[gpui::test]
+    fn tab_switch_swaps_the_whole_per_tab_tree(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let (mut shell, mut strip, workspace_id, split_tab) = seeded_shell(cx);
+            let split = split_shown_tab(&mut shell, &mut strip, workspace_id, cx);
+
+            // A second tab of the same region, opened and therefore shown.
+            let plain_tab = SessionId::new();
+            strip.insert_active(TabEntry::new(plain_tab, workspace_id, "bash".to_owned()));
+            settle(&mut shell, &strip, cx);
+            assert_eq!(shell.pane_count(cx), 1, "the split tab's panes went dormant");
+            assert_eq!(shell.shown_sessions(cx), [plain_tab].into_iter().collect());
+
+            assert_eq!(
+                strip.select(workspace_id, 2),
+                None,
+                "three live sessions, but the split pane is not a tab position"
+            );
+            assert_eq!(
+                strip.select(workspace_id, 0),
+                Some(split_tab),
+                "digit selection counts tabs, not split panes"
+            );
+            let restored = shell.show_tab(workspace_id, split_tab, cx);
+            assert_eq!(restored, vec![split_tab, split], "the whole tree comes back at once");
+            assert_eq!(shell.pane_count(cx), 2);
+
+            assert_eq!(strip.select(workspace_id, 1), Some(plain_tab));
+            assert_eq!(shell.show_tab(workspace_id, plain_tab, cx), vec![plain_tab]);
+            assert_eq!(shell.pane_count(cx), 1);
+        });
+    }
+
+    /// A tab is keyed by the session it opened with, so that session exiting
+    /// must not take its splits with it: the surviving pane becomes the tab.
+    // @lat: [[test#GPUI Client Headless Suites#A tab re-anchors onto its surviving split]]
+    #[gpui::test]
+    fn a_tab_re_anchors_onto_its_surviving_split(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let (mut shell, mut strip, workspace_id, tab) = seeded_shell(cx);
+            let split = split_shown_tab(&mut shell, &mut strip, workspace_id, cx);
+
+            // The tab's own session exits; the split it made is still running.
+            strip.remove(tab);
+            let live = [split].into_iter().collect();
+            let workspaces_with_tabs = HashSet::new();
+            let retired = shell.retain_sessions(&live, &workspaces_with_tabs, cx);
+
+            assert_eq!(retired.promoted_tabs, [split], "the survivor is offered to the strip");
+            assert!(retired.closed_regions.is_empty(), "the region still has a live pane");
+            assert!(strip.promote_pane(split, "bash".to_owned()));
+            settle(&mut shell, &strip, cx);
+
+            assert_eq!(strip.len(), 1, "the region still shows exactly one tab");
+            assert_eq!(shell.pane_count(cx), 1);
+            assert_eq!(shell.region_shown_session(workspace_id), Some(split));
+            let WorkspaceTreeNode::Leaf { session_ids, .. } = shell.wire_tree(&strip, cx) else {
+                panic!("a one-region window reports one leaf")
+            };
+            assert_eq!(session_ids, [split], "the survivor is the tab the server persists");
+        });
     }
 
     /// A replayed region comes back rootless — [`WorkspaceSnapshot`] persists
@@ -1852,39 +2319,42 @@ mod tests {
 
         // One pane showing the middle tab: all three tabs are reported, in
         // strip order, and the active index names the one on screen.
-        let displayed = PaneTreeNode::Leaf { session_id: second };
-        let lone = region_tab_payload(workspace_id, &strip, Some(displayed), Some(second));
+        strip.show(second);
+        let lone = region_tab_payload(workspace_id, &strip, vec![None, None, None]);
         assert_eq!(lone.session_ids, [first, second, third], "other regions' tabs excluded");
         assert_eq!(lone.active_tab_index, 1);
         assert!(lone.pane_trees.iter().all(Option::is_none), "a lone pane needs no tree");
 
-        // A split region carries its tree at the active tab's index, and reading
-        // it back reproduces the same split.
+        // A split stays at its owning tab's index. Its extra pane session is
+        // inside the tree, never appended to `session_ids` as another strip tab.
+        let split_pane = SessionId::new();
         let split = PaneTreeNode::Split {
             direction: LayoutDirection::Horizontal,
             ratio: 0.5,
-            first: Box::new(PaneTreeNode::Leaf { session_id: first }),
-            second: Box::new(PaneTreeNode::Leaf { session_id: third }),
+            first: Box::new(PaneTreeNode::Leaf { session_id: third }),
+            second: Box::new(PaneTreeNode::Leaf { session_id: split_pane }),
         };
-        let carried = region_tab_payload(workspace_id, &strip, Some(split.clone()), Some(third));
+        strip.show(third);
+        let carried =
+            region_tab_payload(workspace_id, &strip, vec![None, None, Some(split.clone())]);
+        assert_eq!(carried.session_ids, [first, second, third]);
         assert_eq!(carried.active_tab_index, 2);
         assert_eq!(
             wire_tab_pane_tree(&carried.session_ids, &carried.pane_trees, carried.active_tab_index),
             Some(split),
             "the report round-trips back to the same split"
         );
-
-        // A pane whose session the strip has not listed yet is still reported —
-        // the tree is the only record the server keeps.
-        let unlisted = SessionId::new();
-        let appended = region_tab_payload(
+        let wire = WorkspaceTreeNode::Leaf {
             workspace_id,
-            &strip,
-            Some(PaneTreeNode::Leaf { session_id: unlisted }),
-            Some(unlisted),
+            session_ids: carried.session_ids,
+            pane_trees: carried.pane_trees,
+            active_tab_index: carried.active_tab_index,
+        };
+        assert_eq!(
+            wire_tree_pane_sessions(&wire),
+            vec![(split_pane, workspace_id)],
+            "reconnect preserves split panes without promoting them to strip tabs"
         );
-        assert_eq!(appended.session_ids, [first, second, third, unlisted]);
-        assert_eq!(appended.active_tab_index, 3);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Tab order spans every region of the tree]]

@@ -52,6 +52,35 @@ fn new_tab_appends_and_focuses() {
     assert!(data[1].is_active);
 }
 
+/// A pane split creates a live session but never a second strip tab. Focusing
+/// that pane attaches it and the server acknowledges every `AttachSessions`
+/// with a fresh `SessionCreated`, and a later `SessionList` names it again, so
+/// both echoes have to leave the strip alone.
+#[test]
+fn pane_session_stays_out_of_the_tab_strip() {
+    let (mut tabs, workspace_id, ids) = strip(1);
+    let pane = SessionId::new();
+    tabs.insert_pane(pane, workspace_id);
+
+    assert_eq!(tabs.len(), 1, "a split leaves the tab count unchanged");
+    assert_eq!(tabs.live_session_ids().len(), 2, "the pane remains live");
+    assert_eq!(tabs.workspace_of(pane), Some(workspace_id));
+    assert_eq!(tabs.region_of_tab(pane), None, "a pane session holds no tab of its own");
+
+    let echo = TabEntry::new(pane, workspace_id, "split".to_owned());
+    assert!(!tabs.insert_active(echo), "a focused pane's attach echo is not a new tab");
+    assert_eq!(tabs.len(), 1);
+
+    tabs.reconcile(
+        vec![
+            TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
+            TabEntry::new(pane, workspace_id, "split".to_owned()),
+        ],
+        Some(pane),
+    );
+    assert_eq!(tabs.len(), 1, "a reconnect must keep split panes out of the strip");
+}
+
 /// The server re-announces `SessionCreated` to acknowledge every
 /// `AttachSessions`. Treating that echo as a new tab would attach again and
 /// loop forever, so a known session must report "not added" and leave the
