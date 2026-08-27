@@ -718,7 +718,7 @@ The GPUI rebuild ports the URL and OSC 8 scanner into the `lib` target so hover,
 
  is a verbatim port of the winit  onto Zed's Alacritty fork: the same scheme list (https/http/ftp/file/mailto/ssh/telnet), `WRAPLINE` join, trailing-punctuation stripping, per-row  geometry, hard-break continuation (), and OSC 8 precedence with `id=` reconnection and the 2048-byte URI cap (). Because the selection port lands in a separate bead, the two grid cell readers (, ) are defined locally instead of imported from `selection`.
 
-Activation is ported alongside detection:  (with the `:N` line-number suffix and `code --goto` fallback), , and the disallowed-scheme gate hook (, ). The view-side hover/dwell/Ctrl-highlight wiring lands in a later GPUI phase.
+Activation is ported alongside detection:  (with the `:N` line-number suffix and `code --goto` fallback), , and the disallowed-scheme gate hook (, ). The live view resolves bare OSC 8 hover immediately into the status-bar preview while Ctrl keeps its click-arming affordance; regular URL and path text never gets a bare-hover preview.
 
 ### GPUI IME Composition
 
@@ -3700,13 +3700,11 @@ The `id=` parameter reconnects same-URI multi-segment hyperlinks separated by un
 
 URI length is capped at 2048 bytes (FR-010). Upstream VTE (in the `std` build Scribe uses) does not cap OSC sequence length, so Scribe applies the cap in `scan_osc8_hyperlinks` itself; URIs longer than the cap are treated as absent and the affected cells fall back to the heuristic detector.
 
-### Hyperlink Hover Tooltip
+### OSC 8 Hover Preview
 
-When the cursor settles on a cell carrying an OSC 8 URI for ≥300 ms with no movement, the verbatim URI is rendered through the existing  above or below the cell.
+A bare pointer over an explicit OSC 8 span immediately underlines its label and replaces the status bar's left group with a muted `→` plus the target URI, so the destination is visible before activation.
 
- is the render-loop hook. `Position::Below` is preferred and flipped to `Above` when the cell is on the bottom row. The URI is cached on `App.hover_tooltip_uri` at dwell-threshold time so subsequent frames render without re-reading `cell.hyperlink()`. Truncation only affects what is *displayed* — long URIs render with a **head + tail** view (`prefix...suffix`) via `osc8_tooltip_truncate` so domain-confusion suffixes stay visible to the user; the full URI is preserved on the span for activation. The dwell state lives on `App.hover_cell` / `hover_started_at` / `hover_tooltip_visible` / `hover_tooltip_uri` and resets whenever the cursor moves to a different cell or leaves the terminal area.
-
-Cells without an OSC 8 hyperlink never trigger the dwell path, so the tooltip does not surface heuristic URLs (those continue to use the established Ctrl+highlight affordance only).
+[[crates/scribe-client/src/main.rs#TerminalView#refresh_osc8_hover]] caches the pane, cell, and published content snapshot, re-resolving a stationary pointer after output, scroll, or resize. [[crates/scribe-client/src/status_bar.rs#truncate_url]] preserves the URI's head and tail within the measured status-bar width, and the accessibility status label retains its full value. Leaving the span or holding a modifier restores the live left group; heuristic URLs and paths retain only the Ctrl-click affordance.
 
 ### Disallowed-Scheme Confirmation
 
@@ -3847,9 +3845,3 @@ The displaced-client  (from ) keeps the `Controlled by <device> (<account>)` hea
 Find-in-scrollback overlay state in , tracking query text, match results, and highlighted match index.
 
 State module plus GPU-rendered overlay. Methods: `open` (clears previous query and results), `close` (resets all state), `push_char`/`pop_char` (edit the query string), `set_results` (replace match list and reset highlight), `next_match`/`prev_match` (cycle through results with wrap-around), `matches` (borrow all results). Match results are `Vec<SearchMatch>` received from the server. All visible matches on the focused pane are highlighted: the current match uses the full accent background with a contrast foreground, while other matches blend the accent into their existing cell background at 40% intensity.
-
-## Tooltip
-
-GPU-rendered tooltip overlay in  that renders a small dark box with light text above or below an anchor rect.
-
- holds the tooltip text and the anchor `Rect`.  selects `Above` or `Below` placement.  emits `CellInstance` quads into the caller's buffer: a 1 px border quad, a background quad, then per-character glyph quads. The tooltip is horizontally centered on the anchor and clamped to stay within `viewport_width`. A 1-character left/right padding is included on each side of the text.

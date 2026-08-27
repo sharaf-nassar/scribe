@@ -3235,17 +3235,13 @@ The script maximizes through an EWMH ADD client message because the image's xdot
 
 ### Ctrl+click links open for real
 
-`tests/e2e/visual/terminal-links.sh` (`just e2e-visual-terminal-links`) is the app-level oracle for [[client#Client#URL Detection#Ctrl+Click in the GPUI Client]]. Detection is unit-tested against a grid; this asserts the rest.
+`tests/e2e/visual/terminal-links.sh` (`just e2e-visual-terminal-links`) is the app-level oracle for [[client#Client#URL Detection#Ctrl+Click in the GPUI Client]] and failed-link feedback. Detection is unit-tested against a grid; this drives the live pointer, pane, and opener path.
 
-Nothing else can. "The pointer was over a link, Ctrl was down, and the OS handler was asked to open the right thing" spans the pointer path, the focused pane's live grid, the pane's CWD as the server reports it, and a spawned process. The oracle is a stand-in `xdg-open` installed on PATH ahead of the client's spawn, which appends its argument to a log — so the assertions are on the exact string [[crates/scribe-client/src/url_detect.rs#open_url]] / [[crates/scribe-client/src/url_detect.rs#open_path]] handed the OS, not on a screenshot of a highlight. It is installed rather than injected because the point is to observe the real `Command::new("xdg-open")` spawn, and the PATH lookup happens per spawn, so the already-running client picks it up with no relaunch.
+A fixed URL column covers the visual pane midpoint without glyph measurements. The disposable container's `xdg-open` shim records real spawn arguments and can be rewritten to succeed, fail, delay, or disappear; the client resolves it at each spawn, so no relaunch is needed. The original phases retain the modifier gate, Ctrl underline, URL activation, OSC 7-relative path resolution, dot-prefixed path, and original-repro assertions.
 
-Every row of the grid is filled with the same link, which is what lets the click land without cell-accurate pixel arithmetic: any point in the middle of the window is over one. What is under test is the routing, and a test that also had to solve for glyph metrics would fail for reasons that have nothing to do with it.
+`link-fail-notfound` removes every `xdg-open` reachable through the client's PATH, then requires the resulting Ctrl-click to paint feedback without invoking an opener. `link-fail-dismiss-key`, `-click`, `-wheel`, and `-output` compare the annotation rectangle with its original pixels after each dismissal; the key, button report, and wheel report cases also require their trigger to reach the PTY. `link-open-success-silent` records a successful child with no paint delta, while `link-fail-stale-drop` changes pane output before a delayed failure reports and requires the settled frame to remain unchanged.
 
-Phase 1 clicks a link with no modifier and requires that nothing opened — the modifier is the entire gate, and a build that opened on a bare click would launch a browser on every drag-select over a URL. Phase 2 parks the pointer, captures the grid, holds Ctrl, and requires the capture to change, then requires it to change back when Ctrl comes up: the rule is the whole discoverability half of the feature, and a build that draws nothing is aiming a click at a link the user was never shown. The capture is cropped above the status bar, whose sparklines resample on their own clock, and the seeded `terminal-links-config.toml` turns the cursor blink off — between two frames of an idle window those are the only things that would otherwise repaint themselves.
-
-Phase 3 Ctrl+clicks the URL. Phase 4 is the one that needs a real shell: it `cd`s into a directory, announces it with OSC 7, fills the grid with `./linkme.txt`, and requires the *absolute* path to come out of the opener. A relative link opened without a CWD would reach the OS as `./linkme.txt` and resolve against whatever directory the client process happens to be in, which is exactly the bug the phase exists to catch.
-
-Phase 5 and Phase 6 stay in the same CWD Phase 4 already announced and cover the bare-relative start-of-token gate ([[test#GPUI URL Detection#Bare relative paths keep their leading punctuation]]) rather than the explicit `./` form: Phase 5 creates `.impeccable/mocks/linkme.html` under it and requires the opener to receive the full dot-prefixed absolute path, not `impeccable/mocks/linkme.html` with the leading `.` dropped; Phase 6 repeats the same assertion against `.impeccable/mocks/beads-board-signal-theme.html`, the exact file from the bug report, so the fix is proven against the original repro and not only a synthetic stand-in.
+`hover-preview` emits an OSC 8 fixture, then requires both its foreground underline and the changed left status-bar crop; `hover-unhover-restore` requires the ordinary left group to return byte-for-pixel. The final Ctrl+Shift+U cycle captures default, busy-row, clamped, and top-flip annotation states through the same renderer as failed Ctrl-clicks.
 
 ### Window lifecycle over the wire
 
@@ -4521,7 +4517,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Update surfaces | | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
 | Cell-accurate paint path | | Box drawing, Font fallback, Ligatures |
 | Find overlay | | `SearchRequest`, `SearchResults`, `find` keybinding |
-| URL/OSC8 detection | | hover/dwell/open surface |
+| URL/OSC8 detection | | hover/status-bar preview/open surface |
 | IPC bridge ordering | | Executor-model ordering risk |
 | Remote connect picker | | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
 | Remote handshake | | `RemoteHandshake` preamble + dial-env spawn |
