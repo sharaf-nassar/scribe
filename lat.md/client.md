@@ -2637,19 +2637,19 @@ Highlighting runs through the cell-accurate paint path.  projects the server's a
 
 ## GPUI Overlays
 
-The GPUI rebuild ports the three interactive overlays — command palette, right-click context menu, and hover tooltip — as `gpui::Entity` views with rounded corners, drop shadows, and hover/pressed states, replacing the winit quad painters.
+The GPUI rebuild ports the command palette and right-click context menu as `gpui::Entity` views with rounded corners, drop shadows, and hover/pressed states, replacing the winit quad painters.
 
  folds the winit palette state and the `main.rs` entry machinery into one entity. The pure assembly stays testable:  holds the fixed action rows (including the feature-013 client-local "Connect to remote machine…" row),  builds the "Switch Profile" rows tagging the active one,  appends the conditional update row, and  applies the case-insensitive substring filter. Typing and  paste (control characters stripped) drive the filter; the wrapping selection and  emit a  via  for the shell to route (the winit `execute_automation_action` seam).
 
  ports the right-click menu.  assembles the ordered rows verbatim: the Copy/Paste/Select-All head (Copy gated on a selection), the OSC 8 "Open URL" precedence and appended "Copy hyperlink address" entry (spec 009 FR-003 / FR-007), the file row, and the smart-selection actions resolved through . Clicking an enabled row runs  (emitting a  on ); Escape or a backdrop click runs .
 
- draws the hover tooltip, sizing and positioning it from the pure geometry ports:  centres the box on the anchor and clamps it inside the viewport,  picks above/below, and  head+tail-elides a long URI (spec 009 FR-006). The spike wires all three into  — Ctrl+Shift+P opens the palette, a right-click opens the menu, Ctrl+Shift+U toggles the tooltip demo — and `tests/e2e/visual/overlays.sh` requires each live surface and its filter/focus transitions to produce a bounded pixel delta.
+[[crates/scribe-client/src/main.rs#AnnotationDemo]] is the Ctrl+Shift+U visual-test seam for failed-link feedback. It cycles default, busy-row, clamped, and top-flip anchors by inserting the same per-pane annotation state the observed opener path uses; [[crates/scribe-client/src/link_feedback.rs#AnnotationLayout]] computes every placement and [[crates/scribe-client/src/terminal_element.rs#TerminalElement#with_annotation]] paints it. `tests/e2e/visual/overlays.sh` captures every state through the live renderer.
 
 #### Overlay Chords Yield To Bindings
 
 Surfaces with no `KeybindingsConfig` field of their own are opened from a fixed chord the shell hard-codes, and a hard-coded chord must never shadow a configured action.
 
- is that table — the tooltip demo, the close dialog, the clipboard dialog, and vi mode — and  resolves a keystroke against it *after*  has had first refusal, returning `None` whenever a binding claims the key. The precedence is load-bearing because  runs ahead of : a chord claimed there never reaches the binding dispatcher at all. During the rebuild the close dialog sat on `ctrl+shift+q`, the Linux default for `close_tab`, so the action was unreachable without a rebind. The dialog moved to `ctrl+shift+d`, and the precedence rule keeps any future collision — including one a user creates by rebinding onto an overlay chord — resolved in the user's favour.
+ is that table — the annotation demo, the close dialog, the clipboard dialog, and vi mode — and  resolves a keystroke against it *after*  has had first refusal, returning `None` whenever a binding claims the key. The precedence is load-bearing because  runs ahead of : a chord claimed there never reaches the binding dispatcher at all. During the rebuild the close dialog sat on `ctrl+shift+q`, the Linux default for `close_tab`, so the action was unreachable without a rebind. The dialog moved to `ctrl+shift+d`, and the precedence rule keeps any future collision — including one a user creates by rebinding onto an overlay chord — resolved in the user's favour.
 
 ### Overlay Action Routing
 
@@ -2697,21 +2697,9 @@ Verifies  drops actions with an empty expanded parameter and that surviving smar
 
 Verifies  emits an enabled row's action, that a disabled row is a no-op, and that  emits `Dismissed`.
 
-### Tooltip centres on its anchor
+### Failed-link annotation demo cycle
 
-Verifies  centres a box that fits horizontally on the middle of its anchor rect.
-
-### Tooltip clamps to the viewport edges
-
-Verifies  pins a box against the right edge when the anchor is near it and to `x=0` at the left edge, so an edge-anchored tooltip slides inward instead of clipping.
-
-### Tooltip picks above or below the anchor
-
-Verifies  returns the anchor-top-minus-height for `Above` and the anchor-bottom for `Below`.
-
-### Tooltip truncates a long URL head and tail
-
-Verifies  returns short URIs unchanged, head+tail-elides an overflowing URI to exactly the budget with a middle `...`, falls back to a plain head cut at tiny budgets, and never splits a multibyte codepoint.
+Verifies [[crates/scribe-client/src/main.rs#AnnotationDemo]] advances through the four placement states, while the visual E2E captures their real per-pane paint inputs.
 
 ## GPUI Dialogs
 

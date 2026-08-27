@@ -9,22 +9,22 @@
 # one — the compositor-overlay case, e.g. GNOME Screenshot covering the terminal
 # — a keystroke delivered to this window must reach nothing at all.
 #
-# The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle: it
-# is consumed by the overlay router and never reaches the PTY, so the guard's
+# The probe keystroke is Ctrl+Shift+U, the client-local annotation-demo cycle:
+# it is consumed by the overlay router and never reaches the PTY, so the guard's
 # verdict is visible as a pure pixel change inside the window and nothing leaks
-# into a shell session. Each phase compares the tooltip region of the window,
-# cropped away from the live status-bar sparklines so the only thing that can
-# move a pixel is the toggle itself.
+# into a shell session. Each phase compares the annotation region, cropped away
+# from the live status-bar sparklines so the only thing that can move a pixel is
+# the demo state.
 #
 # Requires: visual container (Xvfb + openbox + xdotool + scrot + imagemagick).
 set -e
 
 LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 OUT=/output
-# Tooltip-demo region of the 960x680 window: the demo anchors the box at
-# (780, 120) and clamps it into the viewport, so this crop contains the whole
-# tooltip and none of the status bar, whose sparklines resample every 2 s.
-CROP="420x140+520+90"
+# Annotation-demo region of the default 1008x739 window. This covers both the
+# first default state and the following busy-row state while excluding the
+# status bar, whose sparklines resample every 2 s.
+CROP="650x400+180+280"
 SUPPRESSED="x11 focus guard suppressed keystroke"
 
 fail() {
@@ -36,7 +36,7 @@ suppression_count() {
     grep -c "$SUPPRESSED" "$LOG" 2>/dev/null || true
 }
 
-# Raise, focus, and capture just $1's own pixels, cropped to the tooltip region.
+# Raise, focus, and capture just $1's own pixels, cropped to the annotation region.
 shot() {
     local wid="$1" name="$2"
     xdotool windowactivate --sync "$wid" 2>/dev/null || xdotool windowfocus --sync "$wid"
@@ -80,8 +80,8 @@ sleep 0.6
 shot "$W1" 00-baseline.png
 before=$(suppression_count)
 send_toggle "$W1"
-shot "$W1" 01-tooltip-on.png
-[ "$(diff_pixels 00-baseline.png 01-tooltip-on.png)" != "0" ] \
+shot "$W1" 01-annotation-demo-default.png
+[ "$(diff_pixels 00-baseline.png 01-annotation-demo-default.png)" != "0" ] \
     || fail "phase 1: Ctrl+Shift+U changed nothing while the window was active"
 [ "$(suppression_count)" = "$before" ] \
     || fail "phase 1: guard suppressed a keystroke while our window was active"
@@ -113,7 +113,7 @@ send_toggle "$W1"
 shot "$W1" 02-suppressed.png
 [ "$(suppression_count)" -gt "$before" ] \
     || fail "phase 2: the keystroke never reached the guard (nothing suppressed)"
-[ "$(diff_pixels 01-tooltip-on.png 02-suppressed.png)" = "0" ] \
+[ "$(diff_pixels 01-annotation-demo-default.png 02-suppressed.png)" = "0" ] \
     || fail "phase 2: the suppressed keystroke still changed the window"
 echo "PHASE 2 PASS: inactive window — guard dropped the keystroke, pixels unchanged"
 
@@ -128,19 +128,17 @@ sleep 0.8
     || fail "phase 3: the client window never became active again"
 before=$(suppression_count)
 send_toggle "$W1"
-shot "$W1" 03-tooltip-off.png
+shot "$W1" 03-annotation-demo-busy-row.png
 [ "$(suppression_count)" = "$before" ] \
     || fail "phase 3: guard still suppressed after the window became active again"
-[ "$(diff_pixels 01-tooltip-on.png 03-tooltip-off.png)" != "0" ] \
+[ "$(diff_pixels 01-annotation-demo-default.png 03-annotation-demo-busy-row.png)" != "0" ] \
     || fail "phase 3: Ctrl+Shift+U changed nothing after re-activation"
-[ "$(diff_pixels 00-baseline.png 03-tooltip-off.png)" = "0" ] \
-    || fail "phase 3: the window did not return to its pre-toggle state"
-echo "PHASE 3 PASS: re-activated window — keystroke reached the router again"
+echo "PHASE 3 PASS: re-activated window — keystroke advanced the demo cycle"
 
 echo ""
 echo "PASS: X11 active-window guard is live on the GPUI key path"
 echo "  Inspect screenshots in test-output/:"
-echo "    00-baseline.png    — tooltip demo off"
-echo "    01-tooltip-on.png  — Ctrl+Shift+U landed while active"
-echo "    02-suppressed.png  — same key dropped while another window was active"
-echo "    03-tooltip-off.png — key landed again after re-activation"
+echo "    00-baseline.png                       — annotation demo off"
+echo "    01-annotation-demo-default.png        — first state while active"
+echo "    02-suppressed.png                      — key dropped while inactive"
+echo "    03-annotation-demo-busy-row.png       — second state after re-activation"

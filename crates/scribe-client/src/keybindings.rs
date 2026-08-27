@@ -480,8 +480,8 @@ pub enum LayoutAction {
 /// one place, in favour of the configured binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayChord {
-    /// Toggle the tooltip demo overlay.
-    TooltipDemo,
+    /// Cycle the failed-link annotation visual-test demo.
+    AnnotationDemo,
     /// Open the close-confirmation dialog.
     CloseDialog,
     /// Open the clipboard-confirmation dialog.
@@ -504,7 +504,7 @@ pub enum OverlayChord {
 /// here. A rebind can still move a user action onto one of these chords, which
 /// [`translate_overlay_chord`] resolves in the user's favour.
 pub const OVERLAY_CHORDS: [(&str, OverlayChord); 4] = [
-    ("ctrl+shift+u", OverlayChord::TooltipDemo),
+    ("ctrl+shift+u", OverlayChord::AnnotationDemo),
     ("ctrl+shift+d", OverlayChord::CloseDialog),
     ("ctrl+shift+k", OverlayChord::ClipboardDialog),
     ("ctrl+shift+space", OverlayChord::ViMode),

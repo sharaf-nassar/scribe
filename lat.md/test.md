@@ -3022,7 +3022,7 @@ Asserting on the log rather than on pixels alone is deliberate: the status bar's
 
 `tests/e2e/visual/x11-focus-guard.sh` is the scripted oracle for the X11 focus guard parity row: it proves the guard is started by  on the real window and actually gates keystrokes, which no unit test over  can show.
 
-The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so the guard's verdict is a pure pixel change inside the window and nothing can reach a PTY. The script asserts the startup line naming the guarded window id, then walks three phases: with the client active the toggle changes the tooltip crop; with an `xmessage` window holding `_NET_ACTIVE_WINDOW` the same `xdotool key --window` keystroke leaves the crop pixel-identical and adds a `suppressed keystroke` line (proving the key was delivered and dropped, not merely lost); and after re-activation the toggle lands again and the crop returns to its pre-toggle state.
+The probe keystroke is Ctrl+Shift+U, the client-local annotation-demo cycle, so the guard's verdict is a pure pixel change inside the window and nothing can reach a PTY. The script asserts the startup line naming the guarded window id, then walks three phases: with the client active the first annotation-demo state changes the crop; with an `xmessage` window holding `_NET_ACTIVE_WINDOW` the same `xdotool key --window` keystroke leaves that crop pixel-identical and adds a `suppressed keystroke` line (proving the key was delivered and dropped, not merely lost); and after re-activation the next demo state paints.
 
 The crop excludes the status bar deliberately — its sparklines resample every two seconds, so a whole-window comparison could never assert pixel identity.
 

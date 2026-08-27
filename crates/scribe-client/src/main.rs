@@ -134,7 +134,6 @@ use scribe_client::sys_stats::SystemStatsCollector;
 use scribe_client::terminal_image_scene::{
     CommittedImageScene, capability_mismatch_message, filter_terminal_image_placeholders,
 };
-use scribe_client::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client::update::UpdateState;
 use scribe_client::url_detect::{self, OpenObservation, OpenSpawnResult, SpanKind};
 use scribe_client::vi_mode::ViMotion;
@@ -219,7 +218,7 @@ use crate::{
     sync_frames::present_next_burst,
     terminal::{
         Content, ContentAnchor, DisplayOnlyTerminal, HoveredLink, PaneFrame, PaneGrid, PaneGrids,
-        PaneStream, Scroll,
+        PaneStream, Scroll, ViewportPoint,
     },
     terminal_element::{
         AnnotationPaint, CursorPaint, GridBounds, GridColors, GridFont, ImePaint,
@@ -941,8 +940,8 @@ impl ScrollbarSurfaces {
 /// Whether the pointer is currently dragging out a selection over the grid.
 ///
 /// A two-variant enum rather than a bool because the view already carries the
-/// `prompt_bar` and tooltip-demo flags, and a third loose bool is exactly the
-/// shape that stops reading as a state machine.
+/// `prompt_bar` and annotation-demo state, and a third loose bool is exactly
+/// the shape that stops reading as a state machine.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GridDrag {
     /// No button is down over the grid; pointer motion is just a hover.
@@ -987,6 +986,57 @@ struct LinkAnnotation {
     anchor: LinkOpenAnchor,
     message: String,
     layout: AnnotationLayout,
+}
+
+/// Visual-test states for the failed-link annotation renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnnotationDemo {
+    Default,
+    BusyRow,
+    Clamped,
+    TopFlip,
+}
+
+impl AnnotationDemo {
+    const fn next(self) -> Self {
+        match self {
+            Self::Default => Self::BusyRow,
+            Self::BusyRow => Self::Clamped,
+            Self::Clamped => Self::TopFlip,
+            Self::TopFlip => Self::Default,
+        }
+    }
+}
+
+fn annotation_demo_busy_target_row(content: &Content) -> usize {
+    let last_row = content.rows.len().saturating_sub(1);
+    for row in (0..last_row).rev() {
+        if content
+            .rows
+            .get(row)
+            .is_some_and(|cells| cells.iter().any(|cell| !matches!(cell.c, '\0' | ' ')))
+        {
+            return row + 1;
+        }
+    }
+    last_row
+}
+
+fn annotation_demo_clicked_run(state: AnnotationDemo, content: &Content) -> SelectionSpan {
+    let rows = content.rows.len();
+    let cols = content.rows.first().map_or(0, Vec::len);
+    let head = cols / 4;
+    let run_end = head.saturating_add(23).min(cols.saturating_sub(1));
+    let (row, start_col, end_col) = match state {
+        AnnotationDemo::Default => (rows / 2, head, run_end),
+        AnnotationDemo::BusyRow => (annotation_demo_busy_target_row(content), head, run_end),
+        AnnotationDemo::Clamped => {
+            let end_col = cols.saturating_sub(2);
+            (rows / 2, end_col.saturating_sub(23), end_col)
+        }
+        AnnotationDemo::TopFlip => (0, head, run_end),
+    };
+    SelectionSpan { row, start_col, end_col }
 }
 
 /// Per-pane observed opener and visible annotation lifecycle.
@@ -2033,9 +2083,8 @@ struct TerminalView {
     clipboard: ClipboardSurfaces,
     /// Click classification and drag state behind terminal text selection.
     pointer: PointerState,
-    /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
-    /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
-    tooltip_demo: bool,
+    /// Next state for the Ctrl+Shift+U failed-link annotation visual-test seam.
+    annotation_demo: AnnotationDemo,
     /// Workspace board painted this frame and whether it is pinned.
     visible_beads_boards: Vec<(WorkspaceId, bool)>,
     /// One cached strip view per visible workspace board. The entity is what
@@ -2692,7 +2741,7 @@ impl TerminalView {
             pending_agent_prompt: None,
             clipboard: ClipboardSurfaces::new(gate),
             pointer: PointerState::default(),
-            tooltip_demo: false,
+            annotation_demo: AnnotationDemo::Default,
             visible_beads_boards: Vec::new(),
             beads_strip_views: HashMap::new(),
             beads_panel_views: HashMap::new(),
@@ -10120,10 +10169,7 @@ impl TerminalView {
     /// [`translate_overlay_chord`] and is unit-tested there.
     fn open_overlay_chord(&mut self, chord: OverlayChord, cx: &mut Context<Self>) {
         match chord {
-            OverlayChord::TooltipDemo => {
-                self.tooltip_demo = !self.tooltip_demo;
-                cx.notify();
-            }
+            OverlayChord::AnnotationDemo => self.show_annotation_demo(cx),
             OverlayChord::CloseDialog => {
                 self.request_window_close(cx);
             }
@@ -12216,27 +12262,46 @@ impl TerminalView {
         share_overlay(&share, &colors)
     }
 
-    /// Build the demo hover tooltip when the `tooltip_demo` toggle is on: a long
-    /// URI anchored near the right edge, exercising both the head+tail truncation
-    /// and the viewport clamp.
-    fn build_tooltip_demo(&self) -> Option<gpui::AnyElement> {
-        self.tooltip_demo.then(|| {
-            let colors = TooltipColors::from(&self.chrome);
-            let anchor = Rect { x: 780.0, y: 120.0, width: 120.0, height: 18.0 };
-            let display = status_bar::truncate_url(
-                "https://example.com/very/long/path/that/overflows/the/box",
-                48,
-            );
-            tooltip_element(&TooltipRender {
-                text: &display,
-                anchor,
-                position: TooltipPosition::Below,
-                viewport_width: f32::from(CELL_WIDTH) * f32::from(COLUMNS),
-                colors: &colors,
-                char_width: f32::from(CELL_WIDTH),
-                line_height: f32::from(CELL_HEIGHT),
+    /// Put the next visual-test annotation into the same per-pane state the
+    /// observed opener path uses. The root key capture clears the prior state
+    /// before this chord reaches the router, matching normal annotation life.
+    fn show_annotation_demo(&mut self, cx: &mut Context<Self>) {
+        let state = self.annotation_demo;
+        let Some((pane, anchor)) = self.annotation_demo_anchor(state, cx) else { return };
+        let message = "no application handles ssh links".to_owned();
+        let Ok(layout) = self.link_annotation_layout(pane, &anchor, &message, cx) else {
+            return;
+        };
+        self.link_feedback.annotations.insert(pane, LinkAnnotation { anchor, message, layout });
+        self.annotation_demo = state.next();
+        cx.notify();
+    }
+
+    /// Build a stable in-grid anchor for one annotation layout grammar branch.
+    fn annotation_demo_anchor(
+        &self,
+        state: AnnotationDemo,
+        cx: &App,
+    ) -> Option<(PaneId, LinkOpenAnchor)> {
+        let pane = self.shell.focused_pane(cx)?;
+        let session_id = self.focused_session()?;
+        let terminal = self.pane_for(session_id)?;
+        let anchor = terminal
+            .with_terminal(|terminal| {
+                let clicked_run = annotation_demo_clicked_run(state, &terminal.content());
+                let content_anchor = terminal.anchor_at(ViewportPoint {
+                    row: clicked_run.row,
+                    col: clicked_run.start_col,
+                })?;
+                Some(LinkOpenAnchor {
+                    session_id,
+                    content: content_anchor,
+                    clicked_run,
+                    run_segments: vec![clicked_run],
+                })
             })
-        })
+            .flatten()?;
+        Some((pane, anchor))
     }
 
     /// Build the active remote-connect picker above normal terminal chrome.
@@ -12334,9 +12399,13 @@ impl TerminalView {
     }
 
     fn attach_root_interactions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
-        root.capture_key_down(
-            cx.listener(|view, _: &KeyDownEvent, _window, ctx| view.dismiss_link_annotations(ctx)),
-        )
+        root.capture_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
+            if view.compositor_overlay_active(event) {
+                ctx.stop_propagation();
+                return;
+            }
+            view.dismiss_link_annotations(ctx);
+        }))
         .capture_any_mouse_down(cx.listener(|view, _: &MouseDownEvent, _window, ctx| {
             view.dismiss_link_annotations(ctx);
         }))
@@ -12468,7 +12537,6 @@ impl Render for TerminalView {
         let grid = self.render_grid(ime, link, cx);
         let status_bar =
             self.render_status_bar(hover.as_ref().map(|preview| preview.uri.as_str()), window, cx);
-        let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
@@ -12494,7 +12562,6 @@ impl Render for TerminalView {
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
             .children(share)
-            .children(tooltip)
             .children(remote_picker)
             .children(workspace_drag_layers)
             // Last child, so the frozen banner covers every other overlay: while
@@ -17442,6 +17509,14 @@ mod tests {
         assert!(!latest_cancel.load(Ordering::Acquire));
         assert_eq!(feedback.pending.len(), 2);
         assert_eq!(feedback.pending[&pane].generation, latest_generation);
+    }
+
+    #[test]
+    fn annotation_demo_cycles_through_the_mock_placement_states() {
+        assert_eq!(AnnotationDemo::Default.next(), AnnotationDemo::BusyRow);
+        assert_eq!(AnnotationDemo::BusyRow.next(), AnnotationDemo::Clamped);
+        assert_eq!(AnnotationDemo::Clamped.next(), AnnotationDemo::TopFlip);
+        assert_eq!(AnnotationDemo::TopFlip.next(), AnnotationDemo::Default);
     }
 
     #[test]

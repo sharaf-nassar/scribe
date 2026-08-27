@@ -1,14 +1,8 @@
 #!/bin/bash
 [ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
-# Visual E2E test: the command palette, right-click context menu, and hover
-# tooltip overlays of the GPUI client rebuild.
-#
-# Drives the live Scribe window and walks the interaction checklist the overlay
-# bead requires: the command palette opens (Ctrl+Shift+P), filters as you type,
-# and moves its selection; the right-click context menu opens at the cursor with
-# its copy/open/hyperlink entries; and the tooltip demo (Ctrl+Shift+U) shows a
-# head+tail-truncated URL clamped inside the viewport. Every overlay is drawn
-# with rounded corners, a drop shadow, and hover/selected states.
+# Visual E2E test: command palette, context menu, and failed-link annotation
+# demo states. Ctrl+Shift+U cycles the real annotation paint state through the
+# mock's default, busy-row, clamped, and top-flip placement grammar.
 #
 # Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot.
 set -e
@@ -112,19 +106,48 @@ echo "PHASE 4 PASS: right-click painted the context menu ($DIFF px)"
 send_keys Escape
 shot /output/04b-context-dismissed.png
 
-# ── Phase 5: hover tooltip (truncated + clamped URL) ──────────────
+# ── Phase 5: failed-link annotation demo cycle ─────────────────────
+# Leave a real row for the busy-row state to cover. The demo itself only builds
+# the same anchor/lifecycle state as a failed opener; it never writes terminal
+# content.
 focus
+type_text "echo annotation-demo-busy-row"
+send_keys Return
+sleep 0.5
+shot /output/04c-annotation-demo-fixture.png
+
 send_keys ctrl+shift+u
-shot /output/05-tooltip.png
-DIFF=$(pixel_diff /output/04b-context-dismissed.png /output/05-tooltip.png)
-[ "$DIFF" -ge 50 ] || fail "tooltip changed only $DIFF pixels"
-echo "PHASE 5 PASS: tooltip painted ($DIFF px)"
+shot /output/05-annotation-demo-default.png
+DIFF=$(pixel_diff /output/04c-annotation-demo-fixture.png /output/05-annotation-demo-default.png)
+[ "$DIFF" -ge 50 ] || fail "annotation-demo-default changed only $DIFF pixels"
+echo "PHASE 5 PASS: annotation-demo-default painted ($DIFF px)"
+
+send_keys ctrl+shift+u
+shot /output/06-annotation-demo-busy-row.png
+DIFF=$(pixel_diff /output/05-annotation-demo-default.png /output/06-annotation-demo-busy-row.png)
+[ "$DIFF" -ge 50 ] || fail "annotation-demo-busy-row changed only $DIFF pixels"
+echo "PHASE 6 PASS: annotation-demo-busy-row painted ($DIFF px)"
+
+send_keys ctrl+shift+u
+shot /output/07-annotation-demo-clamped.png
+DIFF=$(pixel_diff /output/06-annotation-demo-busy-row.png /output/07-annotation-demo-clamped.png)
+[ "$DIFF" -ge 50 ] || fail "annotation-demo-clamped changed only $DIFF pixels"
+echo "PHASE 7 PASS: annotation-demo-clamped painted ($DIFF px)"
+
+send_keys ctrl+shift+u
+shot /output/08-annotation-demo-top-flip.png
+DIFF=$(pixel_diff /output/07-annotation-demo-clamped.png /output/08-annotation-demo-top-flip.png)
+[ "$DIFF" -ge 50 ] || fail "annotation-demo-top-flip changed only $DIFF pixels"
+echo "PHASE 8 PASS: annotation-demo-top-flip painted ($DIFF px)"
 
 echo ""
 echo "PASS: visual overlays test"
 echo "  Inspect screenshots in test-output/:"
-echo "    01-palette-open.png       — command palette at rest"
-echo "    02-palette-filtered.png   — palette filtered by query"
-echo "    03-palette-selection.png  — palette selection moved"
-echo "    04-context-menu.png       — right-click context menu"
-echo "    05-tooltip.png            — truncated + clamped URL tooltip"
+echo "    01-palette-open.png                   — command palette at rest"
+echo "    02-palette-filtered.png               — palette filtered by query"
+echo "    03-palette-selection.png              — palette selection moved"
+echo "    04-context-menu.png                   — right-click context menu"
+echo "    05-annotation-demo-default.png        — head anchor above the run"
+echo "    06-annotation-demo-busy-row.png       — opaque band over terminal text"
+echo "    07-annotation-demo-clamped.png        — tail anchor with ─┐"
+echo "    08-annotation-demo-top-flip.png       — top-edge flip with └"
