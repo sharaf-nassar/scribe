@@ -15725,6 +15725,13 @@ mod tests {
         {
             let sessions = live_sessions.read().await;
             let session = sessions.get(&session_id).expect("session reached the live registry");
+            // Do not inherit the developer's ~/.config/scribe/config.toml.
+            // `load_shared_scrollback_state` seeds this flag from the real user
+            // config, so an ambient `preserve_ai_scrollback = false` silently
+            // turns AI ED 3 suppression off and fails tests that never changed.
+            // Pin the same default `load_preserve_ai_scrollback_setting` falls
+            // back to when the config cannot be read.
+            session.preserve_ai_scrollback.store(true, std::sync::atomic::Ordering::Relaxed);
             lock_sinks(&session.client_writer).set_sole(Arc::clone(writer), queue);
         }
         (session_id, live_sessions, vec![pty.slave])
