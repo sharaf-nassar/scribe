@@ -78,8 +78,26 @@ Workspace-manager tests derive exact populated-target edge trees, bidirectional
 swap trees, ownership maps, and sole-source close/refusal outcomes. Server tests
 activate unchanged live sessions over real PTY pairs in two populated windows.
 They assert no replacement session is created, both env owners and workspace
-identities survive, outgoing sinks/attached sets are severed, and both windows
-refresh only with `SessionList`.
+identities survive, and outgoing sinks/attached sets are severed.
+
+Share-route coverage runs a swap between two `SharedSingleTypist` windows, each
+with a remote viewer and an in-flight control request. It asserts symmetry in
+both directions: every moved session ends with no sink, no session attachment,
+and no armed pending resize (armed through the pacer before the move), while
+sessions that stayed keep their window's sink; neither window's participants
+retain a departed session or adopt an arriving one; and both pending requests
+are discarded. The frame oracle then reads each of the four connections in
+order — `ControlDenied` for the two requesters, then exactly one `SessionList`
+with a tree, one `ShareRoster` for that window, and a timed-out read proving
+nothing else follows. Separate tests assert stale source key/resize/search/
+close frames for a moved session are refused (and a close through the
+dispatcher leaves it alive) while the destination window is authorized, that a
+remote participant holding control is refused `NoSourceWindowControl` with a
+byte-identical state snapshot, and that the session-initiated route flips to
+the destination window while an unmapped legacy session keeps its start-time
+window. The disconnect race replays the source connection's pre-move attached
+set against the registry after the destination has attached the arrived
+session, asserting neither its sink nor its attachment is clobbered.
 
 Sole-source coverage removes the empty `WindowShare`, reads `Moved` plus
 `WindowClosed`, retries the same move id, then named-MessagePack round-trips the

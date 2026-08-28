@@ -503,9 +503,15 @@ old copies are deleted best-effort and persist schedulers restart on the target.
 Commit severs every source participant's moved-session sinks and attached-id
 entries, then refreshes each over existing `SessionList` frames.
 
-Session-addressed key, resize, and close mutations re-check authoritative
-session→window ownership. Active agent leases are re-announced after commit and
-resolve to the destination window.
+Session-addressed key, resize, search, and close mutations re-check
+authoritative session→window ownership, so a stale source frame for a re-homed
+session is dropped in every share mode.
+[[crates/scribe-server/src/ipc_server.rs#session_route_window]] resolves the
+same mapping for session-INITIATED routes: a PTY reader keeps the window it
+started under, so its OSC 52 gating and prompt target are resolved per send and
+fall back to the start window only for sessions the manager never mapped.
+Active agent leases are re-announced after commit and resolve to the
+destination window.
 
 ### Strict pre/post snapshots
 
@@ -552,15 +558,42 @@ result. The requester receives `WorkspaceMoveResult::Moved` followed by
 `WindowClosed`; retries before or after handoff replay both acknowledgements. A
 sole-source swap returns the specific `SoleWorkspace` refusal.
 
+### Share route migration
+
+[[crates/scribe-server/src/ipc_server.rs#sever_moved_session_routes]] severs
+every route a moved session had into the window it left, before any
+destination participant can address it.
+
+Both windows' participant lists are swept for every moved session, so a swap is
+symmetric without tracking direction: sinks, attached-id entries, and the
+session attachment all go, and the resize pacer's pending size is dropped
+unconditionally — it belongs to a report from the window the session left. A
+window that gave sessions up also loses its in-flight control request
+([[crates/scribe-server/src/ipc_server.rs#discard_control_request]]), whose
+requester gets the existing `ControlDenied` and audit line; holders never
+travel and the destination holder survives. Only destination participants can
+then attach, because
+[[crates/scribe-server/src/ipc_server.rs#filter_attachable_sessions]] admits an
+attach only from the authoritative owner window; the move itself installs no
+sink, so the destination's own `AttachSessions` remains the one attach path.
+
+After commit each surviving window's participants receive one full
+`SessionList` (with its tree) and then one full `ShareRoster` — never a partial
+delta — and session-initiated routes follow ownership rather than the window
+the session started in
+([[server#Workspace Transfer#Viewer severance and authoritative ownership]]).
+
 ### Typed refusals
 
 Every pre-commit move failure is typed and recorded.
 
 Reasons cover capability, source/target control, target availability, workspace
-ownership, handoff, and env staging. Fallible env copies are staged in both
-directions before commit; revalidation failure discards them. No refusal
-changes live sessions, workspace/env ownership, shares, handoff state, or
-agent-world routing.
+ownership, handoff, and env staging. Only the local owner of BOTH windows may
+initiate: a remote participant holding input control is refused
+`NoSourceWindowControl`. Fallible env copies are staged in both directions
+before commit; revalidation failure discards them. No refusal changes live
+sessions, workspace/env ownership, shares, handoff state, or agent-world
+routing.
 
 ## Beads Flow source cache
 
@@ -1466,7 +1499,7 @@ That 250 ms debounce is trailing and single-armed. The first report arms one tim
 
 Changing any sharing key applies live over `ConfigReloaded` with no restart:  takes a  and rewrites active shares immediately (FR-017) — `SharedSingleTypist` demotes all participants to viewers with control unheld, `SingleController` detaches every remote participant with the legacy `WindowTakenOver` displaced notice, `FreeForAll` makes everyone a typist — and cancels any pending control request, informing the requester.
 
-Session-initiated clipboard requests route through : an OSC 52 write goes to the current control holder, falling back to the owning machine when control is unheld or in free-for-all where no single holder exists (FR-013). Revoking a device or severing a transport ejects only the affected participant via the existing sever→detach path (), which detaches its sessions, drops it from the share, and — through  on the 013 remote-audit target — records the departure as `eject` (versus `leave` for a clean disconnect); the share continues for everyone else (FR-011/015, SC-007).
+Session-initiated clipboard requests route through : an OSC 52 write goes to the current control holder, falling back to the owning machine when control is unheld or in free-for-all where no single holder exists (FR-013). Which window's share that is comes from [[crates/scribe-server/src/ipc_server.rs#session_route_window|session_route_window]], not from the window the PTY reader started under, so a session a workspace transfer or move re-homed prompts its new window instead of the one it left. Revoking a device or severing a transport ejects only the affected participant via the existing sever→detach path (), which detaches its sessions, drops it from the share, and — through  on the 013 remote-audit target — records the departure as `eject` (versus `leave` for a clean disconnect); the share continues for everyone else (FR-011/015, SC-007).
 
 #### Local Additive Join
 

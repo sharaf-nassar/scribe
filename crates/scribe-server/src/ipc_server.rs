@@ -8244,19 +8244,14 @@ async fn stage_workspace_move_env(
     Ok(env_rebinds)
 }
 
-#[derive(Clone, Copy)]
-enum WorkspaceMoveDirection {
-    SourceToTarget,
-    TargetToSource,
-}
-
-type WorkspaceMoveAttachment = (SessionId, SessionAttachment, WorkspaceMoveDirection);
-
 struct WorkspaceMoveCommit {
     moved: Vec<SessionId>,
     source_viewers: Vec<TransferViewer>,
     target_viewers: Vec<TransferViewer>,
-    attachments: Vec<WorkspaceMoveAttachment>,
+    attachments: Vec<(SessionId, SessionAttachment)>,
+    /// Control requests the move discarded, one per window that gave sessions
+    /// up, applied as `ControlDenied` + audit once the guards drop.
+    denied_requests: Vec<(WindowId, ControlEffect)>,
     source_closed: bool,
 }
 
@@ -8318,22 +8313,34 @@ async fn commit_workspace_move(
 
     let mut attachments =
         Vec::with_capacity(committed.source_sessions.len() + committed.target_sessions.len());
-    for (&session_id, destination, direction, viewers) in committed
+    for (&session_id, destination) in committed
         .source_sessions
         .iter()
-        .map(|session_id| {
-            (session_id, target_window_id, WorkspaceMoveDirection::SourceToTarget, &source_viewers)
-        })
-        .chain(committed.target_sessions.iter().map(|session_id| {
-            (session_id, source_window, WorkspaceMoveDirection::TargetToSource, &target_viewers)
-        }))
+        .map(|session_id| (session_id, target_window_id))
+        .chain(committed.target_sessions.iter().map(|session_id| (session_id, source_window)))
     {
         if let Some(session) = sessions.get_mut(&session_id) {
             session.env_window_id = destination;
-            if sever_transfer_sinks(session, viewers) {
-                lock_resize_pacer(&session.resize_pacer).discard_pending();
-            }
-            attachments.push((session_id, Arc::clone(&session.attachment), direction));
+            sever_moved_session_routes(session, source_viewers.iter().chain(&target_viewers));
+            attachments.push((session_id, Arc::clone(&session.attachment)));
+        }
+    }
+    // A window that gave sessions up loses its in-flight control request: it
+    // was raised against a window whose contents just changed. The holder is
+    // untouched — a destination holder survives the move and a source holder
+    // keeps whatever stayed.
+    let mut denied_requests = Vec::new();
+    for window_id in [
+        Some(source_window).filter(|_| !committed.source_closed),
+        Some(target_window_id).filter(|_| !committed.target_sessions.is_empty()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let effect =
+            shares.get_mut(&window_id).map_or(ControlEffect::None, discard_control_request);
+        if !matches!(effect, ControlEffect::None) {
+            denied_requests.push((window_id, effect));
         }
     }
     if committed.source_closed {
@@ -8346,7 +8353,50 @@ async fn commit_workspace_move(
         source_viewers,
         target_viewers,
         attachments,
+        denied_requests,
         source_closed: committed.source_closed,
+    })
+}
+
+/// Sever every route a moved session had into the window it just left.
+///
+/// Both windows' participants are passed for every moved session so a swap is
+/// symmetric without tracking direction: the leaving side's sinks go, and a
+/// participant the session was never attached to is a no-op. The resize
+/// pacer's pending size is dropped unconditionally — unlike a detach, which
+/// keeps it while other sinks remain — because it belongs to a report from the
+/// window the session just left, and maturing it would resize the session out
+/// from under its new window's authoritative grid.
+fn sever_moved_session_routes<'a>(
+    session: &LiveSession,
+    viewers: impl Iterator<Item = &'a TransferViewer>,
+) {
+    {
+        let mut sinks = lock_sinks(&session.client_writer);
+        for (writer, _, _) in viewers {
+            sinks.detach(writer);
+        }
+    }
+    lock_resize_pacer(&session.resize_pacer).discard_pending();
+}
+
+/// Discard a window share's pending control request under the caller's write
+/// guard, returning the effect that informs and audits its requester.
+fn discard_control_request(share: &mut WindowShare) -> ControlEffect {
+    let requester_id = match &mut share.control {
+        ControlState::SingleTypist { pending_request, .. } => match pending_request.take() {
+            Some(request) => request.requester,
+            None => return ControlEffect::None,
+        },
+        ControlState::LegacyExclusive { .. } | ControlState::FreeForAll => {
+            return ControlEffect::None;
+        }
+    };
+    share.participants.get(&requester_id).map_or(ControlEffect::None, |requester| {
+        ControlEffect::Denied {
+            requester_writer: Arc::clone(&requester.writer),
+            requester: requester.identity.clone(),
+        }
     })
 }
 
@@ -8358,20 +8408,28 @@ async fn finalize_workspace_move(
 ) {
     let server = context.server;
     let source_window = context.window_id;
-    let WorkspaceMoveCommit { moved, source_viewers, target_viewers, attachments, source_closed } =
-        commit;
+    let WorkspaceMoveCommit {
+        moved,
+        source_viewers,
+        target_viewers,
+        attachments,
+        denied_requests,
+        source_closed,
+    } = commit;
 
-    for (session_id, attachment, direction) in attachments {
+    // Both rosters are swept for every moved session, so neither window keeps
+    // an attached id addressing a session it no longer owns.
+    for (session_id, attachment) in attachments {
         remove_from_session_attachment(&attachment, session_id).await;
         clear_session_attachment(&attachment).await;
-        let viewers = match direction {
-            WorkspaceMoveDirection::SourceToTarget => &source_viewers,
-            WorkspaceMoveDirection::TargetToSource => &target_viewers,
-        };
-        for (_, _, viewer_attached) in viewers {
+        for (_, _, viewer_attached) in source_viewers.iter().chain(&target_viewers) {
             attached_remove(viewer_attached, session_id).await;
         }
         server.env_store.drop_scheduler(session_id).await;
+    }
+
+    for (window_id, effect) in denied_requests {
+        apply_control_effect(server, window_id, effect).await;
     }
 
     for rebind in env_rebinds {
@@ -8416,6 +8474,14 @@ async fn finalize_workspace_move(
         )
         .await;
     }
+
+    // One full-state roster per surviving window, behind its full session list:
+    // the move changed which sessions each roster governs, and a participant
+    // must never have to infer that from a delta.
+    if !source_closed {
+        broadcast_share_roster(server, source_window).await;
+    }
+    broadcast_share_roster(server, target_window_id).await;
 
     server.agent_api.activity().rebroadcast_active(&moved);
     info!(
@@ -12887,12 +12953,33 @@ async fn handle_session_event(
 /// attached client did not advertise support; the caller treats that path
 /// as a headless deny per research decision 7.
 async fn client_clipboard_gating(state: &PtyReaderState) -> bool {
-    state
-        .window_shares
-        .read()
-        .await
-        .get(&state.window_id)
-        .is_some_and(WindowShare::clipboard_gating)
+    let window_id = clipboard_route_window(state).await;
+    state.window_shares.read().await.get(&window_id).is_some_and(WindowShare::clipboard_gating)
+}
+
+/// The window a session-initiated route belongs to NOW.
+///
+/// [`PtyReaderState`]'s `window_id` is the owner the reader started under, and
+/// a workspace transfer or move re-homes a live session without restarting its
+/// reader. Session-initiated routes therefore resolve the authoritative
+/// session→window mapping per send — the same ownership source
+/// [`session_owned_by_window`] gates key, resize, and close on — so a moved
+/// session reaches its new window instead of the one it left. `started_in`
+/// remains the fallback for sessions the manager never mapped (legacy
+/// no-window flows). The workspace-manager guard is released before the caller
+/// takes any share guard, keeping the shares → workspace-manager order.
+async fn session_route_window(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    session_id: SessionId,
+    started_in: WindowId,
+) -> WindowId {
+    let owner = workspace_manager.read().await.window_for_session(session_id);
+    owner.unwrap_or(started_in)
+}
+
+/// [`session_route_window`] for one reader's own session.
+async fn clipboard_route_window(state: &PtyReaderState) -> WindowId {
+    session_route_window(&state.workspace_manager, state.session_id, state.window_id).await
 }
 
 /// Whether *any* client writer is currently attached to this session. Used
@@ -12911,11 +12998,12 @@ fn session_has_attached_client(state: &PtyReaderState) -> bool {
 /// unattended viewer never gets a surprise clipboard prompt. Sends to ONE sink, not
 /// the participant fan-out; a no-op when the window has no share.
 async fn send_clipboard_to_target(state: &PtyReaderState, msg: &ServerMessage) {
+    let window_id = clipboard_route_window(state).await;
     let target = state
         .window_shares
         .read()
         .await
-        .get(&state.window_id)
+        .get(&window_id)
         .and_then(|share| share.controller_writer().cloned());
     if let Some(writer) = target {
         send_message(&writer, msg).await;
@@ -18749,6 +18837,414 @@ mod tests {
         );
         assert_eq!(fixture.state_snapshot().await, snapshot);
         TRANSFER_ENV_FAIL_AT.with(|fail| fail.set(None));
+    }
+
+    struct MoveViewer {
+        client_read: tokio::io::ReadHalf<tokio::net::UnixStream>,
+        attached_ids: AttachedSessionIds,
+    }
+
+    /// Flip one fixture window into a `SharedSingleTypist` share: its local
+    /// owner holds control, a remote viewer views the window's sessions, and
+    /// that viewer has an in-flight control request awaiting the holder.
+    async fn share_window_with_pending_request(
+        fixture: &MoveFixture,
+        window_id: WindowId,
+        session_ids: &[SessionId],
+    ) -> MoveViewer {
+        let (viewer_server, viewer_client) = unix_stream_pair();
+        let (_viewer_read, viewer_write) = tokio::io::split(viewer_server);
+        let (client_read, _viewer_client_write) = tokio::io::split(viewer_client);
+        let writer = test_shared_writer(viewer_write);
+        let attached_ids: AttachedSessionIds =
+            Arc::new(Mutex::new(session_ids.iter().copied().collect()));
+        let mut viewer = Participant::new(
+            &writer,
+            ControllerIdentity::Remote {
+                device_name: String::from("viewer"),
+                login_name: String::from("test"),
+            },
+            ParticipantTransport::Remote,
+            false,
+            AgentApiCapability::Unsupported,
+        );
+        viewer.attached_ids = Arc::clone(&attached_ids);
+        let requester = viewer.id;
+        {
+            let mut shares = fixture.server.window_shares.write().await;
+            let share = shares.get_mut(&window_id).expect("fixture window share");
+            let holder = share.local_participant().expect("local owner").id;
+            share.add_participant(viewer);
+            share.mode = scribe_config::SharingMode::SharedSingleTypist;
+            share.control = ControlState::SingleTypist {
+                holder: Some(holder),
+                pending_request: Some(PendingRequest { requester }),
+            };
+        }
+        let queue = writer.lock().await.queue();
+        let live = fixture.server.live_sessions.read().await;
+        for &session_id in session_ids {
+            let mut sinks = lock_sinks(&live[&session_id].client_writer);
+            sinks.begin_attach(&writer, queue.clone(), true);
+            sinks.finish_attach(&writer, 0, session_id);
+        }
+        drop(live);
+        MoveViewer { client_read, attached_ids }
+    }
+
+    async fn read_move_frame(
+        reader: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+    ) -> ServerMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(3), read_message(reader))
+            .await
+            .expect("post-move frame arrived")
+            .expect("post-move frame decoded")
+    }
+
+    async fn assert_no_further_frame(reader: &mut tokio::io::ReadHalf<tokio::net::UnixStream>) {
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            let frame: ServerMessage = read_message(reader).await.expect("frame decoded");
+            frame
+        })
+        .await;
+        assert!(extra.is_err(), "a second post-move refresh followed: {:?}", extra.ok());
+    }
+
+    async fn assert_pending_request_denied(
+        reader: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+        window_id: WindowId,
+    ) {
+        let denied = read_move_frame(reader).await;
+        assert!(
+            matches!(denied, ServerMessage::ControlDenied { window_id: denied_window }
+                if denied_window == window_id),
+            "the discarded control request was not denied: {denied:?}"
+        );
+    }
+
+    /// Assert one connection's whole post-move refresh: the discarded control
+    /// request's denial (its requester only), then exactly one full
+    /// `SessionList` and one full `ShareRoster`, and nothing behind them.
+    async fn assert_post_move_refresh(
+        reader: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+        window_id: WindowId,
+        requester: bool,
+    ) {
+        if requester {
+            assert_pending_request_denied(reader, window_id).await;
+        }
+        let list = read_move_frame(reader).await;
+        assert!(
+            matches!(list, ServerMessage::SessionList { workspace_tree: Some(_), .. }),
+            "expected one full session list, got {list:?}"
+        );
+        let roster = read_move_frame(reader).await;
+        assert!(
+            matches!(roster, ServerMessage::ShareRoster { window_id: roster_window, .. }
+                if roster_window == window_id),
+            "expected one full share roster, got {roster:?}"
+        );
+        assert_no_further_frame(reader).await;
+    }
+
+    /// Whether `window_id`'s share still carries a pending control request.
+    async fn has_pending_request(fixture: &MoveFixture, window_id: WindowId) -> bool {
+        matches!(
+            fixture.server.window_shares.read().await.get(&window_id).map(|share| &share.control),
+            Some(ControlState::SingleTypist { pending_request: Some(_), .. })
+        )
+    }
+
+    // @lat: [[server#Workspace Move#Share route migration]]
+    #[tokio::test]
+    async fn workspace_move_swap_severs_both_sides_routes_symmetrically() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        let source_viewer = share_window_with_pending_request(
+            &fixture,
+            fixture.source_window,
+            &fixture.sessions[..2],
+        )
+        .await;
+        let target_viewer = share_window_with_pending_request(
+            &fixture,
+            fixture.target_window,
+            &fixture.sessions[2..],
+        )
+        .await;
+        // A drag's trailing resize is still armed on a session about to leave.
+        {
+            let live = fixture.server.live_sessions.read().await;
+            let mut pacer = lock_resize_pacer(&live[&fixture.sessions[0]].resize_pacer);
+            let now = std::time::Instant::now();
+            pacer.admit(viewport(80, 24), now);
+            pacer.admit(viewport(100, 30), now);
+            assert!(pacer.pending.is_some(), "the fixture armed a trailing resize");
+        }
+
+        assert_eq!(
+            fixture.run(110, 2, WorkspaceMoveOperation::Swap).await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        let live = fixture.server.live_sessions.read().await;
+        for moved in [fixture.sessions[0], fixture.sessions[2]] {
+            assert!(
+                lock_sinks(&live[&moved].client_writer).is_empty(),
+                "a moved session kept a sink from the window it left"
+            );
+            assert!(
+                lock_resize_pacer(&live[&moved].resize_pacer).pending.is_none(),
+                "a moved session kept the old window's pending resize"
+            );
+            assert!(live[&moved].attachment.lock().await.is_none());
+        }
+        for stayed in [fixture.sessions[1], fixture.sessions[3]] {
+            assert!(
+                !lock_sinks(&live[&stayed].client_writer).is_empty(),
+                "a session that stayed lost its window's sink"
+            );
+        }
+        drop(live);
+
+        for (attached, left, arrived) in [
+            (&fixture.source_attached, fixture.sessions[0], fixture.sessions[2]),
+            (&source_viewer.attached_ids, fixture.sessions[0], fixture.sessions[2]),
+            (&fixture.target_attached, fixture.sessions[2], fixture.sessions[0]),
+            (&target_viewer.attached_ids, fixture.sessions[2], fixture.sessions[0]),
+        ] {
+            let ids = attached.lock().await;
+            assert!(!ids.contains(&left), "a source participant still addresses a moved session");
+            assert!(!ids.contains(&arrived), "a source participant adopted an arriving session");
+        }
+        // Both windows gave sessions up, so both lost their pending request;
+        // neither holder travelled or changed.
+        assert!(!has_pending_request(&fixture, fixture.source_window).await);
+        assert!(!has_pending_request(&fixture, fixture.target_window).await);
+    }
+
+    // @lat: [[server#Workspace Move#Share route migration]]
+    #[tokio::test]
+    async fn workspace_move_refreshes_each_window_with_one_list_and_roster() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        let mut source_viewer = share_window_with_pending_request(
+            &fixture,
+            fixture.source_window,
+            &fixture.sessions[..2],
+        )
+        .await;
+        let mut target_viewer = share_window_with_pending_request(
+            &fixture,
+            fixture.target_window,
+            &fixture.sessions[2..],
+        )
+        .await;
+
+        assert_eq!(
+            fixture.run(111, 2, WorkspaceMoveOperation::Swap).await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        let source_window = fixture.source_window;
+        let target_window = fixture.target_window;
+        for (reader, window_id, requester) in [
+            (&mut fixture.source_read, source_window, false),
+            (&mut source_viewer.client_read, source_window, true),
+            (&mut fixture.target_read, target_window, false),
+            (&mut target_viewer.client_read, target_window, true),
+        ] {
+            assert_post_move_refresh(reader, window_id, requester).await;
+        }
+    }
+
+    // @lat: [[server#Workspace Move#Share route migration]]
+    #[tokio::test]
+    async fn stale_source_frames_for_a_moved_session_are_refused() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        assert_eq!(
+            fixture
+                .run(
+                    112,
+                    2,
+                    WorkspaceMoveOperation::InsertAtEdge {
+                        edge: scribe_common::protocol::WorkspaceTreeEdge::Left,
+                    },
+                )
+                .await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        let moved = fixture.sessions[0];
+        let mut source_context = ClientDispatchContext {
+            server: &fixture.server,
+            writer: &fixture.source_writer,
+            attached_ids: &fixture.source_attached,
+            window_id: fixture.source_window,
+            is_remote: false,
+        };
+        for message in [
+            ClientMessage::KeyInput {
+                session_id: moved,
+                data: vec![b'x'],
+                dismisses_attention: false,
+            },
+            ClientMessage::Resize { session_id: moved, size: viewport(80, 24) },
+            ClientMessage::SearchRequest { session_id: moved, query: String::from("x"), limit: 1 },
+            ClientMessage::SearchClosed { session_id: moved },
+            ClientMessage::CloseSession { session_id: moved },
+        ] {
+            assert!(
+                !session_message_is_authorized(&message, &source_context).await,
+                "the source window still authorizes {message:?} for a moved session"
+            );
+            dispatch_session_message(message, &mut source_context).await;
+        }
+        assert!(
+            fixture.server.live_sessions.read().await.contains_key(&moved),
+            "a stale source close reached a moved session"
+        );
+
+        let target_context = ClientDispatchContext {
+            server: &fixture.server,
+            writer: &fixture.target_writer,
+            attached_ids: &fixture.target_attached,
+            window_id: fixture.target_window,
+            is_remote: false,
+        };
+        assert!(
+            session_message_is_authorized(
+                &ClientMessage::CloseSession { session_id: moved },
+                &target_context,
+            )
+            .await,
+            "the destination window must own the moved session"
+        );
+    }
+
+    // @lat: [[server#Workspace Move#Share route migration]]
+    #[tokio::test]
+    async fn a_stale_source_disconnect_cannot_detach_the_destination() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        // The set the source connection held before the move; its disconnect
+        // cleanup replays exactly this against the registry.
+        let stale_source_ids = attached_snapshot(&fixture.source_attached).await;
+        assert_eq!(
+            fixture.run(115, 2, WorkspaceMoveOperation::Swap).await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        // The destination attaches the arrived session, as its client does on
+        // the post-move `SessionList`.
+        let moved = fixture.sessions[0];
+        let destination_attached = attach_transfer_controller(
+            &fixture.server.live_sessions,
+            &fixture.target_writer,
+            &[moved],
+        )
+        .await;
+
+        detach_sessions(&fixture.server.live_sessions, &stale_source_ids, &fixture.source_writer)
+            .await;
+
+        let live = fixture.server.live_sessions.read().await;
+        assert!(
+            !lock_sinks(&live[&moved].client_writer).is_empty(),
+            "a stale source disconnect detached the destination's sink"
+        );
+        assert!(
+            live[&moved].attachment.lock().await.is_some(),
+            "a stale source disconnect cleared the destination's attachment"
+        );
+        drop(live);
+        assert!(destination_attached.lock().await.contains(&moved));
+    }
+
+    // @lat: [[server#Workspace Move#Typed refusals]]
+    #[tokio::test]
+    async fn a_remote_participant_cannot_initiate_a_workspace_move() {
+        let fixture = move_fixture(2, [None; 4]).await;
+        let (remote_server, _remote_client) = unix_stream_pair();
+        let (_remote_read, remote_write) = tokio::io::split(remote_server);
+        let remote_writer = test_shared_writer(remote_write);
+        let remote_attached: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut shares = fixture.server.window_shares.write().await;
+            let share = shares.get_mut(&fixture.source_window).expect("source share");
+            let mut remote = Participant::new(
+                &remote_writer,
+                ControllerIdentity::Remote {
+                    device_name: String::from("peer"),
+                    login_name: String::from("test"),
+                },
+                ParticipantTransport::Remote,
+                false,
+                AgentApiCapability::Unsupported,
+            );
+            remote.workspace_move = WorkspaceMoveCapability::Supported;
+            remote.attached_ids = Arc::clone(&remote_attached);
+            let holder = remote.id;
+            share.add_participant(remote);
+            // The remote peer holds input control of the source window.
+            share.mode = scribe_config::SharingMode::SharedSingleTypist;
+            share.control =
+                ControlState::SingleTypist { holder: Some(holder), pending_request: None };
+        }
+        let snapshot = fixture.state_snapshot().await;
+        let mut context = ClientDispatchContext {
+            server: &fixture.server,
+            writer: &remote_writer,
+            attached_ids: &remote_attached,
+            window_id: fixture.source_window,
+            is_remote: true,
+        };
+        let outcome = run_workspace_move(
+            WorkspaceMoveCommand {
+                move_id: 113,
+                workspace_id: fixture.workspaces[0],
+                target_window_id: fixture.target_window,
+                target_workspace_id: fixture.workspaces[2],
+                operation: WorkspaceMoveOperation::Swap,
+            },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            refused_workspace_move(WorkspaceMoveRefusal::NoSourceWindowControl),
+            "a remote participant with control initiated a move"
+        );
+        assert_eq!(fixture.state_snapshot().await, snapshot);
+    }
+
+    // @lat: [[server#Workspace Move#Share route migration]]
+    #[tokio::test]
+    async fn session_routes_follow_a_moved_session_to_its_new_window() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        let moved = fixture.sessions[0];
+        let started_in = fixture.source_window;
+        let manager = &fixture.server.workspace_manager;
+        assert_eq!(session_route_window(manager, moved, started_in).await, fixture.source_window);
+
+        assert_eq!(
+            fixture.run(114, 2, WorkspaceMoveOperation::Swap).await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        let moved_manager = &fixture.server.workspace_manager;
+        assert_eq!(
+            session_route_window(moved_manager, moved, started_in).await,
+            fixture.target_window,
+            "the moved session's clipboard route still names the window it left"
+        );
+        assert_eq!(
+            session_route_window(moved_manager, fixture.sessions[2], fixture.target_window).await,
+            fixture.source_window
+        );
+        // A session the manager never mapped keeps its reader's start window.
+        assert_eq!(
+            session_route_window(moved_manager, SessionId::new(), started_in).await,
+            started_in,
+            "an unmapped legacy session lost its start-time route"
+        );
     }
 
     // @lat: [[server#Workspace Transfer#Viewer severance and authoritative ownership]]
