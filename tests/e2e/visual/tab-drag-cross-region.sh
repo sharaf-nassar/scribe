@@ -50,11 +50,6 @@ leaf_tabs() {
     oracle leaf "$1" | python3 -c 'import json,sys; print(*json.load(sys.stdin)["session_ids"])'
 }
 
-tab_index() {
-    local workspace=$1 session=$2
-    leaf_tabs "$workspace" | tr ' ' '\n' | nl -v0 -ba | awk -v session="$session" '$2 == session { print $1; exit }'
-}
-
 tab_center() {
     local index=$1 width=$2 count=$3
     echo $(( index * width / count + width / (2 * count) ))
