@@ -11,8 +11,6 @@ set -euo pipefail
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
-TITLEBAR_H=34
-BOTTOM_CHROME_H=24
 PILL_CENTER_X=44 # measured from 00-standalone-pill.png: 88px neutral label + padding
 PLACEMENT_TOLERANCE=50
 
@@ -44,7 +42,6 @@ focus_window() {
     WIN_Y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
     WIN_W=$(printf '%s\n' "$info" | awk '/Width:/ { print $2 }')
     WIN_H=$(printf '%s\n' "$info" | awk '/Height:/ { print $2 }')
-    GRID_H=$((WIN_H - TITLEBAR_H - BOTTOM_CHROME_H))
 }
 
 shot() {
@@ -103,7 +100,7 @@ cancel_hold() {
 
 cancel_hold_on_source() {
     xdotool mousemove --sync "$((WIN_X + WIN_W / 4))" \
-        "$((WIN_Y + TITLEBAR_H + GRID_H / 2))"
+        "$((WIN_Y + GRID_TOP + GRID_H / 2))"
     xdotool mouseup 1
     sleep 0.6
 }
@@ -137,18 +134,24 @@ PY
 }
 
 # An 18%-alpha zone changes nearly every pixel under its code-derived rect.
-# Crop dimensions mirror zone_preview_rect: one-third edge bands and center.
+# Baseline rows must change every pixel; other overlay probes retain their
+# broader threshold. Crop dimensions mirror zone_preview_rect's thirds.
 assert_overlay_rect() {
-    local before=$1 after=$2 x=$3 y=$4 w=$5 h=$6 label=$7 value area
+    local before=$1 after=$2 x=$3 y=$4 w=$5 h=$6 label=$7 baseline=${8:-0} value area
     value=$(compare -metric AE \
         \( "$before" -crop "${w}x${h}+${x}+${y}" +repage \) \
         \( "$after" -crop "${w}x${h}+${x}+${y}" +repage \) null: 2>&1 || true)
     value=${value%%.*}
     area=$((w * h))
-    [ "${value:-0}" -gt $((area / 2)) ] \
-        || fail "$label overlay changed ${value:-0}/$area expected pixels"
-    printf '{"label":"%s","x":%d,"y":%d,"width":%d,"height":%d,"changed":%d}\n' \
-        "$label" "$x" "$y" "$w" "$h" "$value" >>/output/workspace-zone-baselines.jsonl
+    if [ "$baseline" -eq 1 ]; then
+        [ "${value:-0}" -eq "$area" ] \
+            || fail "$label overlay changed ${value:-0}/$area expected pixels"
+        printf '{"label":"%s","x":%d,"y":%d,"width":%d,"height":%d,"changed":%d}\n' \
+            "$label" "$x" "$y" "$w" "$h" "$value" >>/output/workspace-zone-baselines.jsonl
+    else
+        [ "${value:-0}" -gt $((area / 2)) ] \
+            || fail "$label overlay changed ${value:-0}/$area expected pixels"
+    fi
 }
 
 focus_window
@@ -167,8 +170,14 @@ read -r a b <<<"$ids"
 [ "$(oracle leaf-session-count "$b")" -eq 0 ] \
     || fail "standalone workspace received a flex tab before chrome move"
 shot 00-standalone-pill.png
+GRID_TOP=$(measure_bar_height /output/00-standalone-pill.png 0 100 workspace-top)
+STATUS_H=$(measure_status_height \
+    /output/00-standalone-pill.png "$(( WIN_H - 100 ))" 100 workspace-status)
+GRID_BOTTOM=$(( WIN_H - STATUS_H ))
+GRID_H=$(( GRID_BOTTOM - GRID_TOP ))
+[ "$GRID_H" -gt 0 ] || fail "measured grid height $GRID_H is not positive"
 right_ink=$(convert /output/00-standalone-pill.png \
-    -crop "88x${TITLEBAR_H}+$((WIN_W / 2))+0" +repage \
+    -crop "88x${GRID_TOP}+$((WIN_W / 2))+0" +repage \
     -colorspace Gray -threshold 35% -format '%[fx:mean*w*h]' info:)
 right_ink=${right_ink%.*}
 [ "${right_ink:-0}" -ge 20 ] || fail "zero-tab standalone pill has no visible label ($right_ink px)"
@@ -177,7 +186,7 @@ echo "PHASE 0 PASS: neutral standalone pill appeared before its delayed tab"
 # Empty titlebar chrome still belongs to compositor window move, not the new
 # pill drag. The pill's measured center fixes its 88px span; capture and guard
 # an ink-free post-pill target patch before pressing it.
-title_y=$((TITLEBAR_H / 2))
+title_y=$((GRID_TOP / 2))
 empty_x=$((WIN_W / 2 + PILL_CENTER_X * 2 + 12))
 [ "$empty_x" -lt "$WIN_W" ] || fail "zero-tab pill leaves no blank titlebar target"
 blank_target=/output/00-standalone-blank-target.png
@@ -194,8 +203,8 @@ old_x=$WIN_X; old_y=$WIN_Y
 xdotool mousemove --sync "$((WIN_X + empty_x))" "$((WIN_Y + title_y))"
 xdotool mousedown 1
 sleep 0.1
-# Cross the titlebar's 4px threshold while still inside its 34px band; only
-# then leave it, after the compositor has accepted the native move request.
+# Cross the titlebar's 4px threshold while still inside its measured band;
+# only then leave it, after the compositor has accepted the native move request.
 xdotool mousemove --sync "$((WIN_X + empty_x + 8))" "$((WIN_Y + title_y))"
 sleep 0.1
 xdotool mousemove --sync "$((WIN_X + empty_x + 80))" "$((WIN_Y + title_y + 50))"
@@ -227,7 +236,7 @@ pill_left=$PILL_CENTER_X
 pill_right=$((WIN_W / 2 + PILL_CENTER_X))
 left_center=$((WIN_W / 4))
 right_center=$((3 * WIN_W / 4))
-grid_mid=$((TITLEBAR_H + GRID_H / 2))
+grid_mid=$((GRID_TOP + GRID_H / 2))
 target_x=$((WIN_W / 2))
 target_w=$((WIN_W / 2))
 third_w=$((target_w / 3))
@@ -239,17 +248,17 @@ third_h=$((GRID_H / 3))
 for zone in left right top bottom center; do
     shot "zone-$zone-before.png"
     case "$zone" in
-        left)   px=$((target_x + 18)); py=$grid_mid; ox=$target_x; oy=$TITLEBAR_H; ow=$third_w; oh=$GRID_H ;;
-        right)  px=$((WIN_W - 18)); py=$grid_mid; ox=$((target_x + target_w - third_w)); oy=$TITLEBAR_H; ow=$third_w; oh=$GRID_H ;;
-        top)    px=$right_center; py=$((TITLEBAR_H + 18)); ox=$target_x; oy=$TITLEBAR_H; ow=$target_w; oh=$third_h ;;
-        bottom) px=$right_center; py=$((TITLEBAR_H + GRID_H - 18)); ox=$target_x; oy=$((TITLEBAR_H + GRID_H - third_h)); ow=$target_w; oh=$third_h ;;
-        center) px=$right_center; py=$grid_mid; ox=$((target_x + third_w)); oy=$((TITLEBAR_H + third_h)); ow=$third_w; oh=$third_h ;;
+        left)   px=$((target_x + 18)); py=$grid_mid; ox=$target_x; oy=$GRID_TOP; ow=$third_w; oh=$GRID_H ;;
+        right)  px=$((WIN_W - 18)); py=$grid_mid; ox=$((target_x + target_w - third_w)); oy=$GRID_TOP; ow=$third_w; oh=$GRID_H ;;
+        top)    px=$right_center; py=$((GRID_TOP + 18)); ox=$target_x; oy=$GRID_TOP; ow=$target_w; oh=$third_h ;;
+        bottom) px=$right_center; py=$((GRID_BOTTOM - 18)); ox=$target_x; oy=$((GRID_BOTTOM - third_h)); ow=$target_w; oh=$third_h ;;
+        center) px=$right_center; py=$grid_mid; ox=$((target_x + third_w)); oy=$((GRID_TOP + third_h)); ow=$third_w; oh=$third_h ;;
     esac
     reset_record
     drag_hold_rel "$pill_left" "$title_y" "$px" "$py"
     shot "zone-$zone-held.png"
     assert_overlay_rect "/output/zone-$zone-before.png" "/output/zone-$zone-held.png" \
-        "$ox" "$oy" "$ow" "$oh" "$zone"
+        "$ox" "$oy" "$ow" "$oh" "$zone" 1
     cancel_hold_on_source
     assert_zero_gesture_frames "$(oracle counts)"
 done
@@ -266,7 +275,7 @@ reset_record
 drag_hold_rel "$pill_left" "$title_y" "$right_center" "$grid_mid"
 shot escape-next-held.png
 assert_overlay_rect /output/escape-next-before.png /output/escape-next-held.png \
-    "$((target_x + third_w))" "$((TITLEBAR_H + third_h))" "$third_w" "$third_h" escape-next
+    "$((target_x + third_w))" "$((GRID_TOP + third_h))" "$third_w" "$third_h" escape-next
 cancel_hold_on_source
 assert_zero_gesture_frames "$(oracle counts)"
 echo "PHASE 2 PASS: Escape was zero-diff and the next drag armed normally"
@@ -291,16 +300,16 @@ corner_dy=$(((12 * GRID_H + target_w - 1) / target_w))
 for corner in top-left bottom-left top-right bottom-right; do
     case "$corner" in
         top-left)
-            source_pill=$pill_left; px=$((target_x + 12)); py=$((TITLEBAR_H + corner_dy))
+            source_pill=$pill_left; px=$((target_x + 12)); py=$((GRID_TOP + corner_dy))
             ox=$target_x; cancel_x=$left_center ;;
         bottom-left)
-            source_pill=$pill_left; px=$((target_x + 12)); py=$((TITLEBAR_H + GRID_H - corner_dy))
+            source_pill=$pill_left; px=$((target_x + 12)); py=$((GRID_BOTTOM - corner_dy))
             ox=$target_x; cancel_x=$left_center ;;
         top-right)
-            source_pill=$pill_right; px=$((target_x - 12)); py=$((TITLEBAR_H + corner_dy))
+            source_pill=$pill_right; px=$((target_x - 12)); py=$((GRID_TOP + corner_dy))
             ox=$((target_x - third_w)); cancel_x=$right_center ;;
         bottom-right)
-            source_pill=$pill_right; px=$((target_x - 12)); py=$((TITLEBAR_H + GRID_H - corner_dy))
+            source_pill=$pill_right; px=$((target_x - 12)); py=$((GRID_BOTTOM - corner_dy))
             ox=$((target_x - third_w)); cancel_x=$right_center ;;
     esac
     shot "corner-$corner-before.png"
@@ -308,7 +317,7 @@ for corner in top-left bottom-left top-right bottom-right; do
     drag_hold_rel "$source_pill" "$title_y" "$px" "$py"
     shot "corner-$corner-held.png"
     assert_overlay_rect "/output/corner-$corner-before.png" "/output/corner-$corner-held.png" \
-        "$ox" "$TITLEBAR_H" "$third_w" "$GRID_H" "$corner-horizontal-tie"
+        "$ox" "$GRID_TOP" "$third_w" "$GRID_H" "$corner-horizontal-tie"
     xdotool mousemove --sync "$((WIN_X + cancel_x))" "$((WIN_Y + grid_mid))"
     xdotool mouseup 1
     sleep 0.6
@@ -334,11 +343,11 @@ drag_rel "$pill_left" "$title_y" "$((WIN_W - 24))" "$grid_mid"
 oracle wait-root Horizontal "$b" "$a" >/output/workspace-right-tree.json \
     || fail "right edge insert did not produce [B,A]"
 reset_record
-drag_rel "$pill_right" "$title_y" "$left_center" "$((TITLEBAR_H + 18))"
+drag_rel "$pill_right" "$title_y" "$left_center" "$((GRID_TOP + 18))"
 oracle wait-root Vertical "$a" "$b" >/output/workspace-top-tree.json \
     || fail "top edge insert did not produce vertical [A,B]"
 reset_record
-drag_rel "$pill_left" "$title_y" "$((WIN_W / 2))" "$((TITLEBAR_H + GRID_H - 18))"
+drag_rel "$pill_left" "$title_y" "$((WIN_W / 2))" "$((GRID_BOTTOM - 18))"
 oracle wait-root Vertical "$b" "$a" >/output/workspace-bottom-tree.json \
     || fail "bottom edge insert did not produce vertical [B,A]"
 echo "PHASE 5 PASS: swap and four edge inserts committed exact wire trees"
@@ -346,15 +355,15 @@ echo "PHASE 5 PASS: swap and four edge inserts committed exact wire trees"
 # Source-disappearance cleanup: a third workspace's shell exits while its pill
 # owns a live drag. The region collapses, release leaves no stuck overlay, and a
 # fresh split/drag works immediately afterwards.
-click_rel "$((WIN_W / 4))" "$((TITLEBAR_H + GRID_H / 4))"
+click_rel "$((WIN_W / 4))" "$((GRID_TOP + GRID_H / 4))"
 send_keys ctrl+alt+backslash
 ids=$(oracle wait-leaves 3 1) || fail "third workspace did not become live"
-click_rel "$((3 * WIN_W / 4))" "$((TITLEBAR_H + GRID_H / 4))"
+click_rel "$((3 * WIN_W / 4))" "$((GRID_TOP + GRID_H / 4))"
 xdotool type --clearmodifiers --delay 2 'sleep 2; exit'
 xdotool key --clearmodifiers Return
 sleep 0.2
 third_pill=$((WIN_W / 2 + PILL_CENTER_X))
-drag_hold_rel "$third_pill" "$title_y" "$((WIN_W / 4))" "$((TITLEBAR_H + GRID_H / 4))"
+drag_hold_rel "$third_pill" "$title_y" "$((WIN_W / 4))" "$((GRID_TOP + GRID_H / 4))"
 for _ in $(seq 1 80); do
     if ids=$(oracle wait-leaves 2 1 2>/dev/null); then break; fi
     sleep 0.2
@@ -365,7 +374,7 @@ xdotool mouseup 1
 # creating another session would mix its asynchronous bootstrap with this race.
 reset_record
 drag_rel "$PILL_CENTER_X" "$title_y" "$((WIN_W / 2))" \
-    "$((TITLEBAR_H + 3 * GRID_H / 4))"
+    "$((GRID_TOP + 3 * GRID_H / 4))"
 for _ in $(seq 1 50); do
     reports=$(oracle counts | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ReportWorkspaceTree",0))')
     [ "$reports" -gt 0 ] && break
@@ -382,7 +391,7 @@ read -r source_workspace other_workspace <<<"$ids"
 click_rel "$PILL_CENTER_X" "$title_y"
 # Pill selection leaves keyboard focus in titlebar chrome; return it to the
 # first region before issuing pane/tab chords.
-click_rel "$((WIN_W / 4))" "$((TITLEBAR_H + GRID_H / 4))"
+click_rel "$((WIN_W / 4))" "$((GRID_TOP + GRID_H / 4))"
 send_keys ctrl+shift+t
 pane_adopts_before=$(grep -acF 'pane adopted a session' "$CLIENT_LOG" 2>/dev/null || true)
 send_keys ctrl+shift+backslash

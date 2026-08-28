@@ -5581,13 +5581,24 @@ They pin every corner's normalized nearest-edge result with horizontal tie prece
 
 [[crates/scribe-client/src/workspace_layout.rs#WindowLayout#rearrange_workspace]] tests pin client-side lowering over the shared tree operations: edge extraction/insertion re-equalizes all region ratios; center swap preserves nested ratios and shape; slot metadata, active tab, pane-owned payload, and source focus stay attached. Directional palette-move tests pin non-wrapping nearest-neighbor selection, no-neighbor feedback/no-op, focused-source movement, and equality with the matching drag edge. [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#rearrange_workspace]] adds the entity boundary assertion that one successful rearrangement emits one report; [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#move_focused_workspace_in_direction]] covers the equivalent palette path. [[crates/scribe-client/src/command_palette.rs#base_entries]] pins all five workspace rows as visible client-local actions. Existing titlebar drag-reorder suites remain the regression oracle for tab marker isolation and window-move behavior.
 
-`tests/e2e/visual/workspace-drag-tearout.sh` drives measured workspace-pill
-drags under X11/Xvfb. Before its delayed standalone pill receives a tab, it
-uses that pill's measured span to guard an ink-free post-pill titlebar patch,
-and crosses the native move threshold while asserting and restoring the X11
-window position. Wire/tree oracles cover swap, all edge inserts, horizontal
-corner ties, Escape and disappearance cleanup, PTY isolation, standalone-pill
-rendering, and exact tear-out preservation. The matching
+`tests/e2e/visual/workspace-drag-tearout.sh` drives workspace-pill drags under
+X11/Xvfb from measured chrome and grid bounds, not a fixed window offset.
+Commit `37fb3af` caused the old test drift; the `bb19b26` hypothesis is
+refuted. For a 1008x741 window, production's layout-local rect is
+`(504,0,504,681)` and its window-relative rect is `(504,36,504,681)`, while
+the script assumed `(504,34,504,683)`. Its phase-4 press therefore became
+production-local `(516,15)`: `left=12/504=0.0238` versus `top=15/681=0.0220`,
+so Top wins outright. The 38136 changed pixels are `168x227`, the intersection
+of the expected left third and actual top third; `zone_at` at
+`crates/scribe-client/src/workspace_drag.rs:289-317` is correct and unchanged.
+After capturing the standalone-pill composed frame, the script measures its
+top and status bands, derives grid top/bottom/height, and routes every pointer
+target and overlay crop through those bounds. Before its delayed standalone
+pill receives a tab, it uses that pill's measured span to guard an ink-free
+post-pill titlebar patch, and crosses the native move threshold while asserting
+and restoring the X11 window position. Wire/tree oracles cover swap, all edge
+inserts, horizontal corner ties, Escape and disappearance cleanup, PTY
+isolation, standalone-pill rendering, and exact tear-out preservation. The matching
 `tests/e2e/visual/workspace-drag-palette.sh` drives every directional action
 and tear-out from the command palette without pointer input. These scripts and
 `tests/e2e/visual/workspace-ipc.sh` call the checked-in, network-free

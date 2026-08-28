@@ -16,6 +16,8 @@
 # means the running client ignored the edit.
 set -euo pipefail
 
+. /tests/visual/tab-geometry-common.bash
+
 CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
@@ -134,47 +136,12 @@ reload_geometry() {
     sleep 0.5
 }
 
-# Measure the bottom of the chrome marks that differ from the stable pane
-# background sampled at the end of this scan. Titlebar and grid backgrounds can
-# be identical; the active underline and bottom hairline still end exactly at
-# the row boundary. The right edge carries no terminal glyph ink below them.
-measure_bar_height() {
-    local image="$1" top="$2" scan_h="$3" label="$4"
-    local x target_y target end mask
-    x=$(( WIN_W - 4 ))
-    target_y=$(( top + scan_h - 2 ))
-    target=$(convert "$image" -format "%[pixel:p{$x,$target_y}]" info:)
-    mask="/tmp/${label}-boundary-mask.png"
-    convert "$image" -crop "1x${scan_h}+${x}+${top}" +repage -alpha on \
-        -fuzz 2% -transparent "$target" "$mask" >/dev/null
-    end=$(convert "$mask" -trim -format '%[fx:page.y+h]' info: 2>/dev/null || true)
-    [ -n "$end" ] || fail "$label row boundary was not measurable"
-    printf '%s' "${end%.*}"
-}
-
 crop_top() {
     convert "$1" -crop "${WIN_W}x100+0+0" +repage "$2"
 }
 
 crop_bottom() {
     convert "$1" -crop "${WIN_W}x100+0+$(( WIN_H - 100 ))" +repage "$2"
-}
-
-# Measure the status band against the stable grid background at the right edge.
-# The top hairline starts the distinct run and the sampled terminal column has
-# no glyph ink there, so its offset is the border-box band boundary.
-measure_status_height() {
-    local image="$1" top="$2" scan_h="$3" label="$4"
-    local x target target_y mask start
-    x=$(( WIN_W - 4 ))
-    target_y=$(( top + 2 ))
-    target=$(convert "$image" -format "%[pixel:p{$x,$target_y}]" info:)
-    mask="/tmp/${label}-status-mask.png"
-    convert "$image" -crop "1x${scan_h}+${x}+${top}" +repage -alpha on \
-        -fuzz 2% -transparent "$target" "$mask" >/dev/null
-    start=$(convert "$mask" -trim -format '%[fx:page.y]' info: 2>/dev/null || true)
-    [ -n "$start" ] || fail "$label status boundary was not measurable"
-    printf '%s' "$(( scan_h - ${start%.*} ))"
 }
 
 last_published_rows() {
