@@ -9,7 +9,10 @@
 use std::time::{Duration, Instant};
 
 use gpui::{Context, Render, Window};
-use scribe_common::ids::WorkspaceId;
+use scribe_common::{
+    ids::WorkspaceId,
+    protocol::{WorkspaceMoveOperation, WorkspaceTreeEdge},
+};
 
 use crate::layout::Rect;
 
@@ -315,6 +318,52 @@ pub fn zone_at(point: DragPoint, rect: Rect) -> Option<WorkspaceDropZone> {
     };
     let (distance, zone) = if horizontal.0 <= vertical.0 { horizontal } else { vertical };
     Some(if distance > 1.0 / 3.0 { WorkspaceDropZone::Center } else { zone })
+}
+
+/// The one sentence a *center* target explains itself with, wherever it is
+/// offered.
+///
+/// The pointer preview and the command palette share this so the two never
+/// drift: a center drop is a two-way exchange, not an insertion, and that is
+/// the only thing about it a user cannot see from the highlight alone. Edge
+/// zones return nothing, which is what keeps the wording off them.
+#[must_use]
+pub fn swap_hint(zone: WorkspaceDropZone, target_name: Option<&str>) -> Option<String> {
+    if zone != WorkspaceDropZone::Center {
+        return None;
+    }
+    Some(swap_hint_text(target_name))
+}
+
+/// The center-target sentence for a target named `target_name`, falling back to
+/// generic wording when the name is missing or blank.
+#[must_use]
+pub fn swap_hint_text(target_name: Option<&str>) -> String {
+    target_name.map(str::trim).filter(|name| !name.is_empty()).map_or_else(
+        || "Swap places with this workspace".to_owned(),
+        |name| format!("Swap places with {name}"),
+    )
+}
+
+/// Lower one resolved zone onto the structural operation a cross-window move
+/// requests. The four edges insert; the center exchanges.
+#[must_use]
+pub const fn move_operation_for(zone: WorkspaceDropZone) -> WorkspaceMoveOperation {
+    match zone {
+        WorkspaceDropZone::Left => {
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left }
+        }
+        WorkspaceDropZone::Right => {
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Right }
+        }
+        WorkspaceDropZone::Top => {
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Top }
+        }
+        WorkspaceDropZone::Bottom => {
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Bottom }
+        }
+        WorkspaceDropZone::Center => WorkspaceMoveOperation::Swap,
+    }
 }
 
 /// Rect painted for one zone preview.
@@ -880,6 +929,46 @@ mod tests {
         on.ingest();
         assert!(on.take_ingested().is_some());
         assert_eq!(on.take_ingested(), None, "one sample closes one paint");
+    }
+
+    // @lat: [[test#Test Harness#GPUI Workspace Drag]]
+    #[test]
+    fn only_center_targets_explain_themselves_and_every_edge_stays_silent() {
+        for zone in [
+            WorkspaceDropZone::Left,
+            WorkspaceDropZone::Right,
+            WorkspaceDropZone::Top,
+            WorkspaceDropZone::Bottom,
+        ] {
+            assert_eq!(swap_hint(zone, Some("Docs")), None, "{zone:?} is an insertion");
+            assert_eq!(swap_hint(zone, None), None);
+        }
+        assert_eq!(
+            swap_hint(WorkspaceDropZone::Center, Some("Docs")),
+            Some("Swap places with Docs".to_owned())
+        );
+        // A blank or whitespace name is not a usable name, so both fall back to
+        // the same generic sentence a nameless region gets.
+        let generic = swap_hint(WorkspaceDropZone::Center, None);
+        assert_eq!(generic, Some("Swap places with this workspace".to_owned()));
+        assert_eq!(swap_hint(WorkspaceDropZone::Center, Some("   ")), generic);
+        // The palette entry text and the pointer preview text are one string.
+        assert_eq!(swap_hint_text(Some("Docs")), "Swap places with Docs");
+        assert_eq!(swap_hint_text(None), generic.unwrap());
+    }
+
+    #[test]
+    fn every_zone_lowers_onto_its_own_move_operation() {
+        use scribe_common::protocol::{WorkspaceMoveOperation, WorkspaceTreeEdge};
+        for (zone, edge) in [
+            (WorkspaceDropZone::Left, WorkspaceTreeEdge::Left),
+            (WorkspaceDropZone::Right, WorkspaceTreeEdge::Right),
+            (WorkspaceDropZone::Top, WorkspaceTreeEdge::Top),
+            (WorkspaceDropZone::Bottom, WorkspaceTreeEdge::Bottom),
+        ] {
+            assert_eq!(move_operation_for(zone), WorkspaceMoveOperation::InsertAtEdge { edge });
+        }
+        assert_eq!(move_operation_for(WorkspaceDropZone::Center), WorkspaceMoveOperation::Swap);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use gpui::{App, Window};
 
+use crate::layout::Rect;
 use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
 use crate::x11_focus::xcb_window_id;
 
@@ -88,6 +89,24 @@ pub fn window_desktop(window: &Window) -> Option<u32> {
 /// manager does not advertise the atom in `_NET_SUPPORTED`.
 pub fn apply_saved_desktop(window: &Window, desktop: u32) -> bool {
     x11::move_to_desktop(window, desktop)
+}
+
+/// The window's mapped content rect as the X server measures it right now,
+/// in root coordinates.
+///
+/// Targeting a *sibling* window under a drag pointer needs where that window is
+/// on the root at this instant, which GPUI cannot answer: its bounds are the
+/// last configure this client happened to see, and on Wayland they are a
+/// deliberate `(0, 0)` for every window. `get_geometry` plus
+/// `translate_coordinates` is the same measured pair [`window_monitor_name`]
+/// already uses, and it resolves through any reparenting frame the window
+/// manager added.
+///
+/// `None` off X11, before the window is mapped, and on any protocol failure —
+/// which is what keeps every non-X11 backend on the palette path.
+#[must_use]
+pub fn mapped_window_bounds(window: &Window) -> Option<Rect> {
+    x11::mapped_window_bounds(window)
 }
 
 /// Whether the platform reports this window's real origin.
@@ -180,6 +199,7 @@ mod x11 {
     };
     use x11rb::rust_connection::RustConnection;
 
+    use crate::layout::Rect;
     use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
     use crate::x11_focus::xcb_window_id;
 
@@ -196,6 +216,21 @@ mod x11 {
             cell.get_or_init(|| x11rb::connect(None).ok().map(|(conn, _screen)| conn))
                 .as_ref()
                 .and_then(f)
+        })
+    }
+
+    /// The window's mapped content rect in root coordinates.
+    pub(super) fn mapped_window_bounds(window: &Window) -> Option<Rect> {
+        let xid = xcb_window_id(window)?;
+        with_connection(|conn| {
+            let geometry = conn.get_geometry(xid).ok()?.reply().ok()?;
+            let origin = conn.translate_coordinates(xid, geometry.root, 0, 0).ok()?.reply().ok()?;
+            Some(Rect {
+                x: f32::from(origin.dst_x),
+                y: f32::from(origin.dst_y),
+                width: f32::from(geometry.width),
+                height: f32::from(geometry.height),
+            })
         })
     }
 
@@ -607,6 +642,7 @@ mod x11 {
 mod x11 {
     use gpui::Window;
 
+    use crate::layout::Rect;
     use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
 
     pub(super) fn observed_window_state(_window: &Window) -> Option<ObservedWindowState> {
@@ -614,6 +650,10 @@ mod x11 {
     }
 
     pub(super) fn window_monitor_name(_window: &Window) -> Option<String> {
+        None
+    }
+
+    pub(super) fn mapped_window_bounds(_window: &Window) -> Option<Rect> {
         None
     }
 

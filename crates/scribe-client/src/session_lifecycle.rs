@@ -382,6 +382,17 @@ impl SessionRegistry {
         }
     }
 
+    /// Whether `session_id` is one this window already tracks.
+    ///
+    /// A session list naming a session the registry has never seen is how a
+    /// window learns another window's workspace was moved into it: the server
+    /// re-lists both survivors of the move, and only the destination's list
+    /// grows.
+    #[must_use]
+    pub fn tracks(&self, session_id: SessionId) -> bool {
+        self.workspace.contains_key(&session_id)
+    }
+
     /// Register a freshly `SessionCreated` pane, appending it in arrival order.
     ///
     /// Re-announcing an existing session only refreshes its workspace mapping.

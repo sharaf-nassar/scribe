@@ -190,14 +190,24 @@ impl WindowLifecycle {
         self.exit = Some(ExitReason::QuitRequested);
     }
 
-    /// Apply `ServerMessage::WindowClosed`, returning whether it acknowledged
-    /// *this* window's pending close.
+    /// Apply `ServerMessage::WindowClosed`, returning whether it named a window
+    /// this client must tear down.
     ///
-    /// An ack for a window the client never asked about is ignored rather than
-    /// obeyed, mirroring the winit client's "ignoring unexpected `WindowClosed`
-    /// ack" branch: an unrelated ack must never close a live window.
+    /// Two frames qualify. One acknowledges *this* window's own pending close.
+    /// The other is unsolicited and names this window anyway: the server closes
+    /// an emptied source window itself when the last workspace it held moves
+    /// into another window, and that frame follows the acknowledged commit. The
+    /// client owns no such decision — the move is committed server-side by the
+    /// time this arrives, so obeying is what stops the emptied shell outliving
+    /// its sessions.
+    ///
+    /// An ack for a *different* window is still ignored rather than obeyed,
+    /// mirroring the winit client's "ignoring unexpected `WindowClosed` ack"
+    /// branch: an unrelated ack must never close a live window.
     pub fn on_window_closed(&mut self, window_id: WindowId) -> bool {
-        if self.pending != Some(PendingShutdown::CloseWindow { window_id }) {
+        let mine = self.pending == Some(PendingShutdown::CloseWindow { window_id })
+            || self.window_id == Some(window_id);
+        if !mine {
             return false;
         }
         self.pending = None;
@@ -343,6 +353,30 @@ mod tests {
         let mut bystander = WindowLifecycle::new();
         bystander.on_quit_requested();
         assert_eq!(bystander.take_exit(), Some(ExitReason::QuitRequested));
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Window Lifecycle#A server-closed source window exits without asking]]
+    #[test]
+    fn a_server_closed_source_window_exits_without_asking() {
+        // The last workspace of this window was moved into another one, so the
+        // server closed the emptied source itself and said so after the
+        // acknowledged commit. Nothing was pending here.
+        let mut lifecycle = WindowLifecycle::new();
+        let window_id = WindowId::new();
+        lifecycle.adopt_window(window_id);
+        assert_eq!(lifecycle.pending(), None);
+
+        assert!(lifecycle.on_window_closed(window_id));
+        assert_eq!(lifecycle.take_exit(), Some(ExitReason::WindowClosed));
+        // Latched for the IPC thread, so its reader stops instead of redialling
+        // for a window that no longer exists.
+        assert!(lifecycle.window_closed());
+
+        // Before `Welcome` names this window there is nothing to match, so an
+        // early frame cannot close a window the client cannot identify.
+        let mut unnamed = WindowLifecycle::new();
+        assert!(!unnamed.on_window_closed(WindowId::new()));
+        assert_eq!(unnamed.take_exit(), None);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#GPUI Window Lifecycle#An unrelated close ack is ignored]]

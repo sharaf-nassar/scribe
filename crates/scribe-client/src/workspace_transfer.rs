@@ -11,7 +11,10 @@ use std::{
 
 use scribe_common::{
     ids::{WindowId, WorkspaceId},
-    protocol::{WorkspaceTransferRefusal, WorkspaceTransferResult},
+    protocol::{
+        WorkspaceMoveOperation, WorkspaceMoveRefusal, WorkspaceMoveResult,
+        WorkspaceTransferRefusal, WorkspaceTransferResult,
+    },
 };
 
 /// How long a sent request may wait before the client safely retries its id.
@@ -258,6 +261,196 @@ impl WorkspaceTransfers {
     }
 }
 
+/// Ids-only request that moves one workspace into an *existing* window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceMoveRequest {
+    pub correlation: u64,
+    pub workspace: WorkspaceId,
+    pub target_window: WindowId,
+    pub target_workspace: WorkspaceId,
+    pub operation: WorkspaceMoveOperation,
+}
+
+/// User-facing refusal or recovery state for one existing-window move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMoveFeedback {
+    CapabilityAbsent,
+    /// The named destination window or workspace is no longer selectable, so
+    /// nothing was sent.
+    StaleTarget,
+    AlreadyPending,
+    SendFailed,
+    Disconnected,
+    Refused(WorkspaceMoveRefusal),
+}
+
+impl WorkspaceMoveFeedback {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::CapabilityAbsent | Self::Refused(WorkspaceMoveRefusal::CapabilityAbsent) => {
+                "Moving a workspace between windows is unavailable with this server"
+            }
+            Self::StaleTarget => "That window is no longer available; nothing was moved",
+            Self::AlreadyPending => "A workspace move is already pending",
+            Self::SendFailed => "Workspace was not moved because the request could not be sent",
+            // The server owns the outcome and its ledger dedupes a retry, so a
+            // lost answer is settled by the authoritative session list the next
+            // connection replays rather than by a client-side guess.
+            Self::Disconnected => {
+                "Workspace move was interrupted; the server list is authoritative"
+            }
+            Self::Refused(WorkspaceMoveRefusal::UnknownWorkspace) => {
+                "Workspace could not be moved because it no longer exists"
+            }
+            Self::Refused(WorkspaceMoveRefusal::NotWorkspaceOwner) => {
+                "Workspace could not be moved because source ownership changed"
+            }
+            Self::Refused(WorkspaceMoveRefusal::SoleWorkspace) => {
+                "This is the window's only workspace; it cannot be swapped away"
+            }
+            Self::Refused(WorkspaceMoveRefusal::TargetWindowUnavailable) => {
+                "The destination window is no longer available"
+            }
+            Self::Refused(WorkspaceMoveRefusal::TargetWorkspaceUnavailable) => {
+                "The destination workspace is no longer available"
+            }
+            Self::Refused(WorkspaceMoveRefusal::NoSourceWindowControl) => {
+                "Workspace could not be moved without control of this window"
+            }
+            Self::Refused(WorkspaceMoveRefusal::NoTargetWindowControl) => {
+                "Workspace could not be moved without control of the destination window"
+            }
+            Self::Refused(WorkspaceMoveRefusal::HandoffInProgress) => {
+                "Workspace could not be moved during server handoff; try again"
+            }
+            Self::Refused(WorkspaceMoveRefusal::EnvironmentRebindFailed) => {
+                "Workspace environment restore data could not be rebound; source was unchanged"
+            }
+        }
+    }
+}
+
+/// Whether a move may start, resolved by the caller against live state at the
+/// moment the request would go out rather than when its affordance was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMoveEligibility {
+    /// The server negotiated moves and the named destination still exists.
+    Ready,
+    /// This connection's `Welcome` did not negotiate the move capability.
+    Unsupported,
+    /// The named destination window or region has gone since it was offered.
+    StaleTarget,
+}
+
+/// One source window's existing-window move coordinator.
+///
+/// Deliberately thinner than [`WorkspaceTransfers`]: a move produces no client
+/// window, and the server answers a committed move with one full `SessionList`
+/// per surviving window, so success needs no foreground work here — the
+/// authoritative tree that list carries is what both windows adopt. Only
+/// refusals and unsent requests need a user-facing answer.
+#[derive(Debug, Default)]
+pub struct WorkspaceMoves {
+    pending: Option<WorkspaceMoveRequest>,
+    ever_sent: bool,
+    feedback: VecDeque<WorkspaceMoveFeedback>,
+}
+
+impl WorkspaceMoves {
+    /// Claim the single in-flight slot without touching either window's layout.
+    ///
+    /// Every refusal here is a request that never reaches the wire, which is
+    /// what makes a cancelled, blurred, stale, or vanished destination a pure
+    /// no-op rather than a server round trip.
+    pub fn begin(
+        &mut self,
+        eligibility: WorkspaceMoveEligibility,
+        request: WorkspaceMoveRequest,
+    ) -> Result<WorkspaceMoveRequest, WorkspaceMoveFeedback> {
+        match eligibility {
+            WorkspaceMoveEligibility::Unsupported => {
+                return Err(WorkspaceMoveFeedback::CapabilityAbsent);
+            }
+            WorkspaceMoveEligibility::StaleTarget => {
+                return Err(WorkspaceMoveFeedback::StaleTarget);
+            }
+            WorkspaceMoveEligibility::Ready => {}
+        }
+        if self.pending.is_some() {
+            return Err(WorkspaceMoveFeedback::AlreadyPending);
+        }
+        self.pending = Some(request);
+        self.ever_sent = false;
+        Ok(request)
+    }
+
+    /// Record successful admission to the ordered writer queue.
+    pub fn mark_sent(&mut self, move_id: u64) -> bool {
+        if self.pending.is_none_or(|pending| pending.correlation != move_id) {
+            return false;
+        }
+        self.ever_sent = true;
+        true
+    }
+
+    /// Recover from writer admission failure. A first-send failure is known not
+    /// to have reached the server, so it settles as a plain no-op.
+    pub fn send_failed(&mut self, move_id: u64) {
+        if self.pending.is_none_or(|pending| pending.correlation != move_id) {
+            return;
+        }
+        self.pending = None;
+        if !self.ever_sent {
+            self.feedback.push_back(WorkspaceMoveFeedback::SendFailed);
+        }
+        self.ever_sent = false;
+    }
+
+    /// Release an admitted request whose answer the stream loss swallowed.
+    pub fn disconnected(&mut self) -> bool {
+        if self.pending.take().is_none() {
+            return false;
+        }
+        let sent = self.ever_sent;
+        self.ever_sent = false;
+        self.feedback.push_back(if sent {
+            WorkspaceMoveFeedback::Disconnected
+        } else {
+            WorkspaceMoveFeedback::SendFailed
+        });
+        true
+    }
+
+    /// Correlate one result. Refusals park feedback; a matching success parks
+    /// none, and unmatched frames have no side effect at all.
+    pub fn receive_result(
+        &mut self,
+        move_id: u64,
+        result: WorkspaceMoveResult,
+    ) -> WorkspaceTransferResultDisposition {
+        if self.pending.is_none_or(|pending| pending.correlation != move_id) {
+            return WorkspaceTransferResultDisposition::Ignored;
+        }
+        self.pending = None;
+        self.ever_sent = false;
+        if let WorkspaceMoveResult::Refused { reason } = result {
+            self.feedback.push_back(WorkspaceMoveFeedback::Refused(reason));
+        }
+        WorkspaceTransferResultDisposition::Accepted
+    }
+
+    /// Drain foreground feedback in protocol order.
+    pub fn take_feedback(&mut self) -> Vec<WorkspaceMoveFeedback> {
+        self.feedback.drain(..).collect()
+    }
+
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +585,120 @@ mod tests {
             WorkspaceTransferResultDisposition::Accepted
         );
         assert_eq!(transfers.take_outcomes(), vec![WorkspaceTransferOutcome::Open(next_target)]);
+    }
+
+    fn move_request(move_id: u64) -> WorkspaceMoveRequest {
+        WorkspaceMoveRequest {
+            correlation: move_id,
+            workspace: WorkspaceId::new(),
+            target_window: WindowId::new(),
+            target_workspace: WorkspaceId::new(),
+            operation: WorkspaceMoveOperation::Swap,
+        }
+    }
+
+    // @lat: [[test#GPUI Workspace Drag]]
+    #[test]
+    fn an_absent_capability_or_a_stale_target_never_reaches_the_wire() {
+        let mut moves = WorkspaceMoves::default();
+        assert_eq!(
+            moves.begin(WorkspaceMoveEligibility::Unsupported, move_request(1)),
+            Err(WorkspaceMoveFeedback::CapabilityAbsent)
+        );
+        assert_eq!(
+            moves.begin(WorkspaceMoveEligibility::StaleTarget, move_request(2)),
+            Err(WorkspaceMoveFeedback::StaleTarget)
+        );
+        assert!(!moves.has_pending());
+
+        moves
+            .begin(WorkspaceMoveEligibility::Ready, move_request(3))
+            .expect("a live target begins");
+        assert_eq!(
+            moves.begin(WorkspaceMoveEligibility::Ready, move_request(4)),
+            Err(WorkspaceMoveFeedback::AlreadyPending)
+        );
+        assert!(moves.has_pending());
+    }
+
+    #[test]
+    fn every_typed_move_refusal_settles_with_specific_feedback() {
+        let reasons = [
+            WorkspaceMoveRefusal::UnknownWorkspace,
+            WorkspaceMoveRefusal::NotWorkspaceOwner,
+            WorkspaceMoveRefusal::SoleWorkspace,
+            WorkspaceMoveRefusal::TargetWindowUnavailable,
+            WorkspaceMoveRefusal::TargetWorkspaceUnavailable,
+            WorkspaceMoveRefusal::NoSourceWindowControl,
+            WorkspaceMoveRefusal::NoTargetWindowControl,
+            WorkspaceMoveRefusal::CapabilityAbsent,
+            WorkspaceMoveRefusal::HandoffInProgress,
+            WorkspaceMoveRefusal::EnvironmentRebindFailed,
+        ];
+        for (index, reason) in reasons.into_iter().enumerate() {
+            let move_id = index as u64 + 20;
+            let mut moves = WorkspaceMoves::default();
+            moves.begin(WorkspaceMoveEligibility::Ready, move_request(move_id)).unwrap();
+            assert!(moves.mark_sent(move_id));
+            assert_eq!(
+                moves.receive_result(move_id, WorkspaceMoveResult::Refused { reason }),
+                WorkspaceTransferResultDisposition::Accepted
+            );
+            assert_eq!(moves.take_feedback(), vec![WorkspaceMoveFeedback::Refused(reason)]);
+            assert!(!WorkspaceMoveFeedback::Refused(reason).message().is_empty());
+            assert!(!moves.has_pending());
+        }
+    }
+
+    #[test]
+    fn a_committed_move_is_silent_while_late_and_foreign_results_are_ignored() {
+        let mut moves = WorkspaceMoves::default();
+        moves.begin(WorkspaceMoveEligibility::Ready, move_request(31)).unwrap();
+        assert!(moves.mark_sent(31));
+        assert!(!moves.mark_sent(999), "another id cannot claim this send");
+        assert_eq!(
+            moves.receive_result(31, WorkspaceMoveResult::Moved),
+            WorkspaceTransferResultDisposition::Accepted
+        );
+        // Success needs no client-side work: the server's post-move session
+        // list is what both windows adopt.
+        assert!(moves.take_feedback().is_empty());
+        assert_eq!(
+            moves.receive_result(31, WorkspaceMoveResult::Moved),
+            WorkspaceTransferResultDisposition::Ignored
+        );
+        assert_eq!(
+            moves.receive_result(
+                777,
+                WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::UnknownWorkspace }
+            ),
+            WorkspaceTransferResultDisposition::Ignored
+        );
+        assert!(moves.take_feedback().is_empty());
+    }
+
+    #[test]
+    fn an_unsent_move_reports_failure_and_an_admitted_one_defers_to_the_server() {
+        let mut unsent = WorkspaceMoves::default();
+        unsent.begin(WorkspaceMoveEligibility::Ready, move_request(41)).unwrap();
+        unsent.send_failed(41);
+        assert!(!unsent.has_pending());
+        assert_eq!(unsent.take_feedback(), vec![WorkspaceMoveFeedback::SendFailed]);
+
+        let mut admitted = WorkspaceMoves::default();
+        admitted.begin(WorkspaceMoveEligibility::Ready, move_request(42)).unwrap();
+        assert!(admitted.mark_sent(42));
+        assert!(admitted.disconnected());
+        assert!(!admitted.has_pending());
+        assert_eq!(admitted.take_feedback(), vec![WorkspaceMoveFeedback::Disconnected]);
+        assert!(!admitted.disconnected(), "an idle coordinator reports nothing");
+
+        // A stream loss before admission is the same safe no-op a refused send
+        // is, so it must not claim an unknown outcome.
+        let mut never_sent = WorkspaceMoves::default();
+        never_sent.begin(WorkspaceMoveEligibility::Ready, move_request(43)).unwrap();
+        assert!(never_sent.disconnected());
+        assert_eq!(never_sent.take_feedback(), vec![WorkspaceMoveFeedback::SendFailed]);
     }
 
     #[test]

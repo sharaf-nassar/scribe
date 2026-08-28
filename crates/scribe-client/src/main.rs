@@ -53,7 +53,8 @@ use scribe_client::clipboard::{
 use scribe_client::clipboard_cleanup::{self, CopyTextOptions};
 use scribe_client::color::TerminalColors as CellColors;
 use scribe_client::command_palette::{
-    CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction, build_entries,
+    CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction,
+    WorkspaceMoveTarget, build_entries,
 };
 use scribe_client::config::{ConfigChangeSignal, ConfigReloadPlan, ConfigRuntime};
 use scribe_client::context_menu::{
@@ -145,7 +146,7 @@ use scribe_client::window_state::{
     normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::workspace_drag::{
-    DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, WorkspaceDrag,
+    self, DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, WorkspaceDrag,
     WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate, WorkspaceDropTarget, ZONE_FADE,
     ZoneFade, ghost_origin, ghost_travel_frame, record_input_to_paint, tear_candidate_at,
     zone_fade_opacity, zone_preview_rect,
@@ -154,8 +155,9 @@ use scribe_client::workspace_layout::{
     self, WorkspaceDividerDrag, workspace_move_no_neighbor_message,
 };
 use scribe_client::workspace_transfer::{
-    TransferWindowSpec, TransferredWindow, WorkspaceTransferFeedback, WorkspaceTransferOutcome,
-    WorkspaceTransferRequest, WorkspaceTransferResultDisposition, WorkspaceTransfers,
+    TransferWindowSpec, TransferredWindow, WorkspaceMoveEligibility, WorkspaceMoveRequest,
+    WorkspaceMoves, WorkspaceTransferFeedback, WorkspaceTransferOutcome, WorkspaceTransferRequest,
+    WorkspaceTransferResultDisposition, WorkspaceTransfers,
 };
 use scribe_client::x11_focus::{X11FocusGuard, should_reconcile_window_activation};
 use scribe_client::zoom::ZoomState;
@@ -185,8 +187,8 @@ use scribe_common::{
     protocol::{
         AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardDecision,
         ClipboardSelection, PromptId, PromptMarkKind, ServerMessage, SessionInfo, ShellTool,
-        TerminalSize, UpdateProgressState, WindowInfo, WorkspaceTransferResult, WorkspaceTreeNode,
-        pi_launch_metadata,
+        TerminalSize, UpdateProgressState, WindowInfo, WorkspaceMoveOperation, WorkspaceMoveResult,
+        WorkspaceTransferResult, WorkspaceTreeNode, pi_launch_metadata,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -706,6 +708,11 @@ struct Shared {
     workspace_transfer: Arc<AtomicBool>,
     /// Correlated tear-out request, retry, and foreground-open state.
     workspace_transfers: Arc<Mutex<WorkspaceTransfers>>,
+    /// Whether the server accepted this client's existing-window move support.
+    /// False until each connection's `Welcome` confirms support.
+    workspace_move: Arc<AtomicBool>,
+    /// Correlated existing-window move request and refusal state.
+    workspace_moves: Arc<Mutex<WorkspaceMoves>>,
     /// Set by the IPC reader once the server has answered this connection's
     /// first `ListSessions`. Cold-restart replay waits on it: only an *answered*
     /// and empty session list proves the server lost everything, which is the
@@ -2025,6 +2032,18 @@ struct TerminalView {
     /// Source bounds sampled with the last drag update, used by release paths
     /// whose titlebar event no longer carries a `Window` reference.
     workspace_drag_bounds: Option<Bounds<Pixels>>,
+    /// This window's own GPUI handle, so sibling enumeration can skip it: the
+    /// root entity is leased while this view runs, and reading it back out of
+    /// the app would be a circular borrow rather than a missing window.
+    gpui_window: gpui::AnyWindowHandle,
+    /// The sibling window and region this drag currently hovers, resolved from
+    /// measured pointer geometry on the backends that supply it. `Some` means
+    /// release commits a cross-window move instead of a tear-out.
+    workspace_drag_external: Option<ExternalDropTarget>,
+    /// A drop preview another window's drag asked this window to paint. Not a
+    /// second overlay system: it feeds the very same zone element the local
+    /// drag paints, so both windows show one surface with one wording.
+    workspace_drop_guest: Option<WorkspaceDropTarget>,
     /// Zone fade-out and post-release ghost travel: the drag feedback that
     /// outlives the lifecycle phase which produced it.
     workspace_drag_motion: WorkspaceDragMotion,
@@ -2260,6 +2279,20 @@ struct RegionBarData {
     badge: Option<GroupBadge>,
     /// The bar's tabs in strip order, each naming the session it selects.
     tabs: Vec<(SessionId, TabData)>,
+}
+
+/// A sibling window's region resolved under this window's drag pointer.
+///
+/// Holds the destination handle so the release path can clear the preview it
+/// asked that window to paint without re-walking every open window.
+#[derive(Debug, Clone)]
+struct ExternalDropTarget {
+    handle: WindowHandle<TerminalView>,
+    window_id: WindowId,
+    target: WorkspaceDropTarget,
+    /// The destination region's usable display name, kept for logging and for
+    /// the wording the destination paints.
+    name: Option<String>,
 }
 
 impl TerminalView {
@@ -2727,6 +2760,9 @@ impl TerminalView {
             region_chrome: RegionChrome::default(),
             workspace_drag: WorkspaceDrag::default(),
             workspace_drag_bounds: None,
+            gpui_window: window.window_handle(),
+            workspace_drag_external: None,
+            workspace_drop_guest: None,
             workspace_drag_motion: WorkspaceDragMotion::default(),
             workspace_drag_probe: DragProbe::from_env(),
             terminal_colors,
@@ -3892,6 +3928,19 @@ impl TerminalView {
             PaletteAction::MoveWorkspaceToNewWindow => self.move_workspace_to_new_window(cx),
             PaletteAction::MoveWorkspace(direction) => {
                 self.move_focused_workspace_in_direction(direction, cx);
+            }
+            PaletteAction::MoveWorkspaceToWindow { target_window, target_workspace, operation } => {
+                // The row was built when the palette opened. Re-resolving the
+                // destination here is what keeps a window closed (or a region
+                // changed) in the meantime from putting a request on the wire.
+                let resolved = self.workspace_move_target_live(target_window, target_workspace, cx);
+                let request = workspace_move_request(
+                    self.shell.focused_workspace_id(cx),
+                    target_window,
+                    target_workspace,
+                    operation,
+                );
+                self.begin_workspace_move(request, resolved, cx);
             }
         }
     }
@@ -5485,6 +5534,7 @@ impl TerminalView {
         self.report_focus();
         self.poll_sibling_windows(cx);
         self.poll_workspace_transfers(cx);
+        self.apply_workspace_move_feedback(cx);
         self.poll_window_list();
         self.poll_beads_board(window);
         self.poll_lan_approval(cx);
@@ -8070,7 +8120,10 @@ impl TerminalView {
             layout_pointer,
             regions: &regions,
             divider_blocked,
-            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire),
+            // A pointer already resolved onto a sibling window is not at this
+            // window's edge to detach; the same release commits a move.
+            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire)
+                && self.workspace_drag_external.is_none(),
         });
     }
 
@@ -8088,6 +8141,7 @@ impl TerminalView {
             tracing::info!(target: "scribe::drag_probe", "workspace drag pointer ingested");
         }
         let pointer = DragPoint { x: f32::from(position.x), y: f32::from(position.y) };
+        self.resolve_external_drop(pointer, window, cx);
         let viewport = self.pane_viewport();
         let layout_pointer = self.workspace_drag_layout_point(pointer);
         let regions = self.shell.workspace_rects(viewport, cx);
@@ -8111,9 +8165,246 @@ impl TerminalView {
             layout_pointer,
             regions: &regions,
             divider_blocked,
-            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire),
+            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire)
+                && self.workspace_drag_external.is_none(),
         });
         cx.notify();
+    }
+
+    /// Whether this backend measures pointer geometry well enough to target
+    /// another window with it.
+    ///
+    /// X11 answers with the mapped, root-relative bounds of every window, and
+    /// its drag delivery continues past the source surface. Wayland exposes
+    /// neither a global cursor nor client window positions, and no sanctioned
+    /// native `AppKit` proof exists for the shipped pill, so both keep the
+    /// command palette as their complete cross-window path rather than
+    /// promising a pointer route they cannot deliver.
+    #[cfg(target_os = "linux")]
+    fn cross_window_pointer_supported() -> bool {
+        gpui::guess_compositor() == "X11"
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn cross_window_pointer_supported() -> bool {
+        false
+    }
+
+    /// Resolve the pointer onto a sibling window's region, and make that window
+    /// paint the matching preview.
+    ///
+    /// Whether the pointer is even outside this window is decided from the
+    /// size GPUI already holds, so an ordinary in-window rearrange issues no
+    /// X11 round trip at all and keeps its phase-1 input-to-paint cost.
+    fn resolve_external_drop(
+        &mut self,
+        pointer: DragPoint,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let size = window.bounds().size;
+        let inside = pointer.x >= 0.0
+            && pointer.y >= 0.0
+            && pointer.x <= f32::from(size.width)
+            && pointer.y <= f32::from(size.height);
+        if inside
+            || !self.shared.workspace_move.load(Ordering::Acquire)
+            || !Self::cross_window_pointer_supported()
+        {
+            self.clear_external_drop(cx);
+            return;
+        }
+        // Only now is the measured frame worth two round trips: it is the one
+        // answer that turns this window's local pointer into a root position
+        // every sibling can be tested against.
+        let Some(frame) = monitor::mapped_window_bounds(window) else {
+            self.clear_external_drop(cx);
+            return;
+        };
+        let root_pointer = DragPoint { x: frame.x + pointer.x, y: frame.y + pointer.y };
+        let mut resolved = None;
+        for (handle, sibling) in self.workspace_move_siblings(cx) {
+            let hit = handle
+                .update(cx, |view, guest_window, ctx| {
+                    view.adopt_guest_drop(
+                        resolved.is_none().then_some(root_pointer),
+                        guest_window,
+                        ctx,
+                    )
+                })
+                .ok()
+                .flatten();
+            if let Some((target, name)) = hit {
+                resolved =
+                    Some(ExternalDropTarget { handle, window_id: sibling.window, target, name });
+            }
+        }
+        if resolved.as_ref().map(|external| (external.window_id, external.target))
+            != self
+                .workspace_drag_external
+                .as_ref()
+                .map(|external| (external.window_id, external.target))
+        {
+            cx.notify();
+        }
+        self.workspace_drag_external = resolved;
+    }
+
+    /// Paint (or drop) the drop preview a sibling window's drag asks for, and
+    /// answer which of this window's regions the pointer is over.
+    ///
+    /// `root_pointer` is in root coordinates; `None` means "you are not the
+    /// window under the pointer", which clears any preview left here.
+    fn adopt_guest_drop(
+        &mut self,
+        root_pointer: Option<DragPoint>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(WorkspaceDropTarget, Option<String>)> {
+        let target = root_pointer
+            .zip(monitor::mapped_window_bounds(window))
+            .and_then(|(root_pointer, frame)| {
+                let local = DragPoint { x: root_pointer.x - frame.x, y: root_pointer.y - frame.y };
+                (local.x >= 0.0
+                    && local.y >= 0.0
+                    && local.x <= frame.width
+                    && local.y <= frame.height)
+                    .then_some(local)
+            })
+            .and_then(|local| self.guest_drop_target(local, cx));
+        if self.workspace_drop_guest != target {
+            self.workspace_drop_guest = target;
+            cx.notify();
+        }
+        target.map(|target| (target, self.workspace_name(target.workspace_id)))
+    }
+
+    /// The region and zone `local` (window-relative) names in this window,
+    /// using the same geometry, divider veto, and zone rule the local drag does.
+    fn guest_drop_target(&self, local: DragPoint, cx: &App) -> Option<WorkspaceDropTarget> {
+        let viewport = self.pane_viewport();
+        let layout_pointer = self.workspace_drag_layout_point(local);
+        let dividers = self.shell.workspace_dividers(viewport, cx);
+        if workspace_layout::hit_test_workspace_divider(
+            &dividers,
+            layout_pointer.x,
+            layout_pointer.y,
+        )
+        .is_some()
+        {
+            return None;
+        }
+        self.shell.workspace_rects(viewport, cx).into_iter().find_map(|(workspace_id, rect)| {
+            workspace_drag::zone_at(layout_pointer, rect)
+                .map(|zone| WorkspaceDropTarget { workspace_id, zone })
+        })
+    }
+
+    /// Drop this drag's sibling target and every preview it asked for.
+    fn clear_external_drop(&mut self, cx: &mut Context<Self>) {
+        let Some(external) = self.workspace_drag_external.take() else { return };
+        drop(
+            external.handle.update(cx, |view, guest_window, ctx| {
+                view.adopt_guest_drop(None, guest_window, ctx)
+            }),
+        );
+        cx.notify();
+    }
+
+    /// Every other connected Scribe window in this process, with the region it
+    /// currently focuses as its one deterministic destination.
+    ///
+    /// A duplicate launch focuses the running client rather than starting a
+    /// second one, so this process holds the user's whole window set and the
+    /// enumeration needs no protocol round trip that could go stale between a
+    /// palette opening and a row being confirmed. Ordered by window id so the
+    /// offered rows do not depend on window-map iteration order.
+    fn workspace_move_siblings(
+        &self,
+        cx: &App,
+    ) -> Vec<(WindowHandle<TerminalView>, WorkspaceMoveTarget)> {
+        let own_window =
+            self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id());
+        let own_handle = self.gpui_window.window_id();
+        let mut siblings: Vec<(WindowHandle<TerminalView>, WorkspaceMoveTarget)> = cx
+            .windows()
+            .into_iter()
+            .filter(|handle| handle.window_id() != own_handle)
+            .filter_map(|handle| handle.downcast::<TerminalView>())
+            .filter_map(|handle| {
+                let view = handle.read(cx).ok()?;
+                if !view.shared.connected.load(Ordering::Acquire) {
+                    return None;
+                }
+                let window = view
+                    .shared
+                    .lifecycle
+                    .lock()
+                    .ok()
+                    .and_then(|lifecycle| lifecycle.window_id())?;
+                if Some(window) == own_window {
+                    return None;
+                }
+                let workspace = view.shell.focused_workspace_id(cx);
+                let workspace_name = view.workspace_name(workspace);
+                Some((handle, WorkspaceMoveTarget { window, workspace, workspace_name }))
+            })
+            .collect();
+        siblings.sort_by_cached_key(|(_, target)| target.window.to_string());
+        siblings
+    }
+
+    /// Whether `window` is still an eligible destination holding `workspace`.
+    ///
+    /// Both entry points re-check this immediately before a request would go
+    /// out, because both name a destination chosen earlier: a palette row was
+    /// built when the overlay opened, and a pointer target was resolved on an
+    /// earlier move. A window closed, disconnected, or reshaped in between
+    /// ends the gesture instead of reaching the wire.
+    fn workspace_move_target_live(
+        &self,
+        window: WindowId,
+        workspace: WorkspaceId,
+        cx: &App,
+    ) -> bool {
+        self.workspace_move_siblings(cx).into_iter().any(|(handle, sibling)| {
+            sibling.window == window
+                && handle.read(cx).is_ok_and(|view| view.shell.has_region(workspace, cx))
+        })
+    }
+
+    /// Commit a release that landed on a sibling window's region.
+    ///
+    /// The destination is re-resolved here for the same reason a palette row
+    /// is: it was chosen on an earlier pointer move, and a window closed or
+    /// disconnected since must end the gesture rather than put a frame on the
+    /// wire for a window that is already gone.
+    fn commit_external_drop(
+        &mut self,
+        external: &ExternalDropTarget,
+        source_workspace_id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(
+            workspace_id = %source_workspace_id,
+            target_window = %external.window_id,
+            target_workspace = %external.target.workspace_id,
+            target_name = external.name.as_deref().unwrap_or_default(),
+            zone = ?external.target.zone,
+            "workspace drag released over a sibling window"
+        );
+        let resolved =
+            self.workspace_move_target_live(external.window_id, external.target.workspace_id, cx);
+        self.begin_workspace_move(
+            workspace_move_request(
+                source_workspace_id,
+                external.window_id,
+                external.target.workspace_id,
+                workspace_drag::move_operation_for(external.target.zone),
+            ),
+            resolved,
+            cx,
+        );
     }
 
     /// Commit one actionable release or clear a no-op gesture.
@@ -8126,6 +8417,14 @@ impl TerminalView {
         let release_point = self.workspace_drag.pointer();
         let grab_point = self.workspace_drag.grab_point();
         let source_bounds = self.workspace_drag_bounds.take();
+        // Resolved before the release clears the drag: a pointer parked over a
+        // sibling window commits there instead of detaching into a new one.
+        let external = self.workspace_drag_external.take();
+        if let Some(external) = external.as_ref() {
+            drop(external.handle.update(cx, |view, guest_window, ctx| {
+                view.adopt_guest_drop(None, guest_window, ctx)
+            }));
+        }
         let tear = self
             .workspace_drag
             .is_tear_armed()
@@ -8138,10 +8437,12 @@ impl TerminalView {
                 tear_candidate_at(point, rect_from_window_bounds(bounds))
             });
         let commit = self.workspace_drag.release();
-        let tearing = tear.is_some();
+        let leaving = tear.is_some() || external.is_some();
         let mut landed = None;
 
-        if let Some((workspace_id, tear_point, tear_bounds)) = tear {
+        if let Some((external, workspace_id)) = external.as_ref().zip(source) {
+            self.commit_external_drop(external, workspace_id, cx);
+        } else if let Some((workspace_id, tear_point, tear_bounds)) = tear {
             let spec =
                 transfer_window_spec(tear_bounds, tear_point, cursor_anchored_transfer_placement());
             self.begin_workspace_transfer(workspace_id, spec, cx);
@@ -8166,9 +8467,9 @@ impl TerminalView {
             self.show_workspace_transfer_feedback(WorkspaceTransferFeedback::CapabilityAbsent);
         }
 
-        // A tear-out replaces this window's ghost with a whole new window, so
-        // only in-window outcomes settle or snap back.
-        if let Some(workspace_id) = source.filter(|_| !tearing) {
+        // A tear-out or cross-window move takes the workspace out of this
+        // window entirely, so only in-window outcomes settle or snap back.
+        if let Some(workspace_id) = source.filter(|_| !leaving) {
             let destination =
                 landed.and_then(|landed| self.workspace_center(landed, cx)).or(grab_point);
             self.travel_workspace_ghost(workspace_id, release_point, destination, source_bounds);
@@ -8210,6 +8511,74 @@ impl TerminalView {
         }
     }
 
+    /// Ask the server to move `workspace_id` into an existing window.
+    ///
+    /// Nothing local moves here. The server owns the transaction and answers a
+    /// commit with one full `SessionList` per surviving window, so this window
+    /// keeps its layout until that authoritative tree arrives — and a refusal
+    /// leaves it untouched by construction.
+    fn begin_workspace_move(
+        &mut self,
+        request: WorkspaceMoveRequest,
+        target_resolved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let eligibility = if !self.shared.workspace_move.load(Ordering::Acquire) {
+            WorkspaceMoveEligibility::Unsupported
+        } else if target_resolved {
+            WorkspaceMoveEligibility::Ready
+        } else {
+            WorkspaceMoveEligibility::StaleTarget
+        };
+        let Ok(mut moves) = self.shared.workspace_moves.lock() else {
+            tracing::warn!("workspace move state mutex poisoned");
+            return;
+        };
+        let begin = moves.begin(eligibility, request);
+        drop(moves);
+        match begin {
+            Ok(accepted) => self.send_workspace_move_request(accepted),
+            Err(feedback) => {
+                set_status(
+                    &self.shared.status,
+                    &self.shared.generation,
+                    feedback.message().to_owned(),
+                );
+            }
+        }
+        self.apply_workspace_move_feedback(cx);
+    }
+
+    fn send_workspace_move_request(&self, request: WorkspaceMoveRequest) {
+        let sent = self.sink.move_workspace(request);
+        let Ok(mut moves) = self.shared.workspace_moves.lock() else {
+            tracing::warn!("workspace move state mutex poisoned");
+            return;
+        };
+        match sent {
+            Ok(()) => {
+                moves.mark_sent(request.correlation);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "workspace move request dropped");
+                moves.send_failed(request.correlation);
+            }
+        }
+    }
+
+    fn apply_workspace_move_feedback(&mut self, cx: &mut Context<Self>) {
+        let feedback = self
+            .shared
+            .workspace_moves
+            .lock()
+            .map(|mut moves| moves.take_feedback())
+            .unwrap_or_default();
+        for entry in feedback {
+            set_status(&self.shared.status, &self.shared.generation, entry.message().to_owned());
+            cx.notify();
+        }
+    }
+
     fn cancel_workspace_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.workspace_drag.is_active() {
             return false;
@@ -8219,6 +8588,7 @@ impl TerminalView {
         let grab_point = self.workspace_drag.grab_point();
         let source_bounds = self.workspace_drag_bounds.take();
         self.workspace_drag.cancel();
+        self.clear_external_drop(cx);
         self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
         if let Some(workspace_id) = source {
             self.travel_workspace_ghost(workspace_id, release_point, grab_point, source_bounds);
@@ -8262,17 +8632,35 @@ impl TerminalView {
     /// One zone highlight, fading in as the live preview or out as the zone the
     /// pointer just left. Both directions end where the zero-duration path
     /// paints on its first frame: fully lit, or gone.
+    ///
+    /// A centre target additionally carries [`workspace_drag::swap_hint`]: a
+    /// centre drop exchanges two regions rather than inserting one, and the
+    /// highlight alone cannot say so. The sentence lives on this element, so
+    /// there is no separate surface to leave behind — and only the fading-*in*
+    /// live target carries it, so an edge transition, cancel, Escape, or blur
+    /// drops the wording on the frame it happens rather than letting it ride
+    /// out the highlight's fade. Cross-window previews call this in the
+    /// destination window, which is what keeps the two paths one wording.
     fn workspace_drag_zone(
         &self,
         target: WorkspaceDropTarget,
         fade: ZoneFade,
-        source_workspace_id: WorkspaceId,
+        accent_workspace_id: WorkspaceId,
         cx: &App,
     ) -> Option<gpui::AnyElement> {
         let region = self.shell.workspace_rect(target.workspace_id, self.pane_viewport(), cx)?;
         let zone = zone_preview_rect(region, target.zone);
         let origin = self.workspace_drag_grid_origin();
-        let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
+        let accent = opaque_slot(self.shell.workspace_accent(accent_workspace_id, cx));
+        let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        let hint = (fade == ZoneFade::In)
+            .then(|| {
+                workspace_drag::swap_hint(
+                    target.zone,
+                    self.workspace_name(target.workspace_id).as_deref(),
+                )
+            })
+            .flatten();
         Some(
             div()
                 .absolute()
@@ -8280,9 +8668,22 @@ impl TerminalView {
                 .top(px(origin.y + zone.y))
                 .w(px(zone.width))
                 .h(px(zone.height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
                 .bg(gpui::Rgba { a: 0.18, ..accent })
                 .border_2()
                 .border_color(accent)
+                .children(hint.map(|hint| {
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(colors.active_text)
+                        .bg(gpui::Rgba { a: 0.85, ..colors.bg })
+                        .rounded_sm()
+                        .child(hint)
+                }))
                 .with_animation(
                     ElementId::Name(
                         format!(
@@ -8390,6 +8791,14 @@ impl TerminalView {
                 self.workspace_drag_motion.track_zone(None, animations.duration(ZONE_FADE));
             let transient_workspace = self.workspace_drag_motion.workspace_id();
             let mut layers = self.workspace_drag_settle(animations, cx);
+            // A sibling window's drag is over one of this window's regions: the
+            // same zone element, the same fade, the same swap wording.
+            if let Some(guest) = self.workspace_drop_guest
+                && let Some(highlight) =
+                    self.workspace_drag_zone(guest, ZoneFade::In, guest.workspace_id, cx)
+            {
+                layers.push(highlight);
+            }
             if let Some(zone) = fading
                 && let Some(workspace_id) = transient_workspace
                 && let Some(highlight) =
@@ -8403,6 +8812,7 @@ impl TerminalView {
             self.workspace_drag.cancel();
             self.workspace_drag_bounds = None;
             self.workspace_drag_motion.clear();
+            self.clear_external_drop(cx);
             self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
             cx.stop_active_drag(window);
             return Vec::new();
@@ -9372,7 +9782,18 @@ impl TerminalView {
         // affordances can never disagree about whether an update is offered.
         let update_version =
             self.shared.update.lock().ok().and_then(|state| state.version().map(str::to_owned));
-        let entries = build_entries(update_version.as_deref(), &profile_names, active.as_deref());
+        let move_targets: Vec<WorkspaceMoveTarget> =
+            if self.shared.workspace_move.load(Ordering::Acquire) {
+                self.workspace_move_siblings(cx).into_iter().map(|(_, sibling)| sibling).collect()
+            } else {
+                Vec::new()
+            };
+        let entries = build_entries(
+            update_version.as_deref(),
+            &profile_names,
+            active.as_deref(),
+            &move_targets,
+        );
         let colors = CommandPaletteColors::from(&self.chrome);
         let palette = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
         cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| {
@@ -12889,6 +13310,34 @@ fn rect_from_window_bounds(bounds: Bounds<Pixels>) -> Rect {
     }
 }
 
+/// Mint the next existing-window move correlation id.
+///
+/// A move names a destination that already exists, so — unlike a tear-out,
+/// whose fresh `WindowId` is itself unique — there is no id in the request to
+/// derive one from. A process-wide counter above the tear-out ids' hash space
+/// is enough: the server's ledger only has to tell this client's requests
+/// apart, and it keys them per connection.
+fn next_workspace_move_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One correlated existing-window move request, with a freshly minted id.
+fn workspace_move_request(
+    workspace: WorkspaceId,
+    target_window: WindowId,
+    target_workspace: WorkspaceId,
+    operation: WorkspaceMoveOperation,
+) -> WorkspaceMoveRequest {
+    WorkspaceMoveRequest {
+        correlation: next_workspace_move_id(),
+        workspace,
+        target_window,
+        target_workspace,
+        operation,
+    }
+}
+
 fn workspace_transfer_id(target_window_id: WindowId) -> u64 {
     let (high, low) = target_window_id.as_uuid().as_u64_pair();
     (high ^ low).max(1)
@@ -13032,6 +13481,8 @@ fn prepare_window_backend(
         pi_provider: Arc::new(AtomicBool::new(false)),
         workspace_transfer: Arc::new(AtomicBool::new(false)),
         workspace_transfers: Arc::new(Mutex::new(WorkspaceTransfers::default())),
+        workspace_move: Arc::new(AtomicBool::new(false)),
+        workspace_moves: Arc::new(Mutex::new(WorkspaceMoves::default())),
         session_list_seen: Arc::new(AtomicBool::new(false)),
         initial_session: Arc::new(InitialSessionBootstrap::new(
             initial_session,
@@ -14201,12 +14652,14 @@ async fn supervise_connection(mut ctx: IpcThread) {
         // every new outage starts at the short initial retry interval.
         if ctx.shared.connected.swap(false, Ordering::AcqRel) {
             reconnect_delay = INITIAL_RECONNECT_DELAY;
-            if ctx
+            let torn = ctx
                 .shared
                 .workspace_transfers
                 .lock()
-                .is_ok_and(|mut transfers| transfers.disconnected())
-            {
+                .is_ok_and(|mut transfers| transfers.disconnected());
+            let moved =
+                ctx.shared.workspace_moves.lock().is_ok_and(|mut moves| moves.disconnected());
+            if torn || moved {
                 ctx.shared.generation.fetch_add(1, Ordering::Release);
             }
         }
@@ -14549,6 +15002,7 @@ where
     // while reconnecting to an older one.
     ctx.shared.pi_provider.store(false, Ordering::Release);
     ctx.shared.workspace_transfer.store(false, Ordering::Release);
+    ctx.shared.workspace_move.store(false, Ordering::Release);
 
     // Write the connection handshake directly before draining the shared
     // outbound queue. A reconnect may have queued UI work while no stream was
@@ -14583,7 +15037,10 @@ where
             // Tear-out UI remains disabled until `Welcome` confirms the server
             // can complete the matching transfer transaction.
             workspace_transfer: true,
-            workspace_move: false,
+            // Likewise for the cross-window move surface: the palette rows and
+            // the pointer's cross-window target stay hidden until `Welcome`
+            // confirms the server can complete the move transaction.
+            workspace_move: true,
         },
     )
     .await
@@ -14631,6 +15088,8 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         pi_provider: Arc::clone(&ctx.shared.pi_provider),
         workspace_transfer: Arc::clone(&ctx.shared.workspace_transfer),
         workspace_transfers: Arc::clone(&ctx.shared.workspace_transfers),
+        workspace_move: Arc::clone(&ctx.shared.workspace_move),
+        workspace_moves: Arc::clone(&ctx.shared.workspace_moves),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
         initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
@@ -15107,6 +15566,10 @@ struct ReaderCtx {
     workspace_transfer: Arc<AtomicBool>,
     /// Correlated tear-out state shared with the foreground window.
     workspace_transfers: Arc<Mutex<WorkspaceTransfers>>,
+    /// Negotiated existing-window move support for this connection.
+    workspace_move: Arc<AtomicBool>,
+    /// Correlated existing-window move state shared with the foreground window.
+    workspace_moves: Arc<Mutex<WorkspaceMoves>>,
     /// Negotiated structured Pi provider support for this connection.
     pi_provider: Arc<AtomicBool>,
     /// Latched by the first `SessionList`; see the `session_list_seen` field of
@@ -15823,7 +16286,7 @@ async fn dispatch_server_message(
             if let Some(tree) = workspace_tree.as_ref() {
                 file_tree_pane_sessions(ctx, tree);
             }
-            park_server_topology(ctx, &sessions, workspace_tree, first_session_list);
+            park_server_topology(ctx, registry, &sessions, workspace_tree, first_session_list);
             on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
@@ -15935,6 +16398,9 @@ async fn dispatch_server_message(
         ServerMessage::WorkspaceTransferResult { transfer_id, result } => {
             on_workspace_transfer_result(ctx, transfer_id, result);
         }
+        ServerMessage::WorkspaceMoveResult { move_id, result } => {
+            on_workspace_move_result(ctx, move_id, result);
+        }
         // The four provider task-label notices all land in the tab strip's
         // label column, so they are named here and routed as one to
         // [`on_task_label_message`]. Naming them is what keeps an AI tab's
@@ -16032,11 +16498,23 @@ async fn dispatch_server_message(
 /// of its own.
 fn park_server_topology(
     ctx: &ReaderCtx,
+    registry: &session_lifecycle::SessionRegistry,
     sessions: &[SessionInfo],
     workspace_tree: Option<WorkspaceTreeNode>,
     first_on_connection: bool,
 ) {
-    if !first_on_connection || sessions.is_empty() {
+    if sessions.is_empty() {
+        return;
+    }
+    // A connection's first list rebuilds the window. A later one is parked only
+    // when it names a session this window has never held, which is exactly the
+    // destination side of a workspace move: the server re-lists both survivors,
+    // and only the destination's list grows. The source side keeps collapsing
+    // through the pane-retire path it already used for a tear-out, so phase-1
+    // behaviour is untouched. Adoption itself remains
+    // [`TerminalView::adopt_server_topology`]'s authorship decision.
+    let adopted = sessions.iter().any(|session| !registry.tracks(session.session_id));
+    if !first_on_connection && !adopted {
         return;
     }
     let Some(tree) = workspace_tree else { return };
@@ -16372,6 +16850,29 @@ fn on_workspace_transfer_result(
         }
         WorkspaceTransferResultDisposition::Ignored => {
             tracing::debug!(transfer_id, "workspace transfer result ignored");
+        }
+    }
+}
+
+/// Correlate one existing-window move answer.
+///
+/// A committed move needs no client-side layout edit: the same transaction
+/// sends every surviving window one full `SessionList` carrying the
+/// authoritative tree, and [`TerminalView::adopt_server_topology`] adopts it.
+fn on_workspace_move_result(ctx: &ReaderCtx, move_id: u64, result: WorkspaceMoveResult) {
+    let disposition = ctx
+        .workspace_moves
+        .lock()
+        .map_or(WorkspaceTransferResultDisposition::Ignored, |mut moves| {
+            moves.receive_result(move_id, result)
+        });
+    match disposition {
+        WorkspaceTransferResultDisposition::Accepted => {
+            tracing::info!(move_id, ?result, "workspace move result accepted");
+            ctx.generation.fetch_add(1, Ordering::Release);
+        }
+        WorkspaceTransferResultDisposition::Ignored => {
+            tracing::debug!(move_id, "workspace move result ignored");
         }
     }
 }
@@ -16986,6 +17487,7 @@ fn on_welcome(
         beads_flow,
         pi_provider,
         workspace_transfer,
+        workspace_move,
         ..
     } = welcome
     else {
@@ -16994,6 +17496,7 @@ fn on_welcome(
     registry.adopt_window(window_id);
     ctx.pi_provider.store(pi_provider, Ordering::Release);
     ctx.workspace_transfer.store(workspace_transfer, Ordering::Release);
+    ctx.workspace_move.store(workspace_move, Ordering::Release);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
     if ctx.fan_out_other_windows && !other_windows.is_empty() {
         tracing::info!(
@@ -17023,6 +17526,7 @@ fn on_welcome(
         clipboard_gating,
         pi_provider,
         workspace_transfer,
+        workspace_move,
         "welcome: adopted window"
     );
 }

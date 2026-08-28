@@ -46,6 +46,7 @@ use std::{
 };
 
 use scribe_client::share::ControlIntent;
+use scribe_client::workspace_transfer::WorkspaceMoveRequest;
 use scribe_common::{
     framing::write_message,
     ids::{SessionId, WindowId, WorkspaceId},
@@ -1443,6 +1444,24 @@ impl IpcSink {
             transfer_id,
             workspace_id,
             target_window_id,
+        })
+    }
+
+    /// Ask the server to atomically move one workspace into an existing window.
+    ///
+    /// Ids and one structural operation only: the server derives both
+    /// post-move trees from its own authoritative state.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn move_workspace(&self, request: WorkspaceMoveRequest) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::MoveWorkspace {
+            move_id: request.correlation,
+            workspace_id: request.workspace,
+            target_window_id: request.target_window,
+            target_workspace_id: request.target_workspace,
+            operation: request.operation,
         })
     }
 

@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (56 variants, 49 reachable)
+## Client messages (56 variants, 50 reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -105,7 +105,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `CreateWorkspace` | workspace creation | scripted-E2E | `main.rs::TerminalView::split_workspace` → `IpcSink::create_workspace` | required |
 | `CloseWorkspace` | workspace close | scripted-E2E | `main.rs::TerminalView::close_pane` / `reconcile_panes` → `TerminalView::close_workspace` → `IpcSink::close_workspace` | required |
 | `TransferWorkspace` | workspace tear-out transaction | unit | — (unwired; client tear-out flow pending) | required |
-| `MoveWorkspace` | existing-window workspace move transaction | unit | — (unwired; client workspace-move flow pending) | required |
+| `MoveWorkspace` | existing-window workspace move transaction | unit | `main.rs::TerminalView::execute_palette_action` `MoveWorkspaceToWindow` arm and `TerminalView::finish_workspace_drag` cross-window release → `TerminalView::begin_workspace_move` → `ipc_bridge.rs::IpcSink::move_workspace` | required |
 | `MoveSession` | session relocation | scripted-E2E | `main.rs::TerminalView::follow_session_to_region` → `IpcSink::move_session` | required |
 | `Subscribe` | session stream subscription | scripted-E2E | `main.rs::attach_session` / `TerminalView::attach` → `IpcSink::subscribe` | required |
 | `RequestSnapshot` | snapshot tooling | scripted-E2E | `main.rs::report_cell_metrics` / `forward_replay` → `IpcSink::request_snapshot` | required |
@@ -155,12 +155,12 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `BeadsIssueWrite` | workspace Beads issue detail edits | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `RequestBeadsEpicGraph` | workspace Beads Flow epic dependency graph | unit | `beads_board.rs::BeadsBoards::request_card_flow` → `main.rs::TerminalView::sync_beads_board_strips` → `ipc_bridge.rs::IpcSink::request_beads_epic_graph` | required |
 
-**Reachability:** 49 of 56 rows name a live-path symbol; 7 are unwired and 0
+**Reachability:** 50 of 56 rows name a live-path symbol; 6 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (74 variants, 67 reachable)
+## Server messages (74 variants, 68 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
@@ -257,11 +257,11 @@ erase a replacement.
 | `BeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
 | `BeadsIssueWriteResult` | workspace Beads issue detail write outcome | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `WorkspaceTransferResult` | workspace tear-out transaction outcome | unit | — (unwired; client tear-out result handling pending) | required |
-| `WorkspaceMoveResult` | existing-window workspace move outcome | unit | — (unwired; client workspace-move result handling pending) | required |
+| `WorkspaceMoveResult` | existing-window workspace move outcome | unit | `main.rs::on_workspace_move_result` → `workspace_transfer.rs::WorkspaceMoves::receive_result` → `TerminalView::apply_workspace_move_feedback` | required |
 | `BeadsEpicGraph` | workspace Beads Flow epic dependency graph reply | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::apply_epic_graph` → `beads_board.rs::flow_strip` | required |
 | `IssueFocused` | local unshared Flow live-agent issue binding | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::set_focused_issue` → `beads_flow.rs::node_dot` | required |
 
-**Reachability:** 67 of 74 rows name a live-path symbol; 7 are unwired and 0
+**Reachability:** 68 of 74 rows name a live-path symbol; 6 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -484,19 +484,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 56 | 49 | 7 | 0 |
-| Server messages | 74 | 67 | 7 | 0 |
+| Client messages | 56 | 50 | 6 | 0 |
+| Server messages | 74 | 68 | 6 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **229** | **215** | **14** | **0** |
+| **Total** | **229** | **217** | **12** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **220 rows, of which 206 are
-reachable (94%)** and 14 are not. **1 of those 220** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **220 rows, of which 208 are
+reachable (95%)** and 12 are not. **1 of those 220** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **205 of 220**.
+the in-client figure is **207 of 220**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

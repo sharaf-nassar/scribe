@@ -3,14 +3,17 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext};
-use scribe_common::protocol::AutomationAction;
+use scribe_common::ids::{WindowId, WorkspaceId};
+use scribe_common::protocol::{AutomationAction, WorkspaceMoveOperation, WorkspaceTreeEdge};
 use scribe_common::theme::minimal_dark;
 
 use super::{
     CommandPaletteColors, CommandPaletteEntry, CommandPaletteEvent, CommandPaletteView,
-    PaletteAction, base_entries, build_entries, filter_entries, profile_entries,
+    PaletteAction, WorkspaceMoveTarget, base_entries, build_entries, filter_entries,
+    profile_entries, workspace_move_entries,
 };
 use crate::layout::FocusDirection;
+use crate::workspace_drag::swap_hint_text;
 
 // @lat: [[client#GPUI Overlays#Palette base entries and update row]]
 #[test]
@@ -44,12 +47,62 @@ fn workspace_move_actions_are_visible() {
 
 #[test]
 fn update_row_is_appended_only_when_an_update_is_available() {
-    let none = build_entries(None, &[], None);
+    let none = build_entries(None, &[], None, &[]);
     assert!(none.iter().all(|e| !e.label.starts_with("Update Scribe")));
 
-    let some = build_entries(Some("9.9.9"), &[], None);
+    let some = build_entries(Some("9.9.9"), &[], None, &[]);
     let update = some.iter().find(|e| e.label == "Update Scribe to v9.9.9").unwrap();
     assert_eq!(update.action, PaletteAction::Automation(AutomationAction::OpenUpdateDialog));
+}
+
+// @lat: [[test#GPUI Workspace Drag]]
+#[test]
+fn each_eligible_window_offers_one_edge_insert_and_one_explained_swap() {
+    let named = WorkspaceMoveTarget {
+        window: WindowId::new(),
+        workspace: WorkspaceId::new(),
+        workspace_name: Some("Docs".to_owned()),
+    };
+    let unnamed = WorkspaceMoveTarget {
+        window: WindowId::new(),
+        workspace: WorkspaceId::new(),
+        // A blank name is not a usable name, so this row takes generic wording.
+        workspace_name: Some("  ".to_owned()),
+    };
+    let rows = workspace_move_entries(&[named.clone(), unnamed.clone()]);
+    assert_eq!(rows.len(), 4, "two deterministic targets per eligible window");
+
+    assert_eq!(rows[0].label, format!("Move workspace right of Docs in {}", named.window));
+    assert_eq!(
+        rows[0].action,
+        PaletteAction::MoveWorkspaceToWindow {
+            target_window: named.window,
+            target_workspace: named.workspace,
+            operation: WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Right },
+        }
+    );
+    assert_eq!(rows[0].detail, None, "an insert needs no explanation");
+
+    assert_eq!(rows[1].label, format!("Swap workspace with Docs in {}", named.window));
+    assert_eq!(
+        rows[1].action,
+        PaletteAction::MoveWorkspaceToWindow {
+            target_window: named.window,
+            target_workspace: named.workspace,
+            operation: WorkspaceMoveOperation::Swap,
+        }
+    );
+    // Byte-identical to the sentence the pointer's centre zone paints.
+    assert_eq!(rows[1].detail.as_deref(), Some(swap_hint_text(Some("Docs")).as_str()));
+
+    assert_eq!(rows[2].label, format!("Move workspace right of workspace in {}", unnamed.window));
+    assert_eq!(rows[3].detail.as_deref(), Some(swap_hint_text(None).as_str()));
+
+    // No eligible window means no move rows at all, so nothing unreachable is
+    // offered on a single-window desktop.
+    assert!(workspace_move_entries(&[]).is_empty());
+    let full = build_entries(None, &[], None, &[named]);
+    assert_eq!(full.iter().filter(|entry| entry.detail.is_some()).count(), 1);
 }
 
 // @lat: [[client#GPUI Overlays#Palette profile rows tag the active profile]]
@@ -81,7 +134,7 @@ fn palette(
     cx: &mut TestAppContext,
 ) -> (Entity<CommandPaletteView>, Arc<Mutex<Vec<CommandPaletteEvent>>>) {
     let colors = CommandPaletteColors::from(&minimal_dark().chrome);
-    let entries = build_entries(Some("1.2.3"), &["work".to_owned()], Some("work"));
+    let entries = build_entries(Some("1.2.3"), &["work".to_owned()], Some("work"), &[]);
     let view = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&log);

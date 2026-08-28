@@ -12,10 +12,11 @@
 //! emits its [`PaletteAction`] for the shell to route.
 
 use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
-use scribe_common::protocol::AutomationAction;
+use scribe_common::ids::{WindowId, WorkspaceId};
+use scribe_common::protocol::{AutomationAction, WorkspaceMoveOperation, WorkspaceTreeEdge};
 use scribe_common::theme::ChromeColors;
 
-use crate::{layout::FocusDirection, tab_bar::srgba};
+use crate::{layout::FocusDirection, tab_bar::srgba, workspace_drag::swap_hint_text};
 
 /// Maximum number of filtered rows the palette shows at once, mirroring the winit
 /// overlay's item cap.
@@ -35,6 +36,17 @@ pub enum PaletteAction {
     MoveWorkspaceToNewWindow,
     /// Move the focused workspace to its nearest neighbour in one direction.
     MoveWorkspace(FocusDirection),
+    /// Move the focused workspace into another connected window, either
+    /// inserted beside a named destination region or exchanged with it.
+    ///
+    /// This is the non-pointer path to the same server transaction the drag
+    /// commits, so it is reachable on every platform — including the ones where
+    /// no cross-surface pointer delivery is promised.
+    MoveWorkspaceToWindow {
+        target_window: WindowId,
+        target_workspace: WorkspaceId,
+        operation: WorkspaceMoveOperation,
+    },
 }
 
 // `AutomationAction` (frozen scribe-common) derives neither `PartialEq` nor
@@ -46,6 +58,18 @@ impl PartialEq for PaletteAction {
             (Self::OpenRemoteConnect, Self::OpenRemoteConnect)
             | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow) => true,
             (Self::MoveWorkspace(a), Self::MoveWorkspace(b)) => a == b,
+            (
+                Self::MoveWorkspaceToWindow {
+                    target_window: aw,
+                    target_workspace: ar,
+                    operation: ao,
+                },
+                Self::MoveWorkspaceToWindow {
+                    target_window: bw,
+                    target_workspace: br,
+                    operation: bo,
+                },
+            ) => aw == bw && ar == br && ao == bo,
             (Self::Automation(a), Self::Automation(b)) => format!("{a:?}") == format!("{b:?}"),
             _ => false,
         }
@@ -59,16 +83,90 @@ impl Eq for PaletteAction {}
 pub struct CommandPaletteEntry {
     /// The row label shown in the list and matched against the query.
     pub label: String,
+    /// One dimmed explanatory line under the label, for a row whose outcome the
+    /// label alone cannot state. Carries the pointer preview's own wording so
+    /// the keyboard path explains a swap exactly as the drag does.
+    pub detail: Option<String>,
     /// The action confirmed when the row is selected.
     pub action: PaletteAction,
 }
 
 impl CommandPaletteEntry {
+    /// Build a plain entry with no explanatory line.
+    #[must_use]
+    pub fn new(label: impl Into<String>, action: PaletteAction) -> Self {
+        Self { label: label.into(), detail: None, action }
+    }
+
     /// Build an entry that dispatches a shared [`AutomationAction`].
     #[must_use]
     pub fn automation(label: impl Into<String>, action: AutomationAction) -> Self {
-        Self { label: label.into(), action: PaletteAction::Automation(action) }
+        Self::new(label, PaletteAction::Automation(action))
     }
+}
+
+/// One connected sibling window this window may move a workspace into, already
+/// reduced to the single destination region the palette offers.
+///
+/// The destination is resolved by the caller (the shell knows which windows are
+/// connected and which region each of them shows), so the row assembly below
+/// stays pure and the offered targets are deterministic rather than
+/// pointer-dependent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceMoveTarget {
+    /// The destination window.
+    pub window: WindowId,
+    /// The destination region inside it.
+    pub workspace: WorkspaceId,
+    /// Its display name, when it has a usable one.
+    pub workspace_name: Option<String>,
+}
+
+impl WorkspaceMoveTarget {
+    fn label(&self) -> String {
+        self.workspace_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "workspace".to_owned(), ToOwned::to_owned)
+    }
+}
+
+/// The per-window move rows: one deterministic edge insert and one centre swap
+/// for every eligible destination, in the order the caller resolved them.
+#[must_use]
+pub fn workspace_move_entries(targets: &[WorkspaceMoveTarget]) -> Vec<CommandPaletteEntry> {
+    targets
+        .iter()
+        .flat_map(|target| {
+            let label = target.label();
+            let window = target.window;
+            let workspace = target.workspace;
+            [
+                CommandPaletteEntry::new(
+                    format!("Move workspace right of {label} in {window}"),
+                    PaletteAction::MoveWorkspaceToWindow {
+                        target_window: window,
+                        target_workspace: workspace,
+                        operation: WorkspaceMoveOperation::InsertAtEdge {
+                            edge: WorkspaceTreeEdge::Right,
+                        },
+                    },
+                ),
+                CommandPaletteEntry {
+                    label: format!("Swap workspace with {label} in {window}"),
+                    // The same sentence the centre drop zone paints, so the two
+                    // paths cannot describe one operation differently.
+                    detail: Some(swap_hint_text(target.workspace_name.as_deref())),
+                    action: PaletteAction::MoveWorkspaceToWindow {
+                        target_window: window,
+                        target_workspace: workspace,
+                        operation: WorkspaceMoveOperation::Swap,
+                    },
+                },
+            ]
+        })
+        .collect()
 }
 
 /// The fixed base command-palette rows, in display order. Ported verbatim from
@@ -89,30 +187,27 @@ pub fn base_entries() -> Vec<CommandPaletteEntry> {
         CommandPaletteEntry::automation("Close Pane", AutomationAction::ClosePane),
         CommandPaletteEntry::automation("Close Tab", AutomationAction::CloseTab),
         CommandPaletteEntry::automation("New Window", AutomationAction::NewWindow),
-        CommandPaletteEntry {
-            label: "Move workspace to new window".into(),
-            action: PaletteAction::MoveWorkspaceToNewWindow,
-        },
-        CommandPaletteEntry {
-            label: "Move workspace left".into(),
-            action: PaletteAction::MoveWorkspace(FocusDirection::Left),
-        },
-        CommandPaletteEntry {
-            label: "Move workspace right".into(),
-            action: PaletteAction::MoveWorkspace(FocusDirection::Right),
-        },
-        CommandPaletteEntry {
-            label: "Move workspace up".into(),
-            action: PaletteAction::MoveWorkspace(FocusDirection::Up),
-        },
-        CommandPaletteEntry {
-            label: "Move workspace down".into(),
-            action: PaletteAction::MoveWorkspace(FocusDirection::Down),
-        },
-        CommandPaletteEntry {
-            label: "Connect to remote machine…".into(),
-            action: PaletteAction::OpenRemoteConnect,
-        },
+        CommandPaletteEntry::new(
+            "Move workspace to new window",
+            PaletteAction::MoveWorkspaceToNewWindow,
+        ),
+        CommandPaletteEntry::new(
+            "Move workspace left",
+            PaletteAction::MoveWorkspace(FocusDirection::Left),
+        ),
+        CommandPaletteEntry::new(
+            "Move workspace right",
+            PaletteAction::MoveWorkspace(FocusDirection::Right),
+        ),
+        CommandPaletteEntry::new(
+            "Move workspace up",
+            PaletteAction::MoveWorkspace(FocusDirection::Up),
+        ),
+        CommandPaletteEntry::new(
+            "Move workspace down",
+            PaletteAction::MoveWorkspace(FocusDirection::Down),
+        ),
+        CommandPaletteEntry::new("Connect to remote machine…", PaletteAction::OpenRemoteConnect),
     ]
 }
 
@@ -139,16 +234,19 @@ pub fn profile_entries(
         .collect()
 }
 
-/// Assemble the full entry list: the base rows, then the conditional "Update
-/// Scribe to v{version}" row when an update is available, then the profile rows.
+/// Assemble the full entry list: the base rows, the per-window move rows for
+/// every eligible destination, then the conditional "Update Scribe to
+/// v{version}" row when an update is available, then the profile rows.
 /// Ported from the winit `command_palette_entries`.
 #[must_use]
 pub fn build_entries(
     update_available: Option<&str>,
     profile_names: &[String],
     active_profile: Option<&str>,
+    move_targets: &[WorkspaceMoveTarget],
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = base_entries();
+    entries.extend(workspace_move_entries(move_targets));
     if let Some(version) = update_available {
         entries.push(CommandPaletteEntry::automation(
             format!("Update Scribe to v{version}"),
@@ -352,9 +450,16 @@ impl CommandPaletteView {
             .px_3()
             .py_1()
             .rounded_sm()
+            .flex()
+            .flex_col()
             .text_sm()
             .text_color(fg)
-            .child(entry.label.clone());
+            .child(entry.label.clone())
+            // The explanatory line is part of the row rather than a hover
+            // tooltip: a keyboard-driven palette never produces a hover.
+            .children(entry.detail.clone().map(|detail| {
+                div().text_xs().text_color(colors.placeholder_fg).child(detail)
+            }));
         if selected {
             row = row.bg(colors.selection_bg);
         }
