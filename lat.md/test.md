@@ -2980,7 +2980,7 @@ Switching between a tab with Scribe prompt chrome and a plain tab must paint eac
 
 The script sends a real `PromptReceived` for the hidden original tab, leaving the selected second tab plain. On plain-to-prompt switch, the wire-recorded `AttachSessions` and first `SessionReplay` must agree on a row count below the plain pane's published count. On prompt-to-plain switch, both must agree on the original larger count. Checking attach and replay ordering distinguishes the first painted state from eventual convergence: the broken path attached with the outgoing tab's rows, then corrected itself through `Resize` and `RequestSnapshot` one round trip later.
 
-The screenshot masks the theme's prompt-text colour rather than all bright pixels. The returned viewport contains ordinary scrollback text, which is valid terminal ink directly above the bar.
+The screenshot masks the theme's prompt-text colour rather than all bright pixels. The returned viewport contains ordinary scrollback text, which is valid terminal ink directly above the bar. Phase 7 keeps `ctrl+Prior` region-scoped and uses `workspace_focus_left` to cross regions before `alt+1` attaches the focused region's tab.
 
 #### Returned tab preserves its scrolled viewport
 

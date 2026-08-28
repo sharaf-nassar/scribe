@@ -122,6 +122,42 @@ impl WorkspaceTabs {
             .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
             .unwrap_or(0);
     }
+
+    /// Remove one tab while retaining this region's shown tab.
+    ///
+    /// A departure before the shown tab shifts its index left, while a shown
+    /// tab's departure leaves its removal slot selected: the successor wins,
+    /// or the predecessor when there is no successor.
+    fn depart(&mut self, index: usize) -> TabEntry {
+        let entry = self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        if !self.tabs.is_empty() {
+            self.active = self.active.min(self.tabs.len() - 1);
+        }
+        entry
+    }
+
+    /// Refresh surviving entries from a `SessionList`, departing the rest.
+    fn refresh_from(&mut self, incoming: &[TabEntry]) {
+        let mut index = 0;
+        while let Some((session_id, workspace_id)) =
+            self.tabs.get(index).map(|tab| (tab.session_id, tab.workspace_id))
+        {
+            let Some(fresh) = incoming
+                .iter()
+                .find(|fresh| fresh.session_id == session_id && fresh.workspace_id == workspace_id)
+                .cloned()
+            else {
+                self.depart(index);
+                continue;
+            };
+            let Some(tab) = self.tabs.get_mut(index) else { break };
+            *tab = fresh;
+            index += 1;
+        }
+    }
 }
 
 /// Where one rendered tab lives: its region, its position inside that region,
@@ -273,29 +309,24 @@ impl TabSessions {
         incoming: Vec<TabEntry>,
         attached: Option<SessionId>,
     ) -> Option<SessionId> {
+        // Regions keep their strip order and lose only the tabs the list
+        // dropped; a tab that moved workspace is re-filed by the append pass
+        // below, so it is removed here too. A tab the list still names keeps
+        // its slot and takes the list's fresh metadata.
+        for region in &mut self.regions {
+            // An authoritative re-file is a source-region departure, so it
+            // uses the same successor-then-predecessor clamp as an optimistic
+            // MoveSession or an exit.
+            region.refresh_from(&incoming);
+        }
+        // Capture the selection after departures and before append selects any
+        // new tab. This preserves the shown tab by identity, including the
+        // successor chosen when the list re-filed the shown source tab.
         let showing: Vec<(WorkspaceId, Option<SessionId>)> = self
             .regions
             .iter()
             .map(|region| (region.workspace_id, region.active_session()))
             .collect();
-        // Regions keep their strip order and lose only the tabs the list
-        // dropped; a tab that moved workspace is re-filed by the append pass
-        // below, so it is removed here too.
-        // A tab the list still names keeps its slot and takes the list's fresh
-        // metadata. One the list re-files under another workspace is dropped
-        // here and re-appended to its new region by the pass below, so the
-        // server's filing always wins over the strip's.
-        let refreshed = |tab: &TabEntry| {
-            incoming
-                .iter()
-                .find(|fresh| {
-                    fresh.session_id == tab.session_id && fresh.workspace_id == tab.workspace_id
-                })
-                .cloned()
-        };
-        for region in &mut self.regions {
-            region.tabs = region.tabs.iter().filter_map(refreshed).collect();
-        }
         self.pane_sessions
             .retain(|session_id, _| incoming.iter().any(|fresh| fresh.session_id == *session_id));
         for fresh in incoming {
@@ -384,18 +415,12 @@ impl TabSessions {
             .find(|region| region.tabs.iter().any(|tab| tab.session_id == session_id))?;
         let index = region.tabs.iter().position(|tab| tab.session_id == session_id)?;
         let was_active = index == region.active;
-        region.tabs.remove(index);
+        region.depart(index);
         self.live_order.retain(|id| *id != session_id);
         if region.tabs.is_empty() {
             self.prune_empty();
             return None;
         }
-        // The slot at `index` now holds what was its successor, so clamping is
-        // already "next tab wins"; only a removal before the shown tab shifts it.
-        if index < region.active {
-            region.active -= 1;
-        }
-        region.active = region.active.min(region.tabs.len() - 1);
         was_active.then(|| region.active_session()).flatten()
     }
 
@@ -524,7 +549,9 @@ impl TabSessions {
     ///
     /// The tab is appended to the target region and shown there, because the
     /// only thing that moves a session between regions is a pane in the target
-    /// adopting it. A source region left empty is dropped.
+    /// adopting it. Its source uses the same departure clamp as an exit or an
+    /// authoritative `SessionList` re-file. A source region left empty is
+    /// dropped.
     pub fn set_workspace(&mut self, session_id: SessionId, workspace_id: WorkspaceId) -> bool {
         if let Some(source) = self.pane_sessions.get_mut(&session_id) {
             if *source == workspace_id {
@@ -546,9 +573,7 @@ impl TabSessions {
         let Some(index) = source.tabs.iter().position(|tab| tab.session_id == session_id) else {
             return false;
         };
-        let showing = source.active_session();
-        let mut entry = source.tabs.remove(index);
-        source.keep_showing(showing);
+        let mut entry = source.depart(index);
         entry.workspace_id = workspace_id;
         self.push(entry);
         self.prune_empty();

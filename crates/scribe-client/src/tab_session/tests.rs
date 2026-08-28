@@ -322,6 +322,56 @@ fn session_list_refiles_a_moved_session() {
     assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]), "region b keeps its shown tab");
 }
 
+/// A source region with an active middle tab and a one-tab target.
+fn active_middle_source_strip() -> (TabSessions, (WorkspaceId, WorkspaceId), Vec<SessionId>) {
+    let source = WorkspaceId::new();
+    let target = WorkspaceId::new();
+    let ids: Vec<SessionId> = (0..4).map(|_| SessionId::new()).collect();
+    let mut tabs = TabSessions::new();
+    tabs.reconcile(
+        vec![
+            TabEntry::new(ids[0], source, "source-0".to_owned()),
+            TabEntry::new(ids[1], source, "source-1".to_owned()),
+            TabEntry::new(ids[2], source, "source-2".to_owned()),
+            TabEntry::new(ids[3], target, "target-0".to_owned()),
+        ],
+        None,
+    );
+    tabs.select(source, 1);
+    (tabs, (source, target), ids)
+}
+
+/// A workspace-split seed is re-filed optimistically when its pane reaches the
+/// target region. Its source keeps the successor at the departed tab's slot.
+#[test]
+fn optimistic_refile_of_active_middle_tab_keeps_source_successor() {
+    let (mut tabs, (source, target), ids) = active_middle_source_strip();
+
+    assert!(tabs.set_workspace(ids[1], target));
+    assert_eq!(tabs.active_session_in(source), Some(ids[2]));
+    assert_eq!(tabs.active_session_in(target), Some(ids[1]), "the target selects its moved seed");
+}
+
+/// The authoritative server re-file follows the same source departure seam as
+/// the optimistic move, rather than resetting the source selection to tab zero.
+#[test]
+fn session_list_refile_of_active_middle_tab_keeps_source_successor() {
+    let (mut tabs, (source, target), ids) = active_middle_source_strip();
+
+    tabs.reconcile(
+        vec![
+            TabEntry::new(ids[0], source, "source-0".to_owned()),
+            TabEntry::new(ids[2], source, "source-2".to_owned()),
+            TabEntry::new(ids[3], target, "target-0".to_owned()),
+            TabEntry::new(ids[1], target, "source-1".to_owned()),
+        ],
+        Some(ids[0]),
+    );
+
+    assert_eq!(tabs.active_session_in(source), Some(ids[2]));
+    assert_eq!(tabs.active_session_in(target), Some(ids[3]), "the target keeps its shown tab");
+}
+
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Region runs are structural]]
 #[test]
 fn a_tab_opened_in_an_earlier_region_joins_that_region_run() {
