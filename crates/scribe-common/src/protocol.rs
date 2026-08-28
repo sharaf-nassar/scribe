@@ -686,6 +686,40 @@ pub enum WorkspaceTransferRefusal {
     EnvironmentRebindFailed,
 }
 
+/// Typed outcome of a workspace move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMoveResult {
+    Moved,
+    Refused { reason: WorkspaceMoveRefusal },
+}
+
+/// Why the server declined a workspace move before committing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMoveRefusal {
+    UnknownWorkspace,
+    NotWorkspaceOwner,
+    TargetWindowUnavailable,
+    TargetWorkspaceUnavailable,
+    NoSourceWindowControl,
+    NoTargetWindowControl,
+    CapabilityAbsent,
+    HandoffInProgress,
+    /// The pre-commit env DEK/envelope re-bind to the target window's
+    /// coordinates failed; the source window is byte-identical and staged
+    /// copies were discarded, so cold restore stays intact.
+    EnvironmentRebindFailed,
+}
+
+/// Structural operation requested for a workspace move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMoveOperation {
+    InsertAtEdge { edge: WorkspaceTreeEdge },
+    Swap,
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,6 +793,19 @@ pub enum ClientMessage {
         transfer_id: u64,
         workspace_id: WorkspaceId,
         target_window_id: WindowId,
+    },
+    /// Atomically move one workspace into an existing destination window.
+    ///
+    /// The client mints `move_id` to correlate this request with
+    /// [`ServerMessage::WorkspaceMoveResult`]. The server derives both
+    /// post-move trees from its authoritative state; no client tree crosses
+    /// this boundary.
+    MoveWorkspace {
+        move_id: u64,
+        workspace_id: WorkspaceId,
+        target_window_id: WindowId,
+        target_workspace_id: WorkspaceId,
+        operation: WorkspaceMoveOperation,
     },
     /// Request the cached Beads board for one authoritative server workspace.
     RequestBeadsBoard {
@@ -880,6 +927,10 @@ pub enum ClientMessage {
         /// participate in a transfer transaction.
         #[serde(default)]
         workspace_transfer: bool,
+        /// Workspace-move protocol support. Missing means the peer cannot
+        /// participate in an existing-window workspace move.
+        #[serde(default)]
+        workspace_move: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -1292,6 +1343,11 @@ pub enum ServerMessage {
         transfer_id: u64,
         result: WorkspaceTransferResult,
     },
+    /// Correlated outcome of one [`ClientMessage::MoveWorkspace`] request.
+    WorkspaceMoveResult {
+        move_id: u64,
+        result: WorkspaceMoveResult,
+    },
     /// Search results for a `SearchRequest`.
     SearchResults {
         session_id: SessionId,
@@ -1350,6 +1406,10 @@ pub enum ServerMessage {
         /// Missing from older servers means unsupported.
         #[serde(default)]
         workspace_transfer: bool,
+        /// Workspace-move protocol support negotiated with the client.
+        /// Missing from older servers means unsupported.
+        #[serde(default)]
+        workspace_move: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -1757,7 +1817,8 @@ pub enum WorkspaceTreeNode {
 }
 
 /// An edge of a workspace region where another workspace can be inserted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceTreeEdge {
     Left,
     Right,
@@ -2570,6 +2631,40 @@ mod tests {
 
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
+    enum HelloWithoutWorkspaceMove {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            join_window: bool,
+            terminal_images: TerminalImageCapabilities,
+            ci_run_bar: bool,
+            pi_provider: bool,
+            agent_api: bool,
+            workspace_transfer: bool,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutWorkspaceMove {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+            beads_write: bool,
+            beads_flow: bool,
+            pi_provider: bool,
+            agent_api: bool,
+            workspace_transfer: bool,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
     enum WelcomeWithoutPiProvider {
         Welcome {
             window_id: WindowId,
@@ -2640,6 +2735,7 @@ mod tests {
             pi_provider: true,
             agent_api: true,
             workspace_transfer: false,
+            workspace_move: false,
         };
         let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize new Hello");
         let _: HelloWithoutPiProvider =
@@ -2657,6 +2753,7 @@ mod tests {
             pi_provider: true,
             agent_api: true,
             workspace_transfer: false,
+            workspace_move: false,
         };
         let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize new Welcome");
         let _: WelcomeWithoutPiProvider =
@@ -2749,6 +2846,7 @@ mod tests {
             pi_provider: true,
             agent_api: true,
             workspace_transfer: true,
+            workspace_move: false,
         };
         let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
         let _: HelloWithoutWorkspaceTransfer =
@@ -2766,10 +2864,85 @@ mod tests {
             pi_provider: true,
             agent_api: true,
             workspace_transfer: true,
+            workspace_move: false,
         };
         let new_welcome_bytes =
             rmp_serde::to_vec_named(&new_welcome).expect("serialize new Welcome");
         let _: WelcomeWithoutWorkspaceTransfer = rmp_serde::from_slice(&new_welcome_bytes)
+            .expect("old server schema decodes new Welcome");
+    }
+
+    // @lat: [[protocol#Client Messages#Workspace move]]
+    #[test]
+    fn workspace_move_capability_defaults_for_old_peers() {
+        let old_hello = HelloWithoutWorkspaceMove::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+        };
+        let old_hello_bytes = rmp_serde::to_vec_named(&old_hello).expect("serialize old Hello");
+        let decoded_hello: ClientMessage =
+            rmp_serde::from_slice(&old_hello_bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded_hello, ClientMessage::Hello { workspace_move: false, .. }));
+
+        let old_welcome = WelcomeWithoutWorkspaceMove::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            beads_flow: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+        };
+        let old_welcome_bytes =
+            rmp_serde::to_vec_named(&old_welcome).expect("serialize old Welcome");
+        let decoded_welcome: ServerMessage =
+            rmp_serde::from_slice(&old_welcome_bytes).expect("deserialize old Welcome");
+        assert!(matches!(decoded_welcome, ServerMessage::Welcome { workspace_move: false, .. }));
+
+        let new_hello = ClientMessage::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+        };
+        let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
+        let _: HelloWithoutWorkspaceMove =
+            rmp_serde::from_slice(&new_hello_bytes).expect("old client schema decodes new Hello");
+
+        let new_welcome = ServerMessage::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            beads_flow: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+        };
+        let new_welcome_bytes =
+            rmp_serde::to_vec_named(&new_welcome).expect("serialize new Welcome");
+        let _: WelcomeWithoutWorkspaceMove = rmp_serde::from_slice(&new_welcome_bytes)
             .expect("old server schema decodes new Welcome");
     }
 
@@ -2821,6 +2994,119 @@ mod tests {
                 decoded_response,
                 ServerMessage::WorkspaceTransferResult {
                     transfer_id: 42,
+                    result: decoded_result,
+                } if decoded_result == result
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_transfer_frames_remain_byte_compatible() {
+        #[derive(Serialize)]
+        #[serde(tag = "type")]
+        enum LegacyClientMessage {
+            TransferWorkspace {
+                transfer_id: u64,
+                workspace_id: WorkspaceId,
+                target_window_id: WindowId,
+            },
+        }
+
+        #[derive(Serialize)]
+        #[serde(tag = "type")]
+        enum LegacyServerMessage {
+            WorkspaceTransferResult { transfer_id: u64, result: WorkspaceTransferResult },
+        }
+
+        let workspace_id = WorkspaceId::new();
+        let target_window_id = WindowId::new();
+        let request =
+            ClientMessage::TransferWorkspace { transfer_id: 42, workspace_id, target_window_id };
+        let legacy_request = LegacyClientMessage::TransferWorkspace {
+            transfer_id: 42,
+            workspace_id,
+            target_window_id,
+        };
+        assert_eq!(
+            rmp_serde::to_vec_named(&request).expect("serialize transfer request"),
+            rmp_serde::to_vec_named(&legacy_request).expect("serialize legacy transfer request")
+        );
+
+        let response = ServerMessage::WorkspaceTransferResult {
+            transfer_id: 42,
+            result: WorkspaceTransferResult::Transferred,
+        };
+        let legacy_response = LegacyServerMessage::WorkspaceTransferResult {
+            transfer_id: 42,
+            result: WorkspaceTransferResult::Transferred,
+        };
+        assert_eq!(
+            rmp_serde::to_vec_named(&response).expect("serialize transfer result"),
+            rmp_serde::to_vec_named(&legacy_response).expect("serialize legacy transfer result")
+        );
+    }
+
+    // @lat: [[protocol#Server Messages#Workspace move]]
+    #[test]
+    fn workspace_move_messages_round_trip_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let target_window_id = WindowId::new();
+        let target_workspace_id = WorkspaceId::new();
+        let requests = [
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left },
+            WorkspaceMoveOperation::Swap,
+        ];
+        for operation in requests {
+            let request = ClientMessage::MoveWorkspace {
+                move_id: 42,
+                workspace_id,
+                target_window_id,
+                target_workspace_id,
+                operation,
+            };
+            let request_bytes =
+                rmp_serde::to_vec_named(&request).expect("serialize workspace move request");
+            let decoded_request: ClientMessage =
+                rmp_serde::from_slice(&request_bytes).expect("deserialize workspace move request");
+            assert!(matches!(
+                decoded_request,
+                ClientMessage::MoveWorkspace {
+                    move_id: 42,
+                    workspace_id: decoded_workspace_id,
+                    target_window_id: decoded_target_window_id,
+                    target_workspace_id: decoded_target_workspace_id,
+                    operation: decoded_operation,
+                } if decoded_workspace_id == workspace_id
+                    && decoded_target_window_id == target_window_id
+                    && decoded_target_workspace_id == target_workspace_id
+                    && decoded_operation == operation
+            ));
+        }
+
+        let results = [
+            WorkspaceMoveResult::Moved,
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::UnknownWorkspace },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NotWorkspaceOwner },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::TargetWindowUnavailable },
+            WorkspaceMoveResult::Refused {
+                reason: WorkspaceMoveRefusal::TargetWorkspaceUnavailable,
+            },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NoSourceWindowControl },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NoTargetWindowControl },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::CapabilityAbsent },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::HandoffInProgress },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::EnvironmentRebindFailed },
+        ];
+        for result in results {
+            let response = ServerMessage::WorkspaceMoveResult { move_id: 42, result };
+            let response_bytes =
+                rmp_serde::to_vec_named(&response).expect("serialize workspace move result");
+            let decoded_response: ServerMessage =
+                rmp_serde::from_slice(&response_bytes).expect("deserialize workspace move result");
+            assert!(matches!(
+                decoded_response,
+                ServerMessage::WorkspaceMoveResult {
+                    move_id: 42,
                     result: decoded_result,
                 } if decoded_result == result
             ));
@@ -3444,6 +3730,7 @@ mod tests {
             pi_provider: true,
             agent_api: false,
             workspace_transfer: false,
+            workspace_move: false,
         };
         let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
         let decoded_write: ServerMessage =
@@ -3492,6 +3779,7 @@ mod tests {
                 pi_provider: true,
                 agent_api: false,
                 workspace_transfer: false,
+                workspace_move: false,
             };
             let bytes = rmp_serde::to_vec_named(&message).expect("serialize Welcome");
             let decoded: ServerMessage =

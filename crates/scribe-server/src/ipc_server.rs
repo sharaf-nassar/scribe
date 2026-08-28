@@ -5758,6 +5758,7 @@ fn welcome_message(
         // welcome advertises it; the client still gates its own commit on
         // the Hello capability it sent.
         workspace_transfer: true,
+        workspace_move: false,
     }
 }
 

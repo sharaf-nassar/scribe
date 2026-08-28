@@ -14583,6 +14583,7 @@ where
             // Tear-out UI remains disabled until `Welcome` confirms the server
             // can complete the matching transfer transaction.
             workspace_transfer: true,
+            workspace_move: false,
         },
     )
     .await
@@ -15535,6 +15536,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::IssueFocused { .. } => "IssueFocused",
         ServerMessage::BeadsIssueWriteResult { .. } => "BeadsIssueWriteResult",
         ServerMessage::WorkspaceTransferResult { .. } => "WorkspaceTransferResult",
+        ServerMessage::WorkspaceMoveResult { .. } => "WorkspaceMoveResult",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::TerminalImageLive { .. } => "TerminalImageLive",

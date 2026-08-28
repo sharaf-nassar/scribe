@@ -124,6 +124,21 @@ The exchange is capability-gated by `Hello.workspace_transfer` and
 local peers neither offer nor accept the additive frames. A client must wait
 for a true `Welcome` bit before sending a transfer request.
 
+### Workspace move
+
+`MoveWorkspace` requests one atomic move into an existing destination window
+using IDs only.
+
+It carries `move_id`, source and target window/workspace IDs, and an `operation`
+of either `InsertAtEdge { edge: WorkspaceTreeEdge }` or `Swap`; no client
+workspace tree is accepted. The matching [[protocol#Server Messages#Workspace move]]
+reply repeats the client-minted `move_id`.
+
+The exchange is independently gated by `Hello.workspace_move` and
+`Welcome.workspace_move`. Both fields serde-default to `false`, so current
+peers advertise no support until the server transaction and client UI land;
+phase-1 `workspace_transfer` remains independent.
+
 ### Automation
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
@@ -134,9 +149,9 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, and `workspace_transfer`. The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, `workspace_transfer`, and `workspace_move`. The server responds with [[protocol#Server Messages]] `Welcome`.
 
-Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` is false, no workspace-transfer frame is sent.
+Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` or `workspace_move` is false, no frame from that transaction family is sent.
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
@@ -421,6 +436,18 @@ is a typed refusal and the source state stays byte-identical.
 The named-MessagePack protocol test round-trips the request, success, and
 every refusal. Its old-peer schemas omit `workspace_transfer` and decode as
 false; those schemas also decode new messages while ignoring the added field.
+
+### Workspace move
+
+`WorkspaceMoveResult { move_id, result }` acknowledges a `MoveWorkspace`
+request as either `Moved` or `Refused { reason }`.
+
+`WorkspaceMoveRefusal` distinguishes unknown or foreign source workspaces,
+unavailable target window or workspace, absent source or target window control,
+absent capability, handoff, and pre-commit environment rebind failure. The
+named-MessagePack tests and fixtures round-trip edge insertion and swap
+requests plus correlated results; old peer schemas omit `workspace_move` and
+default it to false in both handshake directions.
 
 ### Clipboard Variants
 

@@ -78,6 +78,7 @@ impl Peer {
                 pi_provider: false,
                 agent_api: false,
                 workspace_transfer,
+                workspace_move: false,
             },
         )
         .await?;
@@ -281,6 +282,7 @@ fn assert_old_server_schema_compatibility(source_window: WindowId) -> Result<(),
         pi_provider: false,
         agent_api: false,
         workspace_transfer: true,
+        workspace_move: false,
     };
     let current_bytes = rmp_serde::to_vec_named(&current).map_err(|error| error.to_string())?;
     let _: LegacyServerMessage =

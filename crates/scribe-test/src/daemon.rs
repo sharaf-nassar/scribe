@@ -264,6 +264,7 @@ macro_rules! unused_server_message {
             | ServerMessage::BeadsIssueDetail { .. }
             | ServerMessage::IssueFocused { .. }
             | ServerMessage::WorkspaceTransferResult { .. }
+            | ServerMessage::WorkspaceMoveResult { .. }
             | ServerMessage::ShareRoster { .. }
             | ServerMessage::ControlRequested { .. }
             | ServerMessage::ControlDenied { .. }
@@ -416,6 +417,7 @@ pub async fn observe_ci_run(
             pi_provider: false,
             agent_api: false,
             workspace_transfer: false,
+            workspace_move: false,
         },
     )
     .await?;
@@ -592,6 +594,7 @@ pub async fn run() -> Result<(), ScribeError> {
             pi_provider: pi_provider_capability(),
             agent_api: false,
             workspace_transfer: false,
+            workspace_move: false,
         },
     )
     .await?;
@@ -2585,6 +2588,7 @@ mod tests {
                 pi_provider: false,
                 agent_api: false,
                 workspace_transfer: false,
+                workspace_move: false,
             },
         )
         .await

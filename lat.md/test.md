@@ -68,6 +68,18 @@ successor, and verifies exact source/target session trees plus the atomically
 flipped agent-world `window_id`. It also proves old-client refusal and
 old-server capability defaults without a network route.
 
+## Workspace Move Protocol Foundation
+
+Protocol tests pin the workspace-move MessagePack contract before transaction behavior lands.
+
+`scribe-common` named-MessagePack tests and `scribe-test` IPC fixtures
+round-trip ids-only edge-insert and swap `MoveWorkspace` requests with
+correlated results. Old `Hello` and `Welcome` schemas default the independent
+`workspace_move` capability to false and decode current handshakes in both
+directions. The current production-socket transfer oracle retains its legacy
+`CapabilityAbsent` no-mutation check; workspace-move transaction behavior is
+owned by later server and client slices.
+
 ## GitHub CI Tracking
 
 Server unit fixtures verify the local push gate before any GitHub polling or client protocol is involved.

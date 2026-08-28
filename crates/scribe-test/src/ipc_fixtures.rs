@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
-use scribe_common::ids::{SessionId, WindowId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     CiRunDelta, ClientMessage, REMOTE_PROTOCOL_VERSION, RemoteRefusal, ServerMessage,
+    WorkspaceMoveOperation, WorkspaceMoveRefusal, WorkspaceMoveResult, WorkspaceTreeEdge,
 };
 use scribe_common::terminal_images::{
     BoundedImageBytes, CellExtent, ImageBoundError, ImageLimits, PixelRect, PlaceholderMetadata,
@@ -21,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
 const WINDOW_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const WORKSPACE_ID: &str = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+const TARGET_WORKSPACE_ID: &str = "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa";
 
 #[derive(Deserialize)]
 struct FixtureManifest {
@@ -103,7 +106,7 @@ pub fn verify(fixtures: &Path, output: &Path, dump: bool) -> Result<(), String> 
         }
     }
 
-    decode_fixtures(&encoded)?;
+    decode_fixtures(&encoded, &fixture_model()?)?;
     verify_bounds()?;
     let placement_validation = verify_placement_validation(&encoded, &fixture_model()?)?;
     let (older_remote_updates_client, newer_remote_updates_server) = verify_remote_directions()?;
@@ -138,6 +141,8 @@ pub fn verify(fixtures: &Path, output: &Path, dump: bool) -> Result<(), String> 
 struct FixtureModel {
     session_id: SessionId,
     window_id: WindowId,
+    workspace_id: WorkspaceId,
+    target_workspace_id: WorkspaceId,
     generation: TerminalImageGeneration,
     definition: TerminalImageDefinition,
     chunk: TerminalImageDataChunk,
@@ -148,6 +153,9 @@ struct FixtureModel {
 fn fixture_model() -> Result<FixtureModel, String> {
     let session_id = SessionId::from_str(SESSION_ID).map_err(|error| error.to_string())?;
     let window_id = WindowId::from_str(WINDOW_ID).map_err(|error| error.to_string())?;
+    let workspace_id = WorkspaceId::from_str(WORKSPACE_ID).map_err(|error| error.to_string())?;
+    let target_workspace_id =
+        WorkspaceId::from_str(TARGET_WORKSPACE_ID).map_err(|error| error.to_string())?;
     let generation = TerminalImageGeneration(7);
     let definition = TerminalImageDefinition::new(TerminalImageId(42), generation, 1, 1, true)
         .map_err(|error| error.to_string())?;
@@ -182,13 +190,24 @@ fn fixture_model() -> Result<FixtureModel, String> {
     )
     .ok_or_else(|| "expected capability mismatch".to_owned())?;
 
-    Ok(FixtureModel { session_id, window_id, generation, definition, chunk, placement, mismatch })
+    Ok(FixtureModel {
+        session_id,
+        window_id,
+        workspace_id,
+        target_workspace_id,
+        generation,
+        definition,
+        chunk,
+        placement,
+        mismatch,
+    })
 }
 
 fn encoded_fixtures() -> Result<BTreeMap<String, String>, String> {
     let model = fixture_model()?;
     let mut values = BTreeMap::new();
     insert_local_fixtures(&mut values, &model)?;
+    insert_workspace_move_fixtures(&mut values, &model)?;
     insert_image_fixtures(&mut values, &model)?;
     insert_remote_fixtures(&mut values)?;
     Ok(values.into_iter().map(|(name, bytes)| (name, hex(&bytes))).collect())
@@ -216,6 +235,7 @@ fn insert_local_fixtures(
             pi_provider: false,
             agent_api: false,
             workspace_transfer: true,
+            workspace_move: false,
         },
     )?;
     insert_named(
@@ -251,8 +271,46 @@ fn insert_local_fixtures(
             pi_provider: false,
             agent_api: false,
             workspace_transfer: true,
+            workspace_move: false,
         },
     )
+}
+
+fn insert_workspace_move_fixtures(
+    values: &mut BTreeMap<String, Vec<u8>>,
+    model: &FixtureModel,
+) -> Result<(), String> {
+    for (name, move_id, operation) in [
+        (
+            "workspace_move_edge_insert_request",
+            31,
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left },
+        ),
+        ("workspace_move_swap_request", 32, WorkspaceMoveOperation::Swap),
+    ] {
+        insert_named(
+            values,
+            name,
+            &ClientMessage::MoveWorkspace {
+                move_id,
+                workspace_id: model.workspace_id,
+                target_window_id: model.window_id,
+                target_workspace_id: model.target_workspace_id,
+                operation,
+            },
+        )?;
+    }
+    for (name, move_id, result) in [
+        ("workspace_move_edge_insert_result", 31, WorkspaceMoveResult::Moved),
+        (
+            "workspace_move_swap_result",
+            32,
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NoTargetWindowControl },
+        ),
+    ] {
+        insert_named(values, name, &ServerMessage::WorkspaceMoveResult { move_id, result })?;
+    }
+    Ok(())
 }
 
 fn insert_image_fixtures(
@@ -400,11 +458,20 @@ fn insert_named<T: Serialize>(
     Ok(())
 }
 
-fn decode_fixtures(fixtures: &BTreeMap<String, String>) -> Result<(), String> {
+fn decode_fixtures(
+    fixtures: &BTreeMap<String, String>,
+    model: &FixtureModel,
+) -> Result<(), String> {
     for (name, encoded) in fixtures {
         let bytes = unhex(encoded)?;
         match name.as_str() {
             "local_hello_old" | "local_hello_new" => decode_client_fixture(name, &bytes)?,
+            "workspace_move_edge_insert_request" | "workspace_move_swap_request" => {
+                decode_workspace_move_request_fixture(name, &bytes, model)?;
+            }
+            "workspace_move_edge_insert_result" | "workspace_move_swap_result" => {
+                decode_workspace_move_result_fixture(name, &bytes)?;
+            }
             _ => decode_server_fixture(name, &bytes)?,
         }
     }
@@ -415,7 +482,12 @@ fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     let message: ClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
     let ClientMessage::Hello {
-        join_window, terminal_images, ci_run_bar, workspace_transfer, ..
+        join_window,
+        terminal_images,
+        ci_run_bar,
+        workspace_transfer,
+        workspace_move,
+        ..
     } = message
     else {
         return Err(format!("{name} decoded as wrong client message"));
@@ -434,6 +506,9 @@ fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     }
     if name.ends_with("new") && !workspace_transfer {
         return Err("new Hello did not advertise workspace-transfer capability".to_owned());
+    }
+    if workspace_move {
+        return Err("fixture advertised unsupported workspace-move capability".to_owned());
     }
     let _: LegacyClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("legacy decode {name}: {error}"))?;
@@ -459,11 +534,14 @@ fn decode_server_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
         message.validate().map_err(|error| format!("validate {name}: {error}"))?;
     }
     if name == "local_welcome_new" {
-        let ServerMessage::Welcome { workspace_transfer, .. } = &message else {
+        let ServerMessage::Welcome { workspace_transfer, workspace_move, .. } = &message else {
             return Err("new Welcome decoded as wrong message".to_owned());
         };
         if !workspace_transfer {
             return Err("new Welcome did not advertise workspace-transfer capability".to_owned());
+        }
+        if *workspace_move {
+            return Err("fixture advertised unsupported workspace-move capability".to_owned());
         }
         let _: LegacyServerMessage = rmp_serde::from_slice(bytes)
             .map_err(|error| format!("legacy decode {name}: {error}"))?;
@@ -471,8 +549,65 @@ fn decode_server_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_workspace_move_request_fixture(
+    name: &str,
+    bytes: &[u8],
+    model: &FixtureModel,
+) -> Result<(), String> {
+    let message: ClientMessage =
+        rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
+    let expected_operation = match name {
+        "workspace_move_edge_insert_request" => {
+            WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left }
+        }
+        "workspace_move_swap_request" => WorkspaceMoveOperation::Swap,
+        _ => return Err(format!("unknown workspace-move request fixture {name}")),
+    };
+    let expected_move_id = if name.contains("edge_insert") { 31 } else { 32 };
+    if !matches!(
+        message,
+        ClientMessage::MoveWorkspace {
+            move_id,
+            workspace_id,
+            target_window_id,
+            target_workspace_id,
+            operation,
+        } if move_id == expected_move_id
+            && workspace_id == model.workspace_id
+            && target_window_id == model.window_id
+            && target_workspace_id == model.target_workspace_id
+            && operation == expected_operation
+    ) {
+        return Err(format!("{name} lost workspace-move request fields"));
+    }
+    Ok(())
+}
+
+fn decode_workspace_move_result_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
+    let message: ServerMessage =
+        rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
+    let (expected_move_id, expected_result) = match name {
+        "workspace_move_edge_insert_result" => (31, WorkspaceMoveResult::Moved),
+        "workspace_move_swap_result" => (
+            32,
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NoTargetWindowControl },
+        ),
+        _ => return Err(format!("unknown workspace-move result fixture {name}")),
+    };
+    if !matches!(
+        message,
+        ServerMessage::WorkspaceMoveResult { move_id, result }
+            if move_id == expected_move_id && result == expected_result
+    ) {
+        return Err(format!("{name} lost workspace-move result fields"));
+    }
+    Ok(())
+}
+
 fn verify_old_welcome(message: &ServerMessage) -> Result<(), String> {
-    let ServerMessage::Welcome { terminal_images, workspace_transfer, .. } = message else {
+    let ServerMessage::Welcome { terminal_images, workspace_transfer, workspace_move, .. } =
+        message
+    else {
         return Err("old Welcome decoded as wrong message".to_owned());
     };
     if *terminal_images != TerminalImageCapabilities::default() {
@@ -481,9 +616,11 @@ fn verify_old_welcome(message: &ServerMessage) -> Result<(), String> {
     if *workspace_transfer {
         return Err("old Welcome did not default workspace-transfer capability".to_owned());
     }
+    if *workspace_move {
+        return Err("old Welcome did not default workspace-move capability".to_owned());
+    }
     Ok(())
 }
-
 fn verify_bounds() -> Result<(), String> {
     BoundedImageBytes::new(vec![0; BoundedImageBytes::MAX_LEN])
         .map_err(|error| format!("maximum chunk rejected: {error}"))?;
