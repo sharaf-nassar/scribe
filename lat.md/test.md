@@ -68,17 +68,27 @@ successor, and verifies exact source/target session trees plus the atomically
 flipped agent-world `window_id`. It also proves old-client refusal and
 old-server capability defaults without a network route.
 
-## Workspace Move Protocol Foundation
+## Workspace Move Server Transaction
 
-Protocol tests pin the workspace-move MessagePack contract before transaction behavior lands.
+Protocol tests and `scribe-test` IPC fixtures pin ids-only edge-insert and swap
+requests, correlated results, every typed refusal (including `SoleWorkspace`),
+and old-peer default-false capability decoding.
 
-`scribe-common` named-MessagePack tests and `scribe-test` IPC fixtures
-round-trip ids-only edge-insert and swap `MoveWorkspace` requests with
-correlated results. Old `Hello` and `Welcome` schemas default the independent
-`workspace_move` capability to false and decode current handshakes in both
-directions. The current production-socket transfer oracle retains its legacy
-`CapabilityAbsent` no-mutation check; workspace-move transaction behavior is
-owned by later server and client slices.
+Workspace-manager tests derive exact populated-target edge trees, bidirectional
+swap trees, ownership maps, and sole-source close/refusal outcomes. Server tests
+activate unchanged live sessions over real PTY pairs in two populated windows.
+They assert no replacement session is created, both env owners and workspace
+identities survive, outgoing sinks/attached sets are severed, and both windows
+refresh only with `SessionList`.
+
+Sole-source coverage removes the empty `WindowShare`, reads `Moved` plus
+`WindowClosed`, retries the same move id, then named-MessagePack round-trips the
+shared ledger through handoff and verifies the close bit survives. Refusal
+coverage snapshots manager, live env, and share state around capability,
+target-control, handoff, sole-swap, and injected env-staging failures while
+asserting each typed outcome is still recorded. The existing concurrent
+handoff/agent-world gate tests apply to moves because both transaction kinds use
+the same `TransferGate`.
 
 ## GitHub CI Tracking
 

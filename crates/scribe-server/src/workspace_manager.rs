@@ -5,7 +5,8 @@ use tracing::{debug, info, warn};
 
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    LayoutDirection, ServerMessage, WorkspaceTransferRefusal, WorkspaceTreeError, WorkspaceTreeNode,
+    LayoutDirection, ServerMessage, WorkspaceMoveOperation, WorkspaceMoveRefusal,
+    WorkspaceTransferRefusal, WorkspaceTreeEdge, WorkspaceTreeError, WorkspaceTreeNode,
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,25 @@ const ACCENT_COLORS: &[&str] =
 
 type WorkspaceInfoSummary = (Option<String>, String, Option<LayoutDirection>, Option<PathBuf>);
 type WorkspaceTransferTrees = (WorkspaceTreeNode, WorkspaceTreeNode);
+type WorkspaceMoveTrees = (Option<WorkspaceTreeNode>, WorkspaceTreeNode);
+
+/// Session ownership changes derived for one existing-window workspace move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMoveCandidates {
+    pub source_sessions: Vec<SessionId>,
+    pub target_sessions: Vec<SessionId>,
+    pub source_closed: bool,
+}
+
+/// Ids-only input to one server-derived existing-window workspace move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceMoveRequest {
+    pub source_window: WindowId,
+    pub workspace_id: WorkspaceId,
+    pub target_window: WindowId,
+    pub target_workspace_id: WorkspaceId,
+    pub operation: WorkspaceMoveOperation,
+}
 
 /// Manages workspace ↔ session relationships, window ↔ session ownership,
 /// and auto-names workspaces based on configured root directories.
@@ -443,6 +463,224 @@ impl WorkspaceManager {
                 }
             })?;
         Ok((moved, (source_tree, extracted)))
+    }
+
+    // ── Workspace move (existing destination window) ────────────────
+
+    /// Validate an edge insertion or bidirectional swap without mutation.
+    pub fn validate_workspace_move(
+        &self,
+        request: WorkspaceMoveRequest,
+    ) -> Result<WorkspaceMoveCandidates, WorkspaceMoveRefusal> {
+        self.check_workspace_move(request).map(|(candidates, _)| candidates)
+    }
+
+    /// Commit one existing-window workspace move from server-derived trees.
+    ///
+    /// Both directions of a swap are applied under this one mutable borrow.
+    /// Validation and tree edits happen on clones before the first registry
+    /// mutation, so a refusal leaves workspace ownership byte-identical.
+    pub fn move_workspace(
+        &mut self,
+        request: WorkspaceMoveRequest,
+    ) -> Result<WorkspaceMoveCandidates, WorkspaceMoveRefusal> {
+        let (candidates, (source_tree, target_tree)) = self.check_workspace_move(request)?;
+        let WorkspaceMoveRequest {
+            source_window,
+            workspace_id,
+            target_window,
+            target_workspace_id,
+            operation,
+        } = request;
+
+        crate::state_dump::mark_dirty();
+        if let Some(source_tree) = source_tree {
+            self.window_trees.insert(source_window, source_tree);
+        } else {
+            self.window_trees.remove(&source_window);
+        }
+        self.window_trees.insert(target_window, target_tree);
+        for &session_id in &candidates.source_sessions {
+            self.session_to_window.insert(session_id, target_window);
+        }
+        for &session_id in &candidates.target_sessions {
+            self.session_to_window.insert(session_id, source_window);
+        }
+        info!(
+            %workspace_id,
+            %source_window,
+            %target_window,
+            target_workspace = %target_workspace_id,
+            ?operation,
+            source_closed = candidates.source_closed,
+            "moved workspace between existing windows"
+        );
+        Ok(candidates)
+    }
+
+    /// Pure validation and post-tree derivation for [`Self::move_workspace`].
+    fn check_workspace_move(
+        &self,
+        request: WorkspaceMoveRequest,
+    ) -> Result<(WorkspaceMoveCandidates, WorkspaceMoveTrees), WorkspaceMoveRefusal> {
+        let WorkspaceMoveRequest {
+            source_window,
+            workspace_id,
+            target_window,
+            target_workspace_id,
+            operation,
+        } = request;
+        if source_window == target_window {
+            return Err(WorkspaceMoveRefusal::TargetWindowUnavailable);
+        }
+        let source_sessions = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(WorkspaceMoveRefusal::UnknownWorkspace)?
+            .sessions
+            .clone();
+        if !self.sessions_owned_by_window(&source_sessions, source_window) {
+            return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
+        }
+        let source_tree = self.source_move_tree(request, &source_sessions)?;
+        let target_tree = self
+            .window_trees
+            .get(&target_window)
+            .ok_or(WorkspaceMoveRefusal::TargetWindowUnavailable)?;
+        let target_sessions = self
+            .workspaces
+            .get(&target_workspace_id)
+            .ok_or(WorkspaceMoveRefusal::TargetWorkspaceUnavailable)?
+            .sessions
+            .clone();
+        if !self.sessions_owned_by_window(&target_sessions, target_window) {
+            return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
+        }
+
+        let (source_tree, target_tree, source_closed) = match operation {
+            WorkspaceMoveOperation::InsertAtEdge { edge } => Self::derive_edge_move(
+                source_tree.clone(),
+                target_tree.clone(),
+                workspace_id,
+                target_workspace_id,
+                edge,
+            )?,
+            WorkspaceMoveOperation::Swap => Self::derive_swap(
+                source_tree.clone(),
+                target_tree.clone(),
+                workspace_id,
+                target_workspace_id,
+            )?,
+        };
+        Ok((
+            WorkspaceMoveCandidates {
+                source_sessions,
+                target_sessions: if operation == WorkspaceMoveOperation::Swap {
+                    target_sessions
+                } else {
+                    Vec::new()
+                },
+                source_closed,
+            },
+            (source_tree, target_tree),
+        ))
+    }
+
+    fn sessions_owned_by_window(&self, sessions: &[SessionId], window: WindowId) -> bool {
+        sessions.iter().all(|session| self.session_to_window.get(session) == Some(&window))
+    }
+
+    fn source_move_tree(
+        &self,
+        request: WorkspaceMoveRequest,
+        source_sessions: &[SessionId],
+    ) -> Result<&WorkspaceTreeNode, WorkspaceMoveRefusal> {
+        if let Some(tree) = self.window_trees.get(&request.source_window) {
+            return Ok(tree);
+        }
+        let all_source = !source_sessions.is_empty()
+            && self.sessions_for_window(request.source_window).iter().all(|session| {
+                self.session_to_workspace.get(session) == Some(&request.workspace_id)
+            });
+        Err(if all_source && request.operation == WorkspaceMoveOperation::Swap {
+            WorkspaceMoveRefusal::SoleWorkspace
+        } else {
+            WorkspaceMoveRefusal::NotWorkspaceOwner
+        })
+    }
+
+    fn derive_edge_move(
+        mut source_tree: WorkspaceTreeNode,
+        mut target_tree: WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        edge: WorkspaceTreeEdge,
+    ) -> Result<(Option<WorkspaceTreeNode>, WorkspaceTreeNode, bool), WorkspaceMoveRefusal> {
+        let source_closed = matches!(source_tree, WorkspaceTreeNode::Leaf { .. });
+        let detached = Self::detach_workspace_leaf(&mut source_tree, workspace_id)?;
+        target_tree.insert_workspace_at_edge(target_workspace_id, edge, detached).map_err(
+            |error| match error {
+                WorkspaceTreeError::WorkspaceNotFound { .. } => {
+                    WorkspaceMoveRefusal::TargetWorkspaceUnavailable
+                }
+                WorkspaceTreeError::InsertedWorkspaceMustBeLeaf
+                | WorkspaceTreeError::WorkspaceAlreadyPresent { .. }
+                | WorkspaceTreeError::SoleWorkspace { .. } => {
+                    WorkspaceMoveRefusal::NotWorkspaceOwner
+                }
+            },
+        )?;
+        Ok(((!source_closed).then_some(source_tree), target_tree, source_closed))
+    }
+
+    fn detach_workspace_leaf(
+        source_tree: &mut WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+    ) -> Result<WorkspaceTreeNode, WorkspaceMoveRefusal> {
+        match source_tree.extract_workspace(workspace_id) {
+            Ok(detached) => Ok(detached),
+            Err(WorkspaceTreeError::SoleWorkspace { .. }) if matches!(source_tree, WorkspaceTreeNode::Leaf { workspace_id: id, .. } if *id == workspace_id) => {
+                Ok(source_tree.clone())
+            }
+            Err(
+                WorkspaceTreeError::WorkspaceNotFound { .. }
+                | WorkspaceTreeError::InsertedWorkspaceMustBeLeaf
+                | WorkspaceTreeError::WorkspaceAlreadyPresent { .. }
+                | WorkspaceTreeError::SoleWorkspace { .. },
+            ) => Err(WorkspaceMoveRefusal::NotWorkspaceOwner),
+        }
+    }
+
+    fn derive_swap(
+        source_tree: WorkspaceTreeNode,
+        target_tree: WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> Result<(Option<WorkspaceTreeNode>, WorkspaceTreeNode, bool), WorkspaceMoveRefusal> {
+        if matches!(source_tree, WorkspaceTreeNode::Leaf { .. }) {
+            return Err(WorkspaceMoveRefusal::SoleWorkspace);
+        }
+        let mut joined = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(source_tree),
+            second: Box::new(target_tree),
+        };
+        joined.swap_workspaces(workspace_id, target_workspace_id).map_err(|error| match error {
+            WorkspaceTreeError::WorkspaceNotFound { workspace_id: missing }
+                if missing == target_workspace_id =>
+            {
+                WorkspaceMoveRefusal::TargetWorkspaceUnavailable
+            }
+            WorkspaceTreeError::WorkspaceNotFound { .. }
+            | WorkspaceTreeError::InsertedWorkspaceMustBeLeaf
+            | WorkspaceTreeError::WorkspaceAlreadyPresent { .. }
+            | WorkspaceTreeError::SoleWorkspace { .. } => WorkspaceMoveRefusal::NotWorkspaceOwner,
+        })?;
+        match joined {
+            WorkspaceTreeNode::Split { first, second, .. } => Ok((Some(*first), *second, false)),
+            WorkspaceTreeNode::Leaf { .. } => Err(WorkspaceMoveRefusal::NotWorkspaceOwner),
+        }
     }
 
     // ── Window tracking ──────────────────────────────────────────────
@@ -1401,6 +1639,170 @@ mod tests {
             mgr.transfer_workspace(window, only, WindowId::new()),
             Err(WorkspaceTransferRefusal::NotWorkspaceOwner)
         );
+    }
+
+    // @lat: [[server#Workspace Move#Edge insertion]]
+    #[test]
+    fn edge_move_inserts_into_populated_target_and_preserves_leaf_payload() {
+        let (mut manager, source, moved_workspace, staying_workspace, sessions) =
+            transfer_fixture();
+        let target = WindowId::new();
+        let target_workspace = manager.create_workspace();
+        let target_session = SessionId::new();
+        manager.add_session(target_workspace, target_session, None);
+        manager.assign_session_to_window(target, target_session);
+        manager.set_window_tree(target, leaf(target_workspace, vec![target_session]));
+
+        let mut moved_leaf = leaf(moved_workspace, vec![sessions[0], sessions[1]]);
+        if let WorkspaceTreeNode::Leaf { active_tab_index, .. } = &mut moved_leaf {
+            *active_tab_index = 1;
+        }
+        manager.set_window_tree(
+            source,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(moved_leaf.clone()),
+                second: Box::new(leaf(staying_workspace, vec![sessions[2]])),
+            },
+        );
+
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: source,
+                workspace_id: moved_workspace,
+                target_window: target,
+                target_workspace_id: target_workspace,
+                operation: WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left },
+            })
+            .expect("edge move commits");
+        assert_eq!(moved.source_sessions, vec![sessions[0], sessions[1]]);
+        assert!(moved.target_sessions.is_empty());
+        assert!(!moved.source_closed);
+        assert_eq!(manager.window_tree(source), Some(&leaf(staying_workspace, vec![sessions[2]])));
+        assert_eq!(
+            manager.window_tree(target),
+            Some(&WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(moved_leaf),
+                second: Box::new(leaf(target_workspace, vec![target_session])),
+            })
+        );
+        for session in [sessions[0], sessions[1]] {
+            assert_eq!(manager.window_for_session(session), Some(target));
+            assert_eq!(manager.workspace_for_session(session), Some(moved_workspace));
+        }
+    }
+
+    // @lat: [[server#Workspace Move#Bidirectional swap]]
+    #[test]
+    fn swap_exchanges_outgoing_slots_and_ownership_in_one_commit() {
+        let (mut manager, source, left, right, source_sessions) = transfer_fixture();
+        let target = WindowId::new();
+        let target_left = manager.create_workspace();
+        let target_right = manager.create_workspace();
+        let target_left_session = SessionId::new();
+        let target_right_session = SessionId::new();
+        for (workspace, session) in
+            [(target_left, target_left_session), (target_right, target_right_session)]
+        {
+            manager.add_session(workspace, session, None);
+            manager.assign_session_to_window(target, session);
+        }
+        manager.set_window_tree(
+            target,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.25,
+                first: Box::new(leaf(target_left, vec![target_left_session])),
+                second: Box::new(leaf(target_right, vec![target_right_session])),
+            },
+        );
+
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: source,
+                workspace_id: left,
+                target_window: target,
+                target_workspace_id: target_left,
+                operation: WorkspaceMoveOperation::Swap,
+            })
+            .expect("swap commits");
+        assert_eq!(moved.source_sessions, source_sessions[..2]);
+        assert_eq!(moved.target_sessions, vec![target_left_session]);
+        assert!(!moved.source_closed);
+        assert_eq!(
+            manager.window_tree(source),
+            Some(&WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leaf(target_left, vec![target_left_session])),
+                second: Box::new(leaf(right, vec![source_sessions[2]])),
+            })
+        );
+        assert_eq!(
+            manager.window_tree(target),
+            Some(&WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.25,
+                first: Box::new(leaf(left, source_sessions[..2].to_vec())),
+                second: Box::new(leaf(target_right, vec![target_right_session])),
+            })
+        );
+        assert_eq!(manager.window_for_session(target_left_session), Some(source));
+        assert_eq!(manager.window_for_session(source_sessions[0]), Some(target));
+    }
+
+    // @lat: [[server#Workspace Move#Sole-source reattachment]]
+    #[test]
+    fn sole_source_edge_closes_shell_but_swap_refuses_without_mutation() {
+        let mut manager = manager_with_roots(vec![]);
+        let source = WindowId::new();
+        let target = WindowId::new();
+        let source_workspace = manager.create_workspace();
+        let target_workspace = manager.create_workspace();
+        let source_session = SessionId::new();
+        let target_session = SessionId::new();
+        for (window, workspace, session) in
+            [(source, source_workspace, source_session), (target, target_workspace, target_session)]
+        {
+            manager.add_session(workspace, session, None);
+            manager.assign_session_to_window(window, session);
+            manager.set_window_tree(window, leaf(workspace, vec![session]));
+        }
+        let snapshot = |state: &WorkspaceManager| {
+            let (mut workspaces, tree, mut windows) = state.serialize_for_handoff();
+            workspaces.sort_by_key(|workspace| workspace.id.to_full_string());
+            windows.sort_by_key(|window| window.window_id.to_full_string());
+            rmp_serde::to_vec_named(&(workspaces, tree, windows)).expect("serialize manager")
+        };
+        let before = snapshot(&manager);
+        assert_eq!(
+            manager.move_workspace(WorkspaceMoveRequest {
+                source_window: source,
+                workspace_id: source_workspace,
+                target_window: target,
+                target_workspace_id: target_workspace,
+                operation: WorkspaceMoveOperation::Swap,
+            }),
+            Err(WorkspaceMoveRefusal::SoleWorkspace)
+        );
+        assert_eq!(snapshot(&manager), before);
+
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: source,
+                workspace_id: source_workspace,
+                target_window: target,
+                target_workspace_id: target_workspace,
+                operation: WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Bottom },
+            })
+            .expect("sole-source edge move commits");
+        assert!(moved.source_closed);
+        assert!(manager.window_tree(source).is_none());
+        assert!(manager.sessions_for_window(source).is_empty());
+        assert_eq!(manager.window_for_session(source_session), Some(target));
     }
 
     #[test]

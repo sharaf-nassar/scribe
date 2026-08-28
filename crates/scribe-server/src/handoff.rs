@@ -190,7 +190,7 @@ pub struct HandoffState {
     /// Active GitHub CI windows contain no credential and re-poll on takeover.
     #[serde(default)]
     pub ci_windows: Vec<crate::github_ci::HandoffCiWindow>,
-    /// Bounded workspace-transfer result ledger (spec 029), so a transfer ACK
+    /// Bounded workspace transaction result ledger, so a transfer or move ACK
     /// lost across an upgrade still deduplicates the client's retry. Additive
     /// `#[serde(default)]` — an older peer simply starts with an empty ledger.
     #[serde(default)]
@@ -720,10 +720,10 @@ pub async fn serialize_state(
     workspace_transfers: &TransferGate,
 ) -> (HandoffState, Vec<Arc<OwnedFd>>) {
     // Hold the transfer gate across the whole capture (spec 029 C4): a
-    // transfer transaction mutates the live-session and workspace registries
-    // under separate guards, so a snapshot taken between them would carry a
-    // half-moved workspace. Under the gate this snapshot is strictly pre- or
-    // post-transfer state, and the ledger it serializes matches.
+    // workspace transaction mutates live-session, share, and workspace
+    // registries under separate guards, so a snapshot between them would carry
+    // a half-moved workspace. Under the gate this snapshot is strictly pre- or
+    // post-transaction state, and the ledger it serializes matches.
     let transfers = workspace_transfers.lock().await;
     let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =

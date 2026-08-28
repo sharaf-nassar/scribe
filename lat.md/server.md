@@ -454,18 +454,21 @@ capability-gated, idempotent `TransferWorkspace` transaction.
 
 It holds the [[crates/scribe-server/src/workspace_transfer.rs#TransferGate]]
 across validation, env staging, commit, viewer refresh, and ledger write. The
-handoff/state-dump snapshotter and agent world capture take the same gate, so
-those readers see strictly old or new state.
+same gate now serializes existing-window workspace moves. The handoff/state-dump
+snapshotter and agent world capture take it too, so those readers see strictly
+old or new state.
 
 ### Transfer gate and ledger
 
-The gate retains the most recent 64 `transfer_id → result` entries in recording
-order.
+The gate retains the most recent 64 transfer or move outcomes in one shared
+capacity-bounded order.
 
-Every success and typed refusal is recorded; retrying an id returns it without
-re-running validation. Handoff state carries the ledger with
-`#[serde(default)]`, so a lost-ACK retry against the successor still returns
-`Transferred`. A latched handoff refuses new transfers; failure clears the latch.
+Every success and typed refusal is recorded; retrying the same operation id
+returns it without re-running validation. Move records also retain whether the
+source shell closed, so a lost-ACK retry replays both `WorkspaceMoveResult` and
+`WindowClosed`. Handoff state carries the ledger with `#[serde(default)]`; the
+phase-1 transfer entry map remains decode-compatible. A latched handoff refuses
+new transactions, and handoff failure clears the latch.
 
 ### In-gate commit
 
@@ -506,10 +509,58 @@ resolve to the destination window.
 
 ### Strict pre/post snapshots
 
-[[crates/scribe-server/src/handoff.rs#serialize_state]] and the transient agent
-world capture take the transfer gate before their existing ordered registry
-reads. A snapshot that begins before a transfer owns the gate completes as
-pre-state; one arriving during the transfer waits and captures post-state.
+[[crates/scribe-server/src/handoff.rs#serialize_state]] and transient agent-world
+capture take the transaction gate before their ordered registry reads.
+
+A snapshot that begins first completes as pre-state; one arriving during a
+transfer or move waits and captures post-state.
+
+## Workspace Move
+
+[[crates/scribe-server/src/ipc_server.rs#run_workspace_move]] owns the
+capability-gated, idempotent `MoveWorkspace` transaction.
+
+Source and target window control are validated before env staging and
+revalidated under the gate at commit. The server advertises `workspace_move`
+only now that both operations are handled.
+
+### Edge insertion
+
+[[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_workspace]]
+extracts the authoritative source leaf and inserts it at the target edge.
+
+Shared tree operations preserve workspace/session, tab, pane-tree, and
+active-tab payloads while deterministically re-equalizing split ratios. Live
+PTYs are re-owned in place; no session is created.
+
+### Bidirectional swap
+
+A swap is one gate-held bidirectional commit, not two chained moves.
+
+The manager joins cloned source and target trees under a temporary root, uses
+the shared leaf-swap operation once, then stores the two children. Both window
+shapes and outgoing slots remain fixed while session ownership and env
+coordinates flip in both directions.
+
+### Sole-source reattachment
+
+An edge move may detach the source window's only leaf.
+
+Commit removes the empty source tree and `WindowShare`, moves its live sessions
+directly into the populated target, and records `source_closed` beside the
+result. The requester receives `WorkspaceMoveResult::Moved` followed by
+`WindowClosed`; retries before or after handoff replay both acknowledgements. A
+sole-source swap returns the specific `SoleWorkspace` refusal.
+
+### Typed refusals
+
+Every pre-commit move failure is typed and recorded.
+
+Reasons cover capability, source/target control, target availability, workspace
+ownership, handoff, and env staging. Fallible env copies are staged in both
+directions before commit; revalidation failure discards them. No refusal
+changes live sessions, workspace/env ownership, shares, handoff state, or
+agent-world routing.
 
 ## Beads Flow source cache
 

@@ -700,6 +700,7 @@ pub enum WorkspaceMoveResult {
 pub enum WorkspaceMoveRefusal {
     UnknownWorkspace,
     NotWorkspaceOwner,
+    SoleWorkspace,
     TargetWindowUnavailable,
     TargetWorkspaceUnavailable,
     NoSourceWindowControl,
@@ -3087,6 +3088,7 @@ mod tests {
             WorkspaceMoveResult::Moved,
             WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::UnknownWorkspace },
             WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::NotWorkspaceOwner },
+            WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::SoleWorkspace },
             WorkspaceMoveResult::Refused { reason: WorkspaceMoveRefusal::TargetWindowUnavailable },
             WorkspaceMoveResult::Refused {
                 reason: WorkspaceMoveRefusal::TargetWorkspaceUnavailable,
