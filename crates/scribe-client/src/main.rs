@@ -9450,12 +9450,28 @@ impl TerminalView {
     /// window's own focus is the second half of the condition, which is what
     /// makes a click across regions act while a click on the tab the user is
     /// already in stays a no-op.
+    ///
+    /// A session already painted in some pane needs *pane* focus, not a tab
+    /// switch: [`PaneShell::show_tab`] re-showing the tree it is already
+    /// showing moves nothing, so routing a hover or click on a split sibling
+    /// through [`Self::switch_tab`] left the old pane focused — and hover
+    /// focus, still seeing `hovered != focused`, re-fired on every further
+    /// motion inside the pane it had already reported focusing.
     fn activate_session_tab(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         let moved = self.shared.tabs.lock().is_ok_and(|mut tabs| tabs.show(session_id).is_some());
-        if !moved && self.shell.focused_session(cx) == Some(session_id) {
-            return;
+        match session_activation(
+            moved,
+            self.shell.focused_session(cx),
+            session_id,
+            self.shell.pane_for_session(session_id, cx),
+        ) {
+            SessionActivation::Focused => {}
+            SessionActivation::FocusPane(workspace_id, pane) => {
+                self.shell.focus_pane(workspace_id, pane, cx);
+                self.focus_pane_session(cx);
+            }
+            SessionActivation::Switch => self.switch_tab(move |_| Some(session_id), cx),
         }
-        self.switch_tab(move |_| Some(session_id), cx);
     }
 
     /// Translate a window pointer position into the grid band's local space.
@@ -16381,6 +16397,44 @@ fn tab_adoption_target(
     })
 }
 
+/// How [`TerminalView::activate_session_tab`] lands one session activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActivation {
+    /// The strip moved onto the session's tab, or the session is off screen:
+    /// swap the shown tree through the tab-switch path.
+    Switch,
+    /// The pane already painting the session takes the window's pane focus.
+    FocusPane(WorkspaceId, PaneId),
+    /// Already the focused session: activation is a no-op.
+    Focused,
+}
+
+/// Route one session activation. `strip_moved` is whether the strip just
+/// changed what its region shows; `visible_pane` is the pane already painting
+/// the session, if any.
+///
+/// The order is the contract: a strip that moved always takes the full tab
+/// switch, an already-focused session needs nothing (that no-op is what keeps
+/// keyboard repeat and same-pane hover from re-attaching), and a session on
+/// screen without focus — a split sibling under the pointer — needs pane
+/// focus, which re-showing its already-shown tab never grants.
+fn session_activation(
+    strip_moved: bool,
+    focused: Option<SessionId>,
+    session_id: SessionId,
+    visible_pane: Option<(WorkspaceId, PaneId)>,
+) -> SessionActivation {
+    if strip_moved {
+        return SessionActivation::Switch;
+    }
+    if focused == Some(session_id) {
+        return SessionActivation::Focused;
+    }
+    visible_pane.map_or(SessionActivation::Switch, |(workspace_id, pane)| {
+        SessionActivation::FocusPane(workspace_id, pane)
+    })
+}
+
 fn active_session_after_pane_reconcile(
     active: Option<SessionId>,
     active_has_tab: bool,
@@ -18470,6 +18524,37 @@ mod tests {
         assert_eq!(
             tab_adoption_target(Some(workspace_id), true),
             Some(TabAdoptionTarget::Own(workspace_id))
+        );
+    }
+
+    #[test]
+    fn visible_split_sibling_activation_takes_pane_focus_not_a_tab_switch() {
+        let workspace_id = WorkspaceId::new();
+        let pane = PaneId::from_raw(7);
+        let focused = SessionId::new();
+        let hovered = SessionId::new();
+
+        // The phase-10 shape: the strip already shows the hovered session's
+        // tab, focus sits on its split sibling, and the session is painted in
+        // a pane — activation must move pane focus, not re-show the tab.
+        assert_eq!(
+            session_activation(false, Some(focused), hovered, Some((workspace_id, pane))),
+            SessionActivation::FocusPane(workspace_id, pane)
+        );
+        assert_eq!(
+            session_activation(false, Some(hovered), hovered, Some((workspace_id, pane))),
+            SessionActivation::Focused,
+            "an already-focused session stays a no-op"
+        );
+        assert_eq!(
+            session_activation(true, Some(focused), hovered, None),
+            SessionActivation::Switch,
+            "a strip that moved keeps the full tab switch"
+        );
+        assert_eq!(
+            session_activation(false, Some(focused), hovered, None),
+            SessionActivation::Switch,
+            "an off-screen session still switches to its tab"
         );
     }
 

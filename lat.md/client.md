@@ -3061,6 +3061,18 @@ button-free move onto a session other than the focused one. The target then
 goes through [[crates/scribe-client/src/main.rs#TerminalView#activate_session_tab]],
 the same path as pointer tab activation.
 
+Inside that path, [[crates/scribe-client/src/main.rs#session_activation]] decides
+where the activation lands: a strip that moved takes the full tab switch, an
+already-focused session is a no-op, and a session already painted in some pane
+— a split sibling under the pointer — takes pane focus through
+[[crates/scribe-client/src/pane_shell.rs#PaneShell#focus_pane]] and
+[[crates/scribe-client/src/main.rs#TerminalView#focus_pane_session]]. The last
+arm is what makes hover focus level-stable in a same-tab split:
+[[crates/scribe-client/src/pane_shell.rs#PaneShell#show_tab]] re-showing the
+tree it already shows moves no pane focus, so routing a split sibling through
+the tab switch left `hovered != focused` true forever and re-fired the focus
+log on every motion inside the pane.
+
 The focus move returns before application mouse reporting, selection, link,
 scroll, or click handling, so it emits no synthetic pointer input. It changes
 only Scribe's internal pane focus and never requests OS window activation.
