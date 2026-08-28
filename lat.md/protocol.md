@@ -130,9 +130,12 @@ for a true `Welcome` bit before sending a transfer request.
 using IDs only.
 
 It carries `move_id`, source and target window/workspace IDs, and an `operation`
-of either `InsertAtEdge { edge: WorkspaceTreeEdge }` or `Swap`; no client
-workspace tree is accepted. The matching [[protocol#Server Messages#Workspace move]]
-reply repeats the client-minted `move_id`.
+of `InsertAtEdge { edge: WorkspaceTreeEdge }`, `Swap`, or `MoveTab {
+tab_session_id, target_index }`; no client workspace tree is accepted. The tab
+form names the same source/target window and transfers the complete server-held
+parallel tab/pane payload rather than emitting one `MoveSession` per pane. The
+matching [[protocol#Server Messages#Workspace move]] reply repeats the
+client-minted `move_id`.
 
 The exchange is independently gated by `Hello.workspace_move` and
 `Welcome.workspace_move`. Both fields serde-default to `false`, so current

@@ -434,6 +434,37 @@ fn set_workspace_moves_a_tab_between_regions() {
     assert_eq!(tabs.regions().len(), 1);
 }
 
+// @lat: [[test#GPUI Client Headless Suites#Atomic tab-subtree region transfer]]
+#[test]
+fn authoritative_tab_subtree_refile_uses_the_shared_departure_clamp() {
+    let (mut tabs, (source, target), ids) = active_middle_source_strip();
+    let pane = SessionId::new();
+    tabs.insert_pane(pane, source);
+
+    // The server commits the root and pane together, then sends one full list.
+    // The reader files pane-tree children before reconciliation; the root's
+    // departure must use the same successor clamp as MoveSession and exits.
+    tabs.insert_pane(pane, target);
+    tabs.reconcile(
+        vec![
+            TabEntry::new(ids[0], source, "source-0".to_owned()),
+            TabEntry::new(ids[2], source, "source-2".to_owned()),
+            TabEntry::new(ids[3], target, "target-0".to_owned()),
+            TabEntry::new(ids[1], target, "source-1".to_owned()),
+            TabEntry::new(pane, target, "pane".to_owned()),
+        ],
+        Some(pane),
+    );
+    tabs.order_by(&[ids[0], ids[2], ids[3], ids[1]]);
+
+    assert_eq!(tabs.active_session_in(source), Some(ids[2]));
+    assert_eq!(tabs.active_session_in(target), Some(ids[3]));
+    assert_eq!(tabs.workspace_of(ids[1]), Some(target));
+    assert_eq!(tabs.workspace_of(pane), Some(target));
+    assert_eq!(tabs.region_of_tab(pane), None, "the moved pane stays inside its tab subtree");
+    assert_eq!(order(&tabs), [ids[0], ids[2], ids[3], ids[1]]);
+}
+
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab task labels]]
 #[test]
 fn native_title_outranks_task_label_and_reset_reveals_fallbacks() {

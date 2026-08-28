@@ -289,22 +289,20 @@ impl WorkspaceMoveFeedback {
     pub const fn message(self) -> &'static str {
         match self {
             Self::CapabilityAbsent | Self::Refused(WorkspaceMoveRefusal::CapabilityAbsent) => {
-                "Moving a workspace between windows is unavailable with this server"
+                "Moving workspaces or tabs is unavailable with this server"
             }
             Self::StaleTarget => "That window is no longer available; nothing was moved",
-            Self::AlreadyPending => "A workspace move is already pending",
-            Self::SendFailed => "Workspace was not moved because the request could not be sent",
+            Self::AlreadyPending => "A workspace or tab move is already pending",
+            Self::SendFailed => "Nothing moved because the request could not be sent",
             // The server owns the outcome and its ledger dedupes a retry, so a
             // lost answer is settled by the authoritative session list the next
             // connection replays rather than by a client-side guess.
-            Self::Disconnected => {
-                "Workspace move was interrupted; the server list is authoritative"
-            }
+            Self::Disconnected => "Move was interrupted; the server list is authoritative",
             Self::Refused(WorkspaceMoveRefusal::UnknownWorkspace) => {
                 "Workspace could not be moved because it no longer exists"
             }
             Self::Refused(WorkspaceMoveRefusal::NotWorkspaceOwner) => {
-                "Workspace could not be moved because source ownership changed"
+                "Move could not complete because source ownership changed"
             }
             Self::Refused(WorkspaceMoveRefusal::SoleWorkspace) => {
                 "This is the window's only workspace; it cannot be swapped away"

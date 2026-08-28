@@ -15,7 +15,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
     WindowControlArea, deferred, div, prelude::*, px,
 };
-use scribe_common::ids::WorkspaceId;
+use scribe_common::ids::{SessionId, WorkspaceId};
 
 use crate::tab_bar::{
     GroupBadge, TabBarColors, TabData, accent_tab_tone, flash_blend, px_units,
@@ -89,7 +89,7 @@ pub enum TitlebarEvent {
 /// into a drag. Its presence as the active drag keeps mouse-move events
 /// flowing to [`TitlebarView`]'s `on_drag_move` listener anywhere in the
 /// window, so the drag survives the cursor leaving the titlebar band.
-struct TabDrag;
+pub struct TabDrag;
 
 /// Invisible view for the native drag's cursor-following overlay. The real tab
 /// is rendered offset inside the strip instead, so the overlay paints nothing.
@@ -104,6 +104,8 @@ impl Render for TabDragGhost {
 /// In-flight tab drag.
 #[derive(Debug, Clone, Copy)]
 struct DragState {
+    /// Index where this drag began, retained for an atomic cross-region move.
+    origin: usize,
     /// Index of the tab being dragged (updated as it crosses neighbours).
     source: usize,
     /// Left edge of the first tab, in window pixels.
@@ -372,8 +374,23 @@ impl TitlebarView {
         }
         let tab_x = origin_x + px_units(source) * self.tab_width();
         let grab_offset = cursor_x - tab_x;
-        self.drag = Some(DragState { source, origin_x, grab_offset, cursor_x, reordered: false });
+        self.drag = Some(DragState {
+            origin: source,
+            source,
+            origin_x,
+            grab_offset,
+            cursor_x,
+            reordered: false,
+        });
         cx.notify();
+    }
+
+    /// The slot this drag began in and the slot the same tab occupies now.
+    #[must_use]
+    pub fn dragged_slot(&self) -> Option<(usize, usize, SessionId)> {
+        let drag = self.drag?;
+        let session_id = self.tabs.get(drag.source)?.session_id?;
+        Some((drag.origin, drag.source, session_id))
     }
 
     /// Update the active drag to `cursor_x`, reordering when the dragged tab's

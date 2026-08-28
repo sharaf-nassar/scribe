@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    LayoutDirection, ServerMessage, WorkspaceMoveOperation, WorkspaceMoveRefusal,
+    LayoutDirection, PaneTreeNode, ServerMessage, WorkspaceMoveOperation, WorkspaceMoveRefusal,
     WorkspaceTransferRefusal, WorkspaceTreeEdge, WorkspaceTreeError, WorkspaceTreeNode,
 };
 
@@ -27,6 +27,13 @@ const ACCENT_COLORS: &[&str] =
 type WorkspaceInfoSummary = (Option<String>, String, Option<LayoutDirection>, Option<PathBuf>);
 type WorkspaceTransferTrees = (WorkspaceTreeNode, WorkspaceTreeNode);
 type WorkspaceMoveTrees = (Option<WorkspaceTreeNode>, WorkspaceTreeNode);
+
+struct MovedTabSubtree {
+    tab_session_id: SessionId,
+    pane_tree: Option<PaneTreeNode>,
+    sessions: Vec<SessionId>,
+    was_active: bool,
+}
 
 /// Session ownership changes derived for one existing-window workspace move.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,17 +501,26 @@ impl WorkspaceManager {
         } = request;
 
         crate::state_dump::mark_dirty();
-        if let Some(source_tree) = source_tree {
-            self.window_trees.insert(source_window, source_tree);
+        if matches!(operation, WorkspaceMoveOperation::MoveTab { .. }) {
+            self.window_trees.insert(source_window, target_tree);
+            self.move_tab_membership(
+                &candidates.source_sessions,
+                workspace_id,
+                target_workspace_id,
+            );
         } else {
-            self.window_trees.remove(&source_window);
-        }
-        self.window_trees.insert(target_window, target_tree);
-        for &session_id in &candidates.source_sessions {
-            self.session_to_window.insert(session_id, target_window);
-        }
-        for &session_id in &candidates.target_sessions {
-            self.session_to_window.insert(session_id, source_window);
+            if let Some(source_tree) = source_tree {
+                self.window_trees.insert(source_window, source_tree);
+            } else {
+                self.window_trees.remove(&source_window);
+            }
+            self.window_trees.insert(target_window, target_tree);
+            for &session_id in &candidates.source_sessions {
+                self.session_to_window.insert(session_id, target_window);
+            }
+            for &session_id in &candidates.target_sessions {
+                self.session_to_window.insert(session_id, source_window);
+            }
         }
         info!(
             %workspace_id,
@@ -530,6 +546,9 @@ impl WorkspaceManager {
             target_workspace_id,
             operation,
         } = request;
+        if let WorkspaceMoveOperation::MoveTab { tab_session_id, target_index } = operation {
+            return self.check_tab_subtree_move(request, tab_session_id, target_index);
+        }
         if source_window == target_window {
             return Err(WorkspaceMoveRefusal::TargetWindowUnavailable);
         }
@@ -571,6 +590,9 @@ impl WorkspaceManager {
                 workspace_id,
                 target_workspace_id,
             )?,
+            WorkspaceMoveOperation::MoveTab { .. } => {
+                return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
+            }
         };
         Ok((
             WorkspaceMoveCandidates {
@@ -584,6 +606,234 @@ impl WorkspaceManager {
             },
             (source_tree, target_tree),
         ))
+    }
+
+    fn check_tab_subtree_move(
+        &self,
+        request: WorkspaceMoveRequest,
+        tab_session_id: SessionId,
+        target_index: usize,
+    ) -> Result<(WorkspaceMoveCandidates, WorkspaceMoveTrees), WorkspaceMoveRefusal> {
+        let WorkspaceMoveRequest {
+            source_window,
+            workspace_id,
+            target_window,
+            target_workspace_id,
+            ..
+        } = request;
+        if source_window != target_window {
+            return Err(WorkspaceMoveRefusal::TargetWindowUnavailable);
+        }
+        if workspace_id == target_workspace_id {
+            return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
+        }
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(WorkspaceMoveRefusal::UnknownWorkspace);
+        }
+        let target_sessions = self
+            .workspaces
+            .get(&target_workspace_id)
+            .ok_or(WorkspaceMoveRefusal::TargetWorkspaceUnavailable)?
+            .sessions
+            .clone();
+        if !self.sessions_owned_by_window(&target_sessions, target_window) {
+            return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
+        }
+        let mut tree = self
+            .window_trees
+            .get(&source_window)
+            .cloned()
+            .ok_or(WorkspaceMoveRefusal::NotWorkspaceOwner)?;
+        let moved = Self::take_tab_subtree(&mut tree, workspace_id, tab_session_id)?;
+        if !moved.sessions.iter().all(|session_id| {
+            self.session_to_window.get(session_id) == Some(&source_window)
+                && self.session_to_workspace.get(session_id) == Some(&workspace_id)
+        }) {
+            return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
+        }
+        let moved_sessions = moved.sessions.clone();
+        if Self::workspace_leaf_is_empty(&tree, workspace_id) {
+            let source_sessions = &self
+                .workspaces
+                .get(&workspace_id)
+                .ok_or(WorkspaceMoveRefusal::UnknownWorkspace)?
+                .sessions;
+            if source_sessions.iter().any(|session_id| !moved.sessions.contains(session_id)) {
+                return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
+            }
+            tree.extract_workspace(workspace_id)
+                .map_err(|_| WorkspaceMoveRefusal::NotWorkspaceOwner)?;
+        }
+        Self::insert_tab_subtree(&mut tree, target_workspace_id, target_index, moved)?;
+        Ok((
+            WorkspaceMoveCandidates {
+                source_sessions: moved_sessions,
+                target_sessions: Vec::new(),
+                source_closed: false,
+            },
+            (Some(tree.clone()), tree),
+        ))
+    }
+
+    fn take_tab_subtree(
+        node: &mut WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+        tab_session_id: SessionId,
+    ) -> Result<MovedTabSubtree, WorkspaceMoveRefusal> {
+        match node {
+            WorkspaceTreeNode::Leaf {
+                workspace_id: leaf_id,
+                session_ids,
+                pane_trees,
+                active_tab_index,
+            } if *leaf_id == workspace_id => {
+                let index = session_ids
+                    .iter()
+                    .position(|session_id| *session_id == tab_session_id)
+                    .ok_or(WorkspaceMoveRefusal::NotWorkspaceOwner)?;
+                pane_trees.resize(session_ids.len(), None);
+                let showing = session_ids.get(*active_tab_index).copied();
+                let was_active = showing == Some(tab_session_id);
+                session_ids.remove(index);
+                let pane_tree = pane_trees.remove(index);
+                if session_ids.is_empty() {
+                    *active_tab_index = 0;
+                } else {
+                    *active_tab_index = Self::active_index_or(
+                        session_ids,
+                        showing.filter(|session_id| *session_id != tab_session_id),
+                        index.min(session_ids.len() - 1),
+                    );
+                }
+                let mut sessions = Vec::new();
+                if let Some(tree) = pane_tree.as_ref() {
+                    Self::collect_pane_sessions(tree, &mut sessions);
+                }
+                if !sessions.contains(&tab_session_id) {
+                    sessions.insert(0, tab_session_id);
+                }
+                Ok(MovedTabSubtree { tab_session_id, pane_tree, sessions, was_active })
+            }
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                if Self::workspace_tree_has_leaf(first, workspace_id) {
+                    Self::take_tab_subtree(first, workspace_id, tab_session_id)
+                } else {
+                    Self::take_tab_subtree(second, workspace_id, tab_session_id)
+                }
+            }
+            WorkspaceTreeNode::Leaf { .. } => Err(WorkspaceMoveRefusal::NotWorkspaceOwner),
+        }
+    }
+
+    fn insert_tab_subtree(
+        node: &mut WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+        target_index: usize,
+        moved: MovedTabSubtree,
+    ) -> Result<(), WorkspaceMoveRefusal> {
+        match node {
+            WorkspaceTreeNode::Leaf {
+                workspace_id: leaf_id,
+                session_ids,
+                pane_trees,
+                active_tab_index,
+            } if *leaf_id == workspace_id => {
+                if target_index > session_ids.len() {
+                    return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
+                }
+                pane_trees.resize(session_ids.len(), None);
+                let showing = session_ids.get(*active_tab_index).copied();
+                session_ids.insert(target_index, moved.tab_session_id);
+                pane_trees.insert(target_index, moved.pane_tree);
+                *active_tab_index = if moved.was_active {
+                    target_index
+                } else {
+                    Self::active_index_or(session_ids, showing, 0)
+                };
+                Ok(())
+            }
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                if Self::workspace_tree_has_leaf(first, workspace_id) {
+                    Self::insert_tab_subtree(first, workspace_id, target_index, moved)
+                } else {
+                    Self::insert_tab_subtree(second, workspace_id, target_index, moved)
+                }
+            }
+            WorkspaceTreeNode::Leaf { .. } => Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable),
+        }
+    }
+
+    fn active_index_or(
+        session_ids: &[SessionId],
+        showing: Option<SessionId>,
+        fallback: usize,
+    ) -> usize {
+        showing
+            .and_then(|session_id| {
+                session_ids.iter().position(|candidate| *candidate == session_id)
+            })
+            .unwrap_or(fallback)
+    }
+
+    fn workspace_tree_has_leaf(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+        match node {
+            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, .. } => *leaf_id == workspace_id,
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                Self::workspace_tree_has_leaf(first, workspace_id)
+                    || Self::workspace_tree_has_leaf(second, workspace_id)
+            }
+        }
+    }
+
+    fn workspace_leaf_is_empty(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+        match node {
+            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, session_ids, .. } => {
+                *leaf_id == workspace_id && session_ids.is_empty()
+            }
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                Self::workspace_leaf_is_empty(first, workspace_id)
+                    || Self::workspace_leaf_is_empty(second, workspace_id)
+            }
+        }
+    }
+
+    fn collect_pane_sessions(node: &PaneTreeNode, sessions: &mut Vec<SessionId>) {
+        match node {
+            PaneTreeNode::Leaf { session_id } => {
+                if !sessions.contains(session_id) {
+                    sessions.push(*session_id);
+                }
+            }
+            PaneTreeNode::Split { first, second, .. } => {
+                Self::collect_pane_sessions(first, sessions);
+                Self::collect_pane_sessions(second, sessions);
+            }
+        }
+    }
+
+    fn move_tab_membership(
+        &mut self,
+        sessions: &[SessionId],
+        source: WorkspaceId,
+        target: WorkspaceId,
+    ) {
+        if let Some(workspace) = self.workspaces.get_mut(&source) {
+            workspace.sessions.retain(|session_id| !sessions.contains(session_id));
+        }
+        if let Some(workspace) = self.workspaces.get_mut(&target) {
+            let additions: Vec<SessionId> = sessions
+                .iter()
+                .copied()
+                .filter(|session_id| !workspace.sessions.contains(session_id))
+                .collect();
+            workspace.sessions.extend(additions);
+        }
+        for &session_id in sessions {
+            self.session_to_workspace.insert(session_id, target);
+        }
+        if self.workspaces.get(&source).is_some_and(|workspace| workspace.sessions.is_empty()) {
+            self.workspaces.remove(&source);
+        }
     }
 
     fn sessions_owned_by_window(&self, sessions: &[SessionId], window: WindowId) -> bool {
@@ -1803,6 +2053,256 @@ mod tests {
         assert!(manager.window_tree(source).is_none());
         assert!(manager.sessions_for_window(source).is_empty());
         assert_eq!(manager.window_for_session(source_session), Some(target));
+    }
+
+    fn pane_subtree(root: SessionId, pane: SessionId) -> PaneTreeNode {
+        PaneTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.35,
+            first: Box::new(PaneTreeNode::Leaf { session_id: root }),
+            second: Box::new(PaneTreeNode::Leaf { session_id: pane }),
+        }
+    }
+
+    fn tab_subtree_fixture()
+    -> (WorkspaceManager, WindowId, WorkspaceId, WorkspaceId, [SessionId; 5], PaneTreeNode) {
+        let mut manager = manager_with_roots(vec![]);
+        let window = WindowId::new();
+        let top = manager.create_workspace();
+        let lower = manager.create_workspace();
+        let sessions = std::array::from_fn(|_| SessionId::new());
+        let split = pane_subtree(sessions[0], sessions[1]);
+        for session in &sessions[..3] {
+            manager.add_session(top, *session, None);
+            manager.assign_session_to_window(window, *session);
+        }
+        for session in &sessions[3..] {
+            manager.add_session(lower, *session, None);
+            manager.assign_session_to_window(window, *session);
+        }
+        manager.set_window_tree(
+            window,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: top,
+                    session_ids: vec![sessions[0], sessions[2]],
+                    pane_trees: vec![Some(split.clone()), None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: lower,
+                    session_ids: vec![sessions[3], sessions[4]],
+                    pane_trees: vec![None, None],
+                    active_tab_index: 1,
+                }),
+            },
+        );
+        (manager, window, top, lower, sessions, split)
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn pane_tab_moves_between_top_and_lower_regions_in_both_directions() {
+        let (mut manager, window, top, lower, sessions, split) = tab_subtree_fixture();
+        let move_tab = |source, target, index| WorkspaceMoveRequest {
+            source_window: window,
+            workspace_id: source,
+            target_window: window,
+            target_workspace_id: target,
+            operation: WorkspaceMoveOperation::MoveTab {
+                tab_session_id: sessions[0],
+                target_index: index,
+            },
+        };
+
+        let moved = manager.move_workspace(move_tab(top, lower, 1)).expect("top to lower commits");
+        assert_eq!(moved.source_sessions, vec![sessions[0], sessions[1]]);
+        assert_eq!(manager.workspace_for_session(sessions[0]), Some(lower));
+        assert_eq!(manager.workspace_for_session(sessions[1]), Some(lower));
+        assert_eq!(manager.window_for_session(sessions[1]), Some(window));
+        assert_eq!(
+            manager.window_tree(window),
+            Some(&WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: top,
+                    session_ids: vec![sessions[2]],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: lower,
+                    session_ids: vec![sessions[3], sessions[0], sessions[4]],
+                    pane_trees: vec![None, Some(split.clone()), None],
+                    active_tab_index: 1,
+                }),
+            })
+        );
+
+        manager.move_workspace(move_tab(lower, top, 0)).expect("lower to top commits");
+        assert_eq!(manager.workspace_for_session(sessions[0]), Some(top));
+        assert_eq!(manager.workspace_for_session(sessions[1]), Some(top));
+        assert_eq!(
+            manager.window_tree(window),
+            Some(&WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: top,
+                    session_ids: vec![sessions[0], sessions[2]],
+                    pane_trees: vec![Some(split), None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: lower,
+                    session_ids: vec![sessions[3], sessions[4]],
+                    pane_trees: vec![None, None],
+                    active_tab_index: 1,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn moving_an_inactive_tab_keeps_both_regions_showing_the_same_tabs() {
+        let (mut manager, window, top, lower, sessions, _) = tab_subtree_fixture();
+        manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window,
+                workspace_id: top,
+                target_window: window,
+                target_workspace_id: lower,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[2],
+                    target_index: 0,
+                },
+            })
+            .expect("inactive tab move commits");
+
+        let WorkspaceTreeNode::Split { first, second, .. } =
+            manager.window_tree(window).expect("two regions survive")
+        else {
+            panic!("both regions still have tabs")
+        };
+        assert!(matches!(
+            first.as_ref(),
+            WorkspaceTreeNode::Leaf { session_ids, active_tab_index: 0, .. }
+                if session_ids == &[sessions[0]]
+        ));
+        assert!(matches!(
+            second.as_ref(),
+            WorkspaceTreeNode::Leaf { session_ids, active_tab_index: 2, .. }
+                if session_ids == &[sessions[2], sessions[3], sessions[4]]
+        ));
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn tab_subtree_move_handoff_round_trips_and_refusals_mutate_nothing() {
+        let (mut manager, window, top, lower, sessions, split) = tab_subtree_fixture();
+        let request = WorkspaceMoveRequest {
+            source_window: window,
+            workspace_id: top,
+            target_window: window,
+            target_workspace_id: lower,
+            operation: WorkspaceMoveOperation::MoveTab {
+                tab_session_id: sessions[0],
+                target_index: 1,
+            },
+        };
+        manager.move_workspace(request).expect("tab subtree move commits");
+        let committed_tree = manager.window_tree(window).cloned().expect("committed tree");
+        let (workspaces, tree, windows) = manager.serialize_for_handoff();
+        let valid = vec![
+            (sessions[0], lower),
+            (sessions[1], lower),
+            (sessions[2], top),
+            (sessions[3], lower),
+            (sessions[4], lower),
+        ];
+        let restored =
+            WorkspaceManager::restore_from_handoff(Vec::new(), &workspaces, tree, &windows, &valid);
+        assert_eq!(restored.window_tree(window), Some(&committed_tree));
+        assert_eq!(restored.workspace_for_session(sessions[1]), Some(lower));
+        assert_eq!(restored.window_for_session(sessions[1]), Some(window));
+
+        let snapshot = rmp_serde::to_vec_named(&(
+            manager.serialize_for_handoff(),
+            manager.sessions_in_workspace(top),
+            manager.sessions_in_workspace(lower),
+        ))
+        .expect("serialize manager snapshot");
+        for operation in [
+            WorkspaceMoveOperation::MoveTab { tab_session_id: SessionId::new(), target_index: 0 },
+            WorkspaceMoveOperation::MoveTab { tab_session_id: sessions[0], target_index: 99 },
+        ] {
+            assert!(
+                manager
+                    .move_workspace(WorkspaceMoveRequest {
+                        source_window: window,
+                        workspace_id: lower,
+                        target_window: window,
+                        target_workspace_id: top,
+                        operation,
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            rmp_serde::to_vec_named(&(
+                manager.serialize_for_handoff(),
+                manager.sessions_in_workspace(top),
+                manager.sessions_in_workspace(lower),
+            ))
+            .expect("serialize manager after refusals"),
+            snapshot,
+            "typed refusals leave tree and membership byte-identical"
+        );
+        assert!(matches!(split, PaneTreeNode::Split { .. }));
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn moving_a_regions_last_tab_collapses_it_after_commit() {
+        let (mut manager, window, top, lower, sessions, split) = tab_subtree_fixture();
+        manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window,
+                workspace_id: top,
+                target_window: window,
+                target_workspace_id: lower,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[2],
+                    target_index: 0,
+                },
+            })
+            .expect("first tab move commits");
+        manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window,
+                workspace_id: top,
+                target_window: window,
+                target_workspace_id: lower,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[0],
+                    target_index: 1,
+                },
+            })
+            .expect("last tab move commits");
+
+        let WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, active_tab_index } =
+            manager.window_tree(window).expect("source region collapsed")
+        else {
+            panic!("empty source region must collapse")
+        };
+        assert_eq!(*workspace_id, lower);
+        assert_eq!(session_ids, &[sessions[2], sessions[0], sessions[3], sessions[4]]);
+        assert_eq!(pane_trees, &[None, Some(split), None, None]);
+        assert_eq!(*active_tab_index, 1);
+        assert!(manager.workspace_info(top).is_none(), "empty source workspace is retired");
     }
 
     #[test]

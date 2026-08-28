@@ -8122,17 +8122,21 @@ async fn execute_workspace_move(
             Ok(candidates) => candidates,
             Err(reason) => return refused_workspace_move(reason),
         };
-    let env_rebinds = match stage_workspace_move_env(
-        context.server,
-        command.workspace_id,
-        &candidates,
-        context.window_id,
-        command.target_window_id,
-    )
-    .await
-    {
-        Ok(rebinds) => rebinds,
-        Err(reason) => return refused_workspace_move(reason),
+    let env_rebinds = if matches!(command.operation, WorkspaceMoveOperation::MoveTab { .. }) {
+        Vec::new()
+    } else {
+        match stage_workspace_move_env(
+            context.server,
+            command.workspace_id,
+            &candidates,
+            context.window_id,
+            command.target_window_id,
+        )
+        .await
+        {
+            Ok(rebinds) => rebinds,
+            Err(reason) => return refused_workspace_move(reason),
+        }
     };
     let commit = match commit_workspace_move(command, context, &candidates).await {
         Ok(commit) => commit,
@@ -8249,6 +8253,7 @@ struct WorkspaceMoveCommit {
     source_viewers: Vec<TransferViewer>,
     target_viewers: Vec<TransferViewer>,
     attachments: Vec<(SessionId, SessionAttachment)>,
+    same_window: bool,
     /// Control requests the move discarded, one per window that gave sessions
     /// up, applied as `ControlDenied` + audit once the guards drop.
     denied_requests: Vec<(WindowId, ControlEffect)>,
@@ -8303,14 +8308,67 @@ async fn commit_workspace_move(
         return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
     }
 
+    let same_window = matches!(command.operation, WorkspaceMoveOperation::MoveTab { .. });
     let source_viewers = transfer_viewers(
         shares.get(&source_window).ok_or(WorkspaceMoveRefusal::NoSourceWindowControl)?,
     );
-    let target_viewers = transfer_viewers(
-        shares.get(&target_window_id).ok_or(WorkspaceMoveRefusal::TargetWindowUnavailable)?,
-    );
+    let target_viewers = if same_window {
+        Vec::new()
+    } else {
+        transfer_viewers(
+            shares.get(&target_window_id).ok_or(WorkspaceMoveRefusal::TargetWindowUnavailable)?,
+        )
+    };
     let committed = wm.move_workspace(request)?;
 
+    if same_window {
+        return Ok(commit_tab_subtree_move(command, &committed, &mut sessions, source_viewers));
+    }
+    Ok(commit_cross_window_move(
+        &committed,
+        &mut sessions,
+        &mut shares,
+        (source_window, target_window_id),
+        (source_viewers, target_viewers),
+    ))
+}
+
+fn commit_tab_subtree_move(
+    command: WorkspaceMoveCommand,
+    committed: &WorkspaceMoveCandidates,
+    sessions: &mut HashMap<SessionId, LiveSession>,
+    source_viewers: Vec<TransferViewer>,
+) -> WorkspaceMoveCommit {
+    for &session_id in &committed.source_sessions {
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.workspace_id = command.target_workspace_id;
+        }
+    }
+    WorkspaceMoveCommit {
+        moved: Vec::new(),
+        source_viewers,
+        target_viewers: Vec::new(),
+        attachments: Vec::new(),
+        same_window: true,
+        denied_requests: Vec::new(),
+        source_closed: false,
+    }
+}
+
+/// Registry bookkeeping for a committed cross-window move or swap.
+///
+/// Called strictly after the workspace-manager commit point, under the
+/// caller's gate-held write guards (live sessions -> window shares), so the
+/// gate-held lock order and the commit point stay auditable in
+/// [`commit_workspace_move`]: this helper never acquires or releases a lock
+/// and can no longer refuse.
+fn commit_cross_window_move(
+    committed: &WorkspaceMoveCandidates,
+    sessions: &mut HashMap<SessionId, LiveSession>,
+    shares: &mut HashMap<WindowId, WindowShare>,
+    (source_window, target_window_id): (WindowId, WindowId),
+    (source_viewers, target_viewers): (Vec<TransferViewer>, Vec<TransferViewer>),
+) -> WorkspaceMoveCommit {
     let mut attachments =
         Vec::with_capacity(committed.source_sessions.len() + committed.target_sessions.len());
     for (&session_id, destination) in committed
@@ -8348,14 +8406,15 @@ async fn commit_workspace_move(
     }
     let moved =
         committed.source_sessions.iter().chain(&committed.target_sessions).copied().collect();
-    Ok(WorkspaceMoveCommit {
+    WorkspaceMoveCommit {
         moved,
         source_viewers,
         target_viewers,
         attachments,
+        same_window: false,
         denied_requests,
         source_closed: committed.source_closed,
-    })
+    }
 }
 
 /// Sever every route a moved session had into the window it just left.
@@ -8413,16 +8472,87 @@ async fn finalize_workspace_move(
         source_viewers,
         target_viewers,
         attachments,
+        same_window,
         denied_requests,
         source_closed,
     } = commit;
 
+    cleanup_workspace_move_routes(
+        server,
+        attachments,
+        source_viewers.iter().chain(&target_viewers),
+        denied_requests,
+        env_rebinds,
+    )
+    .await;
+
+    if source_closed {
+        for (writer, _, _) in &source_viewers {
+            if !Arc::ptr_eq(writer, context.writer) {
+                send_message(writer, &ServerMessage::WindowClosed { window_id: source_window })
+                    .await;
+            }
+        }
+    } else {
+        for (writer, is_remote, _) in &source_viewers {
+            handle_list_sessions(
+                &server.live_sessions,
+                &server.workspace_manager,
+                writer,
+                source_window,
+                *is_remote,
+            )
+            .await;
+        }
+    }
+    if !same_window {
+        for (writer, is_remote, _) in &target_viewers {
+            handle_list_sessions(
+                &server.live_sessions,
+                &server.workspace_manager,
+                writer,
+                target_window_id,
+                *is_remote,
+            )
+            .await;
+        }
+    }
+
+    if !source_closed {
+        broadcast_share_roster(server, source_window).await;
+    }
+    if !same_window {
+        broadcast_share_roster(server, target_window_id).await;
+    }
+    server.agent_api.activity().rebroadcast_active(&moved);
+    info!(
+        %source_window,
+        target_window = %target_window_id,
+        sessions = moved.len(),
+        source_closed,
+        "workspace move committed"
+    );
+}
+
+/// Route cleanup for a committed workspace move, in commit order: sweep the
+/// moved sessions' attachment rosters, apply the discarded control requests'
+/// denials, then delete the superseded env envelopes. Runs under the transfer
+/// gate with no registry guard held, before [`finalize_workspace_move`] emits
+/// its refreshes, so the post-commit refresh ordering stays explicit there,
+/// beside this cleanup.
+async fn cleanup_workspace_move_routes<'a>(
+    server: &IpcServerState,
+    attachments: Vec<(SessionId, SessionAttachment)>,
+    viewers: impl Iterator<Item = &'a TransferViewer> + Clone,
+    denied_requests: Vec<(WindowId, ControlEffect)>,
+    env_rebinds: &[EnvRebind],
+) {
     // Both rosters are swept for every moved session, so neither window keeps
     // an attached id addressing a session it no longer owns.
     for (session_id, attachment) in attachments {
         remove_from_session_attachment(&attachment, session_id).await;
         clear_session_attachment(&attachment).await;
-        for (_, _, viewer_attached) in source_viewers.iter().chain(&target_viewers) {
+        for (_, _, viewer_attached) in viewers.clone() {
             attached_remove(viewer_attached, session_id).await;
         }
         server.env_store.drop_scheduler(session_id).await;
@@ -8444,53 +8574,6 @@ async fn finalize_workspace_move(
             );
         }
     }
-
-    if source_closed {
-        for (writer, _, _) in &source_viewers {
-            if !Arc::ptr_eq(writer, context.writer) {
-                send_message(writer, &ServerMessage::WindowClosed { window_id: source_window })
-                    .await;
-            }
-        }
-    } else {
-        for (writer, is_remote, _) in &source_viewers {
-            handle_list_sessions(
-                &server.live_sessions,
-                &server.workspace_manager,
-                writer,
-                source_window,
-                *is_remote,
-            )
-            .await;
-        }
-    }
-    for (writer, is_remote, _) in &target_viewers {
-        handle_list_sessions(
-            &server.live_sessions,
-            &server.workspace_manager,
-            writer,
-            target_window_id,
-            *is_remote,
-        )
-        .await;
-    }
-
-    // One full-state roster per surviving window, behind its full session list:
-    // the move changed which sessions each roster governs, and a participant
-    // must never have to infer that from a delta.
-    if !source_closed {
-        broadcast_share_roster(server, source_window).await;
-    }
-    broadcast_share_roster(server, target_window_id).await;
-
-    server.agent_api.activity().rebroadcast_active(&moved);
-    info!(
-        %source_window,
-        target_window = %target_window_id,
-        sessions = moved.len(),
-        source_closed,
-        "workspace move committed"
-    );
 }
 
 /// Helper extracted from [`dispatch_window_message`] to keep the dispatcher's
@@ -18322,6 +18405,33 @@ mod tests {
             .await
         }
 
+        async fn run_tab_subtree(
+            &mut self,
+            move_id: u64,
+            source_workspace_index: usize,
+            target_workspace_index: usize,
+            operation: WorkspaceMoveOperation,
+        ) -> RecordedWorkspaceMove {
+            let mut context = ClientDispatchContext {
+                server: &self.server,
+                writer: &self.source_writer,
+                attached_ids: &self.source_attached,
+                window_id: self.source_window,
+                is_remote: false,
+            };
+            run_workspace_move(
+                WorkspaceMoveCommand {
+                    move_id,
+                    workspace_id: self.workspaces[source_workspace_index],
+                    target_window_id: self.source_window,
+                    target_workspace_id: self.workspaces[target_workspace_index],
+                    operation,
+                },
+                &mut context,
+            )
+            .await
+        }
+
         async fn state_snapshot(&self) -> (Vec<u8>, Vec<(SessionId, WindowId)>, Vec<WindowId>) {
             let manager = self.server.workspace_manager.read().await;
             let (mut workspaces, tree, mut windows) = manager.serialize_for_handoff();
@@ -18617,6 +18727,150 @@ mod tests {
         );
         let sessions = fixture.server.live_sessions.read().await;
         assert_eq!(sessions[&fixture.left_session].env_window_id, target);
+    }
+
+    async fn prepare_tab_subtree_fixture(
+        fixture: &MoveFixture,
+    ) -> scribe_common::protocol::PaneTreeNode {
+        let split = scribe_common::protocol::PaneTreeNode::Split {
+            direction: scribe_common::protocol::LayoutDirection::Horizontal,
+            ratio: 0.4,
+            first: Box::new(scribe_common::protocol::PaneTreeNode::Leaf {
+                session_id: fixture.sessions[0],
+            }),
+            second: Box::new(scribe_common::protocol::PaneTreeNode::Leaf {
+                session_id: fixture.sessions[1],
+            }),
+        };
+        let mut manager = fixture.server.workspace_manager.write().await;
+        assert!(manager.move_session(fixture.sessions[1], fixture.workspaces[0]));
+        manager.set_window_tree(
+            fixture.source_window,
+            WorkspaceTreeNode::Split {
+                direction: scribe_common::protocol::LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: fixture.workspaces[0],
+                    session_ids: vec![fixture.sessions[0]],
+                    pane_trees: vec![Some(split.clone())],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(transfer_leaf(fixture.workspaces[2], vec![fixture.sessions[2]])),
+            },
+        );
+        drop(manager);
+        fixture
+            .server
+            .live_sessions
+            .write()
+            .await
+            .get_mut(&fixture.sessions[1])
+            .expect("pane session is live")
+            .workspace_id = fixture.workspaces[0];
+        split
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[tokio::test]
+    async fn tab_subtree_move_keeps_pty_routes_and_refreshes_the_window_once() {
+        let mut fixture = move_fixture(3, [None; 4]).await;
+        let split = prepare_tab_subtree_fixture(&fixture).await;
+
+        assert_eq!(
+            fixture
+                .run_tab_subtree(
+                    116,
+                    0,
+                    2,
+                    WorkspaceMoveOperation::MoveTab {
+                        tab_session_id: fixture.sessions[0],
+                        target_index: 1,
+                    },
+                )
+                .await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+
+        {
+            let manager = fixture.server.workspace_manager.read().await;
+            assert_eq!(
+                manager.window_for_session(fixture.sessions[0]),
+                Some(fixture.source_window)
+            );
+            assert_eq!(
+                manager.window_for_session(fixture.sessions[1]),
+                Some(fixture.source_window)
+            );
+            assert_eq!(
+                manager.window_tree(fixture.source_window),
+                Some(&WorkspaceTreeNode::Leaf {
+                    workspace_id: fixture.workspaces[2],
+                    session_ids: vec![fixture.sessions[2], fixture.sessions[0]],
+                    pane_trees: vec![None, Some(split)],
+                    active_tab_index: 1,
+                })
+            );
+        }
+        let live = fixture.server.live_sessions.read().await;
+        for session in &fixture.sessions[..3] {
+            assert_eq!(live[session].env_window_id, fixture.source_window);
+            assert!(!lock_sinks(&live[session].client_writer).is_empty());
+        }
+        assert_eq!(live[&fixture.sessions[0]].workspace_id, fixture.workspaces[2]);
+        assert_eq!(live[&fixture.sessions[1]].workspace_id, fixture.workspaces[2]);
+        drop(live);
+        let attached = fixture.source_attached.lock().await;
+        assert!(fixture.sessions[..3].iter().all(|session| attached.contains(session)));
+        drop(attached);
+
+        let list = read_move_frame(&mut fixture.source_read).await;
+        assert!(matches!(
+            list,
+            ServerMessage::SessionList { workspace_tree: Some(WorkspaceTreeNode::Leaf {
+                workspace_id,
+                active_tab_index: 1,
+                ..
+            }), .. } if workspace_id == fixture.workspaces[2]
+        ));
+        assert_no_further_frame(&mut fixture.source_read).await;
+    }
+
+    // @lat: [[server#Workspace Move#Typed refusals]]
+    #[tokio::test]
+    async fn tab_subtree_refusal_and_handoff_gate_leave_live_state_unchanged() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        let before = fixture.state_snapshot().await;
+        assert_eq!(
+            fixture
+                .run_tab_subtree(
+                    117,
+                    0,
+                    1,
+                    WorkspaceMoveOperation::MoveTab {
+                        tab_session_id: SessionId::new(),
+                        target_index: 0,
+                    },
+                )
+                .await,
+            refused_workspace_move(WorkspaceMoveRefusal::NotWorkspaceOwner)
+        );
+        fixture.server.workspace_transfers.lock().await.begin_handoff();
+        assert_eq!(
+            fixture
+                .run_tab_subtree(
+                    118,
+                    0,
+                    1,
+                    WorkspaceMoveOperation::MoveTab {
+                        tab_session_id: fixture.sessions[0],
+                        target_index: 0,
+                    },
+                )
+                .await,
+            refused_workspace_move(WorkspaceMoveRefusal::HandoffInProgress)
+        );
+        fixture.server.workspace_transfers.lock().await.abort_handoff();
+        assert_eq!(fixture.state_snapshot().await, before);
     }
 
     // @lat: [[server#Workspace Move#Edge insertion]]

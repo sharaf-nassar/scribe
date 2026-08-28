@@ -167,10 +167,11 @@ use scribe_client::{
         GroupBadge, TabBarColors, TabData, accent_tab_tone, context_suffix, flash_blend, px_units,
         reorder_target_index, workspace_pill_label,
     },
-    tab_session::{TabAddress, TabEntry, TabSessions},
+    tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent,
-        TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph, beads_graph_icon,
+        StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TabDrag, TitlebarEvent,
+        TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px,
+        beads_graph_icon,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -2027,6 +2028,8 @@ struct TerminalView {
     /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
     /// region's top strip.
     region_chrome: RegionChrome,
+    /// Cross-region destination tracked while a top or lower tab drag is live.
+    tab_subtree_drag: Option<TabSubtreeDragState>,
     /// Client-local workspace pill drag lifecycle and actionable preview.
     workspace_drag: WorkspaceDrag,
     /// Source bounds sampled with the last drag update, used by release paths
@@ -2249,7 +2252,9 @@ struct RegionTabSlot {
 /// the same rule the titlebar's centre test applies.
 #[derive(Clone, Copy)]
 struct RegionTabDragState {
-    /// The bar being dragged within. A drag never crosses regions.
+    /// The root session whose complete pane subtree is being dragged.
+    session_id: SessionId,
+    /// The bar the drag began in.
     workspace_id: WorkspaceId,
     /// Slot the drag began at, held fixed so travel stays absolute.
     origin: usize,
@@ -2268,6 +2273,19 @@ struct RegionTabDragState {
 struct RegionChrome {
     bars: Vec<RegionBarData>,
     drag: Option<RegionTabDragState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSubtreeDropTarget {
+    workspace_id: WorkspaceId,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabSubtreeDragState {
+    source: TabAddress,
+    target: Option<TabSubtreeDropTarget>,
+    left_source_bar: bool,
 }
 
 struct RegionBarData {
@@ -2758,6 +2776,7 @@ impl TerminalView {
             rendered_tabs: TabSessions::new(),
             titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
+            tab_subtree_drag: None,
             workspace_drag: WorkspaceDrag::default(),
             workspace_drag_bounds: None,
             gpui_window: window.window_handle(),
@@ -8842,6 +8861,250 @@ impl TerminalView {
     /// One lower region's bar: named or neutral workspace pill, then its tabs,
     /// over a hairline in the region's tab tone — the same shape the titlebar
     /// draws for a top-row region's group.
+    fn titlebar_tab_drag_source(&self, cx: &App) -> Option<TabAddress> {
+        let (origin, _, session_id) = self.titlebar.read(cx).dragged_slot()?;
+        let source = self.titlebar_slots.get(origin).copied()?;
+        (source.session_id == session_id).then_some(source).or_else(|| {
+            self.rendered_tabs.addresses().find(|address| address.session_id == session_id).map(
+                |mut address| {
+                    address.index = source.index;
+                    address
+                },
+            )
+        })
+    }
+
+    fn lower_tab_drag_source(&self) -> Option<TabAddress> {
+        let drag = self.region_chrome.drag?;
+        Some(TabAddress {
+            workspace_id: drag.workspace_id,
+            index: drag.origin,
+            session_id: drag.session_id,
+        })
+    }
+
+    fn tab_bar_insertion_index(
+        pointer_x: f32,
+        bar_left: f32,
+        bar_width: f32,
+        badge_width: f32,
+        tab_count: usize,
+    ) -> usize {
+        if tab_count == 0 {
+            return 0;
+        }
+        let tabs_left = bar_left + badge_width.min(bar_width.max(0.0));
+        let tab_span = (bar_width - badge_width).max(0.0);
+        let slot_width = tab_span / px_units(tab_count);
+        if slot_width <= 0.0 {
+            return tab_count;
+        }
+        let center = pointer_x - tabs_left + slot_width / 2.0;
+        let mut index = 0;
+        let mut edge = slot_width;
+        while center >= edge && index < tab_count {
+            index += 1;
+            edge += slot_width;
+        }
+        index
+    }
+
+    fn point_in_workspace_tab_bar(
+        &self,
+        point: Point<Pixels>,
+        workspace_id: WorkspaceId,
+        cx: &App,
+    ) -> bool {
+        let pointer = DragPoint { x: f32::from(point.x), y: f32::from(point.y) };
+        let origin = self.workspace_drag_grid_origin();
+        let viewport = self.pane_viewport();
+        if let Some((_, rect)) = self
+            .shell
+            .region_bar_rects(viewport, self.tab_bar_height, cx)
+            .into_iter()
+            .find(|(candidate, _)| *candidate == workspace_id)
+        {
+            return pointer.x >= origin.x + rect.x
+                && pointer.x <= origin.x + rect.x + rect.width
+                && pointer.y >= origin.y + rect.y
+                && pointer.y <= origin.y + rect.y + rect.height;
+        }
+        self.shell.workspace_rect(workspace_id, viewport, cx).is_some_and(|rect| {
+            rect.y <= f32::EPSILON
+                && pointer.x >= origin.x + rect.x
+                && pointer.x <= origin.x + rect.x + rect.width
+                && (0.0..=self.tab_bar_height).contains(&pointer.y)
+        })
+    }
+
+    fn titlebar_badge_width(&self, workspace_id: WorkspaceId, cx: &App) -> f32 {
+        self.titlebar_slots
+            .iter()
+            .zip(self.titlebar.read(cx).tabs())
+            .find_map(|(slot, tab)| {
+                (slot.workspace_id == workspace_id).then_some(tab.badge.as_ref())
+            })
+            .flatten()
+            .map_or(0.0, badge_width_px)
+    }
+
+    fn top_tab_subtree_target(
+        &self,
+        pointer: DragPoint,
+        source_workspace: WorkspaceId,
+        cx: &App,
+    ) -> Option<TabSubtreeDropTarget> {
+        if !(0.0..=self.tab_bar_height).contains(&pointer.y) {
+            return None;
+        }
+        let origin = self.workspace_drag_grid_origin();
+        for (workspace_id, rect) in self.shell.workspace_rects(self.pane_viewport(), cx) {
+            if workspace_id == source_workspace || rect.y > f32::EPSILON {
+                continue;
+            }
+            let left = origin.x + rect.x;
+            if pointer.x < left || pointer.x > left + rect.width {
+                continue;
+            }
+            let count = self.rendered_tabs.region(workspace_id).map_or(0, WorkspaceTabs::len);
+            let badge = self.titlebar_badge_width(workspace_id, cx);
+            return Some(TabSubtreeDropTarget {
+                workspace_id,
+                index: Self::tab_bar_insertion_index(pointer.x, left, rect.width, badge, count),
+            });
+        }
+        None
+    }
+
+    fn lower_tab_subtree_target(
+        &self,
+        pointer: DragPoint,
+        source_workspace: WorkspaceId,
+        cx: &App,
+    ) -> Option<TabSubtreeDropTarget> {
+        let origin = self.workspace_drag_grid_origin();
+        for (workspace_id, rect) in
+            self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx)
+        {
+            if workspace_id == source_workspace {
+                continue;
+            }
+            let rect = Rect {
+                x: origin.x + rect.x,
+                y: origin.y + rect.y,
+                width: rect.width,
+                height: rect.height,
+            };
+            if pointer.x < rect.x
+                || pointer.x > rect.x + rect.width
+                || pointer.y < rect.y
+                || pointer.y > rect.y + rect.height
+            {
+                continue;
+            }
+            let bar = self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id);
+            let count = bar.map_or(0, |bar| bar.tabs.len());
+            let badge = bar.and_then(|bar| bar.badge.as_ref()).map_or(0.0, badge_width_px);
+            return Some(TabSubtreeDropTarget {
+                workspace_id,
+                index: Self::tab_bar_insertion_index(pointer.x, rect.x, rect.width, badge, count),
+            });
+        }
+        None
+    }
+
+    fn tab_subtree_target_at(
+        &self,
+        point: Point<Pixels>,
+        source_workspace: WorkspaceId,
+        cx: &App,
+    ) -> Option<TabSubtreeDropTarget> {
+        let pointer = DragPoint { x: f32::from(point.x), y: f32::from(point.y) };
+        self.top_tab_subtree_target(pointer, source_workspace, cx)
+            .or_else(|| self.lower_tab_subtree_target(pointer, source_workspace, cx))
+    }
+
+    fn update_tab_subtree_drag(
+        &mut self,
+        source: Option<TabAddress>,
+        point: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = source else { return };
+        if self.tab_subtree_drag.is_none_or(|drag| drag.source.session_id != source.session_id) {
+            self.tab_subtree_drag =
+                Some(TabSubtreeDragState { source, target: None, left_source_bar: false });
+        }
+        let target = self.tab_subtree_target_at(point, source.workspace_id, cx);
+        let left_source_bar = !self.point_in_workspace_tab_bar(point, source.workspace_id, cx);
+        if let Some(drag) = self.tab_subtree_drag.as_mut() {
+            drag.target = target;
+            drag.left_source_bar |= left_source_bar;
+        }
+    }
+
+    fn rollback_tab_subtree_reorder(&mut self, drag: TabSubtreeDragState, cx: &mut Context<Self>) {
+        let moved = self.shared.tabs.lock().is_ok_and(|mut tabs| {
+            let Some(current) =
+                tabs.addresses().find(|address| address.session_id == drag.source.session_id)
+            else {
+                return false;
+            };
+            current.workspace_id == drag.source.workspace_id
+                && tabs.reorder(current.workspace_id, current.index, drag.source.index)
+        });
+        if moved {
+            self.report_workspace_tree(cx);
+            cx.notify();
+        }
+    }
+
+    fn finish_tab_subtree_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.tab_subtree_drag.take() else { return false };
+        if !drag.left_source_bar {
+            return false;
+        }
+        self.rollback_tab_subtree_reorder(drag, cx);
+        let Some(target) = drag.target else { return true };
+        let Some(window_id) =
+            self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id())
+        else {
+            return true;
+        };
+        let target_resolved = self.shell.has_region(drag.source.workspace_id, cx)
+            && self.shell.has_region(target.workspace_id, cx)
+            && self.shared.tabs.lock().is_ok_and(|tabs| {
+                tabs.region_of_tab(drag.source.session_id) == Some(drag.source.workspace_id)
+            });
+        self.begin_workspace_move(
+            workspace_move_request(
+                drag.source.workspace_id,
+                window_id,
+                target.workspace_id,
+                WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: drag.source.session_id,
+                    target_index: target.index,
+                },
+            ),
+            target_resolved,
+            cx,
+        );
+        true
+    }
+
+    fn cancel_tab_subtree_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.tab_subtree_drag.take() else { return false };
+        if !drag.left_source_bar {
+            return false;
+        }
+        self.rollback_tab_subtree_reorder(drag, cx);
+        self.region_chrome.drag = None;
+        self.titlebar.update(cx, |titlebar, ctx| titlebar.end_drag(false, ctx));
+        cx.stop_active_drag(window);
+        cx.notify();
+        true
+    }
+
     /// Advance a region bar's tab drag to `cursor_x`, swapping slots as the
     /// dragged tab's centre crosses into a neighbour's.
     ///
@@ -9052,6 +9315,7 @@ impl TerminalView {
                 MouseButton::Left,
                 cx.listener(move |view, event: &MouseDownEvent, _win, ctx| {
                     view.region_chrome.drag = Some(RegionTabDragState {
+                        session_id,
                         workspace_id,
                         origin: index,
                         current: index,
@@ -12857,7 +13121,9 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        if event.keystroke.key == "escape" && self.cancel_workspace_drag(window, cx) {
+        if event.keystroke.key == "escape"
+            && (self.cancel_tab_subtree_drag(window, cx) || self.cancel_workspace_drag(window, cx))
+        {
             cx.stop_propagation();
             return;
         }
@@ -12905,10 +13171,20 @@ impl TerminalView {
             }
             view.update_workspace_drag(event.event.position, win, ctx);
         }))
+        .on_drag_move(cx.listener(|view, event: &DragMoveEvent<TabDrag>, win, ctx| {
+            win.focus(&view.focus.root, ctx);
+            let source = view.titlebar_tab_drag_source(ctx);
+            view.update_tab_subtree_drag(source, event.event.position, ctx);
+        }))
+        .on_drag_move(cx.listener(|view, event: &DragMoveEvent<RegionTabDrag>, win, ctx| {
+            win.focus(&view.focus.root, ctx);
+            let source = view.lower_tab_drag_source();
+            view.update_tab_subtree_drag(source, event.event.position, ctx);
+        }))
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
-                if view.finish_workspace_drag(ctx) {
+                if view.finish_tab_subtree_drag(ctx) || view.finish_workspace_drag(ctx) {
                     ctx.stop_propagation();
                 }
             }),
@@ -12916,7 +13192,7 @@ impl TerminalView {
         .on_mouse_up_out(
             MouseButton::Left,
             cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
-                if view.finish_workspace_drag(ctx) {
+                if view.finish_tab_subtree_drag(ctx) || view.finish_workspace_drag(ctx) {
                     ctx.stop_propagation();
                 }
             }),
@@ -16506,15 +16782,25 @@ fn park_server_topology(
     if sessions.is_empty() {
         return;
     }
-    // A connection's first list rebuilds the window. A later one is parked only
-    // when it names a session this window has never held, which is exactly the
-    // destination side of a workspace move: the server re-lists both survivors,
-    // and only the destination's list grows. The source side keeps collapsing
-    // through the pane-retire path it already used for a tear-out, so phase-1
-    // behaviour is untouched. Adoption itself remains
+    // A connection's first list rebuilds the window. A later one is parked when
+    // it names a session this window has never held (a cross-window workspace
+    // arrival) or re-files an existing session into another region (an atomic
+    // tab-subtree move). Adoption itself remains
     // [`TerminalView::adopt_server_topology`]'s authorship decision.
     let adopted = sessions.iter().any(|session| !registry.tracks(session.session_id));
-    if !first_on_connection && !adopted {
+    let tracked_workspaces: HashMap<SessionId, WorkspaceId> = registry
+        .reconnect_topology()
+        .into_iter()
+        .flat_map(|(workspace_id, tracked_sessions)| {
+            tracked_sessions.into_iter().map(move |session_id| (session_id, workspace_id))
+        })
+        .collect();
+    let refiled = sessions.iter().any(|session| {
+        tracked_workspaces
+            .get(&session.session_id)
+            .is_some_and(|workspace_id| *workspace_id != session.workspace_id)
+    });
+    if !first_on_connection && !adopted && !refiled {
         return;
     }
     let Some(tree) = workspace_tree else { return };
@@ -18185,6 +18471,19 @@ mod tests {
             tab_adoption_target(Some(workspace_id), true),
             Some(TabAdoptionTarget::Own(workspace_id))
         );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Atomic tab-subtree region transfer]]
+    #[test]
+    fn cross_region_tab_drop_resolves_an_insertion_slot() {
+        assert_eq!(TerminalView::tab_bar_insertion_index(100.0, 0.0, 400.0, 0.0, 4), 1);
+        assert_eq!(TerminalView::tab_bar_insertion_index(390.0, 0.0, 400.0, 0.0, 4), 4);
+        assert_eq!(
+            TerminalView::tab_bar_insertion_index(90.0, 0.0, 400.0, 80.0, 4),
+            0,
+            "the workspace pill targets the front of its bar"
+        );
+        assert_eq!(TerminalView::tab_bar_insertion_index(200.0, 0.0, 400.0, 80.0, 0), 0);
     }
 
     #[test]

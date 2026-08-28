@@ -3359,6 +3359,8 @@ Phase 0 opens three tabs. Phase 1 drags the first onto the third slot and requir
 
 Layout chords dispatch from the pane's focus handle, so the script clicks back into the grid before the split: the drag it just performed leaves GPUI focus on a titlebar tab, where a chord never reaches the layout path.
 
+Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. The atomic titlebar↔lower-bar transaction is pinned headlessly below; registering its Docker pointer recipe belongs to the follow-up E2E bead.
+
 ### Warm multi-window restore drives the real client
 
 `tests/e2e/visual/multi-window-restore.sh` (`just e2e-visual-multi-window-restore`) is the app-level oracle for the restart users actually perform: quitting with several windows open and relaunching brings every one of them back.
@@ -4603,6 +4605,14 @@ Pending headless suites and the parity rows they will satisfy:
 Unit coverage for the wire→layout lowering `PaneShell::adopt_server_tree` performs when a fresh window rebuilds its regions from the server's persisted workspace tree.
 
 A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to itself and lowers through `WindowLayout::from_tree` to regions sharing y and splitting the width — pinning the orientation convention (`Horizontal` = side-by-side, `Vertical` = stacked) across the report→persist→adopt round trip so a reconnect can never transpose the window layout.
+
+### Atomic tab-subtree region transfer
+
+Focused client/server tests cover atomic top↔lower tab-subtree moves without starting a live Scribe process.
+
+`TabSessions` proves the authoritative root re-file uses the shared departure clamp while pane sessions stay out of the strip; `PaneShell` adopts the resulting two-region tree with exact tab order, pane split, active indices, and focused child session. The drag-slot helper pins destination insertion at tab midpoints and at the workspace pill's leading edge.
+
+Server manager tests move a split-bearing tab top→lower and lower→top, preserve inactive-region selection, collapse an emptied source only after commit, and serialize/restore the committed tree and workspace membership through handoff. IPC transaction tests prove live PTY routes and attached sets remain intact, the window receives one full `SessionList`, and typed/handoff refusals leave serialized manager/live state unchanged. The named MessagePack fixture freezes the additive `MoveTab` operation under the existing `workspace_move` capability.
 
 ### Lower regions reserve their tab bar
 

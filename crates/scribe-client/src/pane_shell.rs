@@ -2373,6 +2373,78 @@ mod tests {
         );
     }
 
+    // @lat: [[test#GPUI Client Headless Suites#Atomic tab-subtree region transfer]]
+    #[gpui::test]
+    fn authoritative_tab_subtree_adoption_preserves_tree_order_active_tabs_and_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let (top, lower) = (WorkspaceId::new(), WorkspaceId::new());
+            let (moved, pane, top_stays, lower_first, lower_stays) = (
+                SessionId::new(),
+                SessionId::new(),
+                SessionId::new(),
+                SessionId::new(),
+                SessionId::new(),
+            );
+            let (before, after) = subtree_adoption_trees(
+                (top, lower),
+                [moved, pane, top_stays, lower_first, lower_stays],
+            );
+            let live: HashSet<_> =
+                [moved, pane, top_stays, lower_first, lower_stays].into_iter().collect();
+            let mut strip = TabSessions::new();
+            strip.insert_pane(pane, top);
+            strip.reconcile(
+                vec![
+                    TabEntry::new(moved, top, "moved".to_owned()),
+                    TabEntry::new(pane, top, "pane".to_owned()),
+                    TabEntry::new(top_stays, top, "top".to_owned()),
+                    TabEntry::new(lower_first, lower, "lower-first".to_owned()),
+                    TabEntry::new(lower_stays, lower, "lower-stays".to_owned()),
+                ],
+                Some(pane),
+            );
+            strip.order_by(&wire_tree_tab_order(&before));
+            strip.show(moved);
+            strip.show(lower_stays);
+
+            let mut shell = PaneShell::new([0.1, 0.2, 0.3, 1.0], cx);
+            shell.adopt_server_tree(&before, &live, cx);
+            let (_, focused_pane) = shell.pane_for_session(pane, cx).expect("split pane visible");
+            shell.focus_pane(top, focused_pane, cx);
+            assert_eq!(shell.focused_session(cx), Some(pane));
+
+            strip.insert_pane(pane, lower);
+            strip.reconcile(
+                vec![
+                    TabEntry::new(top_stays, top, "top".to_owned()),
+                    TabEntry::new(lower_first, lower, "lower-first".to_owned()),
+                    TabEntry::new(moved, lower, "moved".to_owned()),
+                    TabEntry::new(pane, lower, "pane".to_owned()),
+                    TabEntry::new(lower_stays, lower, "lower-stays".to_owned()),
+                ],
+                Some(pane),
+            );
+            strip.order_by(&wire_tree_tab_order(&after));
+            strip.show(top_stays);
+            strip.show(moved);
+
+            shell.adopt_server_tree(&after, &live, cx);
+            let (_, moved_pane) = shell.pane_for_session(pane, cx).expect("moved pane visible");
+            shell.focus_pane(lower, moved_pane, cx);
+
+            assert_eq!(shell.focused_session(cx), Some(pane));
+            assert_eq!(shell.region_shown_session(top), Some(top_stays));
+            assert_eq!(shell.region_shown_session(lower), Some(moved));
+            assert_eq!(
+                wire_tree_tab_order(&shell.wire_tree(&strip, cx)),
+                [top_stays, lower_first, moved, lower_stays]
+            );
+            assert_eq!(shell.wire_tree(&strip, cx), after);
+        });
+    }
+
     // @lat: [[test#GPUI Client Headless Suites#Tab order spans every region of the tree]]
     #[test]
     fn tab_order_spans_every_region_of_the_tree() {
@@ -2414,5 +2486,48 @@ mod tests {
             first: Box::new(PaneTreeNode::Leaf { session_id: tab }),
             second: Box::new(PaneTreeNode::Leaf { session_id: pane }),
         }
+    }
+
+    /// The before/after authoritative trees for tab-subtree adoption: the
+    /// regression fixture. `moved` — carrying its split with `pane` — leaves
+    /// the top region for the middle of the lower region's strip.
+    fn subtree_adoption_trees(
+        (top, lower): (WorkspaceId, WorkspaceId),
+        [moved, pane, top_stays, lower_first, lower_stays]: [SessionId; 5],
+    ) -> (WorkspaceTreeNode, WorkspaceTreeNode) {
+        let split = pane_split(moved, pane);
+        let before = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: top,
+                session_ids: vec![moved, top_stays],
+                pane_trees: vec![Some(split.clone()), None],
+                active_tab_index: 0,
+            }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: lower,
+                session_ids: vec![lower_first, lower_stays],
+                pane_trees: vec![None, None],
+                active_tab_index: 1,
+            }),
+        };
+        let after = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: top,
+                session_ids: vec![top_stays],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: lower,
+                session_ids: vec![lower_first, moved, lower_stays],
+                pane_trees: vec![None, Some(split), None],
+                active_tab_index: 1,
+            }),
+        };
+        (before, after)
     }
 }

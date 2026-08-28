@@ -625,6 +625,7 @@ impl TabSessions {
             .flat_map(|region| {
                 region.tabs.iter().enumerate().map(move |(index, tab)| {
                     let mut data = TabData::new(tab.display_title().to_owned());
+                    data.session_id = Some(tab.session_id);
                     data.accessibility_id = tab.session_id.to_string();
                     data.is_active = index == region.active;
                     data

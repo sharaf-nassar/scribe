@@ -287,6 +287,11 @@ fn insert_workspace_move_fixtures(
             WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left },
         ),
         ("workspace_move_swap_request", 32, WorkspaceMoveOperation::Swap),
+        (
+            "workspace_move_tab_subtree_request",
+            33,
+            WorkspaceMoveOperation::MoveTab { tab_session_id: model.session_id, target_index: 1 },
+        ),
     ] {
         insert_named(
             values,
@@ -466,7 +471,9 @@ fn decode_fixtures(
         let bytes = unhex(encoded)?;
         match name.as_str() {
             "local_hello_old" | "local_hello_new" => decode_client_fixture(name, &bytes)?,
-            "workspace_move_edge_insert_request" | "workspace_move_swap_request" => {
+            "workspace_move_edge_insert_request"
+            | "workspace_move_swap_request"
+            | "workspace_move_tab_subtree_request" => {
                 decode_workspace_move_request_fixture(name, &bytes, model)?;
             }
             "workspace_move_edge_insert_result" | "workspace_move_swap_result" => {
@@ -561,9 +568,17 @@ fn decode_workspace_move_request_fixture(
             WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left }
         }
         "workspace_move_swap_request" => WorkspaceMoveOperation::Swap,
+        "workspace_move_tab_subtree_request" => {
+            WorkspaceMoveOperation::MoveTab { tab_session_id: model.session_id, target_index: 1 }
+        }
         _ => return Err(format!("unknown workspace-move request fixture {name}")),
     };
-    let expected_move_id = if name.contains("edge_insert") { 31 } else { 32 };
+    let expected_move_id = match name {
+        "workspace_move_edge_insert_request" => 31,
+        "workspace_move_swap_request" => 32,
+        "workspace_move_tab_subtree_request" => 33,
+        _ => return Err(format!("unknown workspace-move request fixture {name}")),
+    };
     if !matches!(
         message,
         ClientMessage::MoveWorkspace {

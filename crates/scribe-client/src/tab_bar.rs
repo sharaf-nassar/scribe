@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use gpui::Rgba;
-use scribe_common::theme::ChromeColors;
+use scribe_common::{ids::SessionId, theme::ChromeColors};
 
 use crate::opacity::scale_alpha;
 
@@ -175,6 +175,9 @@ pub fn context_suffix(percent: u8, warn: u8, danger: u8, pulsing: bool) -> Optio
 /// Per-tab data the titlebar renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabData {
+    /// The root session whose pane subtree this tab owns. Test-only synthetic
+    /// tabs leave it absent.
+    pub session_id: Option<SessionId>,
     /// Stable identifier for the session this tab represents. It is distinct
     /// from the mutable strip index so its AccessKit node survives reorders.
     pub accessibility_id: String,
@@ -223,6 +226,7 @@ impl TabData {
     pub fn new(title: impl Into<String>) -> Self {
         let title = title.into();
         Self {
+            session_id: None,
             // Production callers replace this with the server session ID.
             // Keeping test-only tabs deterministic still makes accidental
             // duplicate IDs apparent in the accessibility coverage.

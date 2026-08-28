@@ -717,8 +717,16 @@ pub enum WorkspaceMoveRefusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceMoveOperation {
-    InsertAtEdge { edge: WorkspaceTreeEdge },
+    InsertAtEdge {
+        edge: WorkspaceTreeEdge,
+    },
     Swap,
+    /// Move one complete tab and its pane subtree between regions of the same
+    /// window, inserting it at `target_index` in the destination leaf.
+    MoveTab {
+        tab_session_id: SessionId,
+        target_index: usize,
+    },
 }
 
 // ── UI → Server ──────────────────────────────────────────────────
@@ -795,12 +803,12 @@ pub enum ClientMessage {
         workspace_id: WorkspaceId,
         target_window_id: WindowId,
     },
-    /// Atomically move one workspace into an existing destination window.
+    /// Atomically move one workspace into an existing destination window, or
+    /// one complete tab subtree between regions of this window.
     ///
     /// The client mints `move_id` to correlate this request with
-    /// [`ServerMessage::WorkspaceMoveResult`]. The server derives both
-    /// post-move trees from its authoritative state; no client tree crosses
-    /// this boundary.
+    /// [`ServerMessage::WorkspaceMoveResult`]. The server derives the resulting
+    /// tree(s) from authoritative state; no client tree crosses this boundary.
     MoveWorkspace {
         move_id: u64,
         workspace_id: WorkspaceId,
@@ -929,7 +937,7 @@ pub enum ClientMessage {
         #[serde(default)]
         workspace_transfer: bool,
         /// Workspace-move protocol support. Missing means the peer cannot
-        /// participate in an existing-window workspace move.
+        /// participate in an existing-window workspace or tab-subtree move.
         #[serde(default)]
         workspace_move: bool,
     },
@@ -3056,6 +3064,7 @@ mod tests {
         let requests = [
             WorkspaceMoveOperation::InsertAtEdge { edge: WorkspaceTreeEdge::Left },
             WorkspaceMoveOperation::Swap,
+            WorkspaceMoveOperation::MoveTab { tab_session_id: SessionId::new(), target_index: 2 },
         ];
         for operation in requests {
             let request = ClientMessage::MoveWorkspace {

@@ -528,7 +528,7 @@ capability-gated, idempotent `MoveWorkspace` transaction.
 
 Source and target window control are validated before env staging and
 revalidated under the gate at commit. The server advertises `workspace_move`
-only now that both operations are handled.
+for edge insertion, swap, and the same-window tab-subtree operation.
 
 ### Edge insertion
 
@@ -557,6 +557,16 @@ directly into the populated target, and records `source_closed` beside the
 result. The requester receives `WorkspaceMoveResult::Moved` followed by
 `WindowClosed`; retries before or after handoff replay both acknowledgements. A
 sole-source swap returns the specific `SoleWorkspace` refusal.
+
+### Atomic tab-subtree transfer
+
+`WorkspaceMoveOperation::MoveTab` reuses the workspace-move capability, gate, result ledger, and full-state refresh for one same-window tab/pane subtree.
+
+[[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_workspace]] extracts the tab root and its parallel `pane_trees` entry as one subtree, derives every child `SessionId`, inserts the untouched payload at `target_index`, and re-files all of those live sessions under the target workspace in one mutable borrow. No PTY, scrollback, program, window owner, env coordinate, sink, attachment, or agent route changes.
+
+The source leaf keeps its shown tab by identity, clamping successor-then-predecessor only when the moved tab was active. The destination likewise keeps its shown tab for an inactive move; an active moved tab remains active at its inserted slot. A source leaf that loses its last tab is extracted only when the moved subtree accounts for every session in that workspace, then its empty workspace record is retired after commit. Refusal, including an invalid root/index or a handoff in progress, happens against cloned trees before any registry mutation.
+
+The finalizer emits one full `SessionList` (and, when the window is shared, one full `ShareRoster`) for the surviving window. Its existing routes remain attached: unlike a cross-window move there is no env staging, severance, destination attach, or activity re-broadcast.
 
 ### Share route migration
 
