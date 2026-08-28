@@ -460,6 +460,10 @@ e2e-visual-geometry-capture-probe: e2e-visual-image-current
 e2e-visual-tab-drag-reorder: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-reorder.sh
 
+# Move a pane-bearing tab subtree between titlebar and lower-region bars.
+e2e-visual-tab-drag-cross-region: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-cross-region.sh
+
 # Run the warm multi-window restore E2E against the real client. No wire tap:
 # it quits and relaunches the client several times, which the tap's renamed
 # socket does not survive. It opens a second window, quits, relaunches, and
@@ -596,6 +600,10 @@ e2e-visual-workspace-drag-tearout: e2e-visual-image-current
 # pointer input, with wire/tree oracles for directional moves and tear-out.
 e2e-visual-workspace-drag-palette: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-drag-palette.sh
+
+# Drive palette and measured-X11 pointer workspace moves into a sibling window.
+e2e-visual-workspace-cross-window: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-cross-window.sh
 
 # Run the workspace Beads board visual contract against the generated mock manifest.
 e2e-visual-beads-board: e2e-visual-image-current
@@ -769,6 +777,7 @@ e2e-all-visual: build-release docker-visual
         'visual/settings-theme-picker.sh|e2e-visual-settings-theme-picker'
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
+        'visual/tab-drag-cross-region.sh|e2e-visual-tab-drag-cross-region'
         'visual/tab-drag-reorder.sh|e2e-visual-tab-drag-reorder'
         'visual/tab-switching.sh|e2e-visual-tab-switching'
         'visual/tab-window-chords.sh|e2e-visual'
@@ -785,6 +794,7 @@ e2e-all-visual: build-release docker-visual
         'visual/window-chrome-bands.sh|e2e-visual-chrome-bands'
         'visual/window-lifecycle.sh|e2e-visual-window-lifecycle'
         'visual/window-resize.sh|e2e-visual-window-resize'
+        'visual/workspace-cross-window.sh|e2e-visual-workspace-cross-window'
         'visual/workspace-drag-palette.sh|e2e-visual-workspace-drag-palette'
         'visual/workspace-drag-tearout.sh|e2e-visual-workspace-drag-tearout'
         'visual/workspace-ipc.sh|e2e-visual-workspace-ipc'

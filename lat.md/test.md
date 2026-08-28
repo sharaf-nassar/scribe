@@ -108,6 +108,14 @@ asserting each typed outcome is still recorded. The existing concurrent
 handoff/agent-world gate tests apply to moves because both transaction kinds use
 the same `TransferGate`.
 
+`tests/e2e/func/workspace-transfer.sh` is the network-none production-socket
+complement: it creates two populated windows with stable launch identities,
+checks legacy move refusal before mutation, edge insertion, bidirectional swap,
+and a sole-source close, while retaining the phase-one unread transfer retry
+after a real upgrade. It reads both `world` and origin-scoped `siblings` before and after the
+edge move, and proves stale source input cannot reach the moved PTY while a
+destination `AttachSessions` can.
+
 ## GitHub CI Tracking
 
 Server unit fixtures verify the local push gate before any GitHub polling or client protocol is involved.
@@ -3359,7 +3367,7 @@ Phase 0 opens three tabs. Phase 1 drags the first onto the third slot and requir
 
 Layout chords dispatch from the pane's focus handle, so the script clicks back into the grid before the split: the drag it just performed leaves GPUI focus on a titlebar tab, where a chord never reaches the layout path.
 
-Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. The atomic titlebar↔lower-bar transaction is pinned headlessly below; registering its Docker pointer recipe belongs to the follow-up E2E bead.
+Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. `tests/e2e/visual/tab-drag-cross-region.sh` now owns the atomic lower-bar→titlebar pointer route: it cancels a live gesture with Escape, then moves one retained tab subtree and requires the correlated `MoveTab`, one same-window full refresh, and no replacement `SessionCreated`.
 
 ### Warm multi-window restore drives the real client
 
@@ -5664,13 +5672,27 @@ bounded timeout, and reads fields from the first matching post-reset frame;
 pointer tear-out keeps source-collapse plus any exact atomic target report, and
 palette keeps its final exact target-leaf contract.
 
+`tests/e2e/visual/workspace-cross-window.sh`
+(`just e2e-visual-workspace-cross-window`) creates two live GPUI windows and
+keeps the text contract split at the right boundary: shared unit coverage pins
+the centre sentence and edge-text absence, while the visual recipe proves the
+palette's edge/swap rows and measured X11 pointer edge/swap reach the matching
+wire operations with no replacement session. It also holds sibling previews
+through Escape and blur, requiring no `MoveWorkspace` on either cancellation.
+
+Wayland proof is palette-only: launch two windows under nested Mutter, use the
+same palette edge and swap rows, confirm both `WorkspaceMoveResult::Moved`
+frames and post-move trees, then verify Escape/blur leaves no stuck palette or
+preview. Do **not** perform or claim a cross-window pointer drop there: Mutter
+is only the non-pointer checklist (two windows map, palette rows appear, edge
+and swap commit, Escape/blur clean up, and no pointer-support assertion).
+
 The native AppKit delivery probe run `32667985883` predates the feature. The
 post-implementation AppKit attempts `32681212383`, `32683626572`,
 `32684587908`, `32685531097`, and `32686590501` did not reach a shipped pill
-drag marker; macOS pointer coverage is deliberately not claimed. The nested
-Mutter spike likewise establishes input delivery only, not a post-implementation
-Wayland interaction checklist. See `specs/029-workspace-drag-tearout.md` for
-failure signatures and the retained platform boundary.
+drag marker; macOS pointer coverage is deliberately not claimed. See
+`specs/029-workspace-drag-tearout.md` for failure signatures and the retained
+platform boundary.
 
 ## GPUI Pane Dividers
 

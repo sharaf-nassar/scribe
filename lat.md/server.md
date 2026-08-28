@@ -592,6 +592,10 @@ After commit each surviving window's participants receive one full
 delta — and session-initiated routes follow ownership rather than the window
 the session started in
 ([[server#Workspace Transfer#Viewer severance and authoritative ownership]]).
+Focused server fixtures assert this order for both local holders and remote
+requesters after a symmetric swap, including discarded pending requests and
+retained destination holders; the production-socket fixture adds the
+network-isolated edge/swap/sole-source and upgrade-replay path.
 
 ### Typed refusals
 

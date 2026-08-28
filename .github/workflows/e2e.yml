@@ -106,6 +106,8 @@ jobs:
           just e2e-visual visual/titlebar.sh
           just e2e-visual-workspace-drag-tearout
           just e2e-visual-workspace-drag-palette
+          just e2e-visual-workspace-cross-window
+          just e2e-visual-tab-drag-cross-region
 
       - name: Run A2/A3 functional contract
         run: just e2e-func-beads-board

@@ -23,7 +23,7 @@ scribe-test workspace-transfer --evidence "$EVIDENCE"
 import json, sys
 with open(sys.argv[1]) as fh:
     evidence = json.load(fh)
-assert evidence["schema_version"] == 1
+assert evidence["schema_version"] == 2
 assert evidence["status"] == "pass"
 expected = {
     "reconnect_tree_persisted",
@@ -34,6 +34,13 @@ expected = {
     "old_server_capability_defaults_false",
     "new_messages_decode_in_old_schemas",
     "agent_world_window_ids_flipped_atomically",
+    "existing_target_edge_insert_preserves_identity_tree_and_env",
+    "bidirectional_centre_swap_preserves_both_trees",
+    "sole_source_reattach_acknowledges_source_close",
+    "workspace_move_never_creates_a_replacement_session",
+    "legacy_workspace_move_refusal_leaves_state_unchanged",
+    "agent_world_and_siblings_flip_workspace_owner",
+    "stale_source_input_cannot_reach_moved_pty",
 }
 assert expected <= set(evidence["checks"]), evidence
 assert evidence["source_window_id"] != evidence["target_window_id"]

@@ -114,6 +114,78 @@ def leaf_session_count(path, wanted):
     return 0
 
 
+def wait_leaf_session_count(path, wanted, count):
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        for item in leaves(latest_tree(path)):
+            if str(item.get("workspace_id")) == wanted and len(item.get("session_ids", [])) == count:
+                print(json.dumps(item, sort_keys=True, separators=(",", ":")))
+                return 0
+        time.sleep(0.2)
+    return 1
+
+
+def assert_workspace_move(path, source_workspace, target_workspace, operation):
+    request = moved = False
+    created = set()
+    known = set()
+    lists = 0
+    for row in rows(path):
+        current = message(row)
+        if row.get("dir") == "client" and current.get("type") == "MoveWorkspace":
+            if (
+                str(current.get("workspace_id")) == source_workspace
+                and str(current.get("target_workspace_id")) == target_workspace
+            ):
+                found = current.get("operation", {})
+                if operation == "swap":
+                    request = found == "swap" or (isinstance(found, dict) and ("swap" in found or "Swap" in found))
+                elif isinstance(found, dict):
+                    edge = found.get("insert_at_edge", found.get("InsertAtEdge", {}))
+                    request = edge.get("edge", "").lower() == operation
+        if row.get("dir") == "server" and current.get("type") == "WorkspaceMoveResult":
+            moved = moved or str(current.get("result", "")).lower() == "moved"
+        if row.get("dir") == "server" and current.get("type") == "SessionList":
+            lists += 1
+            known.update(session.get("session_id") for session in current.get("sessions", []))
+        if row.get("dir") == "server" and current.get("type") == "SessionCreated":
+            created.add(current.get("session_id"))
+    # A move itself creates no PTY. The destination client may attach an
+    # already-listed arrival after its full refresh, which is distinguishable
+    # from a replacement session because every such id was in SessionList.
+    assert request and moved and lists >= 2 and created <= known, (
+        request,
+        moved,
+        lists,
+        created - known,
+    )
+    print(json.dumps({"operation": operation, "session_created_ids_preexisting": True, "session_lists": lists}))
+    return 0
+
+
+def assert_tab_subtree_move(path, source_workspace, target_workspace, session_id):
+    request = moved = False
+    creates = lists = 0
+    for row in rows(path):
+        current = message(row)
+        if row.get("dir") == "client" and current.get("type") == "MoveWorkspace":
+            operation = current.get("operation", {}).get("move_tab", current.get("operation", {}).get("MoveTab", {}))
+            request = request or (
+                str(current.get("workspace_id")) == source_workspace
+                and str(current.get("target_workspace_id")) == target_workspace
+                and str(operation.get("tab_session_id")) == session_id
+            )
+        if row.get("dir") == "server" and current.get("type") == "WorkspaceMoveResult":
+            moved = moved or str(current.get("result", "")).lower() == "moved"
+        if row.get("dir") == "server" and current.get("type") == "SessionList":
+            lists += 1
+        if row.get("dir") == "server" and current.get("type") == "SessionCreated":
+            creates += 1
+    assert request and moved and lists == 1 and creates == 0, (request, moved, lists, creates)
+    print(json.dumps({"session_id": session_id, "session_created": creates, "session_lists": lists}))
+    return 0
+
+
 def wait_report(path):
     deadline = time.time() + 25
     while time.time() < deadline:
@@ -251,6 +323,12 @@ def main(argv):
         return leaf(path, argv[3])
     if command == "leaf-session-count":
         return leaf_session_count(path, argv[3])
+    if command == "wait-leaf-session-count":
+        return wait_leaf_session_count(path, argv[3], int(argv[4]))
+    if command == "assert-workspace-move":
+        return assert_workspace_move(path, argv[3], argv[4], argv[5])
+    if command == "assert-tab-subtree-move":
+        return assert_tab_subtree_move(path, argv[3], argv[4], argv[5])
     if command == "assert-transfer":
         return assert_transfer(path, argv[3], argv[4], argv[5] if len(argv) > 5 else None)
     if command == "frame-types":

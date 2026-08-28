@@ -448,9 +448,11 @@ request as either `Moved` or `Refused { reason }`.
 `WorkspaceMoveRefusal` distinguishes unknown or foreign source workspaces,
 unavailable target window or workspace, absent source or target window control,
 absent capability, handoff, and pre-commit environment rebind failure. The
-named-MessagePack tests and fixtures round-trip edge insertion and swap
-requests plus correlated results; old peer schemas omit `workspace_move` and
-default it to false in both handshake directions.
+named-MessagePack tests and fixtures round-trip edge insertion, swap, and
+tab-subtree requests plus correlated results; old peer schemas omit
+`workspace_move` and default it to false in both handshake directions. The
+network-isolated workspace-transfer fixture also decodes an old `Welcome` and
+proves a legacy `MoveWorkspace` is refused before either tree can mutate.
 
 ### Clipboard Variants
 
