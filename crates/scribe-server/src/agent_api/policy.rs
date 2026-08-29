@@ -101,9 +101,9 @@ struct PolicyState {
     pending: HashMap<PromptKey, PendingPrompt>,
     prompt_keys: HashMap<PromptId, PromptKey>,
     last_decisions: HashMap<PromptKey, CachedDecision>,
-    /// Keys of prompts that stopped being answerable, kept for
-    /// [`PROMPT_TOMBSTONE_TTL`] so a racing click still persists `Always*`.
-    tombstones: HashMap<PromptId, Tombstone>,
+    /// Capabilities and expiry of prompts that stopped being answerable, kept
+    /// for [`PROMPT_TOMBSTONE_TTL`] so a racing click still persists `Always*`.
+    tombstones: HashMap<PromptId, (AgentCapability, Instant)>,
     dismissals: Option<mpsc::UnboundedReceiver<PromptId>>,
 }
 
@@ -132,11 +132,6 @@ impl Hash for PromptKey {
 struct CachedDecision {
     decision: ClipboardDecision,
     resolved_at: Instant,
-}
-
-struct Tombstone {
-    key: PromptKey,
-    expires_at: Instant,
 }
 
 impl AgentPolicyEngine {
@@ -325,7 +320,7 @@ impl AgentPolicyEngine {
                 return;
             };
             let waiters = state.pending.remove(&key).map(|pending| pending.waiters);
-            entomb(&mut state, prompt_id, key);
+            entomb(&mut state, prompt_id, &key);
             waiters
         };
         self.dismissals.send(prompt_id).ok();
@@ -352,7 +347,7 @@ impl AgentPolicyEngine {
             }
             state.pending.remove(&key);
             state.prompt_keys.remove(&prompt_id);
-            entomb(&mut state, prompt_id, key);
+            entomb(&mut state, prompt_id, &key);
         }
         self.dismissals.send(prompt_id).ok();
     }
@@ -360,10 +355,10 @@ impl AgentPolicyEngine {
 
 /// Retire one prompt id that can no longer be answered, keeping its key
 /// answerable for `Always*` until [`PROMPT_TOMBSTONE_TTL`] elapses.
-fn entomb(state: &mut PolicyState, prompt_id: PromptId, key: PromptKey) {
+fn entomb(state: &mut PolicyState, prompt_id: PromptId, key: &PromptKey) {
     let now = Instant::now();
-    state.tombstones.retain(|_, tombstone| tombstone.expires_at > now);
-    state.tombstones.insert(prompt_id, Tombstone { key, expires_at: now + PROMPT_TOMBSTONE_TTL });
+    state.tombstones.retain(|_, (_, expires_at)| *expires_at > now);
+    state.tombstones.insert(prompt_id, (key.capability, now + PROMPT_TOMBSTONE_TTL));
 }
 
 /// Apply a decision that arrived after its prompt was withdrawn.
@@ -378,10 +373,8 @@ fn resolve_tombstoned(
     decision: ClipboardDecision,
     now: Instant,
 ) -> bool {
-    state.tombstones.retain(|_, tombstone| tombstone.expires_at > now);
-    let Some(capability) =
-        state.tombstones.get(&prompt_id).map(|tombstone| tombstone.key.capability)
-    else {
+    state.tombstones.retain(|_, (_, expires_at)| *expires_at > now);
+    let Some((capability, _)) = state.tombstones.get(&prompt_id).copied() else {
         return false;
     };
     if !apply_always_decision(&mut state.config, capability, decision) {

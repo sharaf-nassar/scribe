@@ -165,7 +165,7 @@ design; it is the only out-of-client row in the whole inventory.
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
-The live reader's dispatcher `main.rs::dispatch_server_message` handles 61 of
+The live reader's dispatcher `main.rs::dispatch_server_message` handles 69 of
 76 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —

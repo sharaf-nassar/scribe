@@ -497,7 +497,8 @@ fn build_agent_request(
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
-            progress_ack: true,
+            // Capabilities returns immediately, so it never needs a progress acknowledgement.
+            progress_ack: false,
         },
         AgentCommand::Skill => return None,
     })

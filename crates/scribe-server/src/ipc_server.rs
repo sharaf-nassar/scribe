@@ -11734,27 +11734,10 @@ impl AgentPromptDelivery {
     }
 
     /// Fill in the display context and send the prompt.
-    ///
-    /// Any other frame passes through untouched — this seam only carries
-    /// `AgentPromptRequest` today, and rewriting an unrelated frame would be a
-    /// silent protocol change.
-    async fn send(self, message: ServerMessage) {
-        let message = match message {
-            ServerMessage::AgentPromptRequest {
-                prompt_id,
-                agent_label,
-                capability,
-                target,
-                ..
-            } => ServerMessage::AgentPromptRequest {
-                prompt_id,
-                agent_label,
-                capability,
-                target,
-                context: self.context().await,
-            },
-            other => other,
-        };
+    async fn send(self, mut message: ServerMessage) {
+        if let ServerMessage::AgentPromptRequest { context, .. } = &mut message {
+            *context = self.context().await;
+        }
         send_message(&self.client, &message).await;
     }
 
