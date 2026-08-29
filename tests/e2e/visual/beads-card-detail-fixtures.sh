@@ -19,6 +19,29 @@ window_id() {
     xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1
 }
 
+beads_badge_center() {
+    local marker=/tmp/beads-detail-badge-marker.png
+    local width height scan_height bounds marker_width marker_height marker_x marker_y
+    import -window "$WID" "$marker"
+    read -r width height <<<"$(identify -format '%w %h' "$marker")"
+    scan_height=$(( height < 80 ? height : 80 ))
+    bounds=$(convert "$marker" -crop "${width}x${scan_height}+0+0" \
+        -fill black +opaque '#3B82F6' -fill white -opaque '#3B82F6' -trim \
+        -format '%w %h %X %Y' info:) || fail "could not measure the Beads badge marker"
+    read -r marker_width marker_height marker_x marker_y <<<"$bounds"
+    [[ "$marker_width" =~ ^[0-9]+$ && "$marker_height" =~ ^[0-9]+$ \
+        && "$marker_x" =~ ^\+[0-9]+$ && "$marker_y" =~ ^\+[0-9]+$ ]] \
+        || fail "could not find the Beads badge marker in titlebar geometry: $bounds"
+    printf '%s %s\n' "$(( ${marker_x#+} + marker_width / 2 ))" \
+        "$(( ${marker_y#+} + marker_height / 2 ))"
+}
+
+hover_beads_badge() {
+    local x y
+    read -r x y <<<"$(beads_badge_center)"
+    xdotool mousemove --sync --window "$WID" "$x" "$y"
+}
+
 inject() {
     scribe-test share-inject --control "$CONTROL" "$1"
     sleep 0.5
@@ -116,9 +139,25 @@ LOADING_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
     $1 == "loading" { sub(/^[^\t]*\t/, ""); print; exit }
 ')
 [ -n "$LOADING_MESSAGE" ] || fail "loading fixture missing"
-inject "$LOADING_MESSAGE"
-# Hovering its badge must reveal the five fixture cards.
-xdotool mousemove --sync --window "$WID" 66 17
+
+# Hovering the badge refreshes any board snapshot older than 30 seconds
+# (BEADS_HOVER_REFRESH_AGE), and the real server's NotDetected reply then
+# replaces the fixture before the phase's card click. The one-shot stamp in
+# DETAIL_MESSAGES ages across the run, so every re-injection restamps
+# refreshed_at_epoch_ms to now to keep later phases under that cliff.
+inject_loading_board() {
+    inject "$(python3 - "$LOADING_MESSAGE" <<'PY'
+import json, sys, time
+
+message = json.loads(sys.argv[1])
+message["state"]["Ready"]["snapshot"]["refreshed_at_epoch_ms"] = int(time.time() * 1000)
+print(json.dumps(message, separators=(",", ":")))
+PY
+)"
+}
+inject_loading_board
+# Hovering its measured badge marker must reveal the five fixture cards.
+hover_beads_badge
 sleep 0.5
 import -window "$WID" /output/beads-detail-loading.png
 LOADING_DIFF=$(compare -metric AE /output/beads-detail-before.png \
@@ -262,7 +301,9 @@ python3 /tests/visual/beads-card-detail-inventory.py \
 # restore the exact two-line/one-line inventory measured above.
 convert /output/beads-detail-comment-clamped.png \
     -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage /tmp/beads-detail-collapsed.png
-panel_move 188 217
+# The newest comment's first body line measures panel rows 221-230; click its
+# center so the toggle lands on the comment rather than the separator gap.
+panel_move 188 225
 xdotool click 1
 sleep 0.3
 panel_move_outside
@@ -274,7 +315,7 @@ EXPAND_DIFF=$(compare -metric AE /tmp/beads-detail-collapsed.png \
 EXPAND_DIFF=${EXPAND_DIFF%%.*}
 [ "${EXPAND_DIFF:-0}" -ge 500 ] \
     || fail "expanding the newest comment changed only ${EXPAND_DIFF:-0}px"
-panel_move 188 217
+panel_move 188 225
 xdotool click 1
 sleep 0.3
 panel_move_outside
@@ -316,8 +357,8 @@ COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 # backdrop owns the pointer, so the next card click cannot emit another request.
 xdotool key Escape
 sleep 0.2
-inject "$LOADING_MESSAGE"
-xdotool mousemove --sync --window "$WID" 66 17
+inject_loading_board
+hover_beads_badge
 sleep 0.2
 xdotool mousemove --sync --window "$WID" 80 84
 xdotool click 1
@@ -328,8 +369,8 @@ sleep 0.2
 panel_move 537 23
 xdotool click 1
 sleep 0.2
-inject "$LOADING_MESSAGE"
-xdotool mousemove --sync --window "$WID" 66 17
+inject_loading_board
+hover_beads_badge
 sleep 0.2
 xdotool mousemove --sync --window "$WID" 80 84
 xdotool click 1
@@ -340,8 +381,8 @@ sleep 0.2
 panel_move_outside
 xdotool click 1
 sleep 0.2
-inject "$LOADING_MESSAGE"
-xdotool mousemove --sync --window "$WID" 66 17
+inject_loading_board
+hover_beads_badge
 sleep 0.2
 xdotool mousemove --sync --window "$WID" 80 84
 xdotool click 1
@@ -357,8 +398,8 @@ NOT_FOUND_DIFF=${NOT_FOUND_DIFF%%.*}
 [ "${NOT_FOUND_DIFF:-0}" -ge 1000 ] \
     || fail "not-found close notice changed only ${NOT_FOUND_DIFF:-0}px"
 
-inject "$LOADING_MESSAGE"
-xdotool mousemove --sync --window "$WID" 66 17
+inject_loading_board
+hover_beads_badge
 sleep 0.2
 xdotool mousemove --sync --window "$WID" 80 84
 xdotool click 1
@@ -419,10 +460,13 @@ PY
 )
 
 xdotool key Escape
-inject "$LOADING_MESSAGE"
-xdotool mousemove --sync --window "$WID" 66 17
+inject_loading_board
+hover_beads_badge
 sleep 0.2
-xdotool mousemove --sync --window "$WID" 280 84
+# The A2 board sizes lanes by content: the Ready lane renders at x 418-775
+# with the loading card's title ink at x 444-603 (measured), so the old
+# equal-lane x 280 lands in Backlog. Click the measured Ready card instead.
+xdotool mousemove --sync --window "$WID" 500 84
 xdotool click 1
 sleep 0.2
 inject "$NAV_MESSAGE"
@@ -455,15 +499,21 @@ COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 # Exercise the remaining checked-in settled variants through their real card
 # clicks. Each must request its own ID, paint a distinct panel, and expose that
 # exact identity through the panel's copy target.
+# Blocked and Done render as collapsed A2 rail tabs (measured: x 909-944 and
+# x 961-996 with vertical labels over rows 92-131). Hovering a tab opens its
+# drawer over x 460-944, and the single card's title line inside paints at
+# rows 74-80, so the open click lands mid-title at (600, 77).
 capture_variant() {
-    local name="$1" issue="$2" card_x="$3" message="$4"
+    local name="$1" issue="$2" tab_x="$3" message="$4"
     local before copied diff
     xdotool key Escape
-    inject "$LOADING_MESSAGE"
-    xdotool mousemove --sync --window "$WID" 66 17
+    inject_loading_board
+    hover_beads_badge
     sleep 0.2
     before=$(detail_request_count "$issue")
-    xdotool mousemove --sync --window "$WID" "$card_x" 84
+    xdotool mousemove --sync --window "$WID" "$tab_x" 100
+    sleep 0.35
+    xdotool mousemove --sync --window "$WID" 600 77
     xdotool mousedown 1
     xdotool mouseup 1
     sleep 0.2
@@ -477,7 +527,9 @@ capture_variant() {
         "/output/beads-detail-${name}.png" null: 2>&1 || true)
     diff=${diff%%.*}
     [ "${diff:-0}" -ge 1000 ] || fail "$name fixture painted only ${diff:-0} distinct pixels"
-    panel_move 454 49
+    # The copy target is the leftmost monospace id chip; its ink measures
+    # panel x 17-83 over rows 42-49 for these variants, so click its center.
+    panel_move 50 46
     xdotool click 1
     sleep 0.2
     copied=$(xclip -o -selection clipboard 2>/dev/null || true)
@@ -492,7 +544,7 @@ BLOCKED_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
 ')
 [ -n "$CLOSED_MESSAGE" ] && [ -n "$BLOCKED_MESSAGE" ] \
     || fail "closed or blocked fixture missing"
-capture_variant blocked detail-blocked 700 "$BLOCKED_MESSAGE"
-capture_variant closed detail-closed 900 "$CLOSED_MESSAGE"
+capture_variant blocked detail-blocked 926 "$BLOCKED_MESSAGE"
+capture_variant closed detail-closed 978 "$CLOSED_MESSAGE"
 
 echo "PASS: mock inventory, detail variants, lifecycle, copy, and navigation rendered"

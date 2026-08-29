@@ -103,7 +103,7 @@ def main():
     if min(runin_colors) < 30:
         raise AssertionError(f"run-in heads lost ink: unique colors {runin_colors}")
 
-    rail_y = 321
+    rail_y = 320
     rail_row = [panel[x, rail_y] for x in range(panel_width)]
     rail_ground = collections.Counter(rail_row).most_common(1)[0][0]
     rail = longest_run(rail_row, rail_ground)
@@ -117,13 +117,15 @@ def main():
         raise AssertionError(f"status rail leaves only {next_ink - rail[1]}px before actions")
 
     separator_rows = []
-    field_ground = panel[250, 211]
+    # The hairline renders at row 211 (measured: dominant (64,64,66) vs panel
+    # ground (44,44,46)); sample the ground one row above it.
+    field_ground = panel[250, 210]
     for y in range(200, 225):
         row = [panel[x, y] for x in range(33, 553)]
         dominant, count = collections.Counter(row).most_common(1)[0]
         if count > 480 and distance(dominant, field_ground) > 10:
             separator_rows.append(y)
-    if separator_rows != [212]:
+    if separator_rows != [211]:
         raise AssertionError(f"empty fields moved the comment separator to {separator_rows}")
 
     priority = panel[18, 23]
