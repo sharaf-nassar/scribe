@@ -24,6 +24,7 @@
 //! changed) rather than reaching for the IPC sink itself.
 
 use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::active_tab_index_after_departure;
 
 use crate::tab_bar::TabData;
 
@@ -129,13 +130,10 @@ impl WorkspaceTabs {
     /// tab's departure leaves its removal slot selected: the successor wins,
     /// or the predecessor when there is no successor.
     fn depart(&mut self, index: usize) -> TabEntry {
+        let previously_active_index = self.active;
         let entry = self.tabs.remove(index);
-        if index < self.active {
-            self.active -= 1;
-        }
-        if !self.tabs.is_empty() {
-            self.active = self.active.min(self.tabs.len() - 1);
-        }
+        self.active =
+            active_tab_index_after_departure(self.tabs.len(), index, previously_active_index);
         entry
     }
 

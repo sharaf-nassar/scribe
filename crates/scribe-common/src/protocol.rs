@@ -1887,6 +1887,34 @@ pub enum WorkspaceTreeError {
     WorkspaceAlreadyPresent { workspace_id: WorkspaceId },
 }
 
+/// Select the active tab index after removing one tab.
+///
+/// `remaining_len` is the post-removal tab count, and `removed_index` must be
+/// valid in the pre-removal list. A valid prior selection keeps its tab when a
+/// preceding tab departs; a departing selection chooses its successor, or the
+/// predecessor at the end. A malformed reported active index chooses the
+/// departed slot, clamped to the surviving list.
+#[must_use]
+pub fn active_tab_index_after_departure(
+    remaining_len: usize,
+    removed_index: usize,
+    previously_active_index: usize,
+) -> usize {
+    if remaining_len == 0 {
+        return 0;
+    }
+    if previously_active_index > remaining_len {
+        return removed_index.min(remaining_len - 1);
+    }
+    if removed_index < previously_active_index {
+        return previously_active_index - 1;
+    }
+    if removed_index == previously_active_index {
+        return removed_index.min(remaining_len - 1);
+    }
+    previously_active_index
+}
+
 impl WorkspaceTreeNode {
     /// Remove a workspace leaf and return it, promoting its sibling.
     ///
@@ -4392,6 +4420,33 @@ mod tests {
             ratio,
             first: Box::new(first),
             second: Box::new(second),
+        }
+    }
+
+    // @lat: [[protocol#Client Messages#Workspace Management]]
+    #[test]
+    fn active_tab_index_after_departure_preserves_or_replaces_selection() {
+        let cases = [
+            ((0, 0, 0), 0, "empty list"),
+            ((2, 0, 2), 1, "departure before the shown tab"),
+            ((2, 1, 1), 1, "shown tab yields to its successor"),
+            ((2, 2, 0), 0, "departure after the shown tab"),
+            ((2, 2, 2), 1, "shown final tab yields to its predecessor"),
+            ((2, 0, 99), 0, "malformed active index uses the departed slot"),
+        ];
+
+        for ((remaining_len, removed_index, previously_active_index), expected, description) in
+            cases
+        {
+            assert_eq!(
+                active_tab_index_after_departure(
+                    remaining_len,
+                    removed_index,
+                    previously_active_index,
+                ),
+                expected,
+                "{description}"
+            );
         }
     }
 

@@ -7,6 +7,7 @@ use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     LayoutDirection, PaneTreeNode, ServerMessage, WorkspaceMoveOperation, WorkspaceMoveRefusal,
     WorkspaceTransferRefusal, WorkspaceTreeEdge, WorkspaceTreeError, WorkspaceTreeNode,
+    active_tab_index_after_departure,
 };
 
 use serde::{Deserialize, Serialize};
@@ -692,19 +693,16 @@ impl WorkspaceManager {
                     .position(|session_id| *session_id == tab_session_id)
                     .ok_or(WorkspaceMoveRefusal::NotWorkspaceOwner)?;
                 pane_trees.resize(session_ids.len(), None);
-                let showing = session_ids.get(*active_tab_index).copied();
+                let previously_active_index = *active_tab_index;
+                let showing = session_ids.get(previously_active_index).copied();
                 let was_active = showing == Some(tab_session_id);
                 session_ids.remove(index);
                 let pane_tree = pane_trees.remove(index);
-                if session_ids.is_empty() {
-                    *active_tab_index = 0;
-                } else {
-                    *active_tab_index = Self::active_index_or(
-                        session_ids,
-                        showing.filter(|session_id| *session_id != tab_session_id),
-                        index.min(session_ids.len() - 1),
-                    );
-                }
+                *active_tab_index = active_tab_index_after_departure(
+                    session_ids.len(),
+                    index,
+                    previously_active_index,
+                );
                 let mut sessions = Vec::new();
                 if let Some(tree) = pane_tree.as_ref() {
                     Self::collect_pane_sessions(tree, &mut sessions);
