@@ -224,9 +224,35 @@ assert_panel_midpoint resolved "$PANEL_W" "$PANEL_X" \
     || fail "resolved panel was not centered in the active terminal region"
 [ "$PANEL_X" = "$LOADING_PANEL_X" ] \
     || fail "panel arrived at ${PANEL_X}, after loading at ${LOADING_PANEL_X}"
+
+# A tracker Design value can be 64 KiB. Keep this regression fixture near the
+# reported 526-byte case and vary only Design from the settled detail above.
+LONG_DESIGN_MESSAGE=$(python3 - "$COMMENT_MESSAGE" <<'PY'
+import json, sys
+
+message = json.loads(sys.argv[1])
+design = (
+    "A body design passage protects the identity row from wrapped detail text. " * 7
+).strip()
+if not 450 <= len(design.encode()) <= 550:
+    raise SystemExit(f"long design is {len(design.encode())} bytes, expected about 500")
+message["detail"]["design"] = design
+print(json.dumps(message, separators=(",", ":")))
+PY
+)
+[ -n "$LONG_DESIGN_MESSAGE" ] || fail "long-design fixture missing"
+inject "$LONG_DESIGN_MESSAGE"
+panel_move_outside
+sleep 0.2
+import -window "$WID" /output/beads-detail-long-design.png
+# Restore the short fixture before the existing pointer and comment phases.
+inject "$COMMENT_MESSAGE"
+panel_move_outside
+sleep 0.2
 python3 /tests/visual/beads-card-detail-inventory.py \
     --mock "$MOCK" \
     --image /output/beads-detail-comment-clamped.png \
+    --long-design-image /output/beads-detail-long-design.png \
     --panel "$PANEL_LEFT" "$PANEL_TOP" "$PANEL_W" "$PANEL_H" \
     --scale 1.0 \
     --output /output/beads-detail-inventory.json \

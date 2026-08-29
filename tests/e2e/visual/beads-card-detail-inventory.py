@@ -67,6 +67,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mock", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--long-design-image", type=Path)
     parser.add_argument("--panel", nargs=4, type=int, metavar=("X", "Y", "W", "H"), required=True)
     parser.add_argument("--scale", type=float, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -97,12 +98,12 @@ def main():
         )
 
     runin_colors = []
-    for top in (110, 135):
+    for top in (110, 135, 160):
         runin_colors.append(len({panel[x, y] for x in range(38, 118) for y in range(top, top + 14)}))
     if min(runin_colors) < 30:
         raise AssertionError(f"run-in heads lost ink: unique colors {runin_colors}")
 
-    rail_y = 296
+    rail_y = 321
     rail_row = [panel[x, rail_y] for x in range(panel_width)]
     rail_ground = collections.Counter(rail_row).most_common(1)[0][0]
     rail = longest_run(rail_row, rail_ground)
@@ -116,13 +117,13 @@ def main():
         raise AssertionError(f"status rail leaves only {next_ink - rail[1]}px before actions")
 
     separator_rows = []
-    field_ground = panel[250, 186]
-    for y in range(175, 200):
+    field_ground = panel[250, 211]
+    for y in range(200, 225):
         row = [panel[x, y] for x in range(33, 553)]
         dominant, count = collections.Counter(row).most_common(1)[0]
         if count > 480 and distance(dominant, field_ground) > 10:
             separator_rows.append(y)
-    if separator_rows != [187]:
+    if separator_rows != [212]:
         raise AssertionError(f"empty fields moved the comment separator to {separator_rows}")
 
     priority = panel[18, 23]
@@ -132,11 +133,37 @@ def main():
     if not (epic[2] > epic[0] > epic[1]):
         raise AssertionError(f"epic lost its distinct hue: {epic}")
 
-    comment_groups = ink_groups(panel, 33, 190, 520, 85)
+    comment_groups = ink_groups(panel, 33, 215, 520, 85)
     if len(comment_groups) != 5:
         raise AssertionError(
             f"collapsed comments painted {len(comment_groups)} text rows {comment_groups}; expected 2+1 bodies"
         )
+
+    long_design_evidence = None
+    if args.long_design_image:
+        long_design = pixels(args.long_design_image, panel_width, panel_height, panel_x, panel_y)
+        header_changed = sum(
+            distance(panel[x, y], long_design[x, y]) > 18
+            for x in range(panel_width)
+            for y in range(64)
+        )
+        if header_changed > 25:
+            raise AssertionError(
+                f"long Design changed {header_changed}px in the bounded head/identity region"
+            )
+        body_changed = sum(
+            distance(panel[x, y], long_design[x, y]) > 18
+            for x in range(panel_width)
+            for y in range(70, panel_height)
+        )
+        if body_changed < 500:
+            raise AssertionError(
+                f"long Design changed only {body_changed}px below the queue row"
+            )
+        long_design_evidence = {
+            "header_changed_pixels": header_changed,
+            "body_changed_pixels": body_changed,
+        }
 
     evidence = {
         "mock": str(args.mock),
@@ -149,6 +176,7 @@ def main():
         "priority_rgb": priority,
         "epic_rgb": epic,
         "comment_text_rows": comment_groups,
+        "long_design": long_design_evidence,
     }
     args.output.write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence, separators=(",", ":")))

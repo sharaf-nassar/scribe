@@ -1794,9 +1794,12 @@ neither side treats the capability bit as authorization by itself.
 [[crates/scribe-client/src/beads_panel.rs#render]] renders the panel anatomy from
 `.impeccable/mocks/beads-card-detail.html`: a full-bleed identity head, derived
 queue row, dependency spine, sparse body fields, newest-first comments,
-dependents, and the original status-rail appearance. Theme slots supply every
-colour. The newest collapsed comment gets two lines and each older collapsed
-comment gets one; clicking one expands it in place.
+dependents, and the original status-rail appearance. The identity row keeps a
+truncated Spec pointer only; Design is a labeled editable body passage between
+Description and Acceptance, so its unbounded tracker value cannot grow the
+head. Theme slots supply every colour. The newest collapsed comment gets two
+lines and each older collapsed comment gets one; clicking one expands it in
+place.
 [[crates/scribe-client/src/beads_panel.rs#PanelPresentation#from_detail]] owns
 sparse-section presence, upstream and hidden-comment counts; closed details
 retain close facts but omit write verbs. Queue words pass through the board

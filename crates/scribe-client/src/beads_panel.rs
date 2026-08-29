@@ -2138,11 +2138,7 @@ fn identity_row(
             panel
                 .detail
                 .as_deref()
-                .filter(|_| {
-                    presentation.is_some_and(|build| {
-                        build.has(PanelSection::Spec) || build.has(PanelSection::Design)
-                    })
-                })
+                .filter(|_| presentation.is_some_and(|build| build.has(PanelSection::Spec)))
                 .map(|detail| identity_docs(detail, presentation, wiring)),
         )
         .into_any_element()
@@ -2348,23 +2344,6 @@ fn identity_docs(
                         )
                 }),
         )
-        .children(presentation.is_some_and(|build| build.has(PanelSection::Design)).then(|| {
-            div()
-                .max_w(px(130.0))
-                .flex()
-                .gap(px(4.0))
-                .child(runin("Design", colors, wiring.scale))
-                .child(
-                    editable_text(
-                        wiring.edit_wiring(),
-                        &detail.id,
-                        EditField::Design,
-                        &detail.design,
-                        div().min_w(px(0.0)),
-                    )
-                    .flex_1(),
-                )
-        }))
         .into_any_element()
 }
 
@@ -2714,6 +2693,7 @@ fn detail_content(
     let comments =
         presentation.has(PanelSection::Comments).then(|| comments(detail, presentation, wiring));
     let dependents = presentation.has(PanelSection::Dependents).then(|| unblocks(detail, wiring));
+    let passages = detail_passages(detail, colors);
     div()
         .id(SharedString::from(format!("beads-detail-scroll-{workspace_id}")))
         .flex_1()
@@ -2745,42 +2725,12 @@ fn detail_content(
         )
         .children(blockers.map(|blocker| blocker_row(blocker, colors, scale)))
         .child(queue_row(detail, presentation, colors, scale))
-        .children(presentation.has(PanelSection::Description).then(|| {
-            editable_passage(
-                detail,
-                PassageEdit {
-                    field: EditField::Description,
-                    label: None,
-                    value: &detail.description,
-                    color: colors.title,
-                },
-                wiring,
-            )
-        }))
-        .children(presentation.has(PanelSection::Acceptance).then(|| {
-            editable_passage(
-                detail,
-                PassageEdit {
-                    field: EditField::Acceptance,
-                    label: Some("Acceptance"),
-                    value: &detail.acceptance_criteria,
-                    color: colors.queue_name,
-                },
-                wiring,
-            )
-        }))
-        .children(presentation.has(PanelSection::Notes).then(|| {
-            editable_passage(
-                detail,
-                PassageEdit {
-                    field: EditField::Notes,
-                    label: Some("Notes"),
-                    value: &detail.notes,
-                    color: colors.queue_name,
-                },
-                wiring,
-            )
-        }))
+        .children(
+            passages
+                .into_iter()
+                .filter(|(section, _)| presentation.has(*section))
+                .map(|(_, passage)| editable_passage(detail, passage, wiring)),
+        )
         .children(facts)
         .children(comments)
         .children(dependents)
@@ -2793,6 +2743,50 @@ struct PassageEdit<'a> {
     label: Option<&'static str>,
     value: &'a str,
     color: Rgba,
+}
+
+fn detail_passages<'a>(
+    detail: &'a BeadsIssueDetail,
+    colors: &BeadsBoardColors,
+) -> [(PanelSection, PassageEdit<'a>); 4] {
+    [
+        (
+            PanelSection::Description,
+            PassageEdit {
+                field: EditField::Description,
+                label: None,
+                value: &detail.description,
+                color: colors.title,
+            },
+        ),
+        (
+            PanelSection::Design,
+            PassageEdit {
+                field: EditField::Design,
+                label: Some("Design"),
+                value: &detail.design,
+                color: colors.queue_name,
+            },
+        ),
+        (
+            PanelSection::Acceptance,
+            PassageEdit {
+                field: EditField::Acceptance,
+                label: Some("Acceptance"),
+                value: &detail.acceptance_criteria,
+                color: colors.queue_name,
+            },
+        ),
+        (
+            PanelSection::Notes,
+            PassageEdit {
+                field: EditField::Notes,
+                label: Some("Notes"),
+                value: &detail.notes,
+                color: colors.queue_name,
+            },
+        ),
+    ]
 }
 
 fn editable_passage(
