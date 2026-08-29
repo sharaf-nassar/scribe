@@ -599,7 +599,7 @@ The pane split tree is  (binary `Leaf`/`Split` nodes, ratios clamped 0.1-0.9, sp
 
  is a `gpui::Entity` wrapping a `LayoutTree`. Every structural mutation emits `PaneTreeEvent::Changed` and calls `notify()`.
 
- and  both auto-equalize the surviving ratios so sibling panes stay evenly sized; `close` refuses to remove the sole root leaf.  clamps to 0.1-0.9, and `find_pane_in_direction` resolves directional focus (with edge wrap) without mutating or emitting.
+ splits only its target pane into equal halves, while  promotes the closed pane's sibling into the freed extent; both preserve ratios outside the changed subtree. `close` refuses to remove the sole root leaf.  remains the explicit balance action,  clamps to 0.1-0.9, and `find_pane_in_direction` resolves directional focus (with edge wrap) without mutating or emitting.
 
 #### Workspace Tree Model
 
@@ -2828,7 +2828,7 @@ The layout system has two levels: the window layout splits into workspaces, and 
 
 A binary split tree defined in  where each node is either a `Leaf(PaneId)` or a `Split` with direction, ratio (clamped 0.1-0.9), and two children. Pane IDs are allocated from a global atomic counter.
 
-Splitting a pane automatically equalizes all ratios in the tree so every pane gets equal space.
+Splitting a pane halves only the target pane. Closing one promotes its sibling into the freed extent; all other split ratios stay unchanged. Explicit balance is the only action that equalizes the tree.
 
 ### Focus Navigation
 
@@ -2844,7 +2844,7 @@ If no direct pane or workspace neighbor exists in that direction, focus wraps to
 
 Defined in , the window-level tree splits the viewport into workspace regions. Each `WorkspaceSlot` holds a workspace ID, tab list, active tab index, accent color, name, and project root path.
 
-Splitting a workspace automatically equalizes all workspace ratios so every region gets equal space, and removing a workspace re-equalizes the survivors — the same rule pane close applies. Both route through [[crates/scribe-client/src/workspace_layout.rs#WindowLayout#equalize_all_workspace_ratios]], which weights each split by the leaf count on either side. Restoration (`split_workspace_with_id`, `from_tree`) preserves reported ratios and never equalizes.
+Splitting a workspace halves only the target region, and removing one promotes its sibling into the freed extent; both preserve all other workspace ratios. [[crates/scribe-client/src/workspace_layout.rs#WindowLayout#equalize_all_workspace_ratios]] remains the explicit balance action, weighting each split by the leaf count on either side. Restoration (`split_workspace_with_id`, `from_tree`) also preserves reported ratios.
 
 On reconnect, a reported workspace tree is authoritative for workspace topology. Only the legacy no-tree fallback applies `WorkspaceInfo.split_direction` patches, and each workspace is patched once during startup so later tab or session updates cannot rearrange the live split tree.
 

@@ -104,12 +104,9 @@ log_count() {
 # chrome, pane borders, and the caller's bottom inset. The right pane body is
 # byte-identical across a background exit; routing checks keep the prompt rows.
 #
-# `$5` is where the vertical divider sits as a percentage of the window width,
-# because "half" only names the regions while the tree is one split. Stacking a
-# second region into the left column re-equalizes by leaf count, so the divider
-# moves to two thirds and a 50% crop reaches across it into the *left* column's
-# in-region tab bar — which repaints whenever that region loses a tab, and is
-# not what any of these assertions are about.
+# `$5` is where the vertical divider sits as a percentage of the window width.
+# The second split only halves its target region, so the outer divider remains
+# centered and a 50% crop stays inside its requested region.
 grid_half_diff() {
     local before="$1" after="$2" half="$3" bottom_inset="${4:-8}" divider_pct="${5:-50}"
     local divider=$((WIN_W * divider_pct / 100))
@@ -227,7 +224,7 @@ capture_window /output/08b-focused-after-background-exit.png
 wait_bar_state "ws-[0-9a-f]+:1"
 focused_diff=$(grid_half_diff \
     /output/08a-focused-before-background-exit.png \
-    /output/08b-focused-after-background-exit.png right 64 67)
+    /output/08b-focused-after-background-exit.png right 64 50)
 [ "$focused_diff" -eq 0 ] \
     || fail "background exit changed $focused_diff pixels in the focused region"
 adopts_after=$(log_count "pane adopted a session")

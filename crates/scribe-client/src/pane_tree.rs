@@ -3,9 +3,9 @@
 //! [`PaneTree`] holds a [`LayoutTree`] and turns each structural mutation
 //! (split, close, ratio change, equalize) into a [`PaneTreeEvent::Changed`]
 //! event plus a `cx.notify()`, so subscribers repaint and the owning workspace
-//! model can re-report its serialized tree. Splitting and closing panes both
-//! auto-equalize the surviving ratios, matching the chrome's expectation that
-//! sibling panes stay evenly sized after a structural change.
+//! model can re-report its serialized tree. Splitting halves only the target
+//! pane, and closing promotes its sibling; ratios outside the changed subtree
+//! stay untouched. Explicit equalize remains the opt-in balancing action.
 
 use gpui::{Context, EventEmitter};
 
@@ -81,7 +81,7 @@ impl PaneTree {
         self.tree.find_pane_in_direction(current, direction, rects)
     }
 
-    /// Split `pane_id` in the given direction, then re-equalize all ratios.
+    /// Split `pane_id` in the given direction, halving only that pane.
     ///
     /// Returns the new pane's ID, or `None` if the pane was not found. Emits
     /// [`PaneTreeEvent::Changed`] only when a split actually happened.
@@ -92,12 +92,11 @@ impl PaneTree {
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
         let new_id = self.tree.split_pane(pane_id, direction)?;
-        self.tree.equalize_all_ratios();
         Self::changed(cx);
         Some(new_id)
     }
 
-    /// Close `pane_id`, promoting its sibling, then re-equalize all ratios.
+    /// Close `pane_id`, promoting its sibling into the freed extent.
     ///
     /// Returns `true` if the pane was found and removed. The sole root leaf is
     /// never removed. Emits [`PaneTreeEvent::Changed`] only when a pane closed.
@@ -105,7 +104,6 @@ impl PaneTree {
         if !self.tree.close_pane(pane_id) {
             return false;
         }
-        self.tree.equalize_all_ratios();
         Self::changed(cx);
         true
     }
@@ -198,9 +196,38 @@ mod tests {
 
     // @lat: [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]]
     #[gpui::test]
-    fn close_promotes_sibling_and_reequalizes(cx: &mut TestAppContext) {
-        // A three-pane tree with skewed ratios; closing one pane should leave
-        // two panes whose split re-equalizes to 0.5.
+    fn split_preserves_sibling_ratios(cx: &mut TestAppContext) {
+        let a = PaneId::from_raw(1);
+        let b = PaneId::from_raw(2);
+        let root = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.7,
+            first: Box::new(LayoutNode::Leaf(a)),
+            second: Box::new(LayoutNode::Leaf(b)),
+        };
+        let tree = cx.new(|_| PaneTree::from_root(root, a));
+
+        let new_pane = tree.update(cx, |t, cx| t.split(b, SplitDirection::Horizontal, cx));
+        let new_pane = new_pane.expect("split should succeed");
+
+        tree.read_with(cx, |t, _| {
+            let rects = t.compute_rects(Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 });
+            let rect_for =
+                |id| rects.iter().find(|(pane_id, _, _)| *pane_id == id).map(|(_, r, _)| *r);
+            assert!(
+                (rect_for(a).expect("A exists").width - 70.0).abs() < 0.01,
+                "A keeps its ratio"
+            );
+            assert!((rect_for(b).expect("B exists").width - 15.0).abs() < 0.01, "B's slot halves");
+            assert!((rect_for(new_pane).expect("new pane exists").width - 15.0).abs() < 0.01);
+        });
+    }
+
+    // @lat: [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]]
+    #[gpui::test]
+    fn close_promotes_sibling_without_reequalizing(cx: &mut TestAppContext) {
+        // A three-pane tree with distinct effective widths. Closing C promotes
+        // B into C's parent extent while preserving A's outer split ratio.
         let a = PaneId::from_raw(1);
         let b = PaneId::from_raw(2);
         let c = PaneId::from_raw(3);
@@ -224,10 +251,11 @@ mod tests {
         tree.read_with(cx, |t, _| {
             let ids = t.all_pane_ids();
             assert_eq!(ids, vec![a, b]);
-            // After auto-equalize the two-pane tree splits 50/50.
             let rects = t.compute_rects(Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 });
             let a_rect = rects.iter().find(|(id, _, _)| *id == a).map(|(_, r, _)| *r).unwrap();
-            assert!((a_rect.width - 50.0).abs() < 1.0, "auto-equalized to half");
+            let b_rect = rects.iter().find(|(id, _, _)| *id == b).map(|(_, r, _)| *r).unwrap();
+            assert!((a_rect.width - 80.0).abs() < 0.01, "A keeps its outer ratio");
+            assert!((b_rect.width - 20.0).abs() < 0.01, "B inherits its parent's full extent");
         });
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
