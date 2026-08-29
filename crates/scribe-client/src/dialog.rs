@@ -31,7 +31,9 @@
 
 use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Rgba, Role, div, prelude::*, px};
 use scribe_common::agent::AgentCapability;
-use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
+use scribe_common::protocol::{
+    AgentPromptContext, ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId,
+};
 use scribe_common::theme::ChromeColors;
 
 use crate::lan_approval::{LanApprovalAction, LanApprovalDialog};
@@ -564,11 +566,18 @@ impl ClipboardDialog {
 /// disclosure, not authentication, so the body labels it caller-supplied and
 /// caret-escapes it: a label carrying newlines would otherwise forge extra body
 /// lines, and one carrying an escape sequence would reach the renderer.
+///
+/// `context` is the server's own view of the caller and the target, resolved
+/// from live session state rather than from anything the caller said. It is
+/// what makes the prompt answerable: `target` alone is an opaque session UUID.
+/// An older server sends none of it, and an originless or stale caller resolves
+/// to nothing, so both render an explicit unknown-session line.
 pub struct AgentConsentDialog {
     prompt_id: PromptId,
     agent_label: String,
     capability: AgentCapability,
     target: String,
+    context: AgentPromptContext,
     focused: usize,
 }
 
@@ -587,9 +596,10 @@ impl AgentConsentDialog {
         agent_label: String,
         capability: AgentCapability,
         target: String,
+        context: AgentPromptContext,
     ) -> Self {
         // Index 0 (`Deny once`) is the safe default focus.
-        Self { prompt_id, agent_label, capability, target, focused: 0 }
+        Self { prompt_id, agent_label, capability, target, context, focused: 0 }
     }
 
     /// Correlation id the `AgentPromptResponse` must echo back to the server.
@@ -604,12 +614,19 @@ impl AgentConsentDialog {
         self.capability
     }
 
+    /// The caller-supplied label, for correlating a prompt in the client log.
+    #[must_use]
+    pub fn agent_label(&self) -> &str {
+        &self.agent_label
+    }
+
     fn spec(&self) -> DialogSpec {
         DialogSpec {
             title: String::from("Allow agent request?"),
             body: vec![
                 format!("Capability: {}", capability_phrase(self.capability)),
-                format!("Target: {}", display_field(&self.target)),
+                format!("Target: {}", self.target_line()),
+                format!("Requested by: {}", self.origin_line()),
                 format!("Agent: {} (caller-supplied)", display_field(&self.agent_label)),
                 String::new(),
                 String::from("Scribe cannot verify who is asking."),
@@ -623,6 +640,37 @@ impl AgentConsentDialog {
             ],
             focused: self.focused,
         }
+    }
+
+    /// The session the call came from: title, project directory, and the task
+    /// that session is working on. An originless or stale caller — an external
+    /// CLI, or one naming a session that has since closed — says so instead of
+    /// implying a session Scribe never resolved.
+    fn origin_line(&self) -> String {
+        let Some(title) = self.context.origin_title.as_deref() else {
+            return String::from("unknown session");
+        };
+        let mut line = display_field(title);
+        if let Some(cwd) = self.context.origin_cwd.as_deref() {
+            line.push_str(" — ");
+            line.push_str(&display_field(cwd));
+        }
+        if let Some(task) = self.context.origin_task_label.as_deref() {
+            line.push_str(" (");
+            line.push_str(&display_field(task));
+            line.push(')');
+        }
+        line
+    }
+
+    /// What the call wants to touch, as the server described it. Falls back to
+    /// the raw target id when the server sent no description — an older server,
+    /// or a target it could not resolve.
+    fn target_line(&self) -> String {
+        self.context
+            .target_description
+            .as_deref()
+            .map_or_else(|| display_field(&self.target), display_field)
     }
 }
 

@@ -389,13 +389,18 @@ write_input = "prompt"
 ```
 
 Changes apply live — no server restart — and a policy refresh cancels
-prompts that are still pending.
+prompts that are still pending, closing their dialogs.
 
 ### Prompt mode
 
 A `prompt` capability raises a Scribe-owned confirmation dialog naming the
-caller-supplied agent label and the requested capability. The decision
-defaults to Deny, Escape denies, and choosing "Always" persists that
+caller-supplied agent label and the requested capability. Beside those it
+shows context Scribe resolved itself, not anything the caller claimed: the
+calling session's title, project directory and current task label, and a
+human description of the target — the target session's title and directory
+for a read or write, the action name and its window for a dispatched action.
+A caller with no live origin session is named as an unknown session. The
+decision defaults to Deny, Escape denies, and choosing "Always" persists that
 capability's mode as `allow`. With a live `SCRIBE_SESSION_ID`, Scribe sends
 the prompt only to that session's window; if that window cannot render it,
 the call is denied rather than prompting another window. Originless or stale
@@ -407,6 +412,13 @@ completion, so an unanswered prompt returns `prompt_timeout` rather than
 `unsupported`. An approval is reused for repeated calls with the same agent
 label, capability, and target within `burst_window_ms`, so one confirmation
 covers a tight burst instead of interrogating you per call.
+
+A prompt that stops being answerable — it timed out, a policy reload
+cancelled it, or its last caller went away — is withdrawn: Scribe closes the
+dialog instead of leaving it on screen asking about a request that is already
+gone. A choice made in the moment the dialog is coming down is not lost
+either: for a short window afterwards an "Always" answer still persists that
+capability's mode, while the call it was gating stays failed.
 
 ### Limits
 

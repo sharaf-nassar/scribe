@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext};
 use scribe_common::agent::AgentCapability;
-use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
+use scribe_common::protocol::{
+    AgentPromptContext, ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId,
+};
 use scribe_common::theme::minimal_dark;
 
 use super::{
@@ -161,11 +163,16 @@ fn clipboard_dialog_four_button_policy_and_default_deny() {
 }
 
 fn agent_consent(label: &str) -> AgentConsentDialog {
+    agent_consent_with(label, AgentPromptContext::default())
+}
+
+fn agent_consent_with(label: &str, context: AgentPromptContext) -> AgentConsentDialog {
     AgentConsentDialog::new(
         PromptId(11),
         label.to_owned(),
         AgentCapability::WriteInput,
         "session 7".to_owned(),
+        context,
     )
 }
 
@@ -211,6 +218,49 @@ fn agent_consent_dialog_names_the_request_and_defaults_to_deny() {
         Some(DialogOutcome::AgentConsent(ClipboardDecision::AlwaysAllow))
     );
     assert_eq!(dialog.action_at(4), None);
+}
+
+#[test]
+fn agent_consent_dialog_names_the_origin_session_and_resolved_target() {
+    let dialog = AnyDialog::AgentConsent(agent_consent_with(
+        "claude-code",
+        AgentPromptContext {
+            origin_title: Some("nvim".into()),
+            origin_cwd: Some("/home/dev/scribe".into()),
+            origin_task_label: Some("fix the consent dialog".into()),
+            target_description: Some("zsh — /home/dev/other".into()),
+        },
+    ));
+    let spec = dialog.spec();
+
+    assert!(
+        spec.body.iter().any(|l| l == "Target: zsh — /home/dev/other"),
+        "the resolved target must replace the opaque id: {:?}",
+        spec.body
+    );
+    assert!(
+        spec.body
+            .iter()
+            .any(|l| l == "Requested by: nvim — /home/dev/scribe (fix the consent dialog)"),
+        "the origin session, project and task must be shown: {:?}",
+        spec.body
+    );
+}
+
+#[test]
+fn agent_consent_dialog_falls_back_to_unknown_session_without_context() {
+    // An older server, or a caller with no live origin session, sends nothing.
+    let spec = AnyDialog::AgentConsent(agent_consent("claude-code")).spec();
+    assert!(
+        spec.body.iter().any(|l| l == "Requested by: unknown session"),
+        "an originless caller must be named as such: {:?}",
+        spec.body
+    );
+    assert!(
+        spec.body.iter().any(|l| l == "Target: session 7"),
+        "the raw target id remains the fallback: {:?}",
+        spec.body
+    );
 }
 
 #[test]

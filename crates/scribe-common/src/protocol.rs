@@ -100,6 +100,32 @@ pub enum BridgeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PromptId(pub u64);
 
+/// Display-only context for an agent capability prompt (spec 027), resolved by
+/// the server at prompt-send time so the consent dialog can name the calling
+/// session and what it wants to touch.
+///
+/// Every field is serde-defaulted and optional: a frame from a server that
+/// predates this context decodes with all of them absent, and the dialog falls
+/// back to its unknown-session copy. None of it reaches the policy engine's
+/// prompt key, so burst reuse and parking are unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPromptContext {
+    /// Terminal title of the session the call came from.
+    #[serde(default)]
+    pub origin_title: Option<String>,
+    /// Working directory of the session the call came from.
+    #[serde(default)]
+    pub origin_cwd: Option<String>,
+    /// Provider task label of the session the call came from — what that agent
+    /// is currently working on, as Scribe shows it elsewhere.
+    #[serde(default)]
+    pub origin_task_label: Option<String>,
+    /// Human description of the target: title and CWD for a session read or
+    /// write, action name and window for a dispatched action.
+    #[serde(default)]
+    pub target_description: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -1468,6 +1494,15 @@ pub enum ServerMessage {
         agent_label: String,
         capability: AgentCapability,
         target: String,
+        /// Display-only origin and target context, absent from an older server.
+        #[serde(default)]
+        context: AgentPromptContext,
+    },
+    /// Withdraw a capability prompt that can no longer be answered, so a parked
+    /// or displayed consent dialog closes instead of waiting forever. Clients
+    /// ignore a prompt id they never showed.
+    AgentPromptDismiss {
+        prompt_id: PromptId,
     },
     /// Shows agent activity for a session to capable participants.
     AgentActivity {
@@ -3186,7 +3221,14 @@ mod tests {
                 agent_label: "test-agent".into(),
                 capability: AgentCapability::ReadMetadata,
                 target: "server".into(),
+                context: AgentPromptContext {
+                    origin_title: Some("zsh".into()),
+                    origin_cwd: Some("/home/u/proj".into()),
+                    origin_task_label: Some("fix the parser".into()),
+                    target_description: Some("scribe — /home/u/proj".into()),
+                },
             },
+            ServerMessage::AgentPromptDismiss { prompt_id: PromptId(10) },
             ServerMessage::AgentActivity { session_id: SessionId::new(), active: true },
             ServerMessage::RunActionCorrelated {
                 correlation_id: 11,
@@ -3198,6 +3240,38 @@ mod tests {
             let _: ServerMessage =
                 rmp_serde::from_slice(&server_bytes).expect("deserialize agent server frame");
         }
+    }
+
+    /// An `AgentPromptRequest` from a server that predates the display context
+    /// must still decode, with every context field defaulted to absent.
+    #[test]
+    fn agent_prompt_request_without_display_context_decodes_with_defaults() {
+        #[derive(Serialize)]
+        #[serde(tag = "type")]
+        enum PromptWithoutContext {
+            AgentPromptRequest {
+                prompt_id: PromptId,
+                agent_label: String,
+                capability: AgentCapability,
+                target: String,
+            },
+        }
+
+        let legacy = PromptWithoutContext::AgentPromptRequest {
+            prompt_id: PromptId(3),
+            agent_label: "old-agent".into(),
+            capability: AgentCapability::WriteInput,
+            target: "session-1".into(),
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).expect("serialize legacy prompt frame");
+        let decoded: ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize legacy prompt frame");
+
+        let ServerMessage::AgentPromptRequest { prompt_id, context, .. } = decoded else {
+            panic!("legacy frame did not decode as an agent prompt request");
+        };
+        assert_eq!(prompt_id, PromptId(3));
+        assert_eq!(context, AgentPromptContext::default());
     }
 
     #[test]

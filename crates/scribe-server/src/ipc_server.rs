@@ -11678,6 +11678,180 @@ async fn local_agent_api_writer_for_request(
     window_shares.read().await.get(&origin_window_id).and_then(WindowShare::local_agent_api_writer)
 }
 
+/// What one capability prompt is about, copied out of the request so the prompt
+/// sender can describe it without borrowing the request.
+enum AgentPromptSubject {
+    /// A screen read or an input write against one session.
+    Session(SessionId),
+    /// A window automation action.
+    Action { action: AutomationAction, window: Option<WindowId> },
+    /// Server-wide metadata, where the raw target already says everything.
+    Server,
+}
+
+impl From<&scribe_common::agent::AgentRequest> for AgentPromptSubject {
+    fn from(request: &scribe_common::agent::AgentRequest) -> Self {
+        use scribe_common::agent::AgentRequest as Request;
+        match request {
+            Request::ReadScreen { session_id, .. } | Request::WriteInput { session_id, .. } => {
+                Self::Session(*session_id)
+            }
+            Request::DispatchAction { action, window, .. } => {
+                Self::Action { action: action.clone(), window: *window }
+            }
+            Request::World { .. } | Request::Siblings { .. } | Request::Capabilities { .. } => {
+                Self::Server
+            }
+        }
+    }
+}
+
+/// Everything one capability prompt needs on its way to a local window: the
+/// chosen writer plus the registries that turn the request into the display
+/// context the consent dialog renders.
+struct AgentPromptDelivery {
+    client: SharedWriter,
+    live_sessions: LiveSessionRegistry,
+    workspace_manager: Arc<RwLock<WorkspaceManager>>,
+    origin_session_id: Option<SessionId>,
+    subject: AgentPromptSubject,
+}
+
+impl AgentPromptDelivery {
+    /// Bind one chosen prompt writer to the registries that describe `request`.
+    fn new(
+        server: &IpcServerState,
+        request: &scribe_common::agent::AgentRequest,
+        client: SharedWriter,
+    ) -> Self {
+        Self {
+            client,
+            live_sessions: Arc::clone(&server.live_sessions),
+            workspace_manager: Arc::clone(&server.workspace_manager),
+            origin_session_id: agent_request_origin_session_id(request),
+            subject: AgentPromptSubject::from(request),
+        }
+    }
+
+    /// Fill in the display context and send the prompt.
+    ///
+    /// Any other frame passes through untouched — this seam only carries
+    /// `AgentPromptRequest` today, and rewriting an unrelated frame would be a
+    /// silent protocol change.
+    async fn send(self, message: ServerMessage) {
+        let message = match message {
+            ServerMessage::AgentPromptRequest {
+                prompt_id,
+                agent_label,
+                capability,
+                target,
+                ..
+            } => ServerMessage::AgentPromptRequest {
+                prompt_id,
+                agent_label,
+                capability,
+                target,
+                context: self.context().await,
+            },
+            other => other,
+        };
+        send_message(&self.client, &message).await;
+    }
+
+    /// Resolve the display context one consent dialog needs to be answerable.
+    ///
+    /// Runs in the transport at prompt-send time, not in the policy engine: the
+    /// engine stays metadata-only so `PromptKey` and burst parking are
+    /// unchanged, and nothing here is read for a request policy did not decide
+    /// to prompt for. An originless or stale caller resolves to no origin at
+    /// all, which the dialog renders as an explicit unknown session.
+    async fn context(&self) -> scribe_common::protocol::AgentPromptContext {
+        let mut context = scribe_common::protocol::AgentPromptContext::default();
+        {
+            let sessions = self.live_sessions.read().await;
+            if let Some(origin) = self.origin_session_id.and_then(|id| sessions.get(&id)) {
+                context.origin_title = Some(session_display_title(origin));
+                context.origin_cwd =
+                    origin.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned());
+                context.origin_task_label = origin.task_label.clone();
+            }
+            if let AgentPromptSubject::Session(session_id) = &self.subject {
+                context.target_description = sessions.get(session_id).map(describe_target_session);
+            }
+        }
+        if let AgentPromptSubject::Action { action, window } = &self.subject {
+            let workspace_names = match window {
+                Some(window_id) => {
+                    self.workspace_manager.read().await.workspace_names_for_window(*window_id)
+                }
+                None => Vec::new(),
+            };
+            context.target_description =
+                Some(describe_target_action(action, *window, &workspace_names));
+        }
+        context
+    }
+}
+
+/// A live session's best display name. Falls back to the shell it is running
+/// when no OSC title has landed yet, so a session Scribe *did* resolve never
+/// renders as the dialog's unknown-session case.
+fn session_display_title(session: &LiveSession) -> String {
+    session.title.clone().unwrap_or_else(|| session.shell_name.clone())
+}
+
+/// "<title> — <cwd>" for the session a screen read or input write is aimed at.
+fn describe_target_session(session: &LiveSession) -> String {
+    let mut description = session_display_title(session);
+    if let Some(cwd) = session.cwd.as_ref() {
+        description.push_str(" — ");
+        description.push_str(&cwd.to_string_lossy());
+    }
+    description
+}
+
+/// "<action> in <window>" for a dispatched automation action, naming the target
+/// window by its workspaces where they are named.
+fn describe_target_action(
+    action: &AutomationAction,
+    window: Option<WindowId>,
+    workspace_names: &[String],
+) -> String {
+    let mut description = action_phrase(action);
+    if let Some(window_id) = window {
+        description.push_str(" in ");
+        if workspace_names.is_empty() {
+            description.push_str(&window_id.to_string());
+        } else {
+            description.push_str(&workspace_names.join(", "));
+        }
+    }
+    description
+}
+
+/// Plain-language name for one automation action, for the consent dialog.
+/// Exhaustive on purpose: a new action must be named here rather than reaching
+/// a user as a debug rendering.
+fn action_phrase(action: &AutomationAction) -> String {
+    match action {
+        AutomationAction::OpenSettings => "Open settings".into(),
+        AutomationAction::OpenFind => "Open find".into(),
+        AutomationAction::NewTab => "Open a new tab".into(),
+        AutomationAction::NewClaudeTab => "Open a new Claude tab".into(),
+        AutomationAction::NewClaudeResumeTab => "Resume a Claude tab".into(),
+        AutomationAction::NewCodexTab => "Open a new Codex tab".into(),
+        AutomationAction::NewCodexResumeTab => "Resume a Codex tab".into(),
+        AutomationAction::SplitVertical => "Split the pane vertically".into(),
+        AutomationAction::SplitHorizontal => "Split the pane horizontally".into(),
+        AutomationAction::ClosePane => "Close the pane".into(),
+        AutomationAction::CloseTab => "Close the tab".into(),
+        AutomationAction::NewWindow => "Open a new window".into(),
+        AutomationAction::SwitchProfile { name } => format!("Switch to profile {name}"),
+        AutomationAction::OpenUpdateDialog => "Open the update dialog".into(),
+        AutomationAction::FocusSession { .. } => "Focus a session".into(),
+    }
+}
+
 /// Spec 027 transient one-shot: route an `AgentRequest` through the agent
 /// dispatcher and reply on the same connection, which then closes without
 /// registering a window or attaching a session. The protected registry seams
@@ -11760,8 +11934,11 @@ async fn handle_transient_agent_request(
                 .await
             },
         },
-        prompt_writer.map(|prompt_client| {
-            move |message| async move { send_message(&prompt_client, &message).await }
+        // Display context is resolved on the way out, so only a request that
+        // actually raised a prompt reads session state for it.
+        prompt_writer.map(|client| {
+            let delivery = AgentPromptDelivery::new(server, request, client);
+            move |message| delivery.send(message)
         }),
     ))
     .await;
@@ -14688,6 +14865,46 @@ async fn forward_env_status(
     );
 }
 
+/// Spawn the agent prompt-dismissal forwarder (spec 027).
+///
+/// The policy engine withdraws a prompt on timeout, on policy refresh, and when
+/// its last requester goes away, but holds no writer references. This task
+/// takes its withdrawal stream and broadcasts one
+/// [`ServerMessage::AgentPromptDismiss`] to every capable local window, so the
+/// window that actually rendered the dialog closes it without a decision.
+/// Broadcasting avoids tracking which window that was; a client ignores a
+/// prompt id it never showed. The task ends when the `agent_api` state — the
+/// sender side — is dropped at server shutdown.
+pub fn spawn_agent_prompt_dismiss_forwarder(server: &IpcServerState) {
+    let Some(mut dismissals) = server.agent_api.take_prompt_dismissals() else {
+        return;
+    };
+    let window_shares = Arc::clone(&server.window_shares);
+    tokio::spawn(async move {
+        while let Some(prompt_id) = dismissals.recv().await {
+            forward_agent_prompt_dismiss(&window_shares, prompt_id).await;
+        }
+    });
+}
+
+/// Helper for the dismissal forwarder loop: sends one withdrawal to every
+/// owning-machine client that advertised `agent_api`.
+async fn forward_agent_prompt_dismiss(
+    window_shares: &WindowShares,
+    prompt_id: scribe_common::protocol::PromptId,
+) {
+    let writers = window_shares
+        .read()
+        .await
+        .values()
+        .filter_map(WindowShare::local_agent_api_writer)
+        .collect::<Vec<_>>();
+    let msg = ServerMessage::AgentPromptDismiss { prompt_id };
+    for writer in writers {
+        send_message(&writer, &msg).await;
+    }
+}
+
 /// Spawn the agent-activity indicator forwarder (spec 027).
 ///
 /// Consumes the [`crate::agent_api::activity::AgentActivityTracker`]'s
@@ -15651,6 +15868,7 @@ mod tests {
             agent_label: "test-agent".into(),
             capability: scribe_common::agent::AgentCapability::ReadMetadata,
             target: "server".into(),
+            context: scribe_common::protocol::AgentPromptContext::default(),
         };
         super::send_agent_api_message(&shares, capable_window, &prompt).await;
         super::send_agent_api_message(&shares, incapable_window, &prompt).await;
@@ -15859,6 +16077,266 @@ mod tests {
                 "known incapable origin must not prompt another window"
             );
         }
+    }
+
+    /// Stand up a prompt-mode agent server with one capable and one incapable
+    /// local window, and start the withdrawal forwarder against it.
+    async fn agent_dismiss_fixture(
+        prompt_timeout_ms: u64,
+    ) -> (IpcServerState, tokio::net::UnixStream, tokio::net::UnixStream) {
+        let capable_window = WindowId::new();
+        let incapable_window = WindowId::new();
+        let (capable_writer, capable_client) = ci_test_writer();
+        let (incapable_writer, incapable_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(capable_window, agent_share(&capable_writer, true));
+            shares.insert(incapable_window, agent_share(&incapable_writer, false));
+        }
+        let manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
+        let mut server = transfer_server_state(manager, super::new_live_session_registry(), shares);
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                read_metadata: scribe_common::agent::AgentPolicyMode::Prompt,
+                prompt_timeout_ms,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        super::spawn_agent_prompt_dismiss_forwarder(&server);
+        (server, capable_client, incapable_client)
+    }
+
+    fn originless_world_request(request_id: u64) -> scribe_common::agent::AgentRequest {
+        scribe_common::agent::AgentRequest::World {
+            request_id,
+            agent_label: "dismiss-test".into(),
+            origin_session_id: None,
+            progress_ack: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_agent_prompt_is_withdrawn_from_capable_local_windows() {
+        let (server, mut capable_client, mut incapable_client) = agent_dismiss_fixture(60).await;
+        let request = originless_world_request(1);
+        let (request_writer, _request_client) = ci_test_writer();
+
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+        let prompt_id = tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before delivery"),
+            message = read_message::<ServerMessage, _>(&mut capable_client) => {
+                let ServerMessage::AgentPromptRequest { prompt_id, .. } =
+                    message.expect("read prompt")
+                else {
+                    panic!("expected agent prompt request");
+                };
+                prompt_id
+            }
+        };
+        // The prompt times out unanswered; the dialog is still on screen.
+        dispatch.await;
+
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut capable_client).await.unwrap(),
+            ServerMessage::AgentPromptDismiss { prompt_id: dismissed } if dismissed == prompt_id
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err(),
+            "a window that never advertised agent_api must not receive withdrawals"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_refresh_withdraws_the_prompts_it_cancels() {
+        let (server, mut capable_client, mut incapable_client) =
+            agent_dismiss_fixture(60_000).await;
+        let request = originless_world_request(2);
+        let (request_writer, _request_client) = ci_test_writer();
+
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+        let prompt_id = tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before delivery"),
+            message = read_message::<ServerMessage, _>(&mut capable_client) => {
+                let ServerMessage::AgentPromptRequest { prompt_id, .. } =
+                    message.expect("read prompt")
+                else {
+                    panic!("expected agent prompt request");
+                };
+                prompt_id
+            }
+        };
+
+        server.agent_api.refresh_policy(scribe_common::config::AgentApiConfig {
+            read_metadata: scribe_common::agent::AgentPolicyMode::Prompt,
+            ..scribe_common::config::AgentApiConfig::default()
+        });
+        dispatch.await;
+
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut capable_client).await.unwrap(),
+            ServerMessage::AgentPromptDismiss { prompt_id: dismissed } if dismissed == prompt_id
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err(),
+            "a window that never advertised agent_api must not receive withdrawals"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_prompt_carries_origin_and_target_display_context() {
+        let (sink_writer, _sink_client) = ci_test_writer();
+        let (session_id, live_sessions, _slaves) =
+            live_session_with_sink(80, 24, &sink_writer).await;
+        {
+            let mut sessions = live_sessions.write().await;
+            let session = sessions.get_mut(&session_id).expect("live session");
+            session.title = Some(String::from("nvim"));
+            session.cwd = Some(std::path::PathBuf::from("/home/dev/scribe"));
+            session.task_label = Some(String::from("fix the consent dialog"));
+        }
+
+        let window_id = WindowId::new();
+        let mut manager = WorkspaceManager::new(Vec::new());
+        let workspace = manager.create_workspace();
+        manager.add_session(workspace, session_id, None);
+        manager.assign_session_to_window(window_id, session_id);
+        let manager = Arc::new(RwLock::new(manager));
+        let (prompt_writer, mut prompt_client) = ci_test_writer();
+        let shares = new_window_shares();
+        shares.write().await.insert(window_id, agent_share(&prompt_writer, true));
+
+        let mut server = transfer_server_state(manager, live_sessions, shares);
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                read_content: scribe_common::agent::AgentPolicyMode::Prompt,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        let request = scribe_common::agent::AgentRequest::ReadScreen {
+            request_id: 3,
+            agent_label: "context-test".into(),
+            origin_session_id: Some(session_id),
+            progress_ack: false,
+            session_id,
+            scrollback_lines: None,
+        };
+        let (request_writer, _request_client) = ci_test_writer();
+
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+        let (prompt_id, context) = tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before delivery"),
+            message = read_message::<ServerMessage, _>(&mut prompt_client) => {
+                let ServerMessage::AgentPromptRequest { prompt_id, context, .. } =
+                    message.expect("read prompt")
+                else {
+                    panic!("expected agent prompt request");
+                };
+                (prompt_id, context)
+            }
+        };
+
+        assert_eq!(context.origin_title.as_deref(), Some("nvim"));
+        assert_eq!(context.origin_cwd.as_deref(), Some("/home/dev/scribe"));
+        assert_eq!(context.origin_task_label.as_deref(), Some("fix the consent dialog"));
+        assert_eq!(context.target_description.as_deref(), Some("nvim — /home/dev/scribe"));
+
+        assert!(
+            server
+                .agent_api
+                .resolve_prompt(prompt_id, scribe_common::protocol::ClipboardDecision::DenyOnce)
+        );
+        dispatch.await;
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_action_prompt_carries_the_action_name_and_window() {
+        let window_id = WindowId::new();
+        let (prompt_writer, mut prompt_client) = ci_test_writer();
+        let shares = new_window_shares();
+        shares.write().await.insert(window_id, agent_share(&prompt_writer, true));
+        let manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
+        let mut server = transfer_server_state(manager, super::new_live_session_registry(), shares);
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                dispatch_action: scribe_common::agent::AgentPolicyMode::Prompt,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        let request = scribe_common::agent::AgentRequest::DispatchAction {
+            request_id: 4,
+            agent_label: "action-context-test".into(),
+            origin_session_id: None,
+            progress_ack: false,
+            action: AutomationAction::OpenSettings,
+            window: Some(window_id),
+        };
+        let (request_writer, _request_client) = ci_test_writer();
+
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+        let (prompt_id, context) = tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before delivery"),
+            message = read_message::<ServerMessage, _>(&mut prompt_client) => {
+                let ServerMessage::AgentPromptRequest { prompt_id, context, .. } =
+                    message.expect("read prompt")
+                else {
+                    panic!("expected agent prompt request");
+                };
+                (prompt_id, context)
+            }
+        };
+
+        assert_eq!(
+            context.target_description.as_deref(),
+            Some(format!("Open settings in {window_id}").as_str())
+        );
+        // An external CLI caller has no origin session to name.
+        assert_eq!(context.origin_title, None);
+
+        assert!(
+            server
+                .agent_api
+                .resolve_prompt(prompt_id, scribe_common::protocol::ClipboardDecision::DenyOnce)
+        );
+        dispatch.await;
+    }
+
+    #[test]
+    fn a_dispatch_action_prompt_names_the_action_and_its_window() {
+        let window_id = WindowId::new();
+        assert_eq!(
+            super::describe_target_action(
+                &AutomationAction::OpenSettings,
+                Some(window_id),
+                &[String::from("scribe")],
+            ),
+            "Open settings in scribe"
+        );
+        // An unnamed workspace still identifies the window it targets.
+        assert_eq!(
+            super::describe_target_action(&AutomationAction::CloseTab, Some(window_id), &[]),
+            format!("Close the tab in {window_id}")
+        );
+        // A server-targeted action names no window because it has none.
+        assert_eq!(
+            super::describe_target_action(
+                &AutomationAction::SwitchProfile { name: String::from("work") },
+                None,
+                &[],
+            ),
+            "Switch to profile work"
+        );
     }
 
     #[tokio::test]

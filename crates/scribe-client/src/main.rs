@@ -810,7 +810,7 @@ struct Shared {
     /// entity, so the reader only records the request and the lifecycle tick
     /// opens it. At most one is outstanding — the server parks the rest behind
     /// the same prompt id.
-    agent_prompt: Arc<Mutex<Option<AgentConsentDialog>>>,
+    agent_prompt: Arc<Mutex<AgentPromptSlot>>,
     /// Feature-013 tailnet state. The IPC reader folds the peer-list,
     /// environment, dial-outcome, displacement and severance answers into it and
     /// queues inbound automation actions here; the view renders the displaced
@@ -821,6 +821,45 @@ struct Shared {
     beads_boards: Arc<Mutex<BeadsBoards>>,
     /// Read-only issue panels and their parked detail requests.
     beads_panels: Arc<Mutex<BeadsPanels>>,
+}
+
+/// Spec-027 agent capability prompt handoff between the IPC reader and the GPUI
+/// thread.
+///
+/// A prompt can stop being answerable while it sits here or while it is on
+/// screen — the server withdraws it on timeout, on policy reload, and when its
+/// last requester dies — so the foreground publishes the id it is displaying
+/// and the reader can reach either side.
+#[derive(Default)]
+struct AgentPromptSlot {
+    /// Request awaiting the next foreground tick.
+    parked: Option<AgentConsentDialog>,
+    /// Prompt id currently on screen, set when the foreground raises the modal
+    /// and cleared when it answers or closes it.
+    displayed: Option<PromptId>,
+    /// Displayed prompt the server withdrew; the next foreground tick closes
+    /// that modal without sending a decision.
+    withdrawn: Option<PromptId>,
+}
+
+impl AgentPromptSlot {
+    /// Withdraw one prompt id, reporting whether it was this window's.
+    ///
+    /// A still-parked request is simply dropped; a displayed one is handed to
+    /// the foreground, which owns the modal. The server broadcasts dismissals
+    /// instead of tracking which window rendered the dialog, so an id this
+    /// window never showed is ignored.
+    fn dismiss(&mut self, prompt_id: PromptId) -> bool {
+        let was_parked = self.parked.as_ref().is_some_and(|dialog| dialog.prompt_id() == prompt_id);
+        if was_parked {
+            self.parked = None;
+        }
+        let was_displayed = self.displayed == Some(prompt_id);
+        if was_displayed {
+            self.withdrawn = Some(prompt_id);
+        }
+        was_parked || was_displayed
+    }
 }
 
 /// State shared across the IPC reader and GPUI view for a fresh window's first
@@ -5137,15 +5176,26 @@ impl TerminalView {
     /// a later tick rather than stacking two — the server holds the agent's call
     /// either way, and times it out as a deny if the user never gets to it.
     fn poll_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        let Ok(mut slot) = self.shared.agent_prompt.lock() else {
+            return;
+        };
+        // A withdrawal outranks a fresh prompt: the modal it names is on screen
+        // right now, and it must come down unanswered.
+        if let Some(prompt_id) = slot.withdrawn.take() {
+            slot.displayed = None;
+            drop(slot);
+            self.close_withdrawn_agent_prompt(prompt_id, cx);
+            return;
+        }
         if self.dialog.is_some() {
             return;
         }
-        let Some(prompt) =
-            self.shared.agent_prompt.lock().ok().and_then(|mut parked| parked.take())
-        else {
+        let Some(prompt) = slot.parked.take() else {
             return;
         };
         let pending = (prompt.prompt_id(), prompt.capability());
+        slot.displayed = Some(pending.0);
+        drop(slot);
         tracing::info!(
             prompt_id = pending.0.0,
             capability = ?pending.1,
@@ -5153,6 +5203,21 @@ impl TerminalView {
         );
         self.pending_agent_prompt = Some(pending);
         self.open_dialog(AnyDialog::AgentConsent(prompt), cx);
+    }
+
+    /// Close a consent modal the server withdrew, sending nothing.
+    ///
+    /// The prompt is gone server-side, so any decision would be fabricated
+    /// consent for a request that no longer exists. The id guard keeps this
+    /// from tearing down a different modal that opened over the consent one.
+    fn close_withdrawn_agent_prompt(&mut self, prompt_id: PromptId, cx: &mut Context<Self>) {
+        if self.pending_agent_prompt.is_none_or(|(pending, _)| pending != prompt_id) {
+            return;
+        }
+        tracing::info!(prompt_id = prompt_id.0, "closing the withdrawn agent capability prompt");
+        self.pending_agent_prompt = None;
+        self.dialog = None;
+        cx.notify();
     }
 
     /// Answer a pending agent capability prompt on the wire.
@@ -5168,6 +5233,10 @@ impl TerminalView {
         pending: Option<(PromptId, AgentCapability)>,
         decision: ClipboardDecision,
     ) {
+        if let Ok(mut slot) = self.shared.agent_prompt.lock() {
+            slot.displayed = None;
+            slot.withdrawn = None;
+        }
         let Some((prompt_id, capability)) = pending else {
             tracing::warn!("agent prompt answered with no pending request");
             return;
@@ -13801,7 +13870,7 @@ fn prepare_window_backend(
         workspaces: Arc::new(Mutex::new(Vec::new())),
         server_topology: Arc::new(Mutex::new(None)),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
-        agent_prompt: Arc::new(Mutex::new(None)),
+        agent_prompt: Arc::new(Mutex::new(AgentPromptSlot::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
         beads_boards: Arc::new(Mutex::new(BeadsBoards::default())),
         beads_panels: Arc::new(Mutex::new(BeadsPanels::default())),
@@ -15905,7 +15974,7 @@ struct ReaderCtx {
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
     /// Spec-027 agent capability prompt the reader parks for the foreground.
-    agent_prompt: Arc<Mutex<Option<AgentConsentDialog>>>,
+    agent_prompt: Arc<Mutex<AgentPromptSlot>>,
     /// Feature-013 tailnet state the reader folds every remote answer onto and
     /// queues inbound automation actions in.
     remote: Arc<Mutex<RemoteChrome>>,
@@ -16305,6 +16374,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::AgentRequestAccepted { .. } => "AgentRequestAccepted",
         ServerMessage::AgentResponse(_) => "AgentResponse",
         ServerMessage::AgentPromptRequest { .. } => "AgentPromptRequest",
+        ServerMessage::AgentPromptDismiss { .. } => "AgentPromptDismiss",
         ServerMessage::AgentActivity { .. } => "AgentActivity",
         ServerMessage::QuitRequested => "QuitRequested",
         ServerMessage::UpdateAvailable { .. } => "UpdateAvailable",
@@ -16791,8 +16861,21 @@ async fn dispatch_server_message(
         // consent surface reachable — unnamed, the request reaches the drop
         // counter and the agent's call is denied by timeout with no prompt ever
         // shown to the user who could have allowed it.
-        ServerMessage::AgentPromptRequest { prompt_id, agent_label, capability, target } => {
-            on_agent_prompt_request(ctx, prompt_id, agent_label, capability, target);
+        ServerMessage::AgentPromptRequest {
+            prompt_id,
+            agent_label,
+            capability,
+            target,
+            context,
+        } => on_agent_prompt_request(
+            ctx,
+            AgentConsentDialog::new(prompt_id, agent_label, capability, target, context),
+        ),
+        // Spec 027: the server withdrawing a prompt it can no longer answer.
+        // Unnamed, a consent dialog would sit on screen forever asking about a
+        // request that is already gone.
+        ServerMessage::AgentPromptDismiss { prompt_id } => {
+            on_agent_prompt_dismiss(ctx, prompt_id);
         }
         ServerMessage::AgentActivity { session_id, active } => {
             on_agent_activity(ctx, session_id, active);
@@ -17995,26 +18078,41 @@ fn apply_agent_capability_mode(
 /// key and parks the rest behind it, so the newest request is the live one and
 /// an abandoned prompt can never wedge the slot. Leaving one unanswered is not
 /// a hang either: the server times it out as a deny.
-fn on_agent_prompt_request(
-    ctx: &ReaderCtx,
-    prompt_id: PromptId,
-    agent_label: String,
-    capability: AgentCapability,
-    target: String,
-) {
+fn on_agent_prompt_request(ctx: &ReaderCtx, prompt: AgentConsentDialog) {
     tracing::info!(
-        prompt_id = prompt_id.0,
-        %agent_label,
-        ?capability,
-        %target,
+        prompt_id = prompt.prompt_id().0,
+        agent_label = %prompt.agent_label(),
+        capability = ?prompt.capability(),
         "agent capability prompt requested",
     );
-    let Ok(mut parked) = ctx.agent_prompt.lock() else {
+    let Ok(mut slot) = ctx.agent_prompt.lock() else {
         tracing::warn!("agent prompt mutex poisoned; dropping the capability prompt");
         return;
     };
-    *parked = Some(AgentConsentDialog::new(prompt_id, agent_label, capability, target));
-    drop(parked);
+    slot.parked = Some(prompt);
+    drop(slot);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Withdraw one spec-027 agent capability prompt the server can no longer
+/// answer — it timed out, a policy reload cancelled it, or its last requester
+/// went away.
+///
+/// The server broadcasts the withdrawal rather than tracking which window drew
+/// the dialog, so an id this window never showed is deliberately ignored. A
+/// dialog already on screen is closed by the foreground tick, never answered:
+/// sending a decision here would fabricate consent the user never gave.
+fn on_agent_prompt_dismiss(ctx: &ReaderCtx, prompt_id: PromptId) {
+    let Ok(mut slot) = ctx.agent_prompt.lock() else {
+        tracing::warn!("agent prompt mutex poisoned; dropping the capability dismissal");
+        return;
+    };
+    let ours = slot.dismiss(prompt_id);
+    drop(slot);
+    if !ours {
+        return;
+    }
+    tracing::info!(prompt_id = prompt_id.0, "agent capability prompt withdrawn by the server");
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
@@ -18599,6 +18697,37 @@ mod tests {
         assert!(!apply_agent_activity(&mut active, session_id, true));
         assert!(apply_agent_activity(&mut active, session_id, false));
         assert!(!active.contains(&session_id));
+    }
+
+    #[test]
+    fn a_withdrawn_agent_prompt_closes_its_dialog_without_a_decision() {
+        let mut slot = AgentPromptSlot {
+            parked: Some(AgentConsentDialog::new(
+                PromptId(1),
+                "claude-code".to_owned(),
+                AgentCapability::ReadContent,
+                "session-1".to_owned(),
+                scribe_common::protocol::AgentPromptContext::default(),
+            )),
+            ..AgentPromptSlot::default()
+        };
+
+        // Dismissals are broadcast, so an id this window never showed is
+        // ignored and leaves the live prompt alone.
+        assert!(!slot.dismiss(PromptId(2)));
+        assert!(slot.parked.is_some());
+
+        // A prompt still waiting for the foreground is simply dropped: nothing
+        // was ever displayed, so there is nothing to answer.
+        assert!(slot.dismiss(PromptId(1)));
+        assert!(slot.parked.is_none());
+        assert_eq!(slot.withdrawn, None);
+
+        // A displayed prompt is handed to the foreground tick, which closes the
+        // modal. No decision is recorded anywhere on this path.
+        slot.displayed = Some(PromptId(3));
+        assert!(slot.dismiss(PromptId(3)));
+        assert_eq!(slot.withdrawn, Some(PromptId(3)));
     }
 
     #[test]

@@ -101,6 +101,14 @@ impl AgentApiState {
         self.activity_transitions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
     }
 
+    /// Take the withdrawn-prompt stream. The server consumes it once at startup
+    /// and turns each id into a `ServerMessage::AgentPromptDismiss`.
+    pub fn take_prompt_dismissals(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<scribe_common::protocol::PromptId>> {
+        self.policy.take_dismissals()
+    }
+
     /// Resolve a user decision for one pending capability prompt.
     pub fn resolve_prompt(
         &self,
@@ -435,11 +443,16 @@ where
             let Some(send_prompt) = prompt_sender else {
                 return Err(denied());
             };
+            // Display context is left empty here on purpose: the policy engine
+            // is metadata-only, so the transport's prompt sender — which owns
+            // the registries — resolves origin and target descriptions at
+            // send time, after this authorization decided to prompt at all.
             send_prompt(ServerMessage::AgentPromptRequest {
                 prompt_id: prompt.prompt_id,
                 agent_label: prompt.agent_label,
                 capability: prompt.capability,
                 target: prompt.target,
+                context: scribe_common::protocol::AgentPromptContext::default(),
             })
             .await;
             pending.wait().await

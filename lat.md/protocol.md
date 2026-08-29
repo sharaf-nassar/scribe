@@ -43,11 +43,13 @@ The policy axes are read metadata, read content, dispatch action, dispatch destr
 
 ### Prompt, activity, and action completion frames
 
-Four additive exchanges connect a one-shot caller to the long-lived GPUI client without turning the agent socket into a persistent session.
+Five additive exchanges connect a one-shot caller to the long-lived GPUI client without turning the agent socket into a persistent session.
 
 `ServerMessage::AgentRequestAccepted { request_id }` is emitted only on the transient caller connection before opt-in requests that can park for consent or wait for foreground action completion. It is never sent to the GPUI client; a CLI waits 3 seconds only for this first liveness frame, then applies its completion backstop.
 
-`ServerMessage::AgentPromptRequest` names the prompt id, caller-supplied label, capability, and target. The capable local client answers with `ClientMessage::AgentPromptResponse` using the shared four-way `ClipboardDecision`, preserving allow/deny once and always semantics.
+`ServerMessage::AgentPromptRequest` names the prompt id, caller-supplied label, capability, and target, plus a serde-defaulted [[crates/scribe-common/src/protocol.rs#AgentPromptContext]] of display-only origin title, cwd and task label and one human target description. The context is resolved server-side at send time and never enters the prompt key; an older server omits it and every field decodes absent. The capable local client answers with `ClientMessage::AgentPromptResponse` using the shared four-way `ClipboardDecision`, preserving allow/deny once and always semantics.
+
+`ServerMessage::AgentPromptDismiss { prompt_id }` withdraws a prompt that can no longer be answered. It is broadcast to every capable local window rather than tracked per window, so a client ignores an id it never showed; the receiving client drops a parked prompt or closes the displayed dialog without sending a decision.
 
 `ServerMessage::AgentActivity { session_id, active }` carries server-owned lease edges for tab visibility. `ServerMessage::RunActionCorrelated` carries an action and correlation id; after foreground execution the target client sends `ClientMessage::ActionCompleted` with `Completed` or `Failed` plus an optional created session id. Existing `RunAction` and `ActionDispatched` semantics remain unchanged.
 

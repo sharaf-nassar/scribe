@@ -12,11 +12,20 @@ use std::time::Duration;
 use scribe_common::agent::{AgentCapability, AgentError, AgentPolicyMode};
 use scribe_common::config::AgentApiConfig;
 use scribe_common::protocol::{ClipboardDecision, PromptId};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Maximum simultaneous requests parked behind one prompt key.
 pub const MAX_PENDING_PER_KEY: usize = 64;
+
+/// How long a withdrawn prompt id keeps answering `Always*` decisions.
+///
+/// A dialog is dismissed and clicked concurrently: the click that was already
+/// in flight when the prompt stopped being answerable still carries an explicit
+/// user preference, so the key survives long enough to apply it instead of
+/// dropping it silently. Once-only decisions on a tombstone stay no-ops — the
+/// request they would have answered is already gone.
+const PROMPT_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
 
 /// Prompt payload to route to an agent-API-capable client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +87,11 @@ impl Drop for PendingAuthorization {
 #[derive(Clone)]
 pub struct AgentPolicyEngine {
     inner: Arc<Mutex<PolicyState>>,
+    /// Prompt ids that stopped being answerable. The engine holds no writer
+    /// references, so the transport takes this stream once and turns each id
+    /// into a `ServerMessage::AgentPromptDismiss`, exactly as it does for
+    /// activity transitions.
+    dismissals: mpsc::UnboundedSender<PromptId>,
 }
 
 struct PolicyState {
@@ -87,6 +101,10 @@ struct PolicyState {
     pending: HashMap<PromptKey, PendingPrompt>,
     prompt_keys: HashMap<PromptId, PromptKey>,
     last_decisions: HashMap<PromptKey, CachedDecision>,
+    /// Keys of prompts that stopped being answerable, kept for
+    /// [`PROMPT_TOMBSTONE_TTL`] so a racing click still persists `Always*`.
+    tombstones: HashMap<PromptId, Tombstone>,
+    dismissals: Option<mpsc::UnboundedReceiver<PromptId>>,
 }
 
 struct PendingPrompt {
@@ -116,9 +134,15 @@ struct CachedDecision {
     resolved_at: Instant,
 }
 
+struct Tombstone {
+    key: PromptKey,
+    expires_at: Instant,
+}
+
 impl AgentPolicyEngine {
     #[must_use]
     pub fn new(config: AgentApiConfig) -> Self {
+        let (dismissals, receiver) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(Mutex::new(PolicyState {
                 config,
@@ -127,8 +151,16 @@ impl AgentPolicyEngine {
                 pending: HashMap::new(),
                 prompt_keys: HashMap::new(),
                 last_decisions: HashMap::new(),
+                tombstones: HashMap::new(),
+                dismissals: Some(receiver),
             })),
+            dismissals,
         }
+    }
+
+    /// Take the withdrawn-prompt stream. The server consumes it once at startup.
+    pub fn take_dismissals(&self) -> Option<mpsc::UnboundedReceiver<PromptId>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).dismissals.take()
     }
 
     /// Resolve one request without looking up its target first.
@@ -223,11 +255,13 @@ impl AgentPolicyEngine {
         }
     }
 
-    /// Apply a correlated client decision. Stale and mismatched ids are no-ops.
+    /// Apply a correlated client decision. Mismatched ids are no-ops.
     ///
     /// `AlwaysAllow` and `AlwaysDeny` immediately mutate the matching
     /// capability's in-memory mode; the config-write round trip can persist the
-    /// same mode later without delaying current requests.
+    /// same mode later without delaying current requests. A decision that
+    /// raced its prompt's withdrawal lands on the tombstone instead, where
+    /// `Always*` still persists and once-only choices are no-ops.
     pub fn resolve(&self, prompt_id: PromptId, decision: ClipboardDecision) -> bool {
         self.resolve_at(prompt_id, decision, Instant::now())
     }
@@ -236,7 +270,7 @@ impl AgentPolicyEngine {
         let (waiters, result) = {
             let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(key) = state.prompt_keys.remove(&prompt_id) else {
-                return false;
+                return resolve_tombstoned(&mut state, prompt_id, decision, now);
             };
             let Some(pending) = state.pending.remove(&key) else {
                 return false;
@@ -252,17 +286,26 @@ impl AgentPolicyEngine {
     }
 
     /// Replace live policy and cancel every prompt issued under the old one.
+    ///
+    /// Existing tombstones die with the old policy: the reloaded config is the
+    /// user's own current answer, so a late `Always*` from a prompt raised
+    /// before the reload must not overwrite it.
     pub fn refresh(&self, config: AgentApiConfig) {
-        let waiters = {
+        let (waiters, dismissed) = {
             let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             state.config = config;
-            state.prompt_keys.clear();
             state.last_decisions.clear();
-            std::mem::take(&mut state.pending)
+            state.tombstones.clear();
+            let dismissed = std::mem::take(&mut state.prompt_keys).into_keys().collect::<Vec<_>>();
+            let waiters = std::mem::take(&mut state.pending)
                 .into_values()
                 .flat_map(|pending| pending.waiters.into_values())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (waiters, dismissed)
         };
+        for prompt_id in dismissed {
+            self.dismissals.send(prompt_id).ok();
+        }
         let result = Err(denied("agent capability prompt cancelled by policy refresh"));
         for sender in waiters {
             drop(sender.send(result.clone()));
@@ -281,8 +324,11 @@ impl AgentPolicyEngine {
             let Some(key) = state.prompt_keys.remove(&prompt_id) else {
                 return;
             };
-            state.pending.remove(&key).map(|pending| pending.waiters)
+            let waiters = state.pending.remove(&key).map(|pending| pending.waiters);
+            entomb(&mut state, prompt_id, key);
+            waiters
         };
+        self.dismissals.send(prompt_id).ok();
         if let Some(waiters) = waiters {
             let result = Err(prompt_timeout());
             for sender in waiters.into_values() {
@@ -292,19 +338,57 @@ impl AgentPolicyEngine {
     }
 
     fn cancel_waiter(&self, prompt_id: PromptId, waiter_id: u64) {
-        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(key) = state.prompt_keys.get(&prompt_id).cloned() else {
-            return;
-        };
-        let empty = state.pending.get_mut(&key).is_some_and(|pending| {
-            pending.waiters.remove(&waiter_id);
-            pending.waiters.is_empty()
-        });
-        if empty {
+        {
+            let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(key) = state.prompt_keys.get(&prompt_id).cloned() else {
+                return;
+            };
+            let empty = state.pending.get_mut(&key).is_some_and(|pending| {
+                pending.waiters.remove(&waiter_id);
+                pending.waiters.is_empty()
+            });
+            if !empty {
+                return;
+            }
             state.pending.remove(&key);
             state.prompt_keys.remove(&prompt_id);
+            entomb(&mut state, prompt_id, key);
         }
+        self.dismissals.send(prompt_id).ok();
     }
+}
+
+/// Retire one prompt id that can no longer be answered, keeping its key
+/// answerable for `Always*` until [`PROMPT_TOMBSTONE_TTL`] elapses.
+fn entomb(state: &mut PolicyState, prompt_id: PromptId, key: PromptKey) {
+    let now = Instant::now();
+    state.tombstones.retain(|_, tombstone| tombstone.expires_at > now);
+    state.tombstones.insert(prompt_id, Tombstone { key, expires_at: now + PROMPT_TOMBSTONE_TTL });
+}
+
+/// Apply a decision that arrived after its prompt was withdrawn.
+///
+/// Only `Always*` survives — it is a durable preference the user typed into a
+/// dialog that was still on screen, so dropping it would lose real intent. No
+/// waiter is signalled and no burst decision is cached: the request this would
+/// have answered already failed.
+fn resolve_tombstoned(
+    state: &mut PolicyState,
+    prompt_id: PromptId,
+    decision: ClipboardDecision,
+    now: Instant,
+) -> bool {
+    state.tombstones.retain(|_, tombstone| tombstone.expires_at > now);
+    let Some(capability) =
+        state.tombstones.get(&prompt_id).map(|tombstone| tombstone.key.capability)
+    else {
+        return false;
+    };
+    if !apply_always_decision(&mut state.config, capability, decision) {
+        return false;
+    }
+    state.tombstones.remove(&prompt_id);
+    true
 }
 
 impl Default for AgentPolicyEngine {
@@ -347,15 +431,17 @@ const fn capability_index(capability: AgentCapability) -> u8 {
     }
 }
 
+/// Persist an `Always*` choice onto its capability axis, reporting whether the
+/// decision was one that changes policy at all.
 fn apply_always_decision(
     config: &mut AgentApiConfig,
     capability: AgentCapability,
     decision: ClipboardDecision,
-) {
+) -> bool {
     let mode = match decision {
         ClipboardDecision::AlwaysAllow => AgentPolicyMode::Allow,
         ClipboardDecision::AlwaysDeny => AgentPolicyMode::Deny,
-        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => return,
+        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => return false,
     };
     match capability {
         AgentCapability::ReadMetadata => config.read_metadata = mode,
@@ -364,6 +450,7 @@ fn apply_always_decision(
         AgentCapability::DispatchDestructiveAction => config.dispatch_destructive_action = mode,
         AgentCapability::WriteInput => config.write_input = mode,
     }
+    true
 }
 
 const fn is_allowed(decision: ClipboardDecision) -> bool {
@@ -643,6 +730,99 @@ mod tests {
             engine.authorize("agent-a", AgentCapability::ReadContent, "session-1", true),
             PolicyResolution::Deny
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_always_decision_still_persists_after_prompt_expiry() {
+        let engine = AgentPolicyEngine::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            prompt_timeout_ms: 37,
+            ..AgentApiConfig::default()
+        });
+        let now = Instant::now();
+        let (prompt, pending) = issue_prompt(&engine, now);
+        let wait = tokio::spawn(pending.wait());
+        tokio::time::advance(Duration::from_millis(37)).await;
+        assert!(matches!(wait.await, Ok(Err(AgentError::PromptTimeout { .. }))));
+        // The dialog is still visible; the user clicks "Always allow".
+        let applied = engine.resolve(prompt.prompt_id, ClipboardDecision::AlwaysAllow);
+        assert!(applied, "a late Always decision was silently dropped");
+        assert_eq!(
+            mode_for(&engine.config(), AgentCapability::ReadContent),
+            AgentPolicyMode::Allow,
+            "Always allow did not persist after the prompt expired"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_prompt_is_dismissed_once_and_forgets_once_only_decisions() {
+        let engine = AgentPolicyEngine::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            prompt_timeout_ms: 37,
+            ..AgentApiConfig::default()
+        });
+        let mut dismissals = engine.take_dismissals().expect("dismissal stream");
+        assert!(engine.take_dismissals().is_none(), "the stream is taken exactly once");
+
+        let (prompt, pending) = issue_prompt(&engine, Instant::now());
+        let wait = tokio::spawn(pending.wait());
+        tokio::time::advance(Duration::from_millis(37)).await;
+        assert!(matches!(wait.await, Ok(Err(AgentError::PromptTimeout { .. }))));
+
+        assert_eq!(dismissals.recv().await, Some(prompt.prompt_id));
+        assert!(dismissals.try_recv().is_err(), "the dropped waiter must not dismiss twice");
+
+        // A once-only click on the tombstone changes nothing.
+        assert!(!engine.resolve(prompt.prompt_id, ClipboardDecision::AllowOnce));
+        assert_eq!(engine.config().read_content, AgentPolicyMode::Prompt);
+
+        // The tombstone expires, so a much later click is dropped again.
+        tokio::time::advance(super::PROMPT_TOMBSTONE_TTL + Duration::from_secs(1)).await;
+        assert!(!engine.resolve(prompt.prompt_id, ClipboardDecision::AlwaysAllow));
+        assert_eq!(engine.config().read_content, AgentPolicyMode::Prompt);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_waiter_dismisses_its_prompt() {
+        let engine = AgentPolicyEngine::new(prompt_config());
+        let mut dismissals = engine.take_dismissals().expect("dismissal stream");
+        let now = Instant::now();
+        let (prompt, first) = issue_prompt(&engine, now);
+        let PolicyResolution::Parked(second) = engine.authorize_at(
+            PromptKey {
+                agent_label: "agent-a".into(),
+                capability: AgentCapability::ReadContent,
+                target: "session-1".into(),
+            },
+            true,
+            now,
+        ) else {
+            panic!("expected parked request");
+        };
+
+        drop(first);
+        assert!(dismissals.try_recv().is_err(), "a prompt with waiters left is still answerable");
+        drop(second);
+        assert_eq!(dismissals.recv().await, Some(prompt.prompt_id));
+    }
+
+    #[tokio::test]
+    async fn policy_refresh_dismisses_every_prompt_it_cancels() {
+        let engine = AgentPolicyEngine::new(prompt_config());
+        let mut dismissals = engine.take_dismissals().expect("dismissal stream");
+        let now = Instant::now();
+        let (prompt, pending) = issue_prompt(&engine, now);
+
+        engine.refresh(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+
+        assert_eq!(dismissals.recv().await, Some(prompt.prompt_id));
+        assert!(matches!(pending.wait().await, Err(AgentError::Denied { .. })));
+        // The reloaded config outranks a decision from before it landed.
+        assert!(!engine.resolve(prompt.prompt_id, ClipboardDecision::AlwaysAllow));
+        assert_eq!(engine.config().read_content, AgentPolicyMode::Prompt);
     }
 
     #[tokio::test]

@@ -272,6 +272,7 @@ macro_rules! unused_server_message {
             | ServerMessage::AgentRequestAccepted { .. }
             | ServerMessage::AgentResponse(_)
             | ServerMessage::AgentPromptRequest { .. }
+            | ServerMessage::AgentPromptDismiss { .. }
             | ServerMessage::AgentActivity { .. }
     };
 }

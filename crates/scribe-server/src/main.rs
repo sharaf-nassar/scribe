@@ -578,6 +578,10 @@ async fn run_server_loop(
     // window as `AgentActivity`, gated on the participant's `agent_api` bit.
     ipc_server::spawn_agent_activity_forwarder(&server_state);
 
+    // Spec 027: tell capable windows when a capability prompt stopped being
+    // answerable, so no consent dialog outlives the request it was gating.
+    ipc_server::spawn_agent_prompt_dismiss_forwarder(&server_state);
+
     // Start the remote-control supervisor: it applies the current `[remote]`
     // config (a no-op when disabled — the default) and then rebinds/stops the
     // listener live on every `ConfigReloaded`. Spawned, not awaited, so a wedged

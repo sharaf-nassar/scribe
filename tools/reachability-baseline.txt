@@ -26,8 +26,8 @@
 
 counts modules-total 78
 counts modules-wired 78
-counts server-messages-total 75
-counts server-messages-handled 68
+counts server-messages-total 76
+counts server-messages-handled 69
 counts layout-actions-total 38
 counts layout-actions-handled 38
 
