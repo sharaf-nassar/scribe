@@ -32,15 +32,20 @@ The local agent control surface is an additive, one-shot request/reply family on
 
 ### Requests, replies, and capability gates
 
-One `ClientMessage::AgentRequest(AgentRequest)` carries every control-surface operation and one `ServerMessage::AgentResponse(AgentResponse)` carries its correlated result.
+One `ClientMessage::AgentRequest(AgentRequest)` carries every control-surface operation and a terminal `ServerMessage::AgentResponse(AgentResponse)` carries its correlated result.
 
-[[crates/scribe-common/src/agent.rs#AgentRequest]] defines `World`, `Siblings`, `ReadScreen`, `DispatchAction`, `WriteInput`, and `Capabilities`. Each request includes a client-generated `request_id`, a caller-supplied `agent_label`, and optional `origin_session_id`; the origin orients `Siblings` and `is_caller` only and is not authentication. `Capabilities` is always answerable and reports surface version 1 plus the live mode for every supported capability.
+Requests that opt into `progress_ack` and can wait receive one preceding
+`ServerMessage::AgentRequestAccepted { request_id }` frame.
+
+[[crates/scribe-common/src/agent.rs#AgentRequest]] defines `World`, `Siblings`, `ReadScreen`, `DispatchAction`, `WriteInput`, and `Capabilities`. Each request includes a client-generated `request_id`, a caller-supplied `agent_label`, optional `origin_session_id`, and serde-defaulted `progress_ack`; the origin orients `Siblings` and `is_caller` only and is not authentication. The opt-in field lets a new CLI distinguish a live prompt/action wait from an old server that sends no first frame. `Capabilities` is always answerable and reports surface version 1 plus the live mode for every supported capability.
 
 The policy axes are read metadata, read content, dispatch action, dispatch destructive action, and write input. The action mapping is exhaustive, so a future `AutomationAction` cannot silently inherit the non-destructive gate. Typed errors use stable snake-case codes through the CLI: `denied`, `prompt_timeout`, `not_found`, `ambiguous_target`, `unsupported`, `too_large`, `busy`, `version_mismatch`, `action_failed`, and `internal`.
 
 ### Prompt, activity, and action completion frames
 
-Three additive exchanges connect a one-shot caller to the long-lived GPUI client without turning the agent socket into a persistent session.
+Four additive exchanges connect a one-shot caller to the long-lived GPUI client without turning the agent socket into a persistent session.
+
+`ServerMessage::AgentRequestAccepted { request_id }` is emitted only on the transient caller connection before opt-in requests that can park for consent or wait for foreground action completion. It is never sent to the GPUI client; a CLI waits 3 seconds only for this first liveness frame, then applies its completion backstop.
 
 `ServerMessage::AgentPromptRequest` names the prompt id, caller-supplied label, capability, and target. The capable local client answers with `ClientMessage::AgentPromptResponse` using the shared four-way `ClipboardDecision`, preserving allow/deny once and always semantics.
 

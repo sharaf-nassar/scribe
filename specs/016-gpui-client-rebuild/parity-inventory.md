@@ -160,21 +160,21 @@ are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (74 variants, 68 reachable)
+## Server messages (75 variants, 68 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
 The live reader's dispatcher `main.rs::dispatch_server_message` handles 60 of
-74 variants and routes the rest to `main.rs::unhandled_server_message`, which
+75 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
 `TrustedNetworkList` — are consumed by the settings
 window's synchronous request/reply helper in `settings/server_action.rs`, and
 each of those rows says so. `BeadsIssueDetail`, `BeadsIssueWriteResult`, `WorkspaceTransferResult`,
-`WorkspaceMoveResult`, `RunActionCorrelated`, `AgentResponse`, and
-`AgentActivity` are the remaining unwired replies; their protocol slices land
+`WorkspaceMoveResult`, `RunActionCorrelated`, `AgentRequestAccepted`,
+`AgentResponse`, and `AgentActivity` are the remaining unwired replies; their protocol slices land
 before their consumers. `tools/check-parity-inventory.sh` enforces that:
 any variant the dispatcher does not handle must either carry a marker cell or
 be annotated a settings-window row, so this column cannot claim a reader arm
@@ -220,6 +220,7 @@ erase a replacement.
 | `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
 | `RunActionCorrelated` | correlated agent automation | unit | — (unwired; execution and completion routing lands in `scribe-8uuf.8`) | required |
 | `ActionDispatched` | remote automation | scripted-E2E | `main.rs::on_remote_message` arm — the routing ack for a dispatch this client sent | required |
+| `AgentRequestAccepted` | local agent request liveness acknowledgement | unit | — (unwired; transient CLI-only frame) | required |
 | `AgentResponse` | local agent request reply | unit | — (unwired; the CLI consumer lands in `scribe-8uuf.15`) | required |
 | `AgentPromptRequest` | agent capability consent | unit | `main.rs::dispatch_server_message` → `main.rs::on_agent_prompt_request` parks a `dialog::AgentConsentDialog` → `TerminalView::poll_agent_prompt` raises it on the lifecycle tick → `main.rs::answer_agent_prompt` → `ipc_bridge::IpcSink::agent_prompt_response` | required |
 | `AgentActivity` | visible agent session activity | unit | — (unwired; tab activity state lands in `scribe-8uuf.19`) | required |
@@ -261,7 +262,7 @@ erase a replacement.
 | `BeadsEpicGraph` | workspace Beads Flow epic dependency graph reply | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::apply_epic_graph` → `beads_board.rs::flow_strip` | required |
 | `IssueFocused` | local unshared Flow live-agent issue binding | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::set_focused_issue` → `beads_flow.rs::node_dot` | required |
 
-**Reachability:** 68 of 74 rows name a live-path symbol; 6 are unwired and 0
+**Reachability:** 68 of 75 rows name a live-path symbol; 7 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -485,18 +486,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
 | Client messages | 56 | 50 | 6 | 0 |
-| Server messages | 74 | 68 | 6 | 0 |
+| Server messages | 75 | 68 | 7 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **229** | **217** | **12** | **0** |
+| **Total** | **230** | **217** | **13** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **220 rows, of which 208 are
-reachable (95%)** and 12 are not. **1 of those 220** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **221 rows, of which 208 are
+reachable (94%)** and 13 are not. **1 of those 221** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **207 of 220**.
+the in-client figure is **207 of 221**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

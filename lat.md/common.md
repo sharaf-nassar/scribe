@@ -42,7 +42,7 @@ Shared agent types expose a narrow, versioned local contract without serializing
 
 [[crates/scribe-common/src/agent.rs#AgentRequest]] and [[crates/scribe-common/src/agent.rs#AgentPayload]] are tagged enums for world, sibling, screen, action, input, and capability operations.
 
-Every request carries `request_id`, a caller-supplied label, and optional origin session. [[crates/scribe-common/src/agent.rs#AgentResponse]] echoes the id and wraps either a successful payload or [[crates/scribe-common/src/agent.rs#AgentError]]. `AGENT_SURFACE_VERSION` is 1 and is reported by the capability payload.
+Every request carries `request_id`, a caller-supplied label, optional origin session, and serde-defaulted `progress_ack`. The opt-in acknowledgement makes the transient protocol forward-compatible: a new CLI waits longer only after a new server confirms it received an operation that can park or wait. [[crates/scribe-common/src/agent.rs#AgentResponse]] echoes the id and wraps either a successful payload or [[crates/scribe-common/src/agent.rs#AgentError]]. `AGENT_SURFACE_VERSION` is 1 and is reported by the capability payload.
 
 World DTOs expose window/workspace/session identity and status, with optional title, CWD, provider, AI state, task label, and context fill omitted when unavailable. They deliberately exclude launch ids, retained prompt state and text, conversation ids, model/tool/agent metadata, environment envelopes, controller identity, and participant identity. Screen replies identify the pane and include normalized text, line count, truncation, capture time, and snapshot id.
 

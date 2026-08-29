@@ -287,7 +287,7 @@ impl<'a> From<&'a AgentRequest> for RequestMetadata<'a> {
                 target_kind: "server",
                 target_id: "server".into(),
             },
-            AgentRequest::Siblings { request_id, agent_label, origin_session_id } => Self {
+            AgentRequest::Siblings { request_id, agent_label, origin_session_id, .. } => Self {
                 request_id: *request_id,
                 agent_label,
                 capability: AgentCapability::ReadMetadata,
@@ -739,6 +739,7 @@ mod tests {
             request_id,
             agent_label: "socket-test".into(),
             origin_session_id: None,
+            progress_ack: false,
         }
     }
 
@@ -747,6 +748,7 @@ mod tests {
             request_id,
             agent_label: "world-test".into(),
             origin_session_id: origin,
+            progress_ack: false,
         }
     }
 
@@ -755,6 +757,7 @@ mod tests {
             request_id,
             agent_label: "world-test".into(),
             origin_session_id: origin,
+            progress_ack: false,
         }
     }
 
@@ -763,6 +766,7 @@ mod tests {
             request_id,
             agent_label: "capability-test".into(),
             origin_session_id: None,
+            progress_ack: false,
         }
     }
 
@@ -779,6 +783,7 @@ mod tests {
             request_id,
             agent_label: agent_label.into(),
             origin_session_id: None,
+            progress_ack: false,
             session_id,
             scrollback_lines: Some(1),
         }
@@ -793,6 +798,7 @@ mod tests {
             request_id,
             agent_label: "action-test".into(),
             origin_session_id: None,
+            progress_ack: false,
             action,
             window,
         }
@@ -816,6 +822,7 @@ mod tests {
             request_id,
             agent_label: "write-test".into(),
             origin_session_id: None,
+            progress_ack: false,
             session_id,
             text: text.into(),
             submit,
@@ -1633,12 +1640,14 @@ mod tests {
                 request_id: 3,
                 agent_label: "target-test".into(),
                 origin_session_id: Some(session_id),
+                progress_ack: false,
             },
             screen_request(4, session_id),
             AgentRequest::DispatchAction {
                 request_id: 5,
                 agent_label: "target-test".into(),
                 origin_session_id: None,
+                progress_ack: false,
                 action: AutomationAction::NewTab,
                 window: Some(window_id),
             },
@@ -1646,6 +1655,7 @@ mod tests {
                 request_id: 6,
                 agent_label: "target-test".into(),
                 origin_session_id: None,
+                progress_ack: false,
                 session_id,
                 text: String::new(),
                 submit: false,
@@ -1767,6 +1777,7 @@ mod tests {
             request_id: 23,
             agent_label: "busy-agent".into(),
             origin_session_id: None,
+            progress_ack: false,
         };
         let busy = dispatch_headless(&busy_state, &busy_request).await;
         drop(permits);

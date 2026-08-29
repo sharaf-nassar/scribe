@@ -50,7 +50,12 @@ Stateful actions that need an immediate server-side response (e.g. the Updates p
 
 ### scribe-cli
 
-Thin CLI entry point that launches the client process.
+Thin CLI entry point that launches the client process and hosts the one-shot
+agent command surface.
+
+Agent calls opt into a progress acknowledgement: the CLI applies its 3-second
+compatibility deadline only until the first frame, then waits through the
+bounded prompt and action-completion budgets for the terminal response.
 
 ### scribe-hook-helper
 

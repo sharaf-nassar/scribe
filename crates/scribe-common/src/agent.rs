@@ -21,18 +21,24 @@ pub enum AgentRequest {
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
     },
     Siblings {
         request_id: u64,
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
     },
     ReadScreen {
         request_id: u64,
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scrollback_lines: Option<u32>,
@@ -42,6 +48,8 @@ pub enum AgentRequest {
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
         action: AutomationAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<WindowId>,
@@ -51,6 +59,8 @@ pub enum AgentRequest {
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
         session_id: SessionId,
         text: String,
         submit: bool,
@@ -60,7 +70,37 @@ pub enum AgentRequest {
         agent_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_session_id: Option<SessionId>,
+        #[serde(default)]
+        progress_ack: bool,
     },
+}
+
+impl AgentRequest {
+    /// The caller-generated id correlated by progress and terminal replies.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        match self {
+            Self::World { request_id, .. }
+            | Self::Siblings { request_id, .. }
+            | Self::ReadScreen { request_id, .. }
+            | Self::DispatchAction { request_id, .. }
+            | Self::WriteInput { request_id, .. }
+            | Self::Capabilities { request_id, .. } => *request_id,
+        }
+    }
+
+    /// Whether the caller accepts a progress acknowledgement before completion.
+    #[must_use]
+    pub const fn requests_progress_ack(&self) -> bool {
+        match self {
+            Self::World { progress_ack, .. }
+            | Self::Siblings { progress_ack, .. }
+            | Self::ReadScreen { progress_ack, .. }
+            | Self::DispatchAction { progress_ack, .. }
+            | Self::WriteInput { progress_ack, .. }
+            | Self::Capabilities { progress_ack, .. } => *progress_ack,
+        }
+    }
 }
 
 /// Reply to one [`AgentRequest`].
@@ -356,16 +396,19 @@ mod tests {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
             },
             AgentRequest::Siblings {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
             },
             AgentRequest::ReadScreen {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
                 session_id: sid,
                 scrollback_lines: Some(10),
             },
@@ -373,6 +416,7 @@ mod tests {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
                 action: action(),
                 window: Some(wid),
             },
@@ -380,6 +424,7 @@ mod tests {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
                 session_id: sid,
                 text: String::from("input"),
                 submit: true,
@@ -388,6 +433,7 @@ mod tests {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
+                progress_ack: false,
             },
         ];
         for request in &requests {
@@ -412,9 +458,7 @@ mod tests {
         assert_redacted(&AgentError::Denied { message: String::from("denied") });
         let world = snapshot();
         assert_redacted(&world);
-        assert_eq!(world.windows.len(), 1);
-        assert_eq!(world.workspaces.len(), 1);
-        assert_eq!(world.sessions.len(), 1);
+        assert_eq!((world.windows.len(), world.workspaces.len(), world.sessions.len()), (1, 1, 1));
         for window in &world.windows {
             assert_redacted(window);
         }

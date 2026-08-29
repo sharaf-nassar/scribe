@@ -269,6 +269,7 @@ macro_rules! unused_server_message {
             | ServerMessage::ControlRequested { .. }
             | ServerMessage::ControlDenied { .. }
             | ServerMessage::ShareEnded { .. }
+            | ServerMessage::AgentRequestAccepted { .. }
             | ServerMessage::AgentResponse(_)
             | ServerMessage::AgentPromptRequest { .. }
             | ServerMessage::AgentActivity { .. }

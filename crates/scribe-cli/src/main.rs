@@ -228,7 +228,10 @@ async fn connect_server() -> Result<UnixStream, ScribeError> {
     UnixStream::connect(&path).await.map_err(|e| ScribeError::Io { source: e })
 }
 
+/// Deadline for detecting a server that predates the agent API progress ack.
 const AGENT_API_DEADLINE: Duration = Duration::from_secs(3);
+/// Prompt ceiling (5 minutes) + action completion (1 minute) + transport margin.
+const AGENT_API_COMPLETION_DEADLINE: Duration = Duration::from_secs(375);
 const AGENT_REQUEST_ID: u64 = 1;
 const MAX_AGENT_LABEL_CHARS: usize = 64;
 
@@ -236,6 +239,8 @@ const MAX_AGENT_LABEL_CHARS: usize = 64;
 enum AgentExchangeError {
     Unreachable(ScribeError),
     Unsupported(ScribeError),
+    Completion(ScribeError),
+    CompletionDeadline,
 }
 
 fn agent_label(agent: &str, model: Option<String>) -> Result<String, &'static str> {
@@ -451,16 +456,23 @@ fn build_agent_request(
     origin_session_id: Option<SessionId>,
 ) -> Option<AgentRequest> {
     Some(match command {
-        AgentCommand::World => {
-            AgentRequest::World { request_id: AGENT_REQUEST_ID, agent_label, origin_session_id }
-        }
-        AgentCommand::Siblings => {
-            AgentRequest::Siblings { request_id: AGENT_REQUEST_ID, agent_label, origin_session_id }
-        }
+        AgentCommand::World => AgentRequest::World {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+            progress_ack: true,
+        },
+        AgentCommand::Siblings => AgentRequest::Siblings {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+            progress_ack: true,
+        },
         AgentCommand::Read { session_id, scrollback } => AgentRequest::ReadScreen {
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
+            progress_ack: true,
             session_id,
             scrollback_lines: scrollback,
         },
@@ -468,6 +480,7 @@ fn build_agent_request(
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
+            progress_ack: true,
             action: to_automation_action(action),
             window,
         },
@@ -475,6 +488,7 @@ fn build_agent_request(
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
+            progress_ack: true,
             session_id,
             text,
             submit,
@@ -483,6 +497,7 @@ fn build_agent_request(
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
+            progress_ack: true,
         },
         AgentCommand::Skill => return None,
     })
@@ -507,12 +522,36 @@ where
     write_message(stream, &ClientMessage::AgentRequest(request.clone()))
         .await
         .map_err(AgentExchangeError::Unsupported)?;
-    let response: ServerMessage =
-        read_message(stream).await.map_err(AgentExchangeError::Unsupported)?;
-    let ServerMessage::AgentResponse(response) = response else {
-        return Err(AgentExchangeError::Unsupported(ScribeError::ProtocolError {
-            reason: String::from("server did not return an agent response"),
-        }));
+    let first: ServerMessage = timeout(AGENT_API_DEADLINE, read_message(stream))
+        .await
+        .map_err(|_| {
+            AgentExchangeError::Unsupported(ScribeError::ProtocolError {
+                reason: String::from("server did not answer the agent API handshake"),
+            })
+        })?
+        .map_err(AgentExchangeError::Unsupported)?;
+    let response = match first {
+        ServerMessage::AgentResponse(response) => response,
+        ServerMessage::AgentRequestAccepted { request_id }
+            if request_id == request.request_id() =>
+        {
+            let response: ServerMessage =
+                timeout(AGENT_API_COMPLETION_DEADLINE, read_message(stream))
+                    .await
+                    .map_err(|_| AgentExchangeError::CompletionDeadline)?
+                    .map_err(AgentExchangeError::Completion)?;
+            let ServerMessage::AgentResponse(response) = response else {
+                return Err(AgentExchangeError::Completion(ScribeError::ProtocolError {
+                    reason: String::from("server did not complete the acknowledged agent request"),
+                }));
+            };
+            response
+        }
+        _ => {
+            return Err(AgentExchangeError::Unsupported(ScribeError::ProtocolError {
+                reason: String::from("server did not return an agent response"),
+            }));
+        }
     };
     Ok(response)
 }
@@ -562,14 +601,14 @@ async fn run_agent_command(
         return run_agent_skill_command();
     };
 
-    match timeout(AGENT_API_DEADLINE, exchange_agent_request(&request)).await {
-        Ok(Ok(response)) => agent_response_exit(response),
-        Ok(Err(AgentExchangeError::Unreachable(error))) => {
+    match exchange_agent_request(&request).await {
+        Ok(response) => agent_response_exit(response),
+        Err(AgentExchangeError::Unreachable(error)) => {
             write_stderr_line(&format!("agent API server is unreachable: {error}"));
             _ = print_agent_failure("unreachable", "Scribe server is unreachable.");
             ExitCode::from(3)
         }
-        Ok(Err(AgentExchangeError::Unsupported(error))) => {
+        Err(AgentExchangeError::Unsupported(error)) => {
             write_stderr_line(&format!("agent API is unsupported: {error}"));
             _ = print_agent_failure(
                 "unsupported",
@@ -577,13 +616,25 @@ async fn run_agent_command(
             );
             ExitCode::from(3)
         }
-        Err(_) => {
-            write_stderr_line("agent API deadline elapsed");
+        Err(AgentExchangeError::Completion(error)) => {
+            write_stderr_line(&format!(
+                "agent API exchange failed after request acknowledgement: {error}"
+            ));
             _ = print_agent_failure(
-                "unsupported",
-                "The connected Scribe server does not support the agent API.",
+                "internal",
+                "Scribe server disconnected while processing the agent request.",
             );
-            ExitCode::from(3)
+            ExitCode::from(1)
+        }
+        Err(AgentExchangeError::CompletionDeadline) => {
+            write_stderr_line(
+                "agent API completion deadline elapsed after request acknowledgement",
+            );
+            _ = print_agent_failure(
+                "internal",
+                "Scribe server did not complete the acknowledged agent request.",
+            );
+            ExitCode::from(1)
         }
     }
 }
@@ -959,6 +1010,7 @@ mod tests {
             request_id: 1,
             agent_label: String::from("runner [model-x]"),
             origin_session_id: Some(session_id),
+            progress_ack: true,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -969,6 +1021,7 @@ mod tests {
                     request_id: 1,
                     agent_label,
                     origin_session_id: Some(origin),
+                    progress_ack: true,
                 }) if agent_label == "runner [model-x]" && origin == session_id
             ));
             write_message(
@@ -985,6 +1038,63 @@ mod tests {
         let response = exchange_agent_request_on(&mut client, &request).await.unwrap();
         assert!(matches!(response.result, Ok(AgentPayload::WriteInput)));
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_exchange_survives_a_prompt_parked_reply() {
+        let request = AgentRequest::World {
+            request_id: 1,
+            agent_label: String::from("runner"),
+            origin_session_id: None,
+            progress_ack: true,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _: ClientMessage = read_message(&mut server).await.unwrap();
+            write_message(&mut server, &ServerMessage::AgentRequestAccepted { request_id: 1 })
+                .await
+                .unwrap();
+            tokio::time::sleep(super::AGENT_API_DEADLINE + std::time::Duration::from_secs(1)).await;
+            write_message(
+                &mut server,
+                &ServerMessage::AgentResponse(AgentResponse {
+                    request_id: 1,
+                    result: Ok(AgentPayload::WriteInput),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let response = exchange_agent_request_on(&mut client, &request).await.unwrap();
+        assert!(matches!(response.result, Ok(AgentPayload::WriteInput)));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_exchange_detects_a_silent_old_server_within_the_handshake_deadline() {
+        let request = AgentRequest::World {
+            request_id: 1,
+            agent_label: String::from("runner"),
+            origin_session_id: None,
+            progress_ack: true,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _: ClientMessage = read_message(&mut server).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let started = std::time::Instant::now();
+        let result = exchange_agent_request_on(&mut client, &request).await;
+        assert!(matches!(result, Err(super::AgentExchangeError::Unsupported(_))));
+        assert!(
+            started.elapsed() >= super::AGENT_API_DEADLINE
+                && started.elapsed()
+                    < super::AGENT_API_DEADLINE + std::time::Duration::from_secs(1),
+            "silent old-server detection did not use the handshake deadline"
+        );
+        server_task.abort();
     }
 
     #[test]

@@ -441,6 +441,7 @@ async fn agent_world() -> Result<AgentWorldSnapshot, String> {
             request_id: 91,
             agent_label: "workspace-transfer-e2e".to_owned(),
             origin_session_id: None,
+            progress_ack: false,
         },
         false,
     )
@@ -456,6 +457,7 @@ async fn agent_siblings(
             request_id,
             agent_label: "workspace-transfer-e2e".to_owned(),
             origin_session_id: Some(origin_session_id),
+            progress_ack: false,
         },
         true,
     )

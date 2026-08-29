@@ -16302,6 +16302,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::RunAction { .. } => "RunAction",
         ServerMessage::RunActionCorrelated { .. } => "RunActionCorrelated",
         ServerMessage::ActionDispatched { .. } => "ActionDispatched",
+        ServerMessage::AgentRequestAccepted { .. } => "AgentRequestAccepted",
         ServerMessage::AgentResponse(_) => "AgentResponse",
         ServerMessage::AgentPromptRequest { .. } => "AgentPromptRequest",
         ServerMessage::AgentActivity { .. } => "AgentActivity",

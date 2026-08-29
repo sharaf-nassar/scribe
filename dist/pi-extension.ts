@@ -113,7 +113,9 @@ function contextPercent(ctx: { getContextUsage(): { percent: number | null } | u
 // environment gate as the lifecycle handlers, and each execution re-checks
 // SCRIBE_SESSION_ID so a registered tool no-ops outside a Scribe pane.
 
-const AGENT_CLI_TIMEOUT_MS = 10_000;
+// 5-minute prompt ceiling + 1-minute action ceiling + 15-second CLI margin,
+// plus 15 seconds for this child-process backstop to remain strictly outer.
+const AGENT_CLI_TIMEOUT_MS = 390_000;
 
 const AGENT_ACTION_NAMES = [
   "open-settings",

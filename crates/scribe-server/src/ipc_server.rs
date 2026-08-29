@@ -11688,6 +11688,15 @@ async fn handle_transient_agent_request(
     writer: &SharedWriter,
     request: &scribe_common::agent::AgentRequest,
 ) {
+    if request.requests_progress_ack()
+        && !matches!(request, scribe_common::agent::AgentRequest::Capabilities { .. })
+    {
+        send_message(
+            writer,
+            &ServerMessage::AgentRequestAccepted { request_id: request.request_id() },
+        )
+        .await;
+    }
     let prompt_writer = local_agent_api_writer_for_request(
         &server.window_shares,
         &server.workspace_manager,
@@ -15098,6 +15107,7 @@ mod tests {
                 request_id: 1,
                 agent_label: "test".into(),
                 origin_session_id: None,
+                progress_ack: false,
             },
         )));
     }
@@ -15686,6 +15696,7 @@ mod tests {
             request_id: 1,
             agent_label: "origin-test".into(),
             origin_session_id: Some(origin_session),
+            progress_ack: true,
         };
 
         let mut server =
@@ -15698,6 +15709,13 @@ mod tests {
         let (request_writer, mut request_client) = ci_test_writer();
         let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
         tokio::pin!(dispatch);
+        tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before acknowledgement"),
+            message = read_message::<ServerMessage, _>(&mut request_client) => assert!(matches!(
+                message.unwrap(),
+                ServerMessage::AgentRequestAccepted { request_id: 1 }
+            )),
+        }
         let prompt_id = tokio::select! {
             () = &mut dispatch => panic!("prompted request completed before delivery"),
             message = read_message::<ServerMessage, _>(&mut origin_client) => {
@@ -15732,6 +15750,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_action_dispatch_emits_progress_ack_before_completion() {
+        let window_id = WindowId::new();
+        let manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
+        let (action_writer, mut action_client) = ci_test_writer();
+        let shares = new_window_shares();
+        shares.write().await.insert(window_id, agent_share(&action_writer, true));
+        let mut server =
+            transfer_server_state(manager, super::new_live_session_registry(), Arc::clone(&shares));
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                dispatch_action: scribe_common::agent::AgentPolicyMode::Allow,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        let request = scribe_common::agent::AgentRequest::DispatchAction {
+            request_id: 2,
+            agent_label: "action-test".into(),
+            origin_session_id: None,
+            progress_ack: true,
+            action: AutomationAction::OpenSettings,
+            window: Some(window_id),
+        };
+        let (request_writer, mut request_client) = ci_test_writer();
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+
+        tokio::select! {
+            () = &mut dispatch => panic!("action request completed before acknowledgement"),
+            message = read_message::<ServerMessage, _>(&mut request_client) => assert!(matches!(
+                message.unwrap(),
+                ServerMessage::AgentRequestAccepted { request_id: 2 }
+            )),
+        }
+        let (correlation_id, action) = tokio::select! {
+            () = &mut dispatch => panic!("action request completed before dispatch"),
+            message = read_message::<ServerMessage, _>(&mut action_client) => match message.unwrap() {
+                ServerMessage::RunActionCorrelated { correlation_id, action } => (correlation_id, action),
+                message => panic!("expected correlated action, got {message:?}"),
+            },
+        };
+        assert!(matches!(action, AutomationAction::OpenSettings));
+        assert!(server.agent_api.complete_action(
+            action_client_key(&action_writer),
+            correlation_id,
+            scribe_common::agent::AgentActionOutcome::Completed,
+            None,
+        ));
+        dispatch.await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut request_client).await.unwrap(),
+            ServerMessage::AgentResponse(response) if response.result.is_ok()
+        ));
+    }
+
+    #[tokio::test]
     async fn agent_prompts_deny_when_the_known_origin_window_is_incapable() {
         let origin_window = WindowId::new();
         let fallback_window = WindowId::new();
@@ -15754,6 +15826,7 @@ mod tests {
             request_id: 2,
             agent_label: "origin-test".into(),
             origin_session_id: Some(origin_session),
+            progress_ack: false,
         };
 
         assert!(

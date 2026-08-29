@@ -1456,6 +1456,10 @@ pub enum ServerMessage {
     ActionDispatched {
         window_id: WindowId,
     },
+    /// Confirms an opt-in agent request before it may wait for consent or action completion.
+    AgentRequestAccepted {
+        request_id: u64,
+    },
     /// Reply to a one-shot agent control-surface request.
     AgentResponse(AgentResponse),
     /// Prompt a capable client to approve an agent capability request.
@@ -3130,6 +3134,7 @@ mod tests {
             request_id: 7,
             agent_label: "test-agent".into(),
             origin_session_id: None,
+            progress_ack: false,
         });
         let request_bytes = rmp_serde::to_vec_named(&request).expect("serialize agent request");
         let request_decoded: ClientMessage =
@@ -3175,6 +3180,7 @@ mod tests {
         }
 
         for message in [
+            ServerMessage::AgentRequestAccepted { request_id: 7 },
             ServerMessage::AgentPromptRequest {
                 prompt_id: PromptId(10),
                 agent_label: "test-agent".into(),

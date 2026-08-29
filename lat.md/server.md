@@ -42,7 +42,7 @@ An upgrade server has no durable stdio of its own — Debian `postinst` redirect
 
 The server adapts its authoritative PTY, workspace, window-share, and automation state into one-shot local agent calls without adding a listener or registering an agent window.
 
-[[crates/scribe-server/src/ipc_server.rs#is_transient_first_frame]] classifies `AgentRequest` with the bounded transient pool. [[crates/scribe-server/src/ipc_server.rs#handle_transient_agent_request]] supplies registry and client seams to [[crates/scribe-server/src/agent_api/mod.rs#dispatch]], then sends exactly one `AgentResponse` before the socket closes. Agent traffic never attaches a session, claims a `WindowId`, resizes a PTY, or enters a remote transport.
+[[crates/scribe-server/src/ipc_server.rs#is_transient_first_frame]] classifies `AgentRequest` with the bounded transient pool. [[crates/scribe-server/src/ipc_server.rs#handle_transient_agent_request]] sends one immediate `AgentRequestAccepted` frame when the request opts into progress acknowledgement and can park for consent or wait for action completion, then supplies registry and client seams to [[crates/scribe-server/src/agent_api/mod.rs#dispatch]] and sends the terminal `AgentResponse` before the socket closes. This keeps the CLI's 3-second old-server detector separate from the 5-minute prompt and 1-minute action budgets. Agent traffic never attaches a session, claims a `WindowId`, resizes a PTY, or enters a remote transport.
 
 ### Admission and capability policy
 

@@ -55,11 +55,12 @@ Environment:
   unset or empty variable is fine for every command except `siblings`. An
   invalid value is a usage error.
 
-Every data command is one request and one reply: the CLI connects, sends the
-request, prints exactly one JSON envelope as a single line on stdout, and
-exits. Diagnostics never go to stdout. If the server does not answer within
-3 seconds — for example, a server built before the agent API — the CLI reports
-`unsupported` and exits 3.
+Every data command prints exactly one terminal JSON envelope as a single line
+on stdout and exits. Diagnostics never go to stdout. The CLI waits 3 seconds
+only for the server's first frame, so a server built before the progress-ack
+extension still reports `unsupported` and exits 3. An acknowledged request
+then has up to 6 minutes 15 seconds for the configured 5-minute prompt ceiling,
+the 1-minute action-completion ceiling, and transport margin.
 
 Use `scribe agent <command> --help` for per-command argument details.
 
@@ -117,8 +118,8 @@ Produced by the CLI itself:
 |---|---|---|
 | `usage` | Invalid invocation values. | 2 |
 | `unreachable` | The server socket could not be connected. | 3 |
-| `unsupported` | The connected server predates the agent API or returned no valid reply within 3 seconds. | 3 |
-| `internal` | The CLI could not serialize or correlate the response. | 1 |
+| `unsupported` | The connected server predates the progress-ack extension or returned no valid first frame within 3 seconds. | 3 |
+| `internal` | The CLI could not serialize or correlate the response, or the server disconnected after acknowledging the request. | 1 |
 
 Policy is evaluated before target lookup, so a call denied by policy returns
 `denied` without disclosing whether the target exists.
@@ -400,10 +401,12 @@ the prompt only to that session's window; if that window cannot render it,
 the call is denied rather than prompting another window. Originless or stale
 callers use the deterministic capable-window fallback. The call is also
 denied when no attached Scribe window understands the prompt (headless),
-or when `prompt_timeout_ms` elapses unanswered. An approval is reused for
-repeated calls with the same agent label, capability, and target within
-`burst_window_ms`, so one confirmation covers a tight burst instead of
-interrogating you per call.
+or when `prompt_timeout_ms` elapses unanswered. Once Scribe acknowledges the
+request, the CLI keeps waiting through that prompt and any following action
+completion, so an unanswered prompt returns `prompt_timeout` rather than
+`unsupported`. An approval is reused for repeated calls with the same agent
+label, capability, and target within `burst_window_ms`, so one confirmation
+covers a tight burst instead of interrogating you per call.
 
 ### Limits
 
