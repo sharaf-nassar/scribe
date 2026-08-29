@@ -60,6 +60,52 @@ just e2e-visual-<name> 2>&1 | grep -E 'PHASE [0-9]+ PASS|FAIL:'
 Here that produced `PHASE 0..3 PASS` then the identical phase-4 failure on
 untouched main, settling it immediately.
 
+## Recurrence: run `run-20260829T001254.2dsVsH`
+
+This file's baseline rule paid for itself, and the masking went four defects
+deep.
+
+A worker on `scribe-cwz9` reported that the beads-card-detail visual recipe
+failed before reaching the regression phase it had just added, and claimed the
+failure was pre-existing. Rather than reason from the diff, the orchestrator ran
+the unmodified recipe on untouched main at `d7eed48`:
+
+```text
+FAIL: loading fixture board changed only 1653px
+```
+
+The worker had seen 1759px and 1735px on its branch. Three different numbers
+across two different trees settled two things at once: the claim was true, and
+the counter was *nondeterministic*, which a single observation would not have
+shown. `scribe-cwz9` landed on that evidence and the gate was filed separately
+as `scribe-h6fh`.
+
+Repairing it exposed the deeper shape of this failure mode. Because `fail()`
+exits 1 (`tests/e2e/visual/beads-card-detail-fixtures.sh:12-15`), each fix
+unmasked the next defect, one run at a time: a stale hover coordinate, then a
+rail sample row, then a separator hairline row, then a time-dependent fixture
+staleness race (`e2e-fixture-timestamps-expire-mid-recipe.md`). Four distinct
+causes, discoverable only in sequence.
+
+Two things made that tractable rather than an open-ended rewrite:
+
+**Authorize by defect class, not by file list.** The first attempt was told to
+stop at the third defect and report it. That was right at the time — it prevented
+an unbounded harness rewrite — but it also meant the bead could not finish. The
+retry lifted the bound *for stale-constant defects specifically* while keeping
+it for anything else, and required every corrected constant to be measured from
+a screenshot with before/after readings quoted. The worker then correctly
+stopped again at the fourth defect, because a staleness race is not a stale
+constant, and asked. That is the shape to reuse: bound by class, re-authorize
+explicitly when the class boundary is reached.
+
+**A constant a worker cannot execute is a guess.** `scribe-cwz9` recomputed
+`rail_y` from 296 to 321 when it moved a field out of the detail header. The
+real row was 320. That off-by-one was invisible because the recipe died before
+reaching the assertion, so the worker had no way to check its own arithmetic.
+When a suite is dead, treat every layout constant edited against it as unverified
+— and prefer fixing the suite first, so later edits are checkable.
+
 ## Prevention
 
 **Do a baseline run before accepting any "pre-existing failure" claim, and
