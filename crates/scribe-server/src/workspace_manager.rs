@@ -773,26 +773,37 @@ impl WorkspaceManager {
             .unwrap_or(fallback)
     }
 
-    fn workspace_tree_has_leaf(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+    fn workspace_tree_find_leaf<'a, P>(
+        node: &'a WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+        predicate: &P,
+    ) -> Option<&'a WorkspaceTreeNode>
+    where
+        P: Fn(&WorkspaceTreeNode) -> bool,
+    {
         match node {
-            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, .. } => *leaf_id == workspace_id,
-            WorkspaceTreeNode::Split { first, second, .. } => {
-                Self::workspace_tree_has_leaf(first, workspace_id)
-                    || Self::workspace_tree_has_leaf(second, workspace_id)
+            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, .. }
+                if *leaf_id == workspace_id && predicate(node) =>
+            {
+                Some(node)
             }
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                Self::workspace_tree_find_leaf(first, workspace_id, predicate)
+                    .or_else(|| Self::workspace_tree_find_leaf(second, workspace_id, predicate))
+            }
+            WorkspaceTreeNode::Leaf { .. } => None,
         }
     }
 
+    fn workspace_tree_has_leaf(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+        Self::workspace_tree_find_leaf(node, workspace_id, &|_| true).is_some()
+    }
+
     fn workspace_leaf_is_empty(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
-        match node {
-            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, session_ids, .. } => {
-                *leaf_id == workspace_id && session_ids.is_empty()
-            }
-            WorkspaceTreeNode::Split { first, second, .. } => {
-                Self::workspace_leaf_is_empty(first, workspace_id)
-                    || Self::workspace_leaf_is_empty(second, workspace_id)
-            }
-        }
+        Self::workspace_tree_find_leaf(node, workspace_id, &|leaf| {
+            matches!(leaf, WorkspaceTreeNode::Leaf { session_ids, .. } if session_ids.is_empty())
+        })
+        .is_some()
     }
 
     fn collect_pane_sessions(node: &PaneTreeNode, sessions: &mut Vec<SessionId>) {
@@ -1740,6 +1751,20 @@ mod tests {
     fn leaf(workspace_id: WorkspaceId, session_ids: Vec<SessionId>) -> WorkspaceTreeNode {
         let pane_trees = session_ids.iter().map(|_| None).collect();
         WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, active_tab_index: 0 }
+    }
+
+    #[test]
+    fn workspace_leaf_predicates_scan_all_duplicate_workspace_leaves() {
+        let workspace = WorkspaceId::new();
+        let tree = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf(workspace, vec![SessionId::new()])),
+            second: Box::new(leaf(workspace, Vec::new())),
+        };
+
+        assert!(WorkspaceManager::workspace_tree_has_leaf(&tree, workspace));
+        assert!(WorkspaceManager::workspace_leaf_is_empty(&tree, workspace));
     }
 
     /// One window holding two workspaces side by side, ready to transfer.

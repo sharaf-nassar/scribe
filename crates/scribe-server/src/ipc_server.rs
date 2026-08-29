@@ -7929,7 +7929,10 @@ async fn commit_workspace_transfer(
     Ok(TransferCommit { moved, viewers, attachments })
 }
 
-fn sever_transfer_sinks(session: &LiveSession, viewers: &[TransferViewer]) -> bool {
+fn sever_transfer_sinks<'a>(
+    session: &LiveSession,
+    viewers: impl IntoIterator<Item = &'a TransferViewer>,
+) -> bool {
     let mut sinks = lock_sinks(&session.client_writer);
     for (writer, _, _) in viewers {
         sinks.detach(writer);
@@ -8428,14 +8431,9 @@ fn commit_cross_window_move(
 /// from under its new window's authoritative grid.
 fn sever_moved_session_routes<'a>(
     session: &LiveSession,
-    viewers: impl Iterator<Item = &'a TransferViewer>,
+    viewers: impl IntoIterator<Item = &'a TransferViewer>,
 ) {
-    {
-        let mut sinks = lock_sinks(&session.client_writer);
-        for (writer, _, _) in viewers {
-            sinks.detach(writer);
-        }
-    }
+    let _ = sever_transfer_sinks(session, viewers);
     lock_resize_pacer(&session.resize_pacer).discard_pending();
 }
 
