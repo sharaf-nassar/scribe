@@ -1499,69 +1499,61 @@ mod tests {
     /// target region.
     #[test]
     fn split_workspace_preserves_sibling_ratios() {
-        let ws_a = WorkspaceId::new();
-        let mut layout = WindowLayout::new(ws_a, None);
-        let ws_b = layout
-            .split_workspace(SplitDirection::Horizontal, None)
-            .expect("first split should succeed");
-        let ws_c = layout
-            .split_workspace(SplitDirection::Horizontal, None)
-            .expect("second split should succeed");
-
-        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
-        let rect_for = |id| {
-            layout
-                .compute_workspace_rects(viewport)
-                .iter()
-                .find(|(workspace_id, _)| *workspace_id == id)
-                .map(|(_, rect)| *rect)
-        };
+        let (layout, ws_a, ws_b, ws_c, viewport) = three_workspace_split_row();
         assert!(
-            (rect_for(ws_a).expect("A exists").width - 450.0).abs() < 0.01,
+            (rect_for(&layout, viewport, ws_a).expect("A exists").width - 450.0).abs() < 0.01,
             "A keeps half the viewport"
         );
-        assert!((rect_for(ws_b).expect("B exists").width - 225.0).abs() < 0.01, "B's slot halves");
-        assert!((rect_for(ws_c).expect("C exists").width - 225.0).abs() < 0.01);
+        assert!(
+            (rect_for(&layout, viewport, ws_b).expect("B exists").width - 225.0).abs() < 0.01,
+            "B's slot halves"
+        );
+        assert!((rect_for(&layout, viewport, ws_c).expect("C exists").width - 225.0).abs() < 0.01);
     }
 
     /// Closing a region promotes its sibling without changing any outer split.
     #[test]
     fn remove_workspace_preserves_sibling_ratios() {
-        let ws_a = WorkspaceId::new();
-        let mut layout = WindowLayout::new(ws_a, None);
-        let ws_b = layout
-            .split_workspace(SplitDirection::Horizontal, None)
-            .expect("first split should succeed");
-        let ws_c = layout
-            .split_workspace(SplitDirection::Horizontal, None)
-            .expect("second split should succeed");
+        let (mut layout, ws_a, ws_b, ws_c, viewport) = three_workspace_split_row();
         assert!(layout.set_workspace_ratio(ws_a, ws_b, 0.7));
         assert!(layout.set_workspace_ratio(ws_b, ws_c, 0.2));
 
-        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
-        let rect_for = |id| {
-            layout
-                .compute_workspace_rects(viewport)
-                .iter()
-                .find(|(workspace_id, _)| *workspace_id == id)
-                .map(|(_, rect)| *rect)
-        };
-        let a_before = rect_for(ws_a).expect("A exists");
+        let a_before = rect_for(&layout, viewport, ws_a).expect("A exists");
         assert!((a_before.width - 630.0).abs() < 0.01);
-        assert!((rect_for(ws_b).expect("B exists").width - 54.0).abs() < 0.01);
-        assert!((rect_for(ws_c).expect("C exists").width - 216.0).abs() < 0.01);
+        assert!((rect_for(&layout, viewport, ws_b).expect("B exists").width - 54.0).abs() < 0.01);
+        assert!((rect_for(&layout, viewport, ws_c).expect("C exists").width - 216.0).abs() < 0.01);
 
         assert!(layout.remove_workspace(ws_c));
 
-        let rects = layout.compute_workspace_rects(viewport);
-        let a_after = rects.iter().find(|(id, _)| *id == ws_a).map(|(_, rect)| *rect).unwrap();
-        let b_after = rects.iter().find(|(id, _)| *id == ws_b).map(|(_, rect)| *rect).unwrap();
+        let a_after = rect_for(&layout, viewport, ws_a).expect("A exists");
+        let b_after = rect_for(&layout, viewport, ws_b).expect("B exists");
         assert_eq!(a_after, a_before, "A's outer ratio is unchanged");
         assert!((b_after.width - 270.0).abs() < 0.01, "B inherits C's parent extent");
         match layout.to_tree(&empty_pane_map()) {
             WorkspaceTreeNode::Split { ratio, .. } => assert_eq!(ratio.to_bits(), 0.7f32.to_bits()),
             WorkspaceTreeNode::Leaf { .. } => panic!("expected outer split"),
         }
+    }
+
+    fn three_workspace_split_row() -> (WindowLayout, WorkspaceId, WorkspaceId, WorkspaceId, Rect) {
+        let ws_a = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws_a, None);
+        let ws_b = layout
+            .split_workspace(SplitDirection::Horizontal, None)
+            .expect("first split should succeed");
+        let ws_c = layout
+            .split_workspace(SplitDirection::Horizontal, None)
+            .expect("second split should succeed");
+        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
+        (layout, ws_a, ws_b, ws_c, viewport)
+    }
+
+    fn rect_for(layout: &WindowLayout, viewport: Rect, workspace_id: WorkspaceId) -> Option<Rect> {
+        layout
+            .compute_workspace_rects(viewport)
+            .iter()
+            .find(|(id, _)| *id == workspace_id)
+            .map(|(_, rect)| *rect)
     }
 
     /// `to_tree` → `from_tree` preserves a non-default split ratio.

@@ -746,7 +746,7 @@ impl WorkspaceManager {
                 *active_tab_index = if moved.was_active {
                     target_index
                 } else {
-                    Self::active_index_or(session_ids, showing, 0)
+                    Self::active_index_or(session_ids, showing)
                 };
                 Ok(())
             }
@@ -761,16 +761,12 @@ impl WorkspaceManager {
         }
     }
 
-    fn active_index_or(
-        session_ids: &[SessionId],
-        showing: Option<SessionId>,
-        fallback: usize,
-    ) -> usize {
+    fn active_index_or(session_ids: &[SessionId], showing: Option<SessionId>) -> usize {
         showing
             .and_then(|session_id| {
                 session_ids.iter().position(|candidate| *candidate == session_id)
             })
-            .unwrap_or(fallback)
+            .unwrap_or(0)
     }
 
     fn workspace_tree_find_leaf<'a, P>(

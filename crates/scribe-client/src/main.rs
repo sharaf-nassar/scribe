@@ -6839,9 +6839,8 @@ impl TerminalView {
 
     /// Reset every workspace-region and pane split to equal space.
     ///
-    /// Reached from the `equalize` keybinding, the status-bar balance button
-    /// and the titlebar equalize icon; splits and closes re-equalize on their
-    /// own.
+    /// Reached from the `equalize` keybinding, the status-bar balance button,
+    /// and the titlebar equalize icon.
     fn equalize_layout(&mut self, cx: &mut Context<Self>) {
         self.shell.equalize_all(cx);
         tracing::info!("equalized the window layout");
