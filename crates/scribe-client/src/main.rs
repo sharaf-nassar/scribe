@@ -2235,6 +2235,11 @@ struct TerminalView {
     /// [`TerminalView::capture_geometry`] and used as the settings window's
     /// centring anchor.
     last_window_bounds: Option<Bounds<Pixels>>,
+    /// GPUI's last cached window bounds paired with the root-relative origin
+    /// X11 resolved for them, so a paint with an unchanged cached reading
+    /// reuses the answer instead of asking X11 twice per frame. See
+    /// [`TerminalView::resolve_root_origin`].
+    x11_origin: Option<(Bounds<Pixels>, Point<Pixels>)>,
     /// This view has retired from the process-wide active-view count.
     process_shutdown_finished: bool,
     /// Held to keep the window-bounds observer alive, which is what notices a
@@ -2559,6 +2564,30 @@ impl TerminalView {
         window.minimize_window();
     }
 
+    /// The window's root-relative origin in logical pixels, re-queried only
+    /// when GPUI's cached reading moves.
+    ///
+    /// The cached reading is the *key*, not the answer: it is raw
+    /// `ConfigureNotify` data (see [`monitor::logical_window_origin`]) and only
+    /// signals that the window moved or resized, at which point X11 is asked
+    /// where the window really is. A steady window costs no round trips per
+    /// paint, and a drag re-queries per bounds event over the monitor module's
+    /// cached per-thread connection.
+    fn resolve_root_origin(
+        &mut self,
+        raw: Bounds<Pixels>,
+        window: &Window,
+    ) -> Option<Point<Pixels>> {
+        if let Some((cached, origin)) = self.x11_origin
+            && cached == raw
+        {
+            return Some(origin);
+        }
+        let origin = monitor::logical_window_origin(window)?;
+        self.x11_origin = Some((raw, origin));
+        Some(origin)
+    }
+
     /// Check where the restored window actually landed, once.
     ///
     /// The question that matters is not the pixel residual — `StaticGravity`
@@ -2581,7 +2610,14 @@ impl TerminalView {
             _ => return,
         };
         self.restore.position_target = None;
-        let origin = window.bounds().origin;
+        // The same root-relative reading capture persists: GPUI's cached
+        // origin is raw `ConfigureNotify` data and can still hold a
+        // frame-shifted value long after the window manager answered the move
+        // (it read the Mutter frame offset while the window sat on its saved
+        // monitor, reporting a landing at the primary's top-left).
+        let origin = self
+            .resolve_root_origin(window.bounds(), window)
+            .unwrap_or_else(|| window.bounds().origin);
         // The same rounding the record was written with, so the comparison is
         // between two values in one space rather than two roundings of one.
         let (landed_x, landed_y) =
@@ -2655,7 +2691,18 @@ impl TerminalView {
         // Wayland answers (0, 0) for every window, and persisting that put a
         // later X11 start in the screen corner; the record stores no origin at
         // all instead, and restore falls back to the default placement.
-        let bounds = window.bounds();
+        //
+        // On X11 the cached origin has a subtler failure: it is raw
+        // `ConfigureNotify` data, which a reparenting window manager can leave
+        // frame-relative — Mutter answers a resize with the client's offset
+        // inside its frame and a move with an origin shifted by that same
+        // offset — and persisting it is what sent restored windows to the
+        // primary monitor's top-left with their titlebar under the GNOME
+        // panel. The root-relative reading wins whenever X11 answers.
+        let mut bounds = window.bounds();
+        if let Some(origin) = self.resolve_root_origin(bounds, window) {
+            bounds.origin = origin;
+        }
         // The settings anchor reads this rather than the persisted record: the
         // record only carries an origin on platforms that expose one, and a
         // window that has never been moved has no saved position at all. The
@@ -2867,6 +2914,7 @@ impl TerminalView {
             _bell_subscription: bell_subscription,
             restore: RestoreRuntime::from_seed(seed),
             last_window_bounds: None,
+            x11_origin: None,
             process_shutdown_finished: false,
             _bounds_observer: bounds_observer,
         }

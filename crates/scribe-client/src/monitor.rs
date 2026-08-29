@@ -12,7 +12,7 @@
 //! and reads and re-asserts the window's virtual desktop
 //! ([`window_desktop`]/[`apply_saved_desktop`]).
 
-use gpui::{App, Window};
+use gpui::{App, Pixels, Point, Window, point, px};
 
 use crate::layout::Rect;
 use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
@@ -107,6 +107,25 @@ pub fn apply_saved_desktop(window: &Window, desktop: u32) -> bool {
 #[must_use]
 pub fn mapped_window_bounds(window: &Window) -> Option<Rect> {
     x11::mapped_window_bounds(window)
+}
+
+/// The window's root-relative content origin, in logical pixels.
+///
+/// GPUI's cached `Window::bounds` origin is raw `ConfigureNotify` data, and a
+/// reparenting window manager can leave it frame-relative: Mutter answers a
+/// resize with the client's offset inside its frame and a move with an origin
+/// shifted by that same offset, either of which lands a later restore at the
+/// primary monitor's top-left with the titlebar under the panel. This is the
+/// [`mapped_window_bounds`] reading — `translate_coordinates`, which resolves
+/// through any frame — scaled from device to GPUI's logical pixels.
+///
+/// `None` off X11, before the window is mapped, and on any protocol failure —
+/// callers fall back to the cached origin, which is all those platforms have.
+#[must_use]
+pub fn logical_window_origin(window: &Window) -> Option<Point<Pixels>> {
+    let frame = x11::mapped_window_bounds(window)?;
+    let scale = window.scale_factor();
+    Some(point(px(frame.x / scale), px(frame.y / scale)))
 }
 
 /// Whether the platform reports this window's real origin.
