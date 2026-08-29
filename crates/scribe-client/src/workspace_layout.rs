@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{
     LayoutDirection, PaneTreeNode, WorkspaceTreeEdge, WorkspaceTreeError, WorkspaceTreeNode,
+    active_tab_index_after_departure,
 };
 
 use crate::layout::{
@@ -193,18 +194,19 @@ impl WindowLayout {
     }
 
     /// Remove a tab from the specified workspace.
+    ///
+    /// The surviving selection is decided by the same shared
+    /// [`active_tab_index_after_departure`] the titlebar depart and the
+    /// server's tab-subtree removal use. This model's `active_tab` rides the
+    /// reported workspace tree, which the server persists and replays on
+    /// reconnect — the old clamp-only rule kept the index but not the tab, so
+    /// removing a tab before the shown one restored the wrong selection.
     pub fn remove_tab(&mut self, workspace_id: WorkspaceId, session_id: SessionId) {
         let Some(ws) = self.find_workspace_mut(workspace_id) else { return };
         let Some(idx) = ws.tabs.iter().position(|t| t.session_id == session_id) else { return };
 
         ws.tabs.remove(idx);
-
-        // Adjust active_tab so it stays in bounds.
-        if ws.tabs.is_empty() {
-            ws.active_tab = 0;
-        } else if ws.active_tab >= ws.tabs.len() {
-            ws.active_tab = ws.tabs.len().saturating_sub(1);
-        }
+        ws.active_tab = active_tab_index_after_departure(ws.tabs.len(), idx, ws.active_tab);
     }
 
     /// Replace a tab's session ID (e.g. when the server confirms creation).
@@ -1423,6 +1425,29 @@ mod tests {
         let ids = restored.workspace_ids_in_order();
         assert_eq!(ids, vec![ws_id]);
         assert_eq!(restored.focused_workspace_id(), ws_id);
+    }
+
+    /// Removing a tab before the shown one keeps the same tab selected.
+    ///
+    /// The clamp-only rule this replaced kept the *index*, silently shifting
+    /// the selection onto the departed tab's successor — and this model's
+    /// `active_tab` rides the reported tree the server replays on reconnect,
+    /// so the wrong tab came back selected after a restart.
+    #[test]
+    fn remove_preceding_tab_keeps_the_shown_tab() {
+        let ws = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws, None);
+        let first = SessionId::new();
+        let last = SessionId::new();
+        layout.add_tab(ws, first).expect("workspace exists");
+        layout.add_tab(ws, SessionId::new()).expect("workspace exists");
+        layout.add_tab(ws, last).expect("workspace exists");
+
+        layout.remove_tab(ws, first);
+
+        let slot = layout.find_workspace(ws).expect("workspace survives");
+        assert_eq!(slot.active_tab, 1, "selection follows the shifted tab list");
+        assert_eq!(slot.active_tab().expect("a tab is shown").session_id, last);
     }
 
     /// Two-workspace split preserves direction and workspace order.

@@ -1989,7 +1989,14 @@ impl WorkspaceTreeNode {
     }
 }
 
-fn workspace_tree_contains(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+/// Whether any leaf in the tree names this workspace.
+///
+/// Any-match existence over the whole tree, shared by client and server tree
+/// walks. Unlike the first-match `workspace_tree_leaf`, a workspace id that
+/// appears in several leaves is found wherever it sits, so existence checks
+/// cannot be blinded by an earlier duplicate leaf.
+#[must_use]
+pub fn workspace_tree_contains(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
     match node {
         WorkspaceTreeNode::Leaf { workspace_id: id, .. } => *id == workspace_id,
         WorkspaceTreeNode::Split { first, second, .. } => {
