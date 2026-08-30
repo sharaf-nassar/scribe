@@ -98,7 +98,7 @@ pub struct TabBarColors {
     pub separator: Rgba,
     /// Slightly lighter background for the top of the gradient tab bar.
     pub gradient_top: Rgba,
-    /// Theme accent, reused for the active underline and the attention flash.
+    /// Theme accent, reused for the attention flash and focus chrome.
     pub accent: Rgba,
 }
 
@@ -108,15 +108,34 @@ pub const fn srgba(c: [f32; 4]) -> Rgba {
     Rgba { r: c[0], g: c[1], b: c[2], a: c[3] }
 }
 
+/// Extra lift applied to the strip ground (and its hover/gradient tone) over
+/// the theme's `tab_bar_bg` token, so the raised tab card — which wears the
+/// darker terminal background — clearly reads against the band. Applied here
+/// rather than in the theme because menus, dialogs, and the beads board reuse
+/// `tab_bar_bg` as a quiet ground and must keep it.
+// ponytail: additive lift clamps at white, so a near-white theme flattens the
+// strip again; flip to a darken step behind a brightness probe if one ships.
+pub const STRIP_LIFT: f32 = 0.08;
+
+/// Add `amount` to each RGB channel (clamped to 1.0), preserving alpha.
+fn lift(c: Rgba, amount: f32) -> Rgba {
+    Rgba {
+        r: (c.r + amount).min(1.0),
+        g: (c.g + amount).min(1.0),
+        b: (c.b + amount).min(1.0),
+        a: c.a,
+    }
+}
+
 impl From<&ChromeColors> for TabBarColors {
     fn from(chrome: &ChromeColors) -> Self {
         Self {
-            bg: srgba(chrome.tab_bar_bg),
+            bg: lift(srgba(chrome.tab_bar_bg), STRIP_LIFT),
             active_bg: srgba(chrome.tab_bar_active_bg),
             text: srgba(chrome.tab_text),
             active_text: srgba(chrome.tab_text_active),
             separator: srgba(chrome.tab_separator),
-            gradient_top: srgba(chrome.tab_bar_gradient_top),
+            gradient_top: lift(srgba(chrome.tab_bar_gradient_top), STRIP_LIFT),
             accent: srgba(chrome.accent),
         }
     }
@@ -128,7 +147,7 @@ impl TabBarColors {
     ///
     /// The bar background, the active-tab background and the gradient top are
     /// window backgrounds, so they scale with opacity and let the desktop show
-    /// through. Text, separators and the accent underline are content and keep
+    /// through. Text, separators and the accent are content and keep
     /// the theme's own alpha, matching the legacy renderer which scaled cell
     /// background alpha but never foreground glyphs.
     #[must_use]
@@ -203,8 +222,8 @@ pub struct TabData {
     /// and therefore has a badge.
     pub group_region_x: Option<f32>,
     /// The owning region's accent in a multi-workspace window, tinting the
-    /// active-tab underline so it meets the region border below in the same
-    /// colour. `None` (single workspace) falls back to the theme accent.
+    /// group hairline its tabs sit above. `None` in a single-workspace
+    /// window.
     pub group_accent: Option<Rgba>,
 }
 
@@ -342,9 +361,9 @@ pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors,
-        UNNAMED_WORKSPACE_LABEL, badge_label, context_suffix, flash_blend, px_units,
-        reorder_target_index, tab_display_title, tab_flash_intensity, workspace_pill_label,
+        CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, STRIP_LIFT, TAB_FLASH_SECS,
+        TabBarColors, UNNAMED_WORKSPACE_LABEL, badge_label, context_suffix, flash_blend, px_units,
+        reorder_target_index, srgba, tab_display_title, tab_flash_intensity, workspace_pill_label,
     };
     use gpui::Rgba;
 
@@ -370,6 +389,18 @@ mod tests {
         // An out-of-range config value clamps instead of overshooting.
         assert!((TabBarColors::from_chrome(&chrome, 1.5).bg.a - opaque.bg.a).abs() < 1e-6);
         assert!(TabBarColors::from_chrome(&chrome, -0.2).bg.a.abs() < 1e-6);
+    }
+
+    // @lat: [[client#GPUI Titlebar#Strip ground lifts over the theme token]]
+    #[test]
+    fn strip_ground_lifts_over_the_theme_token() {
+        let chrome = scribe_common::theme::minimal_dark().chrome;
+        let colors = TabBarColors::from(&chrome);
+        assert!((colors.bg.r - (chrome.tab_bar_bg[0] + STRIP_LIFT)).abs() < 1e-6);
+        assert!(
+            (colors.gradient_top.r - (chrome.tab_bar_gradient_top[0] + STRIP_LIFT)).abs() < 1e-6
+        );
+        assert_eq!(colors.active_bg, srgba(chrome.tab_bar_active_bg), "card keeps the theme fill");
     }
 
     // @lat: [[client#GPUI Titlebar#Tab flash envelope self-decays]]

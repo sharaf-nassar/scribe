@@ -32,7 +32,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use gpui::{App, AppContext as _, Entity};
 use scribe_client::divider::{self, Divider};
-use scribe_client::layout::{FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
+use scribe_client::layout::{
+    FocusDirection, LayoutNode, LayoutTree, PaneEdges, PaneId, Rect, SplitDirection,
+};
 use scribe_client::pane_tree::PaneTree;
 use scribe_client::prompt_bar::PromptBarData;
 use scribe_client::restore_replay::{
@@ -53,6 +55,11 @@ use scribe_common::{
 /// Accent used when a region's slot cannot be read back out of the layout,
 /// which only happens if a region is removed between two reads in one frame.
 const FALLBACK_PANE_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
+
+/// Half the window-ground gap between two adjacent pane cards.
+const PANE_GAP_HALF: f32 = 3.0;
+/// Margin a pane card keeps to its region's content edge.
+const PANE_CARD_MARGIN: f32 = 6.0;
 
 /// Frame-local inputs for geometry inside workspace regions.
 #[derive(Debug, Clone, Copy)]
@@ -1225,6 +1232,25 @@ impl PaneShell {
             .collect()
     }
 
+    /// Shrink one leaf rect into its pane card: adjacent panes keep
+    /// `2 * PANE_GAP_HALF` of window ground between them and every pane keeps
+    /// `PANE_CARD_MARGIN` to its region's content edge, so panes read as
+    /// surfaces floating on the ground rather than tiles meeting at seams.
+    /// Applied inside [`PaneShell::placements`] — the one per-frame resolver —
+    /// so paint, published PTY sizes, dividers, and hit-tests shrink together.
+    fn card_rect(rect: Rect, edges: PaneEdges) -> Rect {
+        let left = if edges.left() { PANE_CARD_MARGIN } else { PANE_GAP_HALF };
+        let right = if edges.right() { PANE_CARD_MARGIN } else { PANE_GAP_HALF };
+        let top = if edges.top() { PANE_CARD_MARGIN } else { PANE_GAP_HALF };
+        let bottom = if edges.bottom() { PANE_CARD_MARGIN } else { PANE_GAP_HALF };
+        Rect {
+            x: rect.x + left,
+            y: rect.y + top,
+            width: (rect.width - left - right).max(0.0),
+            height: (rect.height - top - bottom).max(0.0),
+        }
+    }
+
     /// Resolve every pane against `viewport` for one frame.
     pub fn placements(&self, viewport: Rect, tab_bar_height: f32, cx: &App) -> Vec<PanePlacement> {
         let workspace = self.workspace.read(cx);
@@ -1243,12 +1269,12 @@ impl PaneShell {
                 .find_workspace(workspace_id)
                 .map_or(FALLBACK_PANE_ACCENT, |slot: &WorkspaceSlot| slot.accent_color);
             let focused_pane = self.focused.get(tab).copied();
-            for (pane_id, rect, _edges) in tree.read(cx).compute_rects(region) {
+            for (pane_id, rect, edges) in tree.read(cx).compute_rects(region) {
                 out.push(PanePlacement {
                     workspace_id,
                     pane_id,
                     session_id: self.sessions.get(&pane_id).copied(),
-                    rect,
+                    rect: Self::card_rect(rect, edges),
                     focused: workspace_id == focused_workspace && focused_pane == Some(pane_id),
                     accent,
                 });

@@ -3675,7 +3675,7 @@ Unit tests for the GPUI client's ported  scanner —  over Zed's Alacritty fork 
 
 Controlled children prove [[crates/scribe-client/src/url_detect.rs#wait_for_open]] stays bounded: cancellation and a short injected deadline both kill, reap, and join a hung `sleep`.
 
-Starting a succeeding child before cancelling the hung one proves latest-click supersession does not block the new result. A controlled `/bin/false` child exiting 1 proves a spawned `code --goto` child stays the final command and never invokes the fallback opener. A unique missing opener preserves `ErrorKind::NotFound` and the final command name, while target fixtures retain URL scheme, absolute file URI path, and resolved absolute path metadata for the classifier's stat gate.
+Starting a succeeding child before cancelling the hung one proves latest-click supersession does not block the new result. A controlled fixture script exiting 1 (no fixed system path is portable: `/bin/false` lives in `/usr/bin` on macOS) proves a spawned `code --goto` child stays the final command and never invokes the fallback opener. A unique missing opener preserves `ErrorKind::NotFound` and the final command name, while target fixtures retain URL scheme, absolute file URI path, and resolved absolute path metadata for the classifier's stat gate.
 
 ### Explicit hyperlink segment geometry
 
@@ -6247,7 +6247,7 @@ The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::D
 
 ### Usage color escalates with load
 
- returns green below 60%, yellow from 60–85%, and red at or above 85%.
+ keeps the stat's own identity hue below 70%, then switches to ANSI yellow from 70% and ANSI red at or above 90% — the same warn/danger split the AI context bands default to, so "amber means hot" reads identically across the app.
 
 ### Network rate formats to four columns
 

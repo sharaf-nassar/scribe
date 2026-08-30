@@ -837,7 +837,9 @@ fn underline_color(tone: CiTone, colors: &CiBarColors, accent: [f32; 4]) -> [f32
     match tone {
         CiTone::Failure => with_alpha(colors.failure, 0.60),
         CiTone::Stale => with_alpha(colors.stale, 0.50),
-        _ => with_alpha(accent, 0.55),
+        // Ownership, not decoration: a quiet accent hairline keeps the band's
+        // region affiliation legible without reading as a highlighted edge.
+        _ => with_alpha(accent, 0.28),
     }
 }
 

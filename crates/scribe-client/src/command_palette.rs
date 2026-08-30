@@ -449,7 +449,7 @@ impl CommandPaletteView {
             .w_full()
             .px_3()
             .py_1()
-            .rounded_sm()
+            .rounded_md()
             .flex()
             .flex_col()
             .text_sm()

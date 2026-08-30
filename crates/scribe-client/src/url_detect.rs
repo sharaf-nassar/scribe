@@ -1580,6 +1580,20 @@ mod tests {
         OpenTarget { scheme: Some("https".to_owned()), resolved_path: None }
     }
 
+    /// An executable that ignores its arguments and exits 1.
+    ///
+    /// Written into the test fixture because no fixed path is portable:
+    /// `/bin/false` lives in `/usr/bin` on macOS, and shells disagree on the
+    /// exit code for an unrecognized option.
+    fn failing_opener(dir: &TestDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.path().join("exit-1.sh");
+        fs::write(&path, "#!/bin/sh\nexit 1\n").expect("write failing opener");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("mark failing opener executable");
+        path
+    }
+
     fn sleep_child() -> Child {
         Command::new("/bin/sleep").arg("30").spawn().expect("spawn controlled hung child")
     }
@@ -1640,7 +1654,10 @@ mod tests {
         let first_cancel = Arc::new(AtomicBool::new(false));
         let first_worker = wait_worker(first, Arc::clone(&first_cancel), Duration::from_secs(5));
 
-        let second = Command::new("/bin/true").spawn().expect("spawn succeeding second opener");
+        // `sleep 0` exits 0 immediately; unlike `/bin/true`, `/bin/sleep`
+        // exists at the same path on both Linux and macOS.
+        let second =
+            Command::new("/bin/sleep").arg("0").spawn().expect("spawn succeeding second opener");
         let second_worker =
             wait_worker(second, Arc::new(AtomicBool::new(false)), Duration::from_secs(5));
         first_cancel.store(true, Ordering::Release);
@@ -1657,12 +1674,13 @@ mod tests {
     fn code_nonzero_is_final_and_classified_with_code() {
         let fixture = TestDir::new();
         let fallback = fixture.path().join("missing-opener");
+        let code_cmd = failing_opener(&fixture);
         let existing = std::env::current_exe().expect("test executable exists");
         let raw = format!("{}:19", existing.display());
         let (spawn, target) = open_path_observed_with_commands(
             &raw,
             None,
-            std::ffi::OsStr::new("/bin/false"),
+            code_cmd.as_os_str(),
             fallback.as_os_str(),
             "xdg-open",
         );

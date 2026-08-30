@@ -39,6 +39,11 @@ pub const TAB_WIDTH: f32 = 176.0;
 /// crowded lower region compresses identically.
 pub const TAB_MIN_WIDTH: f32 = 56.0;
 
+/// Vertical inset between the strip's top edge and a tab's raised card. The
+/// strip shows through this gap, so the card's rounded top corners read as a
+/// browser-style physical tab instead of a flat full-height band segment.
+const TAB_CARD_TOP_GAP: f32 = 5.0;
+
 /// Pointer travel, in pixels, required before an armed press on the move region
 /// hands the window to the compositor. Absorbs the jitter of an ordinary click
 /// so a wobbly press on empty chrome does not turn into a window move.
@@ -141,7 +146,6 @@ struct TabChildren {
     ai_indicator: Option<AnyElement>,
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
-    underline: Option<AnyElement>,
 }
 
 #[derive(Clone, Copy)]
@@ -644,6 +648,62 @@ pub fn pane_title_pill(title: &str, colors: &TabBarColors, max_cols: usize) -> A
 }
 
 impl TitlebarView {
+    /// A resting tab draws a left hairline against a resting neighbour, so
+    /// tab boundaries stay legible without giving every tab a standing frame.
+    /// The hairline drops beside the active or hovered tab (whose fill marks
+    /// its own edges) and at a workspace group's first tab, where the group
+    /// pill is the boundary.
+    fn tab_wants_left_separator(&self, index: usize, tab: &TabData) -> bool {
+        if index == 0 || tab.is_active || self.hovered_tab == Some(index) {
+            return false;
+        }
+        if tab.group_region_x.is_some() {
+            return false;
+        }
+        let Some(prev) = self.tabs.get(index - 1) else { return false };
+        !prev.is_active && self.hovered_tab != Some(index - 1)
+    }
+
+    /// The boundary mark a resting tab paints against a resting neighbour —
+    /// an active or hovered tab's own fill already draws its edges. A short
+    /// centred absolute child rather than a left border, so every mark is
+    /// the same 13px regardless of tab height and layout never shifts by the
+    /// border's pixel.
+    fn tab_boundary_mark(&self, index: usize, tab: &TabData) -> Option<AnyElement> {
+        self.tab_wants_left_separator(index, tab).then(|| {
+            div()
+                .absolute()
+                .left_0()
+                .top(gpui::relative(0.5))
+                .mt(px(-6.5))
+                .w(px(1.0))
+                .h(px(13.0))
+                .bg(self.colors.separator)
+                .into_any_element()
+        })
+    }
+
+    /// The raised card behind an active, hovered, or flashing tab.
+    ///
+    /// The fill is an absolute child rather than a full-bleed element
+    /// background: inset `TAB_CARD_TOP_GAP` from the top, the strip shows
+    /// above its rounded corners and the shape reads as a browser-style tab.
+    /// The card runs to the band's bottom edge, covering the strip hairline
+    /// there — and the active card wears the terminal background, so the
+    /// active tab visually opens into the content below it. Resting tabs
+    /// paint no card and sit flat on the strip.
+    fn tab_card(bg: Rgba) -> AnyElement {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(TAB_CARD_TOP_GAP))
+            .bottom_0()
+            .rounded_t(px(6.0))
+            .bg(bg)
+            .into_any_element()
+    }
+
     /// Base tab background before the attention flash is blended in.
     fn tab_base_bg(&self, tab: &TabData, is_hovered: bool) -> Rgba {
         if tab.is_active {
@@ -657,7 +717,9 @@ impl TitlebarView {
                 a: bg.a,
             }
         } else {
-            self.colors.gradient_top
+            // Resting tabs paint no card, so this only serves as the flash
+            // blend's base — the strip's own background.
+            self.colors.bg
         }
     }
 
@@ -689,8 +751,14 @@ impl TitlebarView {
             // The close glyph never shrinks: a narrowing tab compresses its
             // title instead, so the × stays whole.
             .flex_none()
-            .ml_1()
-            .px_0p5()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            // Collapse to zero width while hidden so a resting tab spends the
+            // room on its title; the node stays mounted for focus stability.
+            .w(if visible { px(14.0) } else { px(0.0) })
+            .when(visible, gpui::Styled::ml_1)
             .opacity(if visible { 1.0 } else { 0.0 })
             .text_color(fg)
             .when(focused, |this| this.bg(self.colors.accent).text_color(self.colors.active_text))
@@ -740,21 +808,9 @@ impl TitlebarView {
             },
             cx,
         ));
-        let underline = tab.is_active.then(|| {
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .h(px(2.0))
-                // The region's tab tone in a multi-workspace window, so the
-                // underline meets the region border below in one colour.
-                .bg(tab
-                    .group_accent
-                    .map_or(self.colors.accent, |accent| accent_tab_tone(accent, self.colors.bg)))
-                .into_any_element()
-        });
-        TabChildren { display, agent_indicator, ai_indicator, suffix, close, underline }
+        // No accent tick: the raised card's own contrast against the lifted
+        // strip is the active mark.
+        TabChildren { display, agent_indicator, ai_indicator, suffix, close }
     }
 
     fn render_tab(
@@ -764,7 +820,8 @@ impl TitlebarView {
         focused_window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let base_bg = self.tab_base_bg(tab, self.hovered_tab == Some(index));
+        let is_hovered = self.hovered_tab == Some(index);
+        let base_bg = self.tab_base_bg(tab, is_hovered);
         let bg = flash_blend(base_bg, self.colors.accent, tab.tab_flash);
         let fg = if tab.is_active { self.colors.active_text } else { self.colors.text };
         let tab_id = ElementId::from(tab.accessibility_id.clone());
@@ -804,11 +861,12 @@ impl TitlebarView {
             .overflow_hidden()
             .h_full()
             .px_2()
-            .bg(bg)
             .text_color(fg)
-            .text_xs()
-            .border_r_1()
-            .border_color(self.colors.separator);
+            .text_xs();
+        let show_card = tab.is_active || is_hovered || tab.tab_flash.is_some();
+        tab_el = tab_el
+            .children(show_card.then(|| Self::tab_card(bg)))
+            .children(self.tab_boundary_mark(index, tab));
         if focused {
             tab_el = tab_el.border_2().border_color(self.colors.accent);
         }
@@ -829,7 +887,6 @@ impl TitlebarView {
             .child(div().flex_1().truncate().child(children.display))
             .children(children.suffix)
             .children(children.close)
-            .children(children.underline)
             .on_hover(cx.listener(move |this, hovered: &bool, _win, ctx| {
                 this.hovered_tab = if *hovered { Some(index) } else { None };
                 ctx.notify();
@@ -1008,8 +1065,22 @@ impl TitlebarView {
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
+            .hover(|style| style.bg(self.colors.gradient_top))
             .child(badge.label.clone());
-        let mut row = div().flex().flex_none().items_center().h_full().bg(tag_bg);
+        // Inset rounded pill rather than a full-height flush tag, so the badge
+        // reads as its own quiet surface beside the tabs; it keeps the darker
+        // region tab-tone fill that ties it to the group hairline below. The
+        // horizontal padding keeps the Beads icon and label off the pill's
+        // rounded edges.
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .my(px(4.0))
+            .px(px(4.0))
+            .rounded(px(6.0))
+            .overflow_hidden()
+            .bg(tag_bg);
         if badge.beads {
             let focus = self
                 .beads_focus_handles
@@ -1092,6 +1163,7 @@ impl TitlebarView {
             .on_click(cx.listener(move |_this, _, _window, ctx| {
                 ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
             }))
+            .hover(|style| style.bg(self.colors.gradient_top))
             .child(standalone.badge.label.clone())
             .into_any_element()
     }
@@ -1106,7 +1178,16 @@ impl TitlebarView {
         let tag_bg = accent_tab_tone(standalone.badge.accent, self.colors.bg);
         let workspace_id = standalone.workspace_id;
         let label = self.render_standalone_badge_label(index, standalone, cx);
-        let mut pill = div().flex().flex_none().items_center().h_full().bg(tag_bg);
+        // Same inset rounded pill treatment as the tab-run badge.
+        let mut pill = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .my(px(4.0))
+            .px(px(4.0))
+            .rounded(px(6.0))
+            .overflow_hidden()
+            .bg(tag_bg);
         if standalone.badge.beads {
             let focus = self
                 .standalone_beads_focus_handles
@@ -1202,8 +1283,7 @@ impl Render for TitlebarView {
             .flex_none()
             .h(px(self.height))
             .bg(self.colors.bg)
-            .border_b_1()
-            .border_color(self.colors.separator)
+            .relative()
             // Declared for Windows, where the platform consults the hit-test
             // areas. X11/Wayland ignore it, so the handlers below drive the move.
             .window_control_area(WindowControlArea::Drag)
@@ -1253,6 +1333,20 @@ impl Render for TitlebarView {
                     let click_swallowed = ctx.has_active_drag();
                     this.end_drag(click_swallowed, ctx);
                 }),
+            )
+            // The strip's bottom hairline is an absolute child rather than
+            // a container border: children can paint over it, and the active
+            // tab's card does — interrupting the line under the active tab so
+            // it merges with the terminal below, the way a browser tab meets
+            // its toolbar.
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(self.colors.separator),
             )
             .child(
                 div()

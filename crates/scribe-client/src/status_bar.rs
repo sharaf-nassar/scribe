@@ -48,6 +48,12 @@ const FALLBACK_GREEN: [f32; 4] = [0.4, 0.9, 0.5, 1.0];
 const FALLBACK_RED: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
 /// Fallback yellow when ANSI index 3 is unavailable.
 const FALLBACK_YELLOW: [f32; 4] = [0.9, 0.8, 0.2, 1.0];
+/// Fallback blue when ANSI index 4 is unavailable.
+const FALLBACK_BLUE: [f32; 4] = [0.45, 0.6, 1.0, 1.0];
+/// Fallback magenta when ANSI index 5 is unavailable.
+const FALLBACK_MAGENTA: [f32; 4] = [0.75, 0.55, 1.0, 1.0];
+/// Fallback cyan when ANSI index 6 is unavailable.
+const FALLBACK_CYAN: [f32; 4] = [0.45, 0.8, 1.0, 1.0];
 
 /// Number of sparkline chars for CPU and GPU displays.
 const CPU_SPARK_WIDTH: usize = 8;
@@ -125,14 +131,24 @@ pub struct StatusBarColors {
     pub connected_dot: [f32; 4],
     /// Connection dot when disconnected (ANSI red).
     pub disconnected_dot: [f32; 4],
-    /// Moderate usage (60–85%) — ANSI yellow.
+    /// Moderate usage (70–90%) — ANSI yellow, the shared warn band.
     pub warning: [f32; 4],
-    /// High usage (>85%) — ANSI red.
+    /// High usage (≥90%) — ANSI red, the shared danger band.
     pub critical: [f32; 4],
     /// Dimmed colour for stat labels.
     pub label: [f32; 4],
     /// 1px hairline at the top edge.
     pub top_border: [f32; 4],
+    /// CPU identity hue (ANSI blue) — below-warn bars and readout.
+    pub stat_cpu: [f32; 4],
+    /// Memory identity hue (ANSI magenta).
+    pub stat_mem: [f32; 4],
+    /// Network identity hue (ANSI cyan).
+    pub stat_net: [f32; 4],
+    /// GPU identity hue (ANSI green).
+    pub stat_gpu: [f32; 4],
+    /// Quiet rounded fill behind each segment cluster (text at 5% alpha).
+    pub zone_fill: [f32; 4],
 }
 
 impl StatusBarColors {
@@ -157,6 +173,16 @@ impl StatusBarColors {
                 text.get(3).copied().unwrap_or(1.0) * 0.55,
             ],
             top_border: chrome.status_bar_separator,
+            stat_cpu: ansi_colors.get(4).copied().unwrap_or(FALLBACK_BLUE),
+            stat_mem: ansi_colors.get(5).copied().unwrap_or(FALLBACK_MAGENTA),
+            stat_net: ansi_colors.get(6).copied().unwrap_or(FALLBACK_CYAN),
+            stat_gpu: ansi_colors.get(2).copied().unwrap_or(FALLBACK_GREEN),
+            zone_fill: [
+                text.first().copied().unwrap_or(1.0),
+                text.get(1).copied().unwrap_or(1.0),
+                text.get(2).copied().unwrap_or(1.0),
+                0.05,
+            ],
         }
     }
 
@@ -180,11 +206,14 @@ pub struct Span {
     /// Full copy revealed on hover when the visible text is a compact glyph,
     /// so long error strings do not crowd the band inline.
     pub tooltip: Option<String>,
+    /// Invisible cluster boundary: [`render`] starts a new zone fill here
+    /// instead of painting the span.
+    pub zone_break: bool,
 }
 
 impl Span {
     fn new(text: impl Into<String>, color: [f32; 4]) -> Self {
-        Self { text: text.into(), color, tooltip: None }
+        Self { text: text.into(), color, tooltip: None, zone_break: false }
     }
 
     fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
@@ -390,12 +419,11 @@ fn build_center(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Option<(S
 fn build_right(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
     let mut spans = Vec::new();
 
-    if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
-        push_stats(&mut spans, stats, config, colors);
-    }
-
+    // Repository/session metadata leads and the stats cluster follows: the
+    // metadata cluster's width is stable, so putting it left of the stats
+    // keeps it still while samples change, and the stats zone itself is
+    // width-pinned by [`stats_zone_width`].
     if let Some(branch) = data.git_branch {
-        push_sep(&mut spans, colors);
         spans.push(Span::new(branch, colors.accent));
     }
 
@@ -424,92 +452,170 @@ fn build_right(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> 
         spans.push(Span::new(data.host_label, colors.text));
     }
 
+    if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
+        push_zone_break(&mut spans);
+        push_stats(&mut spans, stats, config, colors);
+    }
+
     if !data.time.is_empty() {
-        push_sep(&mut spans, colors);
+        push_zone_break(&mut spans);
         spans.push(Span::new(data.time, colors.text));
     }
 
-    spans.push(Span::new(" ", colors.text));
     spans
 }
 
-/// Push a separator " │ " span when `spans` is non-empty.
+/// The stats zone's worst-case text: every enabled segment at its widest
+/// rendering — full-height bars, three-digit percentages, four-column rates —
+/// with the same gaps [`push_stats`] emits.
+#[must_use]
+pub fn stats_worst_case_text(config: &StatusBarStatsConfig, has_gpu: bool) -> String {
+    let gap = |out: &mut String| {
+        if !out.is_empty() {
+            out.push_str("  ");
+        }
+    };
+    let mut out = String::new();
+    if config.usage.compute.cpu {
+        out.push_str("CPU ");
+        out.push_str(&"\u{2588}".repeat(CPU_SPARK_WIDTH));
+        out.push_str(" 100%");
+    }
+    if config.usage.memory {
+        gap(&mut out);
+        out.push_str("MEM \u{2588} 100%");
+    }
+    if config.network {
+        gap(&mut out);
+        out.push('\u{2191}');
+        out.push_str(&"\u{2588}".repeat(NET_SPARK_WIDTH));
+        out.push_str("  >1G \u{2193}");
+        out.push_str(&"\u{2588}".repeat(NET_SPARK_WIDTH));
+        out.push_str("  >1G");
+    }
+    if config.usage.compute.gpu && has_gpu {
+        gap(&mut out);
+        out.push_str("GPU ");
+        out.push_str(&"\u{2588}".repeat(CPU_SPARK_WIDTH));
+        out.push_str(" 100%");
+    }
+    out
+}
+
+/// Measure the fixed width the stats zone reserves, including the zone
+/// pill's own horizontal padding.
+///
+/// Live samples change the painted glyphs every couple of seconds, and even
+/// fixed character counts shift when a fallback font gives the block glyphs
+/// uneven advances — so the zone is pinned to its measured worst case and
+/// its neighbours never move.
+#[must_use]
+pub fn stats_zone_width(
+    config: Option<&StatusBarStatsConfig>,
+    has_gpu: bool,
+    window: &Window,
+) -> Option<f32> {
+    let text = stats_worst_case_text(config?, has_gpu);
+    if text.is_empty() {
+        return None;
+    }
+    Some(status_text_width(&text, window) + 12.0)
+}
+
+/// Push a quiet " · " separator between segments inside one zone.
 fn push_sep(spans: &mut Vec<Span>, colors: &StatusBarColors) {
     if !spans.is_empty() {
-        spans.push(Span::new(" \u{2502} ", colors.separator));
+        spans.push(Span::new(" \u{00B7} ", colors.separator));
     }
 }
 
-/// CPU / MEM / NET / GPU stat groups, each gated by config.
+/// Mark a cluster boundary: [`render`] closes the current zone fill and opens
+/// the next one, replacing the legacy " │ " hairline between clusters.
+fn push_zone_break(spans: &mut Vec<Span>) {
+    if !spans.is_empty() {
+        spans.push(Span { text: String::new(), color: [0.0; 4], tooltip: None, zone_break: true });
+    }
+}
+
+/// CPU / MEM / NET / GPU stat groups, each gated by config. The stats share
+/// one zone, spaced by plain gaps rather than separator glyphs — each stat's
+/// identity hue is what tells them apart.
 fn push_stats(
     spans: &mut Vec<Span>,
     stats: &SystemStats,
     config: &StatusBarStatsConfig,
     colors: &StatusBarColors,
 ) {
+    let gap = |cluster: &mut Vec<Span>| {
+        if !cluster.is_empty() {
+            cluster.push(Span::new("  ", colors.text));
+        }
+    };
     if config.usage.compute.cpu {
-        push_sep(spans, colors);
+        gap(spans);
         push_cpu(spans, stats, colors);
     }
     if config.usage.memory {
-        push_sep(spans, colors);
+        gap(spans);
         push_mem(spans, stats, colors);
     }
     if config.network {
-        push_sep(spans, colors);
+        gap(spans);
         push_net(spans, stats, colors);
     }
     if config.usage.compute.gpu && stats.gpu_percent.is_some() {
-        push_sep(spans, colors);
+        gap(spans);
         push_gpu(spans, stats, colors);
     }
 }
 
 /// CPU: label + 8 sparkline bars (left-padded) + fixed-width percentage.
 fn push_cpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
-    spans.push(Span::new("CPU ", colors.label));
+    let hue = colors.stat_cpu;
+    spans.push(Span::new("CPU ", mix(hue, colors.label, 0.45)));
     let pad = CPU_SPARK_WIDTH.saturating_sub(stats.cpu_history.len());
     for _ in 0..pad {
         spans.push(Span::new("\u{2581}", colors.label));
     }
     for &v in &stats.cpu_history {
-        spans.push(Span::new(sparkline_char(v).to_string(), usage_color(v, colors)));
+        spans.push(Span::new(sparkline_char(v).to_string(), stat_color(v, hue, colors)));
     }
     let pct = stats.cpu_percent;
-    spans.push(Span::new(format!(" {pct:>3.0}%"), usage_color(pct, colors)));
+    spans.push(Span::new(format!(" {pct:>3.0}%"), stat_color(pct, hue, colors)));
 }
 
 /// Memory: label + 1 sparkline bar + fixed-width percentage.
 fn push_mem(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
+    let hue = colors.stat_mem;
     let mem_pct =
         if stats.mem_total_gb > 0.0 { stats.mem_used_gb / stats.mem_total_gb * 100.0 } else { 0.0 };
-    spans.push(Span::new("MEM ", colors.label));
-    spans.push(Span::new(sparkline_char(mem_pct).to_string(), usage_color(mem_pct, colors)));
-    spans.push(Span::new(format!(" {mem_pct:>3.0}%"), usage_color(mem_pct, colors)));
+    spans.push(Span::new("MEM ", mix(hue, colors.label, 0.45)));
+    spans.push(Span::new(sparkline_char(mem_pct).to_string(), stat_color(mem_pct, hue, colors)));
+    spans.push(Span::new(format!(" {mem_pct:>3.0}%"), stat_color(mem_pct, hue, colors)));
 }
 
 /// Network: ↑ sparklines rate ↓ sparklines rate (all fixed-width).
 fn push_net(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
-    spans.push(Span::new("\u{2191}", colors.label));
+    spans.push(Span::new("\u{2191}", mix(colors.stat_net, colors.label, 0.45)));
     let up_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_up_history.len());
     for _ in 0..up_pad {
         spans.push(Span::new("\u{2581}", colors.label));
     }
     for &v in &stats.net_up_history {
-        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.accent));
+        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.stat_net));
     }
     spans.push(Span::new(
         format!(" {}", format_bytes_rate_fixed(stats.net_up_bytes_sec)),
         colors.text,
     ));
 
-    spans.push(Span::new(" \u{2193}", colors.label));
+    spans.push(Span::new(" \u{2193}", mix(colors.stat_net, colors.label, 0.45)));
     let down_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_down_history.len());
     for _ in 0..down_pad {
         spans.push(Span::new("\u{2581}", colors.label));
     }
     for &v in &stats.net_down_history {
-        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.accent));
+        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.stat_net));
     }
     spans.push(Span::new(
         format!(" {}", format_bytes_rate_fixed(stats.net_down_bytes_sec)),
@@ -520,15 +626,16 @@ fn push_net(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors
 /// GPU: label + 8 sparkline bars (left-padded) + fixed-width percentage.
 fn push_gpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
     let Some(gpu_pct) = stats.gpu_percent else { return };
-    spans.push(Span::new("GPU ", colors.label));
+    let hue = colors.stat_gpu;
+    spans.push(Span::new("GPU ", mix(hue, colors.label, 0.45)));
     let pad = CPU_SPARK_WIDTH.saturating_sub(stats.gpu_history.len());
     for _ in 0..pad {
         spans.push(Span::new("\u{2581}", colors.label));
     }
     for &v in &stats.gpu_history {
-        spans.push(Span::new(sparkline_char(v).to_string(), usage_color(v, colors)));
+        spans.push(Span::new(sparkline_char(v).to_string(), stat_color(v, hue, colors)));
     }
-    spans.push(Span::new(format!(" {gpu_pct:>3.0}%"), usage_color(gpu_pct, colors)));
+    spans.push(Span::new(format!(" {gpu_pct:>3.0}%"), stat_color(gpu_pct, hue, colors)));
 }
 
 // ---------------------------------------------------------------------------
@@ -619,15 +726,29 @@ fn rounded_div(value: u64, divisor: u64) -> u64 {
     value.saturating_add(divisor / 2) / divisor
 }
 
-/// Pick green/yellow/red based on usage percentage.
-fn usage_color(pct: f32, colors: &StatusBarColors) -> [f32; 4] {
-    if pct >= 85.0 {
+/// Band a usage percentage: the stat's identity hue below the warn threshold,
+/// ANSI yellow from 70%, ANSI red from 90% — the same warn/danger split the AI
+/// context bands default to, so "amber means hot" reads identically across
+/// the app while a calm graph keeps its own recognisable hue.
+fn stat_color(pct: f32, hue: [f32; 4], colors: &StatusBarColors) -> [f32; 4] {
+    if pct >= 90.0 {
         colors.critical
-    } else if pct >= 60.0 {
+    } else if pct >= 70.0 {
         colors.warning
     } else {
-        colors.connected_dot
+        hue
     }
+}
+
+/// Channel-wise sRGB mix of `a` toward `b` by `t` (0 = a, 1 = b).
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
 }
 
 /// Format bytes/sec as a human-readable string of ≤4 chars.
@@ -807,6 +928,59 @@ impl gpui::Render for SpanTooltip {
     }
 }
 
+/// Wrap one cluster in the quiet rounded zone fill. A `fixed_width` pins the
+/// zone's extent regardless of its live content.
+fn zone_pill(
+    inner: gpui::AnyElement,
+    colors: &StatusBarColors,
+    fixed_width: Option<f32>,
+) -> gpui::AnyElement {
+    div()
+        .rounded(px(6.0))
+        .px(px(6.0))
+        .py(px(2.0))
+        .bg(rgba(colors.zone_fill))
+        .flex()
+        .flex_row()
+        .items_center()
+        .when_some(fixed_width, |zone, width| zone.w(px(width)).flex_none().overflow_hidden())
+        .child(inner)
+        .into_any_element()
+}
+
+/// Span texts that identify the stats cluster inside the right group.
+const STAT_ZONE_MARKS: [&str; 4] = ["CPU ", "MEM ", "GPU ", "\u{2191}"];
+
+fn is_stats_zone(zone: &[Span]) -> bool {
+    zone.iter().any(|span| STAT_ZONE_MARKS.contains(&span.text.as_str()))
+}
+
+/// Render a span group as rounded zone fills split on [`Span::zone_break`]
+/// boundaries, so each segment cluster reads as its own quiet surface. The
+/// stats cluster takes `stats_width` when supplied, pinning its extent.
+fn zoned_row(
+    spans: &[Span],
+    colors: &StatusBarColors,
+    stats_width: Option<f32>,
+) -> impl IntoElement {
+    let mut zones: Vec<Vec<Span>> = vec![Vec::new()];
+    for span in spans {
+        if span.zone_break {
+            if zones.last().is_some_and(|zone| !zone.is_empty()) {
+                zones.push(Vec::new());
+            }
+        } else if let Some(zone) = zones.last_mut() {
+            zone.push(span.clone());
+        }
+    }
+    div().flex().flex_row().items_center().gap(px(8.0)).children(
+        zones.into_iter().filter(|zone| !zone.is_empty()).map(move |zone| {
+            let fixed = stats_width.filter(|_| is_stats_zone(&zone));
+            zone_pill(span_row(&zone, colors).into_any_element(), colors, fixed)
+        }),
+    )
+}
+
 fn span_row(spans: &[Span], colors: &StatusBarColors) -> impl IntoElement {
     let colors = *colors;
     div().flex().flex_row().items_center().children(spans.iter().enumerate().map(|(ix, span)| {
@@ -849,28 +1023,38 @@ fn center_cta(
     on_update: Option<UpdateActionHandler>,
 ) -> gpui::AnyElement {
     let base = div()
-        .h_full()
         .flex()
         .items_center()
         .px_2()
+        .py(px(2.0))
+        .rounded(px(6.0))
         .text_color(rgba(span.color))
         .child(span.text.clone());
     match (on_update.filter(|_| clickable), update_focus) {
-        (Some(action), Some(focus)) => base
-                .id("status-bar-update-cta")
+        (Some(action), Some(focus)) => {
+            // An actionable CTA is an accent-tinted chip — a solid fill with a
+            // deeper hover layer — while progress labels stay inert plain text.
+            let chip_bg = rgba([colors.accent[0], colors.accent[1], colors.accent[2], 0.15]);
+            let chip_hover = rgba([colors.accent[0], colors.accent[1], colors.accent[2], 0.26]);
+            let chip_text = rgba(mix(colors.accent, span.color, 0.45));
+            let hover_text = rgba(span.color);
+            let focus_bg = rgba(colors.accent);
+            let focus_text = rgba(colors.bg);
+            base.id("status-bar-update-cta")
                 .track_focus(focus)
                 .role(Role::Button)
                 .aria_label(span.text.clone())
                 .aria_description("Press Enter or Space to open the update confirmation")
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgba(colors.accent)))
-                .focus_visible(|style| {
-                    style.bg(rgba(colors.accent)).text_color(rgba(colors.bg))
-                })
+                .bg(chip_bg)
+                .text_color(chip_text)
+                .hover(move |style| style.bg(chip_hover).text_color(hover_text))
+                .focus_visible(move |style| style.bg(focus_bg).text_color(focus_text))
                 // GPUI maps Enter/Space and AccessKit Click onto `on_click`.
                 .on_key_down(stop_activation_key)
                 .on_click(move |_, window, cx| action(window, cx))
-                .into_any_element(),
+                .into_any_element()
+        }
         _ => base.into_any_element(),
     }
 }
@@ -887,6 +1071,7 @@ pub fn render(
     height_px: f32,
     colors: &StatusBarColors,
     actions: StatusBarActions<'_>,
+    stats_width: Option<f32>,
 ) -> impl IntoElement {
     let StatusBarActions { update_focus, on_update, on_equalize, on_settings } = actions;
     let center = model
@@ -914,11 +1099,36 @@ pub fn render(
         .font_family("monospace")
         .text_xs()
         .text_color(rgba(colors.text))
-        .child(span_row(&model.left, colors))
-        .child(div().h_full().flex_1().flex().flex_row().justify_center().children(center))
-        .child(span_row(&model.right, colors))
-        .children(on_equalize.map(|action| equalize_button(colors, action)))
-        .children(on_settings.map(|action| settings_gear(colors, action)))
+        .child(zoned_row(&model.left, colors, None))
+        .child(
+            div()
+                .h_full()
+                .flex_1()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .items_center()
+                .children(center),
+        )
+        .child(zoned_row(&model.right, colors, stats_width))
+        .when(on_equalize.is_some() || on_settings.is_some(), |bar| {
+            // Window controls share one quiet zone at the band's far right,
+            // matching the segment clusters; buttons stay full-height inside
+            // it so their hit targets keep the whole band.
+            bar.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h_full()
+                    .ml(px(8.0))
+                    .px(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(rgba(colors.zone_fill))
+                    .children(on_equalize.map(|action| equalize_button(colors, action)))
+                    .children(on_settings.map(|action| settings_gear(colors, action))),
+            )
+        })
 }
 
 /// The balance button at the band's bottom-right corner, beside the gear —
@@ -997,6 +1207,11 @@ mod tests {
             critical: [1.0, 0.0, 0.0, 1.0],
             label: [0.5, 0.5, 0.5, 1.0],
             top_border: [0.1, 0.1, 0.1, 1.0],
+            stat_cpu: [0.2, 0.4, 1.0, 1.0],
+            stat_mem: [0.7, 0.4, 1.0, 1.0],
+            stat_net: [0.3, 0.8, 1.0, 1.0],
+            stat_gpu: [0.2, 0.9, 0.4, 1.0],
+            zone_fill: [1.0, 1.0, 1.0, 0.05],
         }
     }
 
@@ -1178,9 +1393,13 @@ mod tests {
     #[test]
     fn usage_color_escalates_with_load() {
         let colors = colors();
-        crate::assert_rgba_eq(usage_color(10.0, &colors), colors.connected_dot);
-        crate::assert_rgba_eq(usage_color(70.0, &colors), colors.warning);
-        crate::assert_rgba_eq(usage_color(95.0, &colors), colors.critical);
+        let hue = [0.1, 0.2, 0.9, 1.0];
+        // Below warn the stat keeps its identity hue; the shared 70/90
+        // warn/danger split takes over above it.
+        crate::assert_rgba_eq(stat_color(10.0, hue, &colors), hue);
+        crate::assert_rgba_eq(stat_color(69.9, hue, &colors), hue);
+        crate::assert_rgba_eq(stat_color(70.0, hue, &colors), colors.warning);
+        crate::assert_rgba_eq(stat_color(95.0, hue, &colors), colors.critical);
     }
 
     // @lat: [[test#GPUI Status Bar#Network rate formats to four columns]]
@@ -1203,6 +1422,30 @@ mod tests {
         );
         assert_eq!(shorten_cwd_with_home(Path::new("/etc/hosts"), Some(home)), "/etc/hosts");
         assert_eq!(shorten_cwd_with_home(Path::new("/etc/hosts"), None), "/etc/hosts");
+    }
+
+    #[test]
+    fn stats_worst_case_gates_on_config_and_gpu_presence() {
+        let config = StatusBarStatsConfig {
+            usage: StatusBarUsageStatsConfig {
+                compute: StatusBarComputeStatsConfig { cpu: true, gpu: true },
+                memory: true,
+            },
+            network: true,
+        };
+        let all = stats_worst_case_text(&config, true);
+        assert!(all.contains("CPU") && all.contains("MEM") && all.contains("GPU"));
+        assert!(all.contains('\u{2191}') && all.contains('\u{2193}'));
+        // A GPU-less host reserves no phantom GPU segment even when enabled.
+        assert!(!stats_worst_case_text(&config, false).contains("GPU"));
+        let none = StatusBarStatsConfig {
+            usage: StatusBarUsageStatsConfig {
+                compute: StatusBarComputeStatsConfig { cpu: false, gpu: false },
+                memory: false,
+            },
+            network: false,
+        };
+        assert!(stats_worst_case_text(&none, true).is_empty());
     }
 
     // @lat: [[test#GPUI Status Bar#Right side stitches enabled segments in order]]

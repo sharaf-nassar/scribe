@@ -385,14 +385,30 @@ fn window_bringup_ms() -> Option<f64> {
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
 
-/// Width of the border a split window draws around every pane, in logical
-/// pixels — `border_1()` in [`TerminalView::render_panes`].
+/// Width of the hairline card border every pane draws, in logical pixels —
+/// `border_1()` in [`TerminalView::render_panes`].
 ///
 /// GPUI hands taffy the border as a box inset, so the grid a bordered pane
 /// paints is this much smaller on each side than the pane's placement rect.
 /// [`TerminalView::painted_pane_rect`] takes it back off before the PTY is
 /// told how many columns it has.
 const PANE_BORDER_WIDTH: f32 = 1.0;
+
+/// Corner radius of a pane card. The card's own fill and border round
+/// correctly; children paint under GPUI's rectangular content mask, so a
+/// full-background application's corner cells can square off the curve.
+// ponytail: rectangular content mask — thread corner radii into the grid's
+// corner cell-bg quads if that artifact ever matters.
+const PANE_CARD_RADIUS: f32 = 8.0;
+
+/// Entrance transition for a toast chip; removal stays timer-owned.
+const TOAST_ENTRANCE: Duration = Duration::from_millis(150);
+
+/// Breathing room between a pane card's border and its terminal grid, per
+/// side. Laid out on the grid slot and subtracted again in
+/// [`TerminalView::painted_pane_rect`], so the PTY is never told about
+/// columns the padding consumed.
+const PANE_CONTENT_PADDING: f32 = 10.0;
 
 /// Label of the demo smart-selection row in the right-click context menu.
 const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
@@ -903,6 +919,11 @@ impl InitialSessionBootstrap {
 /// enough that a saved edit lands within a frame or two, long enough that a
 /// delete-and-recreate save collapses into a single reload.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// How long a toast stays before its removal timer takes it down.
+const TOAST_TTL: Duration = Duration::from_millis(2600);
+/// Newest toasts win; older ones drop off the top of the stack.
+const MAX_TOASTS: usize = 3;
 
 /// How often the foreground refreshes the X11 active-window guard. Short enough
 /// that a compositor overlay opening while the user is idle is noticed before
@@ -1987,6 +2008,11 @@ struct TerminalView {
     beads_editor: Entity<BeadsEditor>,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
+    /// Transient bottom-right toast stack: `(id, message)` newest last, capped
+    /// at [`MAX_TOASTS`]. A per-toast timer owns removal.
+    toasts: Vec<(u64, String)>,
+    /// Monotonic toast id source, so a timer only ever removes its own toast.
+    toast_seq: u64,
     /// Font metrics the terminal grid paints with, rebuilt on a font reload
     /// and on every zoom step.
     font: GridFont,
@@ -2335,7 +2361,7 @@ struct TabSubtreeDragState {
 struct RegionBarData {
     /// The region this bar belongs to, keyed by its (server) workspace.
     workspace_id: WorkspaceId,
-    /// Region accent, tinting the bar's hairline and active underline.
+    /// Region accent, tinting the bar's hairline.
     accent: [f32; 4],
     /// Named or neutral fallback pill for this multi-region workspace.
     badge: Option<GroupBadge>,
@@ -2835,6 +2861,8 @@ impl TerminalView {
             beads_colors,
             beads_editor,
             stats_config,
+            toasts: Vec::new(),
+            toast_seq: 0,
             font,
             zoom,
             smart_selection,
@@ -3738,7 +3766,7 @@ impl TerminalView {
             LayoutAction::PromptJumpUp => self.jump_to_prompt(JumpDirection::Up, cx),
             LayoutAction::PromptJumpDown => self.jump_to_prompt(JumpDirection::Down, cx),
             LayoutAction::JumpToFailure => self.jump_to_failure(cx),
-            LayoutAction::CopySelection => self.copy_selection(),
+            LayoutAction::CopySelection => self.copy_selection(cx),
             LayoutAction::PasteClipboard => self.paste_clipboard(cx),
         }
     }
@@ -4484,7 +4512,7 @@ impl TerminalView {
                 );
             }
             ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
-            ContextMenuAction::Copy => self.copy_selection(),
+            ContextMenuAction::Copy => self.copy_selection(cx),
             ContextMenuAction::Paste => self.paste_clipboard(cx),
             ContextMenuAction::CopyText(text) | ContextMenuAction::CopyHyperlinkAddress(text) => {
                 self.write_clipboard(text);
@@ -4605,12 +4633,92 @@ impl TerminalView {
     /// happens without a selection, which is what makes the chord safe to press
     /// on an empty grid: an empty copy would otherwise wipe whatever the user
     /// had on the clipboard already.
-    fn copy_selection(&mut self) {
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let Some(text) = self.selection_copy_text() else {
             tracing::debug!("copy ignored: the focused pane has no selection");
             return;
         };
+        let lines = text.lines().count().max(1);
         self.write_clipboard(text);
+        // The one feedback surface a copy has: nothing else in the window
+        // changes when text lands on the clipboard.
+        let noun = if lines == 1 { "line" } else { "lines" };
+        self.push_toast(format!("Copied {lines} {noun}"), cx);
+    }
+
+    /// Show a transient toast at the window's bottom-right.
+    ///
+    /// The timer owns removal — motion preferences change how a toast looks,
+    /// never whether it leaves — and each timer removes only its own id, so a
+    /// newer toast can never be taken down by an older toast's expiry.
+    fn push_toast(&mut self, message: String, cx: &mut Context<Self>) {
+        self.toast_seq += 1;
+        let id = self.toast_seq;
+        self.toasts.push((id, message));
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.remove(0);
+        }
+        cx.notify();
+        cx.spawn(async move |view, app| {
+            app.background_executor().timer(TOAST_TTL).await;
+            view.update(app, |view, ctx| {
+                view.toasts.retain(|(toast_id, _)| *toast_id != id);
+                ctx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The toast stack overlay: raised chrome-toned chips at the grid band's
+    /// bottom-right, above panes and dividers. One status node announces the
+    /// newest message; the chips themselves stay decorative.
+    fn render_toasts(&self) -> Option<gpui::AnyElement> {
+        let newest = self.toasts.last()?.1.clone();
+        let bg = scribe_client::tab_bar::srgba(self.chrome.tab_bar_active_bg);
+        let text = scribe_client::tab_bar::srgba(self.chrome.tab_text);
+        let border = surface(self.chrome.divider, 1.0);
+        let animations = self.animations();
+        Some(
+            div()
+                .id("toast-stack")
+                .role(gpui::Role::Status)
+                .aria_label(newest)
+                .absolute()
+                .right(px(14.0))
+                .bottom(px(12.0))
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(8.0))
+                .children(self.toasts.iter().map(|(id, message)| {
+                    let seq = usize::try_from(*id).unwrap_or_default();
+                    let chip = div()
+                        .id(("toast", seq))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(bg)
+                        .border_1()
+                        .border_color(border)
+                        .text_xs()
+                        .text_color(text)
+                        .child(message.clone());
+                    // Entrance only: a chip fades and slides in, while removal
+                    // stays the timer's — motion may shape arrival, never exit.
+                    if animations.enabled() {
+                        chip.with_animation(
+                            ("toast-in", seq),
+                            animations.transition(TOAST_ENTRANCE),
+                            |chip, delta| chip.opacity(delta).mt(px(6.0 * (1.0 - delta))),
+                        )
+                        .into_any_element()
+                    } else {
+                        chip.into_any_element()
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Put `text` on the system clipboard, reporting a dead handle rather than
@@ -6088,11 +6196,10 @@ impl TerminalView {
         let launches = self.shell.adopt_restored(rebuilt, cx);
         let viewport = self.pane_viewport();
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
-        let split = placements.len() > 1;
         let sizes: HashMap<PaneId, TerminalSize> = placements
             .into_iter()
             .map(|placement| {
-                let rect = self.painted_pane_rect(&placement, split);
+                let rect = self.painted_pane_rect(&placement);
                 (placement.pane_id, self.grid_size_for(rect))
             })
             .collect();
@@ -7161,19 +7268,19 @@ impl TerminalView {
 
     /// The rect a pane actually paints its terminal grid into.
     ///
-    /// The placement rect is the pane's *outer* box, and two bands live inside
-    /// it that the PTY must not be told about. A split window draws a one-pixel
-    /// border on every pane and GPUI insets the child's content box by it, so
-    /// the painted grid is two pixels narrower and shorter than the placement.
-    /// The prompt strip is pane-internal chrome, so its rows come out of that
-    /// pane's own PTY rather than the shared grid band. Reserving neither is
-    /// how the client came to report more columns than it renders.
-    fn painted_pane_rect(&self, placement: &PanePlacement, split: bool) -> Rect {
+    /// The placement rect is the pane's *outer* box, and three things live
+    /// inside it that the PTY must not be told about. Every pane card draws a
+    /// one-pixel hairline border and lays [`PANE_CONTENT_PADDING`] of
+    /// breathing room inside it, and GPUI insets the child's content box by
+    /// both. The prompt strip is pane-internal chrome, so its rows come out
+    /// of that pane's own PTY rather than the shared grid band. Reserving
+    /// none of these is how the client came to report more columns than it
+    /// renders.
+    fn painted_pane_rect(&self, placement: &PanePlacement) -> Rect {
+        let inset = 2.0 * (PANE_BORDER_WIDTH + PANE_CONTENT_PADDING);
         let mut rect = placement.rect;
-        if split {
-            rect.width = (rect.width - 2.0 * PANE_BORDER_WIDTH).max(0.0);
-            rect.height = (rect.height - 2.0 * PANE_BORDER_WIDTH).max(0.0);
-        }
+        rect.width = (rect.width - inset).max(0.0);
+        rect.height = (rect.height - inset).max(0.0);
         if let Some(session_id) = placement.session_id {
             rect.height = (rect.height - self.pane_prompt_bar_height(session_id)).max(0.0);
         }
@@ -7189,11 +7296,10 @@ impl TerminalView {
     fn placed_pane_size(&self, session_id: SessionId, cx: &App) -> Option<TerminalSize> {
         let viewport = self.measured_pane_viewport()?;
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
-        let split = placements.len() > 1;
         placements
             .iter()
             .find(|placement| placement.session_id == Some(session_id))
-            .map(|placement| self.grid_size_for(self.painted_pane_rect(placement, split)))
+            .map(|placement| self.grid_size_for(self.painted_pane_rect(placement)))
     }
 
     /// Tell the server (and each local grid) how big every pane now is.
@@ -7234,7 +7340,6 @@ impl TerminalView {
             }
         }
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
-        let split = placements.len() > 1;
         let live: HashSet<SessionId> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
         // Hidden-but-open tabs keep their last published size. That memory is
@@ -7250,7 +7355,7 @@ impl TerminalView {
         );
         self.pane_sizes.retain(|session, _| live.contains(session) || open.contains(session));
         for placement in placements {
-            let size = self.grid_size_for(self.painted_pane_rect(&placement, split));
+            let size = self.grid_size_for(self.painted_pane_rect(&placement));
             if placement.focused {
                 self.adopt_focused_pane_size(size);
             }
@@ -7948,7 +8053,6 @@ impl TerminalView {
         // borrows `self` immutably. The state has to outlive the element (the
         // fade is a wall-clock animation across frames), so it lives here and
         // the element only borrows a handle.
-        let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
         let (mut ime, mut link, opacity) = (Some(ime), link, self.opacity);
         // Identical for every pane, so it is built once and cloned in: the
@@ -7959,11 +8063,14 @@ impl TerminalView {
             opacity,
         };
         let idle_border = surface(self.chrome.divider, opacity);
-        let chrome_bg = scribe_client::tab_bar::srgba(self.chrome.tab_bar_bg);
+        // The lifted strip ground, so pane borders mix their accent tone
+        // against the same surface the titlebar and region bars paint.
+        let chrome_bg = TabBarColors::from(&self.chrome).bg;
         let mut focused = Some(focused);
         placements
             .into_iter()
-            .map(|placement| {
+            .enumerate()
+            .map(|(pane_ix, placement)| {
                 let session_id = placement.session_id;
                 let image_paint =
                     self.terminal_images_paint(session_id, Rc::clone(&active_sessions));
@@ -7972,17 +8079,8 @@ impl TerminalView {
                 } else {
                     placement.session_id.and_then(|s| self.pane_content(s)).unwrap_or_default()
                 };
-                let mut pane = div()
-                    .absolute()
-                    .left(relative(placement.rect.x / viewport.width))
-                    .top(relative(placement.rect.y / viewport.height))
-                    .w(relative(placement.rect.width / viewport.width))
-                    .h(relative(placement.rect.height / viewport.height))
-                    .overflow_hidden();
-                if split {
-                    let border = pane_border(&placement, idle_border, chrome_bg, opacity);
-                    pane = pane.border_1().border_color(border);
-                }
+                let border = pane_border(&placement, idle_border, chrome_bg, opacity);
+                let mut pane = pane_card(&placement, viewport, colors.background, border);
                 let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
                 // Find and selection follow keyboard focus; pointer hover may
                 // rule any visible pane without moving that focus.
@@ -8016,7 +8114,14 @@ impl TerminalView {
                 .with_scrollbar(placement.session_id.and_then(|s| self.scrollbar_paint(s)))
                 .with_jump_button_pressed(placement.session_id == self.pressed_jump_button())
                 .with_ime(placement.focused.then(|| ime.take()).flatten());
-                let pane = self.compose_pane_content(pane, element.paint(), &placement, cx);
+                // A pane still waiting on its session paints skeleton bars
+                // instead of an empty grid.
+                let grid_el = if placement.session_id.is_some() {
+                    element.paint().into_any_element()
+                } else {
+                    pane_skeleton(self.chrome.status_bar_text, self.animations(), pane_ix)
+                };
+                let pane = self.compose_pane_content(pane, grid_el, &placement, cx);
                 let mut pane = Self::attach_wheel(pane, &placement, cx);
                 if let Some(color) = ai_border {
                     pane = pane.children(ai_pane_border(placement.rect, color));
@@ -8080,13 +8185,37 @@ impl TerminalView {
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
+            // Breathing room between the card border and the glyphs;
+            // `painted_pane_rect` subtracts the same value before the PTY
+            // grid is derived, so painted and published stay one rect.
+            .p(px(PANE_CONTENT_PADDING))
             .child(grid)
             .children(jump_button)
             .children(find_overlay);
+        // The strip paints its own background under the card's rectangular
+        // content mask, so its outer corners take the card radius themselves
+        // or they would square off the rounded corner they sit in.
+        let radius = px(PANE_CARD_RADIUS - PANE_BORDER_WIDTH);
         let pane = pane.flex().flex_col();
         if self.prompt_bar.position == PromptBarPosition::Top {
+            let strip = strip.map(|strip| {
+                div()
+                    .flex_none()
+                    .rounded_t(radius)
+                    .overflow_hidden()
+                    .child(strip)
+                    .into_any_element()
+            });
             pane.children(strip).child(grid_slot)
         } else {
+            let strip = strip.map(|strip| {
+                div()
+                    .flex_none()
+                    .rounded_b(radius)
+                    .overflow_hidden()
+                    .child(strip)
+                    .into_any_element()
+            });
             pane.child(grid_slot).children(strip)
         }
     }
@@ -9350,8 +9479,19 @@ impl TerminalView {
                         view.focus_workspace_region(workspace_id, ctx);
                     }
                 }))
+                .hover(|style| style.bg(colors.gradient_top))
                 .child(badge.label.clone());
-            let mut pill = div().flex().flex_none().items_center().h_full().bg(tone);
+            // Same inset rounded pill treatment as the titlebar badges, so
+            // upper and lower workspace pills read as one component.
+            let mut pill = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .my(px(4.0))
+                .px(px(4.0))
+                .rounded(px(6.0))
+                .overflow_hidden()
+                .bg(tone);
             if badge.beads {
                 pill = pill.child(
                     div()
@@ -9454,7 +9594,7 @@ impl TerminalView {
             }))
     }
 
-    /// AI dot, context suffix, active underline) minus its keyboard chrome.
+    /// AI dot, context suffix) minus its keyboard chrome.
     ///
     /// Drag-reorder is not part of that subtraction. A region bar holds every
     /// tab of every region below the first, so leaving it out made those tabs
@@ -9485,11 +9625,6 @@ impl TerminalView {
             .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
-        });
-        let underline = tab.is_active.then(|| {
-            let tone =
-                tab.group_accent.map_or(colors.accent, |accent| accent_tab_tone(accent, colors.bg));
-            div().absolute().bottom_0().left_0().right_0().h(px(2.0)).bg(tone).into_any_element()
         });
         let close = tab.is_active.then(|| {
             div()
@@ -9534,7 +9669,6 @@ impl TerminalView {
             .child(div().flex_1().truncate().child(display))
             .children(suffix)
             .children(close)
-            .children(underline)
             .into_any_element()
     }
 
@@ -12072,6 +12206,11 @@ impl TerminalView {
                 }
             });
         let on_equalize = equalize_visible.then_some(equalize_action);
+        // The GPU segment is present exactly when the model emitted it, so
+        // the reserved worst-case width never budgets a phantom segment.
+        let has_gpu = model.right.iter().any(|span| span.text == "GPU ");
+        let stats_width =
+            status_bar::stats_zone_width(Some(&self.stats_config), has_gpu, status_window);
         status_bar::render(
             &model,
             self.status_bar_height,
@@ -12082,6 +12221,7 @@ impl TerminalView {
                 on_equalize,
                 on_settings: Some(on_settings),
             },
+            stats_width,
         )
         .into_any_element()
     }
@@ -12293,22 +12433,25 @@ impl TerminalView {
         // it belongs in the grid band with them rather than in a window-wide
         // band that would span every region.
         let beads_boards = self.render_beads_boards(cx);
-        let beads_panels = self.render_beads_panels(cx);
         div()
             .id("terminal-grid")
             .flex_1()
             .relative()
-            .bg(surface(self.terminal_colors.background, self.opacity))
+            // The window ground the pane cards float on: the theme background
+            // stepped darker, so inter-pane gaps read as a layer beneath the
+            // terminal surfaces rather than as seams in one flush surface.
+            .bg(surface(pane_ground(self.terminal_colors.background), self.opacity))
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(region_bars)
             .children(ci_bars)
             .children(beads_boards)
-            .children(beads_panels)
+            .children(self.render_beads_panels(cx))
             // Dividers paint last, over panes, region bars, and boards alike:
             // a region divider runs the full height of the split, so two
             // regions with boards open must still read as two regions.
             .children(dividers)
+            .children(self.render_toasts())
             // Every button gesture below asks the mouse reporter first: an
             // application that enabled tracking owns the pointer, and only when
             // it declines (or Shift takes the pointer back) does the click mean
@@ -16312,6 +16455,81 @@ static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
 /// Tinting the focused pane with its *region's* accent is what makes a
 /// two-region window readable at a glance: the ring says both which pane types
 /// go to and which region that pane belongs to.
+/// The window ground behind the pane cards: the theme background with its
+/// colour channels stepped to 80%, so the ground sits one visible layer
+/// below the pane surfaces.
+///
+/// A black or near-black background has nothing left to darken — 80% of
+/// zero is zero, the gaps disappear, and the card border stops meaning
+/// anything — so below a small brightness floor the ground lightens by a
+/// fixed step instead. The layer split survives in both directions; only
+/// which side is darker flips.
+fn pane_ground([red, green, blue, alpha]: [f32; 4]) -> [f32; 4] {
+    if red.max(green).max(blue) < 0.09 {
+        [red + 0.05, green + 0.05, blue + 0.05, alpha]
+    } else {
+        [red * 0.8, green * 0.8, blue * 0.8, alpha]
+    }
+}
+
+/// Placeholder painted while a pane's session is still in flight — a restore
+/// replay or a fresh split awaiting `SessionCreated`. Quiet bars set the
+/// card's layout expectation instead of flashing an empty surface. Static by
+/// design: the reduced-motion policy needs no branch here, and the session's
+/// first frame replaces the whole thing.
+/// One pane's card div: its placement rect as viewport fractions, its own
+/// theme-background fill (skipped default-bg cells show this, not the
+/// ground), and the hairline card border — the focused pane's takes the
+/// region tone. The gap around it comes from the placement inset itself.
+fn pane_card(
+    placement: &pane_shell::PanePlacement,
+    viewport: Rect,
+    fill: gpui::Rgba,
+    border: gpui::Rgba,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .left(relative(placement.rect.x / viewport.width))
+        .top(relative(placement.rect.y / viewport.height))
+        .w(relative(placement.rect.width / viewport.width))
+        .h(relative(placement.rect.height / viewport.height))
+        .overflow_hidden()
+        .rounded(px(PANE_CARD_RADIUS))
+        .bg(fill)
+        .border_1()
+        .border_color(border)
+}
+
+fn pane_skeleton(ink: [f32; 4], animations: AnimationSettings, pane_ix: usize) -> gpui::AnyElement {
+    let bar = move |fraction: f32| {
+        div()
+            .h(px(9.0))
+            .w(relative(fraction))
+            .rounded(px(4.0))
+            .bg(gpui::Rgba { r: ink[0], g: ink[1], b: ink[2], a: 0.07 })
+            .into_any_element()
+    };
+    let bars = div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .gap(px(13.0))
+        .p(px(16.0))
+        .children([0.52, 0.7, 0.34, 0.61, 0.22].into_iter().map(bar));
+    // The CI trace's 1.2s breathing cadence, on the whole stack: waiting is
+    // the same kind of liveness. Reduced motion renders the static bars.
+    if animations.enabled() {
+        bars.with_animation(
+            ("pane-skeleton-breathe", pane_ix),
+            gpui::Animation::new(Duration::from_millis(1_200)).repeat(),
+            |bars, delta| bars.opacity(0.55 + 0.45 * (1.0 - (delta * 2.0 - 1.0).abs())),
+        )
+        .into_any_element()
+    } else {
+        bars.into_any_element()
+    }
+}
+
 fn pane_border(
     placement: &pane_shell::PanePlacement,
     idle: gpui::Rgba,
@@ -18471,6 +18689,19 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn pane_ground_stays_distinct_on_black() {
+        // A black theme cannot darken further: the ground lightens instead,
+        // so the card gaps and border never vanish into the background.
+        let black = pane_ground([0.0, 0.0, 0.0, 1.0]);
+        assert!(black[0] > 0.03 && black[1] > 0.03 && black[2] > 0.03);
+        assert!((black[3] - 1.0).abs() < 1e-6);
+        // An ordinary background keeps the darker-ground layering.
+        let mid = pane_ground([0.5, 0.4, 0.3, 1.0]);
+        assert!((mid[0] - 0.4).abs() < 1e-6);
+        assert!(mid[1] < 0.4 && mid[2] < 0.3);
+    }
 
     #[test]
     fn client_tracing_mirrors_to_a_fresh_state_log() {
