@@ -15,9 +15,13 @@
 //! its own linear conversion), unlike the legacy renderer which pre-multiplied
 //! into linear for the raw GPU pipeline.
 
+use std::ops::Range;
 use std::path::Path;
 
-use gpui::{App, FocusHandle, Font, Rgba, Role, TextRun, Window, div, prelude::*, px};
+use gpui::{
+    App, FocusHandle, Font, HighlightStyle, Rgba, Role, StyledText, TextRun, Window, div,
+    prelude::*, px,
+};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
@@ -147,8 +151,6 @@ pub struct StatusBarColors {
     pub stat_net: [f32; 4],
     /// GPU identity hue (ANSI green).
     pub stat_gpu: [f32; 4],
-    /// Quiet rounded fill behind each segment cluster (text at 5% alpha).
-    pub zone_fill: [f32; 4],
 }
 
 impl StatusBarColors {
@@ -177,12 +179,6 @@ impl StatusBarColors {
             stat_mem: ansi_colors.get(5).copied().unwrap_or(FALLBACK_MAGENTA),
             stat_net: ansi_colors.get(6).copied().unwrap_or(FALLBACK_CYAN),
             stat_gpu: ansi_colors.get(2).copied().unwrap_or(FALLBACK_GREEN),
-            zone_fill: [
-                text.first().copied().unwrap_or(1.0),
-                text.get(1).copied().unwrap_or(1.0),
-                text.get(2).copied().unwrap_or(1.0),
-                0.05,
-            ],
         }
     }
 
@@ -928,18 +924,14 @@ impl gpui::Render for SpanTooltip {
     }
 }
 
-/// Wrap one cluster in the quiet rounded zone fill. A `fixed_width` pins the
-/// zone's extent regardless of its live content.
-fn zone_pill(
-    inner: gpui::AnyElement,
-    colors: &StatusBarColors,
-    fixed_width: Option<f32>,
-) -> gpui::AnyElement {
+/// Wrap one cluster in its zone container — spacing and rounding only, no
+/// fill: clusters sit flat on the band's base background. A `fixed_width`
+/// pins the zone's extent regardless of its live content.
+fn zone_pill(inner: gpui::AnyElement, fixed_width: Option<f32>) -> gpui::AnyElement {
     div()
         .rounded(px(6.0))
         .px(px(6.0))
         .py(px(2.0))
-        .bg(rgba(colors.zone_fill))
         .flex()
         .flex_row()
         .items_center()
@@ -955,9 +947,10 @@ fn is_stats_zone(zone: &[Span]) -> bool {
     zone.iter().any(|span| STAT_ZONE_MARKS.contains(&span.text.as_str()))
 }
 
-/// Render a span group as rounded zone fills split on [`Span::zone_break`]
-/// boundaries, so each segment cluster reads as its own quiet surface. The
-/// stats cluster takes `stats_width` when supplied, pinning its extent.
+/// Render a span group as zone containers split on [`Span::zone_break`]
+/// boundaries, so each segment cluster keeps its own spacing on the flat
+/// band background. The stats cluster takes `stats_width` when supplied,
+/// pinning its extent.
 fn zoned_row(
     spans: &[Span],
     colors: &StatusBarColors,
@@ -976,9 +969,36 @@ fn zoned_row(
     div().flex().flex_row().items_center().gap(px(8.0)).children(
         zones.into_iter().filter(|zone| !zone.is_empty()).map(move |zone| {
             let fixed = stats_width.filter(|_| is_stats_zone(&zone));
-            zone_pill(span_row(&zone, colors).into_any_element(), colors, fixed)
+            // The pinned stats cluster paints as ONE shaped line: its pin is
+            // measured by shaping the worst-case text once, and a per-span
+            // element row lays every span out in its own rounded box — the
+            // accumulated drift across ~40 spans clipped the zone's tail.
+            // One StyledText shapes exactly like the measurement.
+            let inner = if fixed.is_some() {
+                div().whitespace_nowrap().child(stats_text(&zone)).into_any_element()
+            } else {
+                span_row(&zone, colors).into_any_element()
+            };
+            zone_pill(inner, fixed)
         }),
     )
+}
+
+/// Join the stats cluster's spans into one shaped text with per-span color
+/// highlights. Stats spans never carry tooltips, so nothing is lost by
+/// leaving [`span_row`]'s per-span hover nodes behind.
+fn stats_text(spans: &[Span]) -> StyledText {
+    let mut text = String::new();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for span in spans {
+        let start = text.len();
+        text.push_str(&span.text);
+        highlights.push((
+            start..text.len(),
+            HighlightStyle { color: Some(rgba(span.color).into()), ..HighlightStyle::default() },
+        ));
+    }
+    StyledText::new(text).with_highlights(highlights)
 }
 
 fn span_row(spans: &[Span], colors: &StatusBarColors) -> impl IntoElement {
@@ -1112,9 +1132,9 @@ pub fn render(
         )
         .child(zoned_row(&model.right, colors, stats_width))
         .when(on_equalize.is_some() || on_settings.is_some(), |bar| {
-            // Window controls share one quiet zone at the band's far right,
-            // matching the segment clusters; buttons stay full-height inside
-            // it so their hit targets keep the whole band.
+            // Window controls share one trailing cluster at the band's far
+            // right, flat like the segment clusters; buttons stay full-height
+            // inside it so their hit targets keep the whole band.
             bar.child(
                 div()
                     .flex()
@@ -1124,7 +1144,6 @@ pub fn render(
                     .ml(px(8.0))
                     .px(px(4.0))
                     .rounded(px(6.0))
-                    .bg(rgba(colors.zone_fill))
                     .children(on_equalize.map(|action| equalize_button(colors, action)))
                     .children(on_settings.map(|action| settings_gear(colors, action))),
             )
@@ -1211,7 +1230,6 @@ mod tests {
             stat_mem: [0.7, 0.4, 1.0, 1.0],
             stat_net: [0.3, 0.8, 1.0, 1.0],
             stat_gpu: [0.2, 0.9, 0.4, 1.0],
-            zone_fill: [1.0, 1.0, 1.0, 0.05],
         }
     }
 

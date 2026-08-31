@@ -18,7 +18,7 @@ use gpui::{
 use scribe_common::ids::{SessionId, WorkspaceId};
 
 use crate::tab_bar::{
-    GroupBadge, TabBarColors, TabData, accent_tab_tone, flash_blend, px_units,
+    GroupBadge, TabBarColors, TabData, TabShown, flash_blend, pill_fill, px_units,
     reorder_target_index, tab_display_title,
 };
 use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
@@ -42,7 +42,9 @@ pub const TAB_MIN_WIDTH: f32 = 56.0;
 /// Vertical inset between the strip's top edge and a tab's raised card. The
 /// strip shows through this gap, so the card's rounded top corners read as a
 /// browser-style physical tab instead of a flat full-height band segment.
-const TAB_CARD_TOP_GAP: f32 = 5.0;
+/// Workspace pills share the same inset and bottom-flush height so pills and
+/// tab cards sit on one line, as in the layered chrome mock.
+pub const TAB_CARD_TOP_GAP: f32 = 5.0;
 
 /// Pointer travel, in pixels, required before an armed press on the move region
 /// hands the window to the compositor. Absorbs the jitter of an ordinary click
@@ -146,6 +148,7 @@ struct TabChildren {
     ai_indicator: Option<AnyElement>,
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
+    tick: Option<AnyElement>,
 }
 
 #[derive(Clone, Copy)]
@@ -338,7 +341,7 @@ impl TitlebarView {
             return;
         }
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            tab.is_active = i == index;
+            tab.shown = TabShown::from_active(i == index);
         }
         cx.emit(TitlebarEvent::SelectTab { index, source });
         cx.notify();
@@ -347,7 +350,7 @@ impl TitlebarView {
     /// Remove `index` and emit [`TitlebarEvent::CloseTab`], keeping one tab active.
     pub fn close(&mut self, index: usize, cx: &mut Context<Self>) {
         let was_active = match self.tabs.get(index) {
-            Some(tab) => tab.is_active,
+            Some(tab) => tab.is_active(),
             None => return,
         };
         self.tabs.remove(index);
@@ -357,7 +360,7 @@ impl TitlebarView {
         if was_active && !self.tabs.is_empty() {
             let new_active = index.min(self.tabs.len() - 1);
             for (i, tab) in self.tabs.iter_mut().enumerate() {
-                tab.is_active = i == new_active;
+                tab.shown = TabShown::from_active(i == new_active);
             }
         }
         cx.emit(TitlebarEvent::CloseTab(index));
@@ -580,6 +583,14 @@ pub fn badge_width_px(badge: &GroupBadge) -> f32 {
     px_units(badge.label.chars().count() + 2) * CHAR_WIDTH + if badge.beads { 42.0 } else { 16.0 }
 }
 
+/// The 7px square identity dot leading a workspace pill: the one place a
+/// pill carries its workspace color now that every pill wears the shared
+/// neutral chip fill (the layered chrome mock's `wdot`).
+#[must_use]
+pub fn workspace_pill_dot(accent: Rgba) -> AnyElement {
+    div().flex_none().size(px(7.0)).rounded(px(2.0)).bg(accent).into_any_element()
+}
+
 /// Connected-node Beads mark shared by workspace badges in both tab bars.
 #[must_use]
 pub fn beads_graph_icon(color: Rgba) -> AnyElement {
@@ -654,14 +665,14 @@ impl TitlebarView {
     /// its own edges) and at a workspace group's first tab, where the group
     /// pill is the boundary.
     fn tab_wants_left_separator(&self, index: usize, tab: &TabData) -> bool {
-        if index == 0 || tab.is_active || self.hovered_tab == Some(index) {
+        if index == 0 || tab.is_active() || self.hovered_tab == Some(index) {
             return false;
         }
         if tab.group_region_x.is_some() {
             return false;
         }
         let Some(prev) = self.tabs.get(index - 1) else { return false };
-        !prev.is_active && self.hovered_tab != Some(index - 1)
+        !prev.is_active() && self.hovered_tab != Some(index - 1)
     }
 
     /// The boundary mark a resting tab paints against a resting neighbour —
@@ -688,10 +699,9 @@ impl TitlebarView {
     /// The fill is an absolute child rather than a full-bleed element
     /// background: inset `TAB_CARD_TOP_GAP` from the top, the strip shows
     /// above its rounded corners and the shape reads as a browser-style tab.
-    /// The card runs to the band's bottom edge, covering the strip hairline
-    /// there — and the active card wears the terminal background, so the
-    /// active tab visually opens into the content below it. Resting tabs
-    /// paint no card and sit flat on the strip.
+    /// The card runs to the band's bottom edge — and the active card wears
+    /// the pane fill, so the active tab visually opens into the content
+    /// below it. Resting tabs paint no card and sit flat on the strip.
     fn tab_card(bg: Rgba) -> AnyElement {
         div()
             .absolute()
@@ -706,7 +716,7 @@ impl TitlebarView {
 
     /// Base tab background before the attention flash is blended in.
     fn tab_base_bg(&self, tab: &TabData, is_hovered: bool) -> Rgba {
-        if tab.is_active {
+        if tab.is_active() {
             self.colors.active_bg
         } else if is_hovered {
             let bg = self.colors.bg;
@@ -796,7 +806,8 @@ impl TitlebarView {
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
-        let visible = tab.is_active || self.hovered_tab == Some(index) || focused || close_focused;
+        let visible =
+            tab.is_focused() || self.hovered_tab == Some(index) || focused || close_focused;
         let close = Some(self.render_tab_close(
             TabClose {
                 index,
@@ -808,9 +819,26 @@ impl TitlebarView {
             },
             cx,
         ));
-        // No accent tick: the raised card's own contrast against the lifted
-        // strip is the active mark.
-        TabChildren { display, agent_indicator, ai_indicator, suffix, close }
+        // The mock's active mark: a 2px tick riding the card's top edge,
+        // inset 8px from each side, in the workspace's effective accent —
+        // the same color the pill dot wears, so it stays a muted gray until
+        // a project names the workspace and takes its palette color. Only
+        // the window-focused region's shown tab wears it: other regions'
+        // shown tabs keep the raised card (their open-tab marker) but go
+        // quiet, so the tick answers "where is my keyboard" while the card
+        // answers "which tab is open here".
+        let tick = tab.is_focused().then(|| {
+            div()
+                .absolute()
+                .top(px(TAB_CARD_TOP_GAP))
+                .left(px(8.0))
+                .right(px(8.0))
+                .h(px(2.0))
+                .rounded_b(px(2.0))
+                .bg(tab.group_accent.unwrap_or(self.colors.accent))
+                .into_any_element()
+        });
+        TabChildren { display, agent_indicator, ai_indicator, suffix, close, tick }
     }
 
     fn render_tab(
@@ -823,7 +851,7 @@ impl TitlebarView {
         let is_hovered = self.hovered_tab == Some(index);
         let base_bg = self.tab_base_bg(tab, is_hovered);
         let bg = flash_blend(base_bg, self.colors.accent, tab.tab_flash);
-        let fg = if tab.is_active { self.colors.active_text } else { self.colors.text };
+        let fg = if tab.is_focused() { self.colors.active_text } else { self.colors.text };
         let tab_id = ElementId::from(tab.accessibility_id.clone());
         let Some(tab_focus) = self.tab_focus_handles.get(index).cloned() else {
             return div().into_any_element();
@@ -842,7 +870,7 @@ impl TitlebarView {
             .id(tab_id)
             .role(Role::Tab)
             .aria_label(tab_accessible_label(tab))
-            .aria_selected(tab.is_active)
+            .aria_selected(tab.is_active())
             .aria_position_in_set(index + 1)
             .aria_size_of_set(self.tabs.len())
             .track_focus(&tab_focus)
@@ -863,7 +891,7 @@ impl TitlebarView {
             .px_2()
             .text_color(fg)
             .text_xs();
-        let show_card = tab.is_active || is_hovered || tab.tab_flash.is_some();
+        let show_card = tab.is_active() || is_hovered || tab.tab_flash.is_some();
         tab_el = tab_el
             .children(show_card.then(|| Self::tab_card(bg)))
             .children(self.tab_boundary_mark(index, tab));
@@ -887,6 +915,7 @@ impl TitlebarView {
             .child(div().flex_1().truncate().child(children.display))
             .children(children.suffix)
             .children(children.close)
+            .children(children.tick)
             .on_hover(cx.listener(move |this, hovered: &bool, _win, ctx| {
                 this.hovered_tab = if *hovered { Some(index) } else { None };
                 ctx.notify();
@@ -994,13 +1023,10 @@ impl TitlebarView {
             .iter()
             .enumerate()
             .map(|(group, &(start, end))| {
+                // No hairline closes the group off: the strip is the bare
+                // window ground, and region identity lives in the pill dot,
+                // the focused tab's tick, and the pane focus ring below.
                 let mut row = div().flex().flex_row().items_center().h_full();
-                // The group is a bar spanning its whole region, closed off by
-                // a 1px bottom hairline in the region's tab tone so the bar
-                // meets the region border below in the same colour.
-                if let Some(accent) = tabs.get(start).and_then(|tab| tab.group_accent) {
-                    row = row.border_b_1().border_color(accent_tab_tone(accent, self.colors.bg));
-                }
                 if let Some(badge) = tabs.get(start).and_then(|tab| tab.badge.as_ref()) {
                     row = row.child(self.render_group_badge(start, badge, cx));
                 }
@@ -1035,10 +1061,10 @@ impl TitlebarView {
         badge: &GroupBadge,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // A full-height tag flush with the bar's left edge, filled with the
-        // darker tab-tone of the region accent — the same colour the group
-        // hairline and the region border wear, so all three read as one shape.
-        let tag_bg = accent_tab_tone(badge.accent, self.colors.bg);
+        // The mock's uniform quiet chip: every pill shares one neutral fill,
+        // and the workspace color lives in the leading square dot — or the
+        // Beads icon standing in its place when a board is detected.
+        let chip_bg = pill_fill(&self.colors);
         let label = div()
             .id(ElementId::from(format!("workspace-badge-{index}")))
             .role(Role::Button)
@@ -1065,22 +1091,22 @@ impl TitlebarView {
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
-            .hover(|style| style.bg(self.colors.gradient_top))
+            .hover(|style| style.rounded(px(4.0)).bg(self.colors.gradient_top))
             .child(badge.label.clone());
-        // Inset rounded pill rather than a full-height flush tag, so the badge
-        // reads as its own quiet surface beside the tabs; it keeps the darker
-        // region tab-tone fill that ties it to the group hairline below. The
-        // horizontal padding keeps the Beads icon and label off the pill's
-        // rounded edges.
+        // The pill shares the tab card's vertical rhythm — the same top gap,
+        // flush to the band's bottom — so pills and tab cards sit on one
+        // line. The horizontal padding keeps the dot, Beads icon, and label
+        // off the pill's rounded edges.
         let mut row = div()
             .flex()
             .flex_none()
             .items_center()
-            .my(px(4.0))
-            .px(px(4.0))
+            .mt(px(TAB_CARD_TOP_GAP))
+            .h(px(self.height - TAB_CARD_TOP_GAP))
+            .px(px(6.0))
             .rounded(px(6.0))
             .overflow_hidden()
-            .bg(tag_bg);
+            .bg(chip_bg);
         if badge.beads {
             let focus = self
                 .beads_focus_handles
@@ -1098,7 +1124,6 @@ impl TitlebarView {
                     .justify_center()
                     .w(px(26.0))
                     .h_full()
-                    .text_color(self.colors.accent)
                     .cursor_pointer()
                     .hover(|style| style.bg(self.colors.gradient_top))
                     .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
@@ -1111,8 +1136,12 @@ impl TitlebarView {
                         window.focus(&focus, ctx);
                         ctx.emit(TitlebarEvent::ToggleBeadsBoard { index });
                     }))
-                    .child(beads_graph_icon(self.colors.accent)),
+                    // The workspace's own accent, so a Beads pill still
+                    // carries its identity color where the dot would sit.
+                    .child(beads_graph_icon(badge.accent)),
             );
+        } else {
+            row = row.child(workspace_pill_dot(badge.accent));
         }
         row.child(label).into_any_element()
     }
@@ -1163,7 +1192,7 @@ impl TitlebarView {
             .on_click(cx.listener(move |_this, _, _window, ctx| {
                 ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
             }))
-            .hover(|style| style.bg(self.colors.gradient_top))
+            .hover(|style| style.rounded(px(4.0)).bg(self.colors.gradient_top))
             .child(standalone.badge.label.clone())
             .into_any_element()
     }
@@ -1175,19 +1204,20 @@ impl TitlebarView {
         next_region_x: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tag_bg = accent_tab_tone(standalone.badge.accent, self.colors.bg);
+        let chip_bg = pill_fill(&self.colors);
         let workspace_id = standalone.workspace_id;
         let label = self.render_standalone_badge_label(index, standalone, cx);
-        // Same inset rounded pill treatment as the tab-run badge.
+        // Same rhythm as the tab-run badge: top gap, bottom flush.
         let mut pill = div()
             .flex()
             .flex_none()
             .items_center()
-            .my(px(4.0))
-            .px(px(4.0))
+            .mt(px(TAB_CARD_TOP_GAP))
+            .h(px(self.height - TAB_CARD_TOP_GAP))
+            .px(px(6.0))
             .rounded(px(6.0))
             .overflow_hidden()
-            .bg(tag_bg);
+            .bg(chip_bg);
         if standalone.badge.beads {
             let focus = self
                 .standalone_beads_focus_handles
@@ -1205,7 +1235,6 @@ impl TitlebarView {
                     .justify_center()
                     .w(px(26.0))
                     .h_full()
-                    .text_color(self.colors.accent)
                     .cursor_pointer()
                     .hover(|style| style.bg(self.colors.gradient_top))
                     .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
@@ -1221,17 +1250,12 @@ impl TitlebarView {
                         window.focus(&focus, ctx);
                         ctx.emit(TitlebarEvent::ToggleStandaloneBeadsBoard(workspace_id));
                     }))
-                    .child(beads_graph_icon(self.colors.accent)),
+                    .child(beads_graph_icon(standalone.badge.accent)),
             );
+        } else {
+            pill = pill.child(workspace_pill_dot(standalone.badge.accent));
         }
-        let row = div()
-            .absolute()
-            .top_0()
-            .left(px(standalone.region_x))
-            .h_full()
-            .overflow_hidden()
-            .border_b_1()
-            .border_color(tag_bg);
+        let row = div().absolute().top_0().left(px(standalone.region_x)).h_full().overflow_hidden();
         let row = match next_region_x {
             Some(next) => row.w(px((next - standalone.region_x).max(0.0))),
             None => row.right_0(),
@@ -1283,7 +1307,6 @@ impl Render for TitlebarView {
             .flex_none()
             .h(px(self.height))
             .bg(self.colors.bg)
-            .relative()
             // Declared for Windows, where the platform consults the hit-test
             // areas. X11/Wayland ignore it, so the handlers below drive the move.
             .window_control_area(WindowControlArea::Drag)
@@ -1334,20 +1357,6 @@ impl Render for TitlebarView {
                     this.end_drag(click_swallowed, ctx);
                 }),
             )
-            // The strip's bottom hairline is an absolute child rather than
-            // a container border: children can paint over it, and the active
-            // tab's card does — interrupting the line under the active tab so
-            // it merges with the terminal below, the way a browser tab meets
-            // its toolbar.
-            .child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(self.colors.separator),
-            )
             .child(
                 div()
                     .id("terminal-tabs")
@@ -1390,7 +1399,7 @@ mod tests {
         StandaloneBadge, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px,
         tab_accessible_label, workspace_group_ranges,
     };
-    use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
+    use crate::tab_bar::{GroupBadge, TabBarColors, TabData, TabShown};
 
     const TEST_TAB_BAR_HEIGHT: f32 = 36.0;
 
@@ -1406,7 +1415,7 @@ mod tests {
             let tabs = (0..n)
                 .map(|i| {
                     let mut tab = TabData::new(format!("tab-{i}"));
-                    tab.is_active = i == 0;
+                    tab.shown = TabShown::from_active(i == 0);
                     tab
                 })
                 .collect();
@@ -1551,8 +1560,8 @@ mod tests {
         let (bar, log) = titlebar_with_tabs(3, cx);
         bar.update(cx, |bar, cx| bar.select(2, TabActivationSource::Pointer, cx));
         bar.read_with(cx, |bar, _| {
-            assert!(bar.tabs()[2].is_active);
-            assert!(!bar.tabs()[0].is_active);
+            assert!(bar.tabs()[2].is_active());
+            assert!(!bar.tabs()[0].is_active());
         });
         assert_eq!(
             log.lock().unwrap().as_slice(),
@@ -1577,7 +1586,7 @@ mod tests {
         bar.update(cx, |bar, cx| bar.close(0, cx));
         bar.read_with(cx, |bar, _| {
             assert_eq!(bar.tabs().len(), 2);
-            assert!(bar.tabs().iter().filter(|t| t.is_active).count() == 1);
+            assert!(bar.tabs().iter().filter(|t| t.is_active()).count() == 1);
         });
         assert_eq!(log.lock().unwrap().as_slice(), &[TitlebarEvent::CloseTab(0)]);
     }
@@ -1671,8 +1680,8 @@ mod tests {
             bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {
-            assert!(bar.tabs()[1].is_active);
-            assert!(!bar.tabs()[0].is_active);
+            assert!(bar.tabs()[1].is_active());
+            assert!(!bar.tabs()[0].is_active());
         });
         assert_eq!(
             log.lock().unwrap().as_slice(),

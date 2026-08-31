@@ -84,9 +84,6 @@ pub struct PanePlacement {
     pub rect: Rect,
     /// Whether this is the focused pane of the focused region.
     pub focused: bool,
-    /// The owning region's accent colour, used to tint the focus ring so two
-    /// regions are visually distinguishable.
-    pub accent: [f32; 4],
 }
 
 /// What [`PaneShell::close_focused_pane`] actually did.
@@ -1265,9 +1262,6 @@ impl PaneShell {
             );
             let Some(tab) = self.shown_tabs.get(&workspace_id) else { continue };
             let Some(tree) = self.trees.get(tab) else { continue };
-            let accent = workspace
-                .find_workspace(workspace_id)
-                .map_or(FALLBACK_PANE_ACCENT, |slot: &WorkspaceSlot| slot.accent_color);
             let focused_pane = self.focused.get(tab).copied();
             for (pane_id, rect, edges) in tree.read(cx).compute_rects(region) {
                 out.push(PanePlacement {
@@ -1276,7 +1270,6 @@ impl PaneShell {
                     session_id: self.sessions.get(&pane_id).copied(),
                     rect: Self::card_rect(rect, edges),
                     focused: workspace_id == focused_workspace && focused_pane == Some(pane_id),
-                    accent,
                 });
             }
         }

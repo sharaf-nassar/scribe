@@ -92,7 +92,7 @@ impl Theme {
         background: [f32; 4],
         ansi_colors: &[[f32; 4]; 16],
     ) -> ChromeColors {
-        let tab_bar_bg = lighten(background, 0.06);
+        let tab_bar_bg = ground_tone(background);
         let tab_bar_active_bg = background;
         let tab_text = with_alpha(foreground, 0.45);
         let tab_text_active = foreground;
@@ -350,6 +350,21 @@ fn parse_hex_channel(
     u8::from_str_radix(slice, 16).map_err(|err| ScribeError::ThemeParse {
         reason: format!("invalid {channel_name} channel: {err}"),
     })
+}
+
+/// The window-ground tone the pane band paints behind its cards: the
+/// background stepped to 80%, or lightened by a fixed step when it is too
+/// dark to darken. The tab strip's `tab_bar_bg` shares this exact tone — the
+/// layered chrome mock's `--ground` — so the titlebar band and the pane gaps
+/// read as one surface, and the active tab card (which wears the background
+/// itself) reads as a pane surface against both.
+#[must_use]
+pub fn ground_tone([red, green, blue, alpha]: [f32; 4]) -> [f32; 4] {
+    if red.max(green).max(blue) < 0.09 {
+        [red + 0.05, green + 0.05, blue + 0.05, alpha]
+    } else {
+        [red * 0.8, green * 0.8, blue * 0.8, alpha]
+    }
 }
 
 /// Lighten an sRGB color by adding `amount` to each RGB channel, clamped to 1.0.

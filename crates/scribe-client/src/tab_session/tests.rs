@@ -48,8 +48,8 @@ fn new_tab_appends_and_focuses() {
     // The new tab is the one the titlebar renders as active.
     let data = tabs.to_tab_data();
     assert_eq!(data.len(), 2);
-    assert!(!data[0].is_active);
-    assert!(data[1].is_active);
+    assert!(!data[0].is_active());
+    assert!(data[1].is_active());
 }
 
 /// A pane split creates a live session but never a second strip tab. Focusing
@@ -265,7 +265,7 @@ fn reorder_and_addresses_stay_region_local() {
     assert_eq!(slots[2].workspace_id, ws_b);
     assert_eq!(slots[2].index, 0, "the third strip tab is region b's first");
     // Each region underlines its own shown tab, not one tab for the window.
-    assert_eq!(data.iter().filter(|tab| tab.is_active).count(), 2);
+    assert_eq!(data.iter().filter(|tab| tab.is_active()).count(), 2);
 }
 
 #[test]

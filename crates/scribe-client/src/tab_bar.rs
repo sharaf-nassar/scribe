@@ -108,34 +108,15 @@ pub const fn srgba(c: [f32; 4]) -> Rgba {
     Rgba { r: c[0], g: c[1], b: c[2], a: c[3] }
 }
 
-/// Extra lift applied to the strip ground (and its hover/gradient tone) over
-/// the theme's `tab_bar_bg` token, so the raised tab card — which wears the
-/// darker terminal background — clearly reads against the band. Applied here
-/// rather than in the theme because menus, dialogs, and the beads board reuse
-/// `tab_bar_bg` as a quiet ground and must keep it.
-// ponytail: additive lift clamps at white, so a near-white theme flattens the
-// strip again; flip to a darken step behind a brightness probe if one ships.
-pub const STRIP_LIFT: f32 = 0.08;
-
-/// Add `amount` to each RGB channel (clamped to 1.0), preserving alpha.
-fn lift(c: Rgba, amount: f32) -> Rgba {
-    Rgba {
-        r: (c.r + amount).min(1.0),
-        g: (c.g + amount).min(1.0),
-        b: (c.b + amount).min(1.0),
-        a: c.a,
-    }
-}
-
 impl From<&ChromeColors> for TabBarColors {
     fn from(chrome: &ChromeColors) -> Self {
         Self {
-            bg: lift(srgba(chrome.tab_bar_bg), STRIP_LIFT),
+            bg: srgba(chrome.tab_bar_bg),
             active_bg: srgba(chrome.tab_bar_active_bg),
             text: srgba(chrome.tab_text),
             active_text: srgba(chrome.tab_text_active),
             separator: srgba(chrome.tab_separator),
-            gradient_top: lift(srgba(chrome.tab_bar_gradient_top), STRIP_LIFT),
+            gradient_top: srgba(chrome.tab_bar_gradient_top),
             accent: srgba(chrome.accent),
         }
     }
@@ -191,6 +172,33 @@ pub fn context_suffix(percent: u8, warn: u8, danger: u8, pulsing: bool) -> Optio
     Some(ContextSuffix { text, color })
 }
 
+/// How a tab relates to its region's display and the window's focus.
+///
+/// Every region shows exactly one tab, independent of window focus; only
+/// the focused region's shown tab is the one keyboard input reaches. The
+/// enum makes "focused but not shown" unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabShown {
+    /// Not the tab its region is showing.
+    #[default]
+    Rest,
+    /// The tab its region shows while the window's focus is elsewhere: it
+    /// keeps the raised card but stays quiet.
+    Shown,
+    /// The shown tab of the window-focused region, wearing the accent tick,
+    /// bright title, and standing close button.
+    Focused,
+}
+
+impl TabShown {
+    /// `Shown` when `active`, else `Rest` — the region-local tier before the
+    /// client promotes the focused region's shown tab to `Focused`.
+    #[must_use]
+    pub fn from_active(active: bool) -> Self {
+        if active { Self::Shown } else { Self::Rest }
+    }
+}
+
 /// Per-tab data the titlebar renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabData {
@@ -202,8 +210,8 @@ pub struct TabData {
     pub accessibility_id: String,
     /// Tab title (task label while active, otherwise the shell/process title).
     pub title: String,
-    /// Whether this tab is the active/focused tab in its workspace.
-    pub is_active: bool,
+    /// How this tab relates to its region's display and the window's focus.
+    pub shown: TabShown,
     /// Whether the agent API currently holds an activity lease for this tab.
     pub agent_active: bool,
     /// AI state indicator color. `None` when no active AI state.
@@ -240,6 +248,18 @@ pub struct GroupBadge {
 }
 
 impl TabData {
+    /// Whether this tab is the one its region is showing (focused or not).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.shown != TabShown::Rest
+    }
+
+    /// Whether this tab is the shown tab of the window-focused region.
+    #[must_use]
+    pub fn is_focused(&self) -> bool {
+        self.shown == TabShown::Focused
+    }
+
     /// A plain inactive tab with just a title.
     #[must_use]
     pub fn new(title: impl Into<String>) -> Self {
@@ -251,7 +271,7 @@ impl TabData {
             // duplicate IDs apparent in the accessibility coverage.
             accessibility_id: format!("tab-{title}"),
             title,
-            is_active: false,
+            shown: TabShown::Rest,
             agent_active: false,
             ai_indicator: None,
             context_suffix: None,
@@ -358,11 +378,19 @@ pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
     }
 }
 
+/// The uniform quiet fill every workspace pill wears — the theme foreground
+/// at 5% alpha over the strip, the layered chrome mock's `--fill`. Identity
+/// color lives in the pill's leading dot or Beads icon, never in the fill.
+#[must_use]
+pub fn pill_fill(colors: &TabBarColors) -> Rgba {
+    Rgba { r: colors.text.r, g: colors.text.g, b: colors.text.b, a: 0.05 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, STRIP_LIFT, TAB_FLASH_SECS,
-        TabBarColors, UNNAMED_WORKSPACE_LABEL, badge_label, context_suffix, flash_blend, px_units,
+        CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors,
+        UNNAMED_WORKSPACE_LABEL, badge_label, context_suffix, flash_blend, px_units,
         reorder_target_index, srgba, tab_display_title, tab_flash_intensity, workspace_pill_label,
     };
     use gpui::Rgba;
@@ -391,16 +419,18 @@ mod tests {
         assert!(TabBarColors::from_chrome(&chrome, -0.2).bg.a.abs() < 1e-6);
     }
 
-    // @lat: [[client#GPUI Titlebar#Strip ground lifts over the theme token]]
+    // @lat: [[client#GPUI Titlebar#Strip shares the window ground]]
     #[test]
-    fn strip_ground_lifts_over_the_theme_token() {
-        let chrome = scribe_common::theme::minimal_dark().chrome;
-        let colors = TabBarColors::from(&chrome);
-        assert!((colors.bg.r - (chrome.tab_bar_bg[0] + STRIP_LIFT)).abs() < 1e-6);
-        assert!(
-            (colors.gradient_top.r - (chrome.tab_bar_gradient_top[0] + STRIP_LIFT)).abs() < 1e-6
+    fn strip_shares_the_window_ground() {
+        let theme = scribe_common::theme::minimal_dark();
+        let colors = TabBarColors::from(&theme.chrome);
+        let ground = scribe_common::theme::ground_tone(theme.background);
+        assert_eq!(colors.bg, srgba(ground), "strip is the pane band's ground tone");
+        assert_eq!(
+            colors.active_bg,
+            srgba(theme.chrome.tab_bar_active_bg),
+            "card keeps the pane fill"
         );
-        assert_eq!(colors.active_bg, srgba(chrome.tab_bar_active_bg), "card keeps the theme fill");
     }
 
     // @lat: [[client#GPUI Titlebar#Tab flash envelope self-decays]]

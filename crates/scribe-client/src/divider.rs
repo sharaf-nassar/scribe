@@ -1,6 +1,8 @@
 //! Pane divider geometry and drag-resize math.
 //!
-//! Dividers are 1px lines between adjacent panes. This module owns the pure
+//! Dividers are the 1px seams between adjacent panes — resize hit zones,
+//! not painted lines (the gaps show bare window ground, per the layered
+//! chrome mock). This module owns the pure
 //! geometry ported from the legacy client: collecting divider rects from the
 //! split tree, applying viewport padding insets, hit-testing with a 4px
 //! tolerance, and mapping a drag position back to a split ratio. The GPUI

@@ -164,14 +164,14 @@ use scribe_client::zoom::ZoomState;
 use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{
-        GroupBadge, TabBarColors, TabData, accent_tab_tone, context_suffix, flash_blend, px_units,
-        reorder_target_index, workspace_pill_label,
+        GroupBadge, TabBarColors, TabData, TabShown, accent_tab_tone, context_suffix, flash_blend,
+        pill_fill, px_units, reorder_target_index, workspace_pill_label,
     },
     tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TabDrag, TitlebarEvent,
-        TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px,
-        beads_graph_icon,
+        StandaloneBadge, TAB_CARD_TOP_GAP, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TabDrag,
+        TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph,
+        badge_width_px, beads_graph_icon, workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -3455,6 +3455,34 @@ impl TerminalView {
             .map_or_else(|| opaque_slot(fallback), opaque_slot)
     }
 
+    /// The workspace's effective accent, as every piece of region chrome
+    /// paints it — always the color the workspace pill wears: a named
+    /// workspace takes the badge's name-hashed palette color, an unnamed
+    /// one the pill's muted tab-separator tone. Resolving here is what
+    /// keeps the focus ring, group hairline, region-bar tone, drag chrome,
+    /// and CI bar matching the pill — and following it when entering a
+    /// Beads project names the workspace.
+    fn region_accent(&self, workspace_id: WorkspaceId, cx: &App) -> [f32; 4] {
+        let name = self.workspace_name(workspace_id);
+        let Some(name) = name.as_deref().map(str::trim).filter(|name| !name.is_empty()) else {
+            return self.muted_workspace_accent();
+        };
+        let badge = Self::workspace_badge_accent(
+            name,
+            &self.config.config().config.workspaces.badge_colors,
+            self.shell.workspace_accent(workspace_id, cx),
+        );
+        [badge.r, badge.g, badge.b, badge.a]
+    }
+
+    /// The unnamed workspace's quiet gray: the tab-separator hue lifted to a
+    /// clearly visible alpha, shared by the pill dot, active-tab tick, and
+    /// focus ring — at the separator's own 0.18 the ring all but vanished.
+    fn muted_workspace_accent(&self) -> [f32; 4] {
+        let sep = self.chrome.tab_separator;
+        [sep[0], sep[1], sep[2], 0.5]
+    }
+
     fn workspace_group_badge(
         workspace_name: Option<&str>,
         palette: &[String],
@@ -3490,7 +3518,7 @@ impl TerminalView {
         let region_x = self.shell.region_left_edges(self.pane_viewport(), cx);
         let mut previous = None;
         for (tab, slot) in data.iter_mut().zip(slots) {
-            let accent = self.shell.workspace_accent(slot.workspace_id, cx);
+            let accent = self.region_accent(slot.workspace_id, cx);
             tab.group_accent = Some(opaque_slot(accent));
             if previous != Some(slot.workspace_id) {
                 tab.group_region_x = (!single_region)
@@ -3505,7 +3533,7 @@ impl TerminalView {
                     workspace_name.as_deref(),
                     &self.config.config().config.workspaces.badge_colors,
                     accent,
-                    opaque_slot(self.chrome.tab_separator),
+                    opaque_slot(self.muted_workspace_accent()),
                     !single_region,
                 )
                 .map(|badge| GroupBadge { beads, ..badge });
@@ -3521,13 +3549,13 @@ impl TerminalView {
         }
         let tabbed: HashSet<WorkspaceId> = slots.iter().map(|slot| slot.workspace_id).collect();
         let palette = &self.config.config().config.workspaces.badge_colors;
-        let muted_accent = opaque_slot(self.chrome.tab_separator);
+        let muted_accent = opaque_slot(self.muted_workspace_accent());
         self.shell
             .top_region_left_edges(self.pane_viewport(), cx)
             .into_iter()
             .filter(|(workspace_id, _)| !tabbed.contains(workspace_id))
             .filter_map(|(workspace_id, region_x)| {
-                let accent = self.shell.workspace_accent(workspace_id, cx);
+                let accent = self.region_accent(workspace_id, cx);
                 let beads = self
                     .shared
                     .beads_boards
@@ -3571,7 +3599,7 @@ impl TerminalView {
             .region_bar_rects(viewport, self.tab_bar_height, cx)
             .into_iter()
             .map(|(workspace_id, _)| {
-                let accent = self.shell.workspace_accent(workspace_id, cx);
+                let accent = self.region_accent(workspace_id, cx);
                 RegionBarData {
                     workspace_id,
                     accent,
@@ -3579,7 +3607,7 @@ impl TerminalView {
                         self.workspace_name(workspace_id).as_deref(),
                         badge_palette,
                         accent,
-                        opaque_slot(self.chrome.tab_separator),
+                        opaque_slot(self.muted_workspace_accent()),
                         true,
                     )
                     .map(|mut badge| {
@@ -3596,9 +3624,18 @@ impl TerminalView {
             .collect();
         let mut titlebar_data = Vec::new();
         let mut titlebar_slots = Vec::new();
+        let focused_workspace = self.shell.focused_workspace_id(cx);
         for (mut tab, slot) in data.into_iter().zip(self.rendered_tabs.addresses()) {
-            tab.is_active =
+            // The shell owns what each region shows; the focused region's
+            // shown tab is promoted to the Focused tier so both bars can
+            // quiet the other regions' active tabs.
+            let shown_here =
                 self.shell.region_shown_session(slot.workspace_id) == Some(slot.session_id);
+            tab.shown = match (shown_here, slot.workspace_id == focused_workspace) {
+                (true, true) => TabShown::Focused,
+                (true, false) => TabShown::Shown,
+                (false, _) => TabShown::Rest,
+            };
             let Some(bar) = bars.iter_mut().find(|bar| bar.workspace_id == slot.workspace_id)
             else {
                 titlebar_data.push(tab);
@@ -8062,10 +8099,10 @@ impl TerminalView {
             cells: Arc::clone(&self.terminal_colors.cells),
             opacity,
         };
-        let idle_border = surface(self.chrome.divider, opacity);
-        // The lifted strip ground, so pane borders mix their accent tone
-        // against the same surface the titlebar and region bars paint.
-        let chrome_bg = TabBarColors::from(&self.chrome).bg;
+        // The mock's whisper pane edge: the divider tone at 40% of its own
+        // alpha, so a resting seam reads as a card edge, not a drawn line.
+        let edge = self.chrome.divider;
+        let idle_border = surface([edge[0], edge[1], edge[2], edge[3] * 0.4], opacity);
         let mut focused = Some(focused);
         placements
             .into_iter()
@@ -8079,7 +8116,8 @@ impl TerminalView {
                 } else {
                     placement.session_id.and_then(|s| self.pane_content(s)).unwrap_or_default()
                 };
-                let border = pane_border(&placement, idle_border, chrome_bg, opacity);
+                let accent = self.region_accent(placement.workspace_id, cx);
+                let border = pane_border(&placement, idle_border, accent, opacity);
                 let mut pane = pane_card(&placement, viewport, colors.background, border);
                 let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
                 // Find and selection follow keyboard focus; pointer hover may
@@ -8221,10 +8259,15 @@ impl TerminalView {
     }
 
     /// Paint each live workspace and pane divider above the grids it separates.
+    /// Resize affordances for the workspace-region gaps: invisible bands
+    /// carrying the axis resize cursor. The gaps themselves stay bare window
+    /// ground — pane edges, not painted lines, mark the seams, matching the
+    /// layered chrome mock. Pane dividers keep their hit-test-driven drag
+    /// with no painted line at all.
     fn render_dividers(&self, cx: &App) -> Vec<gpui::AnyElement> {
         let viewport = self.pane_viewport();
-        let workspace_dividers = self.shell.workspace_dividers(viewport, cx);
-        let cursor_bands = workspace_dividers
+        self.shell
+            .workspace_dividers(viewport, cx)
             .iter()
             .map(|divider| {
                 let rect = workspace_layout::workspace_divider_hit_rect(divider);
@@ -8237,27 +8280,6 @@ impl TerminalView {
                     .cursor(Self::workspace_divider_cursor(divider.direction))
                     .into_any_element()
             })
-            .collect::<Vec<_>>();
-        workspace_dividers
-            .into_iter()
-            .map(|divider| divider.rect)
-            .chain(
-                self.shell
-                    .dividers(viewport, self.tab_bar_height, cx)
-                    .into_iter()
-                    .map(|divider| divider.rect),
-            )
-            .map(|rect| {
-                div()
-                    .absolute()
-                    .left(px(rect.x))
-                    .top(px(rect.y))
-                    .w(px(rect.width))
-                    .h(px(rect.height))
-                    .bg(surface(self.chrome.divider, self.opacity))
-                    .into_any_element()
-            })
-            .chain(cursor_bands)
             .collect()
     }
 
@@ -8915,7 +8937,7 @@ impl TerminalView {
         let region = self.shell.workspace_rect(target.workspace_id, self.pane_viewport(), cx)?;
         let zone = zone_preview_rect(region, target.zone);
         let origin = self.workspace_drag_grid_origin();
-        let accent = opaque_slot(self.shell.workspace_accent(accent_workspace_id, cx));
+        let accent = opaque_slot(self.region_accent(accent_workspace_id, cx));
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
         let hint = (fade == ZoneFade::In)
             .then(|| {
@@ -8972,7 +8994,7 @@ impl TerminalView {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "workspace".to_owned());
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
-        let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
+        let accent = opaque_slot(self.region_accent(source_workspace_id, cx));
         let tone = accent_tab_tone(accent, colors.bg);
         div()
             .absolute()
@@ -9409,9 +9431,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let bar = self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id);
-        let accent =
-            bar.map_or_else(|| self.shell.workspace_accent(workspace_id, cx), |bar| bar.accent);
-        let tone = accent_tab_tone(opaque_slot(accent), colors.bg);
+        // No hairline closes the bar off: like the titlebar strip, it is the
+        // bare window ground, and region identity lives in the pill dot.
         let mut row = div()
             .absolute()
             .left(px(rect.x))
@@ -9423,8 +9444,6 @@ impl TerminalView {
             .items_center()
             .overflow_hidden()
             .bg(colors.bg)
-            .border_b_1()
-            .border_color(tone)
             // Every move while a region tab drag is active, so the drag keeps
             // tracking the cursor after it leaves this bar's band.
             .on_drag_move(cx.listener(
@@ -9479,19 +9498,22 @@ impl TerminalView {
                         view.focus_workspace_region(workspace_id, ctx);
                     }
                 }))
-                .hover(|style| style.bg(colors.gradient_top))
+                .hover(|style| style.rounded(px(4.0)).bg(colors.gradient_top))
                 .child(badge.label.clone());
-            // Same inset rounded pill treatment as the titlebar badges, so
-            // upper and lower workspace pills read as one component.
+            // Same neutral chip + identity dot treatment and tab-card rhythm
+            // as the titlebar badges, so upper and lower workspace pills read
+            // as one component; the accent tab-tone stays on the bar hairline
+            // only.
             let mut pill = div()
                 .flex()
                 .flex_none()
                 .items_center()
-                .my(px(4.0))
-                .px(px(4.0))
+                .mt(px(TAB_CARD_TOP_GAP))
+                .h(px((rect.height - TAB_CARD_TOP_GAP).max(0.0)))
+                .px(px(6.0))
                 .rounded(px(6.0))
                 .overflow_hidden()
-                .bg(tone);
+                .bg(pill_fill(colors));
             if badge.beads {
                 pill = pill.child(
                     div()
@@ -9503,7 +9525,6 @@ impl TerminalView {
                         .justify_center()
                         .w(px(26.0))
                         .h_full()
-                        .text_color(colors.accent)
                         .cursor_pointer()
                         .hover(|style| style.bg(colors.gradient_top))
                         .on_hover(cx.listener(move |view, hovered: &bool, _window, ctx| {
@@ -9539,8 +9560,12 @@ impl TerminalView {
                             }
                             ctx.notify();
                         }))
-                        .child(beads_graph_icon(colors.accent)),
+                        // The workspace's own accent, so a Beads pill still
+                        // carries its identity color where the dot would sit.
+                        .child(beads_graph_icon(badge.accent)),
                 );
+            } else {
+                pill = pill.child(workspace_pill_dot(badge.accent));
             }
             let pill = pill.child(label);
             row = row.child(pill);
@@ -9607,9 +9632,9 @@ impl TerminalView {
         colors: &TabBarColors,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let base_bg = if tab.is_active { colors.active_bg } else { colors.bg };
+        let base_bg = if tab.is_active() { colors.active_bg } else { colors.bg };
         let bg = flash_blend(base_bg, colors.accent, tab.tab_flash);
-        let fg = if tab.is_active { colors.active_text } else { colors.text };
+        let fg = if tab.is_focused() { colors.active_text } else { colors.text };
         let hover_bg = gpui::Rgba {
             r: (colors.bg.r + 0.04).min(1.0),
             g: (colors.bg.g + 0.04).min(1.0),
@@ -9626,7 +9651,7 @@ impl TerminalView {
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
-        let close = tab.is_active.then(|| {
+        let close = tab.is_focused().then(|| {
             div()
                 .id(ElementId::from(format!("region-tab-close-{session_id}")))
                 .flex_none()
@@ -9659,7 +9684,7 @@ impl TerminalView {
             .border_r_1()
             .border_color(colors.separator)
             .cursor_pointer()
-            .when(!tab.is_active, |this| this.hover(move |s| s.bg(hover_bg)))
+            .when(!tab.is_active(), |this| this.hover(move |s| s.bg(hover_bg)))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
             .children(agent_glyph)
             .children(ai_dot)
@@ -12964,7 +12989,7 @@ impl TerminalView {
                         open_id,
                         dismiss_id,
                         rect,
-                        accent: self.shell.workspace_accent(*workspace_id, cx),
+                        accent: self.region_accent(*workspace_id, cx),
                         animations,
                         expanded,
                         trace,
@@ -16464,12 +16489,10 @@ static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
 /// anything — so below a small brightness floor the ground lightens by a
 /// fixed step instead. The layer split survives in both directions; only
 /// which side is darker flips.
-fn pane_ground([red, green, blue, alpha]: [f32; 4]) -> [f32; 4] {
-    if red.max(green).max(blue) < 0.09 {
-        [red + 0.05, green + 0.05, blue + 0.05, alpha]
-    } else {
-        [red * 0.8, green * 0.8, blue * 0.8, alpha]
-    }
+fn pane_ground(bg: [f32; 4]) -> [f32; 4] {
+    // Shared with the theme's `tab_bar_bg` derivation, so the tab strip and
+    // the pane band are one surface by construction.
+    scribe_common::theme::ground_tone(bg)
 }
 
 /// Placeholder painted while a pane's session is still in flight — a restore
@@ -16533,23 +16556,35 @@ fn pane_skeleton(ink: [f32; 4], animations: AnimationSettings, pane_ix: usize) -
 fn pane_border(
     placement: &pane_shell::PanePlacement,
     idle: gpui::Rgba,
-    chrome_bg: gpui::Rgba,
+    accent: [f32; 4],
     opacity: f32,
 ) -> gpui::Rgba {
     if placement.focused {
-        // The region's darker tab tone, matching the workspace tag and the
-        // strip hairline, rather than the raw accent.
-        let tone =
-            scribe_client::tab_bar::accent_tab_tone(opaque_slot(placement.accent), chrome_bg);
-        scribe_client::opacity::scale_alpha(tone, opacity)
+        // The workspace's effective accent — the layered chrome mock's
+        // bright focus ring, in the same color the workspace pill wears
+        // (`TerminalView::region_accent`), so entering a Beads project
+        // recolors the ring with the pill.
+        scribe_client::opacity::scale_alpha(opaque_slot(accent), opacity)
     } else {
         idle
     }
 }
 
 /// Paintable AI border strips inset into one pane's local coordinate space.
+///
+/// The card's absolute children resolve against its padding box — shrunk by
+/// the 1px card border — and the card clips there too, so strips sized to
+/// the full placement rect overflowed by the border width at the bottom and
+/// right and were clipped away entirely: the pulse showed on two edges only.
+/// Shrinking the local rect by the border on both axes keeps all four
+/// strips inside the visible card.
 fn ai_pane_border(rect: Rect, color: gpui::Rgba) -> Vec<gpui::AnyElement> {
-    let local = Rect { x: 0.0, y: 0.0, width: rect.width, height: rect.height };
+    let local = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: (rect.width - 2.0 * PANE_BORDER_WIDTH).max(0.0),
+        height: (rect.height - 2.0 * PANE_BORDER_WIDTH).max(0.0),
+    };
     pane_border_edges(local, 0.0)
         .into_iter()
         .map(|edge| {

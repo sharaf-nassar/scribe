@@ -613,9 +613,11 @@ impl TabSessions {
 
     /// Lower the strip into the titlebar's render model, in strip order.
     ///
-    /// `is_active` marks the tab each region is *showing*, not one tab for the
-    /// whole window: every region paints its own bar and every bar underlines
-    /// its own tab, independent of which region holds the window's focus.
+    /// `shown` marks the tab each region is *showing* (the `Shown` tier),
+    /// not one tab for the whole window: every region paints its own bar,
+    /// independent of which region holds the window's focus. The client
+    /// promotes the focused region's shown tab to `Focused` when it
+    /// partitions the strip.
     #[must_use]
     pub fn to_tab_data(&self) -> Vec<TabData> {
         self.regions
@@ -625,7 +627,7 @@ impl TabSessions {
                     let mut data = TabData::new(tab.display_title().to_owned());
                     data.session_id = Some(tab.session_id);
                     data.accessibility_id = tab.session_id.to_string();
-                    data.is_active = index == region.active;
+                    data.shown = crate::tab_bar::TabShown::from_active(index == region.active);
                     data
                 })
             })
