@@ -7654,9 +7654,8 @@ impl TerminalView {
         }
         // A replay queues every pane and `active` is the newest `SessionCreated`.
         // Let `fill_pending_panes` pair the FIFO launches and panes instead.
-        if !self.restore.replaying
-            && let Some(session_id) =
-                active.filter(|session| !self.shell.shown_sessions(cx).contains(session))
+        if let Some(session_id) =
+            tab_adoption_candidate(self.restore.replaying, active, &self.shell.assigned_sessions())
         {
             // A split queued the pane that asked for this session; anything
             // else (a new tab, a reattach, a refocus after an exit) belongs in
@@ -9570,9 +9569,9 @@ impl TerminalView {
             let pill = pill.child(label);
             row = row.child(pill);
         }
-        row = row.children(bar.tabs.iter().enumerate().map(|(index, (session_id, tab))| {
+        row = row.children((0..bar.tabs.len()).filter_map(|index| {
             let slot = RegionTabSlot { workspace_id, index };
-            Self::render_region_bar_tab(*session_id, tab, slot, colors, cx)
+            Self::render_region_bar_tab(&bar.tabs, slot, colors, cx)
         }));
         row.into_any_element()
     }
@@ -9625,13 +9624,20 @@ impl TerminalView {
     /// tab of every region below the first, so leaving it out made those tabs
     /// the only ones in the window a user could not reorder — the titlebar's
     /// drag reached the top region alone.
+    ///
+    /// Takes the whole bar's tab list so the tab can see its own position:
+    /// only a tab with a right-hand neighbour paints the separator, so the
+    /// bar's last tab shows no divider abutting the next region's workspace
+    /// pill. Returns `None` for an out-of-range slot.
     fn render_region_bar_tab(
-        session_id: SessionId,
-        tab: &TabData,
+        tabs: &[(SessionId, TabData)],
         slot: RegionTabSlot,
         colors: &TabBarColors,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> Option<gpui::AnyElement> {
+        let (session_id, tab) = tabs.get(slot.index)?;
+        let session_id = *session_id;
+        let separator = slot.index + 1 < tabs.len();
         let base_bg = if tab.is_active() { colors.active_bg } else { colors.bg };
         let bg = flash_blend(base_bg, colors.accent, tab.tab_flash);
         let fg = if tab.is_focused() { colors.active_text } else { colors.text };
@@ -9666,7 +9672,7 @@ impl TerminalView {
                 }))
                 .into_any_element()
         });
-        div()
+        let element = div()
             .id(ElementId::from(format!("region-tab-{session_id}")))
             .relative()
             .flex()
@@ -9681,8 +9687,7 @@ impl TerminalView {
             .bg(bg)
             .text_color(fg)
             .text_xs()
-            .border_r_1()
-            .border_color(colors.separator)
+            .when(separator, |this| this.border_r_1().border_color(colors.separator))
             .cursor_pointer()
             .when(!tab.is_active(), |this| this.hover(move |s| s.bg(hover_bg)))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
@@ -9694,7 +9699,8 @@ impl TerminalView {
             .child(div().flex_1().truncate().child(display))
             .children(suffix)
             .children(close)
-            .into_any_element()
+            .into_any_element();
+        Some(element)
     }
 
     /// Focus an empty region through its retained pane.
@@ -16806,6 +16812,30 @@ fn session_activation(
     })
 }
 
+/// The session the pane-adoption pass should place, if any.
+///
+/// Adoption exists for a session with no pane anywhere — a fresh tab's
+/// `CreateSession` answer, a reattach. A session already assigned to some
+/// tab's tree, shown or dormant, has a home: showing it is a tab switch, and
+/// re-adopting it would bind one session into two panes. That double bind is
+/// exactly what the focus-follows-mouse race produced — hover re-activated
+/// the old session in the frame a fresh tab's empty tree took the region, the
+/// old (assigned, merely hidden) session was adopted into the new tab's own
+/// pane, and the new session was left with no pane at all, so the "new" tab
+/// kept painting the old content and clicks on it looked dead. A replay
+/// adopts nothing here; its panes pair with sessions through the FIFO
+/// [`TerminalView::fill_pending_panes`].
+fn tab_adoption_candidate(
+    replaying: bool,
+    active: Option<SessionId>,
+    assigned: &HashSet<SessionId>,
+) -> Option<SessionId> {
+    if replaying {
+        return None;
+    }
+    active.filter(|session| !assigned.contains(session))
+}
+
 fn active_session_after_pane_reconcile(
     active: Option<SessionId>,
     active_has_tab: bool,
@@ -18968,6 +18998,24 @@ mod tests {
             SessionActivation::Switch,
             "an off-screen session still switches to its tab"
         );
+    }
+
+    #[test]
+    fn adoption_skips_sessions_already_assigned_to_a_tab_tree() {
+        let fresh = SessionId::new();
+        let dormant = SessionId::new();
+        let assigned: HashSet<SessionId> = std::iter::once(dormant).collect();
+
+        // The focus-follows-mouse race: hover re-activates the old session in
+        // the frame a fresh tab's empty tree takes the region. The old session
+        // is assigned (merely hidden), so it must not be adopted into the new
+        // tab's pane.
+        assert_eq!(tab_adoption_candidate(false, Some(dormant), &assigned), None);
+        // A freshly created session has no pane anywhere and adopts.
+        assert_eq!(tab_adoption_candidate(false, Some(fresh), &assigned), Some(fresh));
+        // A replay pairs panes with sessions through its own FIFO fill.
+        assert_eq!(tab_adoption_candidate(true, Some(fresh), &assigned), None);
+        assert_eq!(tab_adoption_candidate(false, None, &assigned), None);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Atomic tab-subtree region transfer]]

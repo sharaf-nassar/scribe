@@ -3,9 +3,9 @@
 //! [`PaneTree`] holds a [`LayoutTree`] and turns each structural mutation
 //! (split, close, ratio change, equalize) into a [`PaneTreeEvent::Changed`]
 //! event plus a `cx.notify()`, so subscribers repaint and the owning workspace
-//! model can re-report its serialized tree. Splitting halves only the target
-//! pane, and closing promotes its sibling; ratios outside the changed subtree
-//! stay untouched. Explicit equalize remains the opt-in balancing action.
+//! model can re-report its serialized tree. Splitting auto-equalizes every
+//! ratio so all panes rebalance evenly the moment a split lands; closing
+//! promotes the sibling and preserves ratios outside the changed subtree.
 
 use gpui::{Context, EventEmitter};
 
@@ -81,7 +81,8 @@ impl PaneTree {
         self.tree.find_pane_in_direction(current, direction, rects)
     }
 
-    /// Split `pane_id` in the given direction, halving only that pane.
+    /// Split `pane_id` in the given direction, then re-equalize all ratios
+    /// so every pane in the tab rebalances to equal space.
     ///
     /// Returns the new pane's ID, or `None` if the pane was not found. Emits
     /// [`PaneTreeEvent::Changed`] only when a split actually happened.
@@ -92,6 +93,7 @@ impl PaneTree {
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
         let new_id = self.tree.split_pane(pane_id, direction)?;
+        self.tree.equalize_all_ratios();
         Self::changed(cx);
         Some(new_id)
     }
@@ -196,7 +198,9 @@ mod tests {
 
     // @lat: [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]]
     #[gpui::test]
-    fn split_preserves_sibling_ratios(cx: &mut TestAppContext) {
+    fn split_reequalizes_all_ratios(cx: &mut TestAppContext) {
+        // A dragged 0.7 ratio must not survive a split: the moment the tree
+        // gains a pane, every pane rebalances to an equal share.
         let a = PaneId::from_raw(1);
         let b = PaneId::from_raw(2);
         let root = LayoutNode::Split {
@@ -211,15 +215,15 @@ mod tests {
         let new_pane = new_pane.expect("split should succeed");
 
         tree.read_with(cx, |t, _| {
-            let rects = t.compute_rects(Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 });
+            let rects = t.compute_rects(Rect { x: 0.0, y: 0.0, width: 90.0, height: 40.0 });
             let rect_for =
                 |id| rects.iter().find(|(pane_id, _, _)| *pane_id == id).map(|(_, r, _)| *r);
-            assert!(
-                (rect_for(a).expect("A exists").width - 70.0).abs() < 0.01,
-                "A keeps its ratio"
-            );
-            assert!((rect_for(b).expect("B exists").width - 15.0).abs() < 0.01, "B's slot halves");
-            assert!((rect_for(new_pane).expect("new pane exists").width - 15.0).abs() < 0.01);
+            for id in [a, b, new_pane] {
+                assert!(
+                    (rect_for(id).expect("pane exists").width - 30.0).abs() < 0.01,
+                    "every pane rebalances to a third"
+                );
+            }
         });
     }
 

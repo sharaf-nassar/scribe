@@ -368,11 +368,13 @@ impl WindowLayout {
         split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
     }
 
-    /// Split the focused workspace region, halving only that region.
+    /// Split the focused workspace region, creating a new workspace alongside
+    /// it, then re-equalize all region ratios so every region rebalances to
+    /// equal space.
     ///
     /// Returns the new workspace ID, or `None` if the focused workspace was
     /// not found in the tree. Restoration goes through
-    /// [`Self::split_workspace_with_id`] instead, which also preserves ratios.
+    /// [`Self::split_workspace_with_id`] instead, which preserves ratios.
     pub fn split_workspace(
         &mut self,
         direction: SplitDirection,
@@ -390,6 +392,7 @@ impl WindowLayout {
 
         if split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
         {
+            self.equalize_all_workspace_ratios();
             self.focused_workspace = new_id;
             Some(new_id)
         } else {
@@ -1468,9 +1471,9 @@ mod tests {
 
     /// Complex three-workspace tree preserves exact topology and ratios.
     ///
-    /// Original tree:
+    /// Original tree (interactive splits equalize by leaf count):
     /// ```text
-    ///     V(0.5)
+    ///     V(1/3)
     ///    /      \
     ///   A      H(0.5)
     ///          /    \
@@ -1498,42 +1501,51 @@ mod tests {
         let ids = restored.workspace_ids_in_order();
         assert_eq!(ids, vec![ws_a, ws_b, ws_c]);
 
-        // Verify the tree structure via rects. The second split only halves
-        // B's bottom-half slot, leaving A's top-half extent unchanged.
+        // Verify the tree structure via rects. Interactive splits equalize,
+        // so A keeps a third of the height while B and C split the rest
+        // side-by-side.
         let viewport = Rect { x: 0.0, y: 0.0, width: 1000.0, height: 1000.0 };
         let rects = restored.compute_workspace_rects(viewport);
 
-        // A: full width, top half.
+        // A: full width, top third.
         let a_rect = rects.iter().find(|(id, _)| *id == ws_a).map(|(_, r)| *r).unwrap();
         assert!((a_rect.width - 1000.0).abs() < 1.0);
-        assert!((a_rect.height - 500.0).abs() < 1.0);
+        assert!((a_rect.height - 1000.0 / 3.0).abs() < 1.0);
 
-        // B: left half of the bottom half.
+        // B: left half of the remaining two thirds.
         let b_rect = rects.iter().find(|(id, _)| *id == ws_b).map(|(_, r)| *r).unwrap();
         assert!((b_rect.width - 500.0).abs() < 1.0);
-        assert!((b_rect.height - 500.0).abs() < 1.0);
+        assert!((b_rect.height - 2000.0 / 3.0).abs() < 1.0);
 
-        // C: right half of the bottom half.
+        // C: right half of the remaining two thirds.
         let c_rect = rects.iter().find(|(id, _)| *id == ws_c).map(|(_, r)| *r).unwrap();
         assert!((c_rect.width - 500.0).abs() < 1.0);
-        assert!((c_rect.height - 500.0).abs() < 1.0);
+        assert!((c_rect.height - 2000.0 / 3.0).abs() < 1.0);
         assert!((c_rect.x - 500.0).abs() < 1.0);
     }
 
-    /// Splitting a region leaves sibling ratios intact and halves only the
-    /// target region.
+    /// Interactive splits auto-balance: two same-direction splits leave every
+    /// region with a third of the window, even after a divider drag.
     #[test]
-    fn split_workspace_preserves_sibling_ratios() {
-        let (layout, ws_a, ws_b, ws_c, viewport) = three_workspace_split_row();
-        assert!(
-            (rect_for(&layout, viewport, ws_a).expect("A exists").width - 450.0).abs() < 0.01,
-            "A keeps half the viewport"
-        );
-        assert!(
-            (rect_for(&layout, viewport, ws_b).expect("B exists").width - 225.0).abs() < 0.01,
-            "B's slot halves"
-        );
-        assert!((rect_for(&layout, viewport, ws_c).expect("C exists").width - 225.0).abs() < 0.01);
+    fn split_workspace_equalizes_ratios() {
+        let ws_a = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws_a, None);
+        let ws_b = layout
+            .split_workspace(SplitDirection::Horizontal, None)
+            .expect("first split should succeed");
+        assert!(layout.set_workspace_ratio(ws_a, ws_b, 0.8), "drag the divider");
+        let ws_c = layout
+            .split_workspace(SplitDirection::Horizontal, None)
+            .expect("second split should succeed");
+
+        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
+        for id in [ws_a, ws_b, ws_c] {
+            assert!(
+                (rect_for(&layout, viewport, id).expect("region exists").width - 300.0).abs()
+                    < 0.01,
+                "each region gets a third"
+            );
+        }
     }
 
     /// Closing a region promotes its sibling without changing any outer split.
