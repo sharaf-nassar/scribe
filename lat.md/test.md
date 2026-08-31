@@ -5072,6 +5072,10 @@ Production-seam and live-terminal tests close the gap between the golden byte en
 
 A GPUI Shift+Enter event encoded with focused Kitty disambiguation must produce exact `ESC [ 13 ; 2 u`, the production regression for Pi prompt newline insertion.
 
+#### Kitty Enter ends split scroll
+
+Plain Kitty Enter ends a split-scroll view like legacy CR, while Shift+Enter keeps it open to extend a Pi prompt.
+
 #### Kitty set reset push and pop stay live
 
 A live `DisplayOnlyTerminal` parses Kitty replace/difference/push/pop sequences. All five bits map independently; reset removes only its bit, push replaces the active view, and pop restores the prior entry.

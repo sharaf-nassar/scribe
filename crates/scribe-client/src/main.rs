@@ -11697,7 +11697,7 @@ impl TerminalView {
                 return None;
             }
             let pinned = terminal.pin_rows() > 0;
-            if pinned && bytes != b"\r" {
+            if pinned && !input_submits(bytes) {
                 return None;
             }
             terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
@@ -11938,6 +11938,11 @@ fn escape_report_bytes(bytes: &[u8]) -> String {
             other => format!("\\x{other:02x}"),
         })
         .collect()
+}
+
+/// `true` when input submits the current prompt rather than extending it.
+fn input_submits(bytes: &[u8]) -> bool {
+    matches!(bytes, b"\r" | b"\x1b[13u")
 }
 
 /// Encode one GPUI key-down event through the production level-4 encoder.
@@ -20620,6 +20625,14 @@ mod tests {
 
     fn key_up(key: &str, modifiers: gpui::Modifiers) -> KeyUpEvent {
         KeyUpEvent { keystroke: gpui::Keystroke { modifiers, key: key.into(), key_char: None } }
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Kitty Enter ends split scroll]]
+    #[test]
+    fn kitty_enter_submits_input() {
+        assert!(input_submits(b"\r"));
+        assert!(input_submits(b"\x1b[13u"));
+        assert!(!input_submits(b"\x1b[13;2u"));
     }
 
     // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Production Shift Enter uses the live mode]]
