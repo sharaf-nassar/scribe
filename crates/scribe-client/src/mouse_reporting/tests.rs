@@ -86,9 +86,11 @@ fn encode_case(name: &str) -> Vec<u8> {
         "sgr-1006-drag-right-alt" => {
             encode_mouse_motion(4, 7, Some(MouseButton::Right), alt(), Sgr)
         }
+        "sgr-1006-motion-no-button" => encode_mouse_motion(4, 7, None, no_mods(), Sgr),
         "x10-left-press" => encode_mouse_press(MouseButton::Left, 0, 0, no_mods(), X10),
         "x10-release" => encode_mouse_release(MouseButton::Right, 4, 6, no_mods(), X10),
         "x10-middle-drag" => encode_mouse_motion(0, 0, Some(MouseButton::Middle), no_mods(), X10),
+        "x10-motion-no-button" => encode_mouse_motion(0, 0, None, no_mods(), X10),
         "x10-coordinate-clamp" => encode_mouse_press(MouseButton::Left, 999, 999, no_mods(), X10),
         other => panic!("unmapped golden case: {other}"),
     }

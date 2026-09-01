@@ -182,7 +182,8 @@ pub fn encode_mouse_scroll(
 /// Encode a mouse motion event.
 ///
 /// The motion flag (+32) is added to the Cb value. When a button is held,
-/// its base value is `OR`ed in; otherwise the base is 0 (no button).
+/// its base value is `OR`ed in; otherwise the base is 3 (xterm's no-button
+/// value), yielding Cb 35.
 pub fn encode_mouse_motion(
     col: u16,
     row: u16,
@@ -190,7 +191,7 @@ pub fn encode_mouse_motion(
     modifiers: Modifiers,
     mode: MouseReportMode,
 ) -> Vec<u8> {
-    let base = button_held.and_then(button_base).unwrap_or(0);
+    let base = button_held.and_then(button_base).unwrap_or(3);
     let cb = base | 32 | modifier_bits(modifiers);
     encode_button_report(mode, cb, col, row, true)
 }

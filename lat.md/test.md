@@ -5887,7 +5887,7 @@ structurally contains the focused element, not a fixed claimant list.
 
 Golden byte-capture and decision tests for  — the X10 / SGR-1006 encoders against the captured legacy fixture, and the pure gates the live pointer path consults around them.
 
-The encoder half is the US1 correctness oracle described in . The decision half exists because the shell's event handlers hold no policy of their own: everything they branch on is one of the functions below, so a wrong branch is a failing unit test rather than a silent behaviour change nobody can see without a mouse.
+The encoder half is the US1 correctness oracle described in , including `sgr-1006-motion-no-button` at 4,7 and `x10-motion-no-button` at 0,0: both use no-button base 3 plus the motion bit (Cb 35). The decision half exists because the shell's event handlers hold no policy of their own: everything they branch on is one of the functions below, so a wrong branch is a failing unit test rather than a silent behaviour change nobody can see without a mouse.
 
 ### Wheel routing orders its three consumers
 

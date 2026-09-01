@@ -3170,7 +3170,7 @@ well as on motion, with no second timer.
 
 The future GPUI client ports input byte-for-byte from committed old-client captures before this implementation is deleted.
 
-`tests/fixtures/gpui-client/keyboard-byte-golden.json` captures legacy xterm, Kitty CSI-u, DECCKM, and DECPAM bytes. `mouse-byte-golden.json` captures X10, SGR-1006, and the 1000/1002/1003 motion gate. The root test-fixture location survives old-client deletion and is copied into the new crate when that scaffold exists; porting beads load the captures rather than recreate expected strings by hand.
+`tests/fixtures/gpui-client/keyboard-byte-golden.json` captures legacy xterm, Kitty CSI-u, DECCKM, and DECPAM bytes. `mouse-byte-golden.json` captures X10, SGR-1006, and the 1000/1002/1003 motion gate, including `sgr-1006-motion-no-button` at 4,7 and `x10-motion-no-button` at 0,0. The root test-fixture location survives old-client deletion and is copied into the new crate when that scaffold exists; porting beads load the captures rather than recreate expected strings by hand.
 
 The GPUI reporter lives in  and its siblings (, , ), retargeted from winit's `MouseButton`/`ModifiersState` to GPUI's `MouseButton`/`Modifiers` but byte-identical on the wire. The motion gate is the pure ; the click-count / selection-mode classifier and edge-scroll helper port verbatim into  and . A golden byte-capture test replays every `mouse-byte-golden.json` case and the motion-gate truth table against the port.
 
@@ -3190,7 +3190,7 @@ The mouse-mode gate uses `intersects(MOUSE_MODE)`, not `contains`, because `cont
 
 App-forwarding is tracked separately from native selection so mouse-off behavior is unchanged: `mouse_selecting` still drives native click-drag selection, while `mouse_report_button` records the button currently forwarded to the app.
 
-Drag motion (mode 1002) gates on `mouse_report_button.is_some()`, and the reported Cb carries that exact button rather than a hardcoded Left.
+Drag motion (mode 1002) gates on `mouse_report_button.is_some()`, and the reported Cb carries that exact button rather than a hardcoded Left. Buttonless mode-1003 motion uses xterm's no-button base 3 plus the motion bit, yielding Cb 35 in both SGR and X10.
 
 `mouse_report_button` is set when a press is forwarded.  clears it (and `last_mouse_report_cell`) on **every physical button release** — left, middle, and right — even when the release itself could not be forwarded (mode disabled mid-drag, Shift held), so a button-up always ends a forwarded press.
 
