@@ -11,17 +11,19 @@
 //! The layout logic splits in two: [`build_model`] is a pure function turning
 //! [`StatusBarData`] into a [`StatusBarModel`] of coloured [`Span`]s (left /
 //! centre / right groups), unit-tested without a live window; [`render`] maps
-//! that model onto GPUI elements. Colours stay in sRGB space here (GPUI does
-//! its own linear conversion), unlike the legacy renderer which pre-multiplied
-//! into linear for the raw GPU pipeline.
+//! that model onto GPUI elements. The sparklines are graph spans painted as
+//! quads by [`render`], not block glyphs in the text run: at the band's text
+//! size the `▁▂▃` run was a few pixels of smear at the baseline, shaped by
+//! whichever fallback face supplied the glyphs. Every size in the band is a
+//! fraction of `appearance.status_bar_height` ([`StatusBarMetrics`]), so the
+//! type, graphs and gaps grow with the band instead of leaving it empty.
+//! Colours stay in sRGB space here (GPUI does its own linear conversion),
+//! unlike the legacy renderer which pre-multiplied into linear for the raw
+//! GPU pipeline.
 
-use std::ops::Range;
 use std::path::Path;
 
-use gpui::{
-    App, FocusHandle, Font, HighlightStyle, Rgba, Role, StyledText, TextRun, Window, div,
-    prelude::*, px,
-};
+use gpui::{App, FocusHandle, Font, FontWeight, Rgba, Role, TextRun, Window, div, prelude::*, px};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
@@ -59,12 +61,92 @@ const FALLBACK_MAGENTA: [f32; 4] = [0.75, 0.55, 1.0, 1.0];
 /// Fallback cyan when ANSI index 6 is unavailable.
 const FALLBACK_CYAN: [f32; 4] = [0.45, 0.8, 1.0, 1.0];
 
-/// Number of sparkline chars for CPU and GPU displays.
+/// Number of sparkline bars for CPU and GPU displays.
 const CPU_SPARK_WIDTH: usize = 8;
-/// Number of sparkline chars for network displays.
+/// Number of sparkline bars for network displays.
 const NET_SPARK_WIDTH: usize = 4;
 /// Network sparklines saturate at 100 MB/s.
 const NET_SPARK_MAX_BYTES_PER_SEC: u64 = 100_000_000;
+
+/// The band's pixel geometry, every value a fraction of the configured
+/// `appearance.status_bar_height` so the bar fills whatever height it is
+/// given. The reference is the 36px default: 14px text, 12px semibold stat
+/// labels, 16px readouts, 8 bars of 5px with 2px gaps in a 22px box, 36px
+/// between chips, 20px between zones, 14px band edge, 28px-wide controls.
+///
+/// Type scales down only to 72% of the reference (10/9/12px), so a 24px
+/// band stays legible; graphs and gaps scale all the way so they always
+/// fit the band. The E2E scripts that click the controls derive their
+/// offsets from these numbers (`tests/e2e/visual/settings-entry.sh`,
+/// `window-chrome-bands.sh`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatusBarMetrics {
+    pub height: f32,
+    /// Base text: cwd, branch, sessions, host.
+    pub text: f32,
+    /// Stat chip labels (`CPU`, `MEM`, `↑`), semibold.
+    pub label: f32,
+    /// Stat readouts, the clock, and the control glyphs.
+    pub readout: f32,
+    /// Sparkline bar width, the gap between bars, and a full bar's height.
+    pub bar_width: f32,
+    pub bar_gap: f32,
+    pub graph_height: f32,
+    /// MEM gauge width and thickness.
+    pub gauge_width: f32,
+    pub gauge_height: f32,
+    /// Space between two chips inside the stats zone.
+    pub chip_gap: f32,
+    /// Space between the pieces of one chip (label, graph, readout).
+    pub piece_gap: f32,
+    /// Space between zones, and the band's horizontal edge padding.
+    pub zone_gap: f32,
+    pub edge: f32,
+    /// Width of each trailing control button (balance, settings): a fixed
+    /// hit target, never the glyph's advance, floored at 12px.
+    pub control: f32,
+}
+
+/// Horizontal padding on each side of the trailing controls cluster.
+pub const CONTROLS_PADDING: f32 = 4.0;
+
+impl StatusBarMetrics {
+    /// Scale the reference geometry to `height` pixels.
+    #[must_use]
+    pub fn for_height(height: f32) -> Self {
+        let height = height.max(1.0);
+        let scale = height / 36.0;
+        let at = |reference: f32| (reference * scale).round().max(1.0);
+        let type_scale = scale.max(0.72);
+        let type_at = |reference: f32| (reference * type_scale).round();
+        Self {
+            height,
+            text: type_at(14.0),
+            label: type_at(12.0),
+            readout: type_at(16.0),
+            bar_width: at(5.0),
+            bar_gap: at(2.0),
+            graph_height: at(22.0),
+            gauge_width: at(48.0),
+            gauge_height: at(5.0),
+            chip_gap: at(36.0),
+            piece_gap: at(10.0),
+            zone_gap: at(20.0),
+            edge: at(14.0),
+            control: at(28.0).max(12.0),
+        }
+    }
+
+    /// Painted width of an `n`-bar graph.
+    #[must_use]
+    pub fn graph_width(&self, bars: usize) -> f32 {
+        if bars == 0 {
+            return 0.0;
+        }
+        let n = f32::from(u8::try_from(bars).unwrap_or(u8::MAX));
+        (n - 1.0).mul_add(self.bar_gap, n * self.bar_width)
+    }
+}
 
 /// Feature 015 (T024/T026): the shared-window presence badge inputs.
 pub struct SharePresenceData {
@@ -194,7 +276,36 @@ impl StatusBarColors {
     }
 }
 
-/// One styled run of text in the status bar.
+/// One painted sparkline bar: its fill level in `0.0..=1.0` and colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bar {
+    pub level: f32,
+    pub color: [f32; 4],
+}
+
+/// How [`render`] paints a [`Span`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SpanKind {
+    /// Base text at [`StatusBarMetrics::text`].
+    #[default]
+    Text,
+    /// A semibold stat label at [`StatusBarMetrics::label`].
+    Label,
+    /// A medium-weight stat readout at [`StatusBarMetrics::readout`],
+    /// right-aligned in a fixed number of cells.
+    Readout,
+    /// A bar graph; `Span::color` is the graph's identity hue (its baseline).
+    Graph(Vec<Bar>),
+    /// A horizontal gauge filled to `level`; `Span::color` is the hue.
+    Gauge { level: f32, color: [f32; 4] },
+    /// Invisible boundary between two chips in the stats zone.
+    ChipBreak,
+    /// Invisible boundary between two zones: [`render`] starts a new zone
+    /// container here instead of painting the span.
+    ZoneBreak,
+}
+
+/// One styled run of text in the status bar, or one painted graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
     pub text: String,
@@ -202,14 +313,22 @@ pub struct Span {
     /// Full copy revealed on hover when the visible text is a compact glyph,
     /// so long error strings do not crowd the band inline.
     pub tooltip: Option<String>,
-    /// Invisible cluster boundary: [`render`] starts a new zone fill here
-    /// instead of painting the span.
-    pub zone_break: bool,
+    pub kind: SpanKind,
 }
 
 impl Span {
     fn new(text: impl Into<String>, color: [f32; 4]) -> Self {
-        Self { text: text.into(), color, tooltip: None, zone_break: false }
+        Self { text: text.into(), color, tooltip: None, kind: SpanKind::Text }
+    }
+
+    fn kind(kind: SpanKind, text: impl Into<String>, color: [f32; 4]) -> Self {
+        Self { kind, ..Self::new(text, color) }
+    }
+
+    /// Whether this span is a zone boundary.
+    #[must_use]
+    pub fn is_zone_break(&self) -> bool {
+        self.kind == SpanKind::ZoneBreak
     }
 
     fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
@@ -461,63 +580,6 @@ fn build_right(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> 
     spans
 }
 
-/// The stats zone's worst-case text: every enabled segment at its widest
-/// rendering — full-height bars, three-digit percentages, four-column rates —
-/// with the same gaps [`push_stats`] emits.
-#[must_use]
-pub fn stats_worst_case_text(config: &StatusBarStatsConfig, has_gpu: bool) -> String {
-    let gap = |out: &mut String| {
-        if !out.is_empty() {
-            out.push_str("  ");
-        }
-    };
-    let mut out = String::new();
-    if config.usage.compute.cpu {
-        out.push_str("CPU ");
-        out.push_str(&"\u{2588}".repeat(CPU_SPARK_WIDTH));
-        out.push_str(" 100%");
-    }
-    if config.usage.memory {
-        gap(&mut out);
-        out.push_str("MEM \u{2588} 100%");
-    }
-    if config.network {
-        gap(&mut out);
-        out.push('\u{2191}');
-        out.push_str(&"\u{2588}".repeat(NET_SPARK_WIDTH));
-        out.push_str("  >1G \u{2193}");
-        out.push_str(&"\u{2588}".repeat(NET_SPARK_WIDTH));
-        out.push_str("  >1G");
-    }
-    if config.usage.compute.gpu && has_gpu {
-        gap(&mut out);
-        out.push_str("GPU ");
-        out.push_str(&"\u{2588}".repeat(CPU_SPARK_WIDTH));
-        out.push_str(" 100%");
-    }
-    out
-}
-
-/// Measure the fixed width the stats zone reserves, including the zone
-/// pill's own horizontal padding.
-///
-/// Live samples change the painted glyphs every couple of seconds, and even
-/// fixed character counts shift when a fallback font gives the block glyphs
-/// uneven advances — so the zone is pinned to its measured worst case and
-/// its neighbours never move.
-#[must_use]
-pub fn stats_zone_width(
-    config: Option<&StatusBarStatsConfig>,
-    has_gpu: bool,
-    window: &Window,
-) -> Option<f32> {
-    let text = stats_worst_case_text(config?, has_gpu);
-    if text.is_empty() {
-        return None;
-    }
-    Some(status_text_width(&text, window) + 12.0)
-}
-
 /// Push a quiet " · " separator between segments inside one zone.
 fn push_sep(spans: &mut Vec<Span>, colors: &StatusBarColors) {
     if !spans.is_empty() {
@@ -529,109 +591,127 @@ fn push_sep(spans: &mut Vec<Span>, colors: &StatusBarColors) {
 /// the next one, replacing the legacy " │ " hairline between clusters.
 fn push_zone_break(spans: &mut Vec<Span>) {
     if !spans.is_empty() {
-        spans.push(Span { text: String::new(), color: [0.0; 4], tooltip: None, zone_break: true });
+        spans.push(Span::kind(SpanKind::ZoneBreak, "", [0.0; 4]));
     }
 }
 
-/// CPU / MEM / NET / GPU stat groups, each gated by config. The stats share
-/// one zone, spaced by plain gaps rather than separator glyphs — each stat's
-/// identity hue is what tells them apart.
+/// CPU / MEM / NET / GPU stat chips, each gated by config. The chips share
+/// one zone, spaced by [`StatusBarMetrics::chip_gap`] rather than separator
+/// glyphs — each stat's identity hue is what tells them apart. A chip is
+/// `label graph readout`: a semibold hue-tinted label, a painted graph (or
+/// the MEM gauge), and a readout right-aligned in fixed cells and banded by
+/// load. Fixed bar counts and fixed readout cells in the terminal's
+/// monospace font keep the zone's width stable while samples change.
 fn push_stats(
     spans: &mut Vec<Span>,
     stats: &SystemStats,
     config: &StatusBarStatsConfig,
     colors: &StatusBarColors,
 ) {
-    let gap = |cluster: &mut Vec<Span>| {
-        if !cluster.is_empty() {
-            cluster.push(Span::new("  ", colors.text));
+    let zone_start = spans.len();
+    let chip_break = |cluster: &mut Vec<Span>| {
+        if cluster.len() > zone_start {
+            cluster.push(Span::kind(SpanKind::ChipBreak, "", [0.0; 4]));
         }
     };
     if config.usage.compute.cpu {
-        gap(spans);
+        chip_break(spans);
         push_cpu(spans, stats, colors);
     }
     if config.usage.memory {
-        gap(spans);
+        chip_break(spans);
         push_mem(spans, stats, colors);
     }
     if config.network {
-        gap(spans);
+        chip_break(spans);
         push_net(spans, stats, colors);
     }
     if config.usage.compute.gpu && stats.gpu_percent.is_some() {
-        gap(spans);
+        chip_break(spans);
         push_gpu(spans, stats, colors);
     }
 }
 
-/// CPU: label + 8 sparkline bars (left-padded) + fixed-width percentage.
-fn push_cpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
-    let hue = colors.stat_cpu;
-    spans.push(Span::new("CPU ", mix(hue, colors.label, 0.45)));
-    let pad = CPU_SPARK_WIDTH.saturating_sub(stats.cpu_history.len());
-    for _ in 0..pad {
-        spans.push(Span::new("\u{2581}", colors.label));
-    }
-    for &v in &stats.cpu_history {
-        spans.push(Span::new(sparkline_char(v).to_string(), stat_color(v, hue, colors)));
-    }
-    let pct = stats.cpu_percent;
-    spans.push(Span::new(format!(" {pct:>3.0}%"), stat_color(pct, hue, colors)));
+/// A stat label: semibold, the hue pulled toward the dim label colour.
+fn label(text: &str, hue: [f32; 4], colors: &StatusBarColors) -> Span {
+    Span::kind(SpanKind::Label, text, mix(hue, colors.label, 0.45))
 }
 
-/// Memory: label + 1 sparkline bar + fixed-width percentage.
+/// A readout right-aligned in four cells.
+fn readout(text: String, color: [f32; 4]) -> Span {
+    Span::kind(SpanKind::Readout, text, color)
+}
+
+/// Left-pad a short history with idle stubs in the dim label colour, so the
+/// graph keeps its fixed width from the first sample and a missing sample
+/// never reads as a real zero.
+fn padded_graph(
+    width: usize,
+    history: impl ExactSizeIterator<Item = Bar>,
+    hue: [f32; 4],
+    colors: &StatusBarColors,
+) -> Span {
+    let pad = width.saturating_sub(history.len());
+    let bars =
+        std::iter::repeat_n(Bar { level: 0.0, color: colors.label }, pad).chain(history).collect();
+    Span::kind(SpanKind::Graph(bars), "", hue)
+}
+
+/// A usage bar banded by load: the stat's hue at 72% alpha, so a calm graph
+/// sits behind its readout, below the warn threshold; the solid shared
+/// warn/danger colours above it.
+fn usage_bar(pct: f32, hue: [f32; 4], colors: &StatusBarColors) -> Bar {
+    let color = if pct >= 70.0 { stat_color(pct, hue, colors) } else { with_alpha(hue, 0.72) };
+    Bar { level: usage_level(pct), color }
+}
+
+/// CPU: label + 8 usage bars (left-padded) + percentage.
+fn push_cpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
+    let hue = colors.stat_cpu;
+    spans.push(label("CPU", hue, colors));
+    let history = stats.cpu_history.iter().map(|&v| usage_bar(v, hue, colors));
+    spans.push(padded_graph(CPU_SPARK_WIDTH, history, hue, colors));
+    let pct = stats.cpu_percent;
+    spans.push(readout(format!("{pct:>3.0}%"), stat_color(pct, hue, colors)));
+}
+
+/// Memory: label + gauge + percentage. A one-sample bar graph was noise;
+/// a horizontal gauge reads as the fraction it is.
 fn push_mem(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
     let hue = colors.stat_mem;
     let mem_pct =
         if stats.mem_total_gb > 0.0 { stats.mem_used_gb / stats.mem_total_gb * 100.0 } else { 0.0 };
-    spans.push(Span::new("MEM ", mix(hue, colors.label, 0.45)));
-    spans.push(Span::new(sparkline_char(mem_pct).to_string(), stat_color(mem_pct, hue, colors)));
-    spans.push(Span::new(format!(" {mem_pct:>3.0}%"), stat_color(mem_pct, hue, colors)));
+    spans.push(label("MEM", hue, colors));
+    let fill = usage_bar(mem_pct, hue, colors);
+    spans.push(Span::kind(SpanKind::Gauge { level: fill.level, color: fill.color }, "", hue));
+    spans.push(readout(format!("{mem_pct:>3.0}%"), stat_color(mem_pct, hue, colors)));
 }
 
-/// Network: ↑ sparklines rate ↓ sparklines rate (all fixed-width).
+/// Network: ↑ bars rate ↓ bars rate. Rates are not banded: there is no
+/// "too much" bandwidth.
 fn push_net(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
-    spans.push(Span::new("\u{2191}", mix(colors.stat_net, colors.label, 0.45)));
-    let up_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_up_history.len());
-    for _ in 0..up_pad {
-        spans.push(Span::new("\u{2581}", colors.label));
-    }
-    for &v in &stats.net_up_history {
-        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.stat_net));
-    }
-    spans.push(Span::new(
-        format!(" {}", format_bytes_rate_fixed(stats.net_up_bytes_sec)),
-        colors.text,
-    ));
+    let hue = colors.stat_net;
+    let rate_bar = |bytes: &u64| Bar { level: rate_level(*bytes), color: with_alpha(hue, 0.72) };
 
-    spans.push(Span::new(" \u{2193}", mix(colors.stat_net, colors.label, 0.45)));
-    let down_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_down_history.len());
-    for _ in 0..down_pad {
-        spans.push(Span::new("\u{2581}", colors.label));
-    }
-    for &v in &stats.net_down_history {
-        spans.push(Span::new(sparkline_char_for_network_rate(v).to_string(), colors.stat_net));
-    }
-    spans.push(Span::new(
-        format!(" {}", format_bytes_rate_fixed(stats.net_down_bytes_sec)),
-        colors.text,
-    ));
+    spans.push(label("\u{2191}", hue, colors));
+    let up = stats.net_up_history.iter().map(rate_bar);
+    spans.push(padded_graph(NET_SPARK_WIDTH, up, hue, colors));
+    spans.push(readout(format_bytes_rate_fixed(stats.net_up_bytes_sec), colors.text));
+
+    spans.push(label("\u{2193}", hue, colors));
+    let down = stats.net_down_history.iter().map(rate_bar);
+    spans.push(padded_graph(NET_SPARK_WIDTH, down, hue, colors));
+    spans.push(readout(format_bytes_rate_fixed(stats.net_down_bytes_sec), colors.text));
 }
 
-/// GPU: label + 8 sparkline bars (left-padded) + fixed-width percentage.
+/// GPU: label + 8 usage bars (left-padded) + percentage.
 fn push_gpu(spans: &mut Vec<Span>, stats: &SystemStats, colors: &StatusBarColors) {
     let Some(gpu_pct) = stats.gpu_percent else { return };
     let hue = colors.stat_gpu;
-    spans.push(Span::new("GPU ", mix(hue, colors.label, 0.45)));
-    let pad = CPU_SPARK_WIDTH.saturating_sub(stats.gpu_history.len());
-    for _ in 0..pad {
-        spans.push(Span::new("\u{2581}", colors.label));
-    }
-    for &v in &stats.gpu_history {
-        spans.push(Span::new(sparkline_char(v).to_string(), stat_color(v, hue, colors)));
-    }
-    spans.push(Span::new(format!(" {gpu_pct:>3.0}%"), stat_color(gpu_pct, hue, colors)));
+    spans.push(label("GPU", hue, colors));
+    let history = stats.gpu_history.iter().map(|&v| usage_bar(v, hue, colors));
+    spans.push(padded_graph(CPU_SPARK_WIDTH, history, hue, colors));
+    spans.push(readout(format!("{gpu_pct:>3.0}%"), stat_color(gpu_pct, hue, colors)));
 }
 
 // ---------------------------------------------------------------------------
@@ -697,25 +777,17 @@ fn suffix_within(text: &str, min_start: usize, budget_cols: usize) -> &str {
     &text[start..]
 }
 
-/// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).
-fn sparkline_char(pct: f32) -> char {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    const THRESHOLDS: [f32; 7] =
-        [7.142_857, 21.428_572, 35.714_287, 50.0, 64.285_71, 78.571_43, 92.857_14];
-    if !pct.is_finite() {
-        return BLOCKS.first().copied().unwrap_or('▁');
-    }
-    let index = THRESHOLDS.iter().position(|threshold| pct <= *threshold).unwrap_or(7);
-    BLOCKS.get(index).copied().unwrap_or('▁')
+/// Map a 0-100 percentage onto a bar level; non-finite input reads as idle.
+fn usage_level(pct: f32) -> f32 {
+    if pct.is_finite() { (pct / 100.0).clamp(0.0, 1.0) } else { 0.0 }
 }
 
-fn sparkline_char_for_network_rate(bytes_per_sec: u64) -> char {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let capped = bytes_per_sec.min(NET_SPARK_MAX_BYTES_PER_SEC);
-    let rounded_index = capped.saturating_mul(7).saturating_add(NET_SPARK_MAX_BYTES_PER_SEC / 2)
+/// Map a byte rate onto a bar level, saturating at [`NET_SPARK_MAX_BYTES_PER_SEC`].
+fn rate_level(bytes_per_sec: u64) -> f32 {
+    // Per-mille keeps the ratio exact in integers before the one cast.
+    let per_mille = bytes_per_sec.min(NET_SPARK_MAX_BYTES_PER_SEC).saturating_mul(1000)
         / NET_SPARK_MAX_BYTES_PER_SEC;
-    let index = usize::try_from(rounded_index).unwrap_or(BLOCKS.len().saturating_sub(1));
-    BLOCKS.get(index).copied().unwrap_or('▁')
+    f32::from(u16::try_from(per_mille).unwrap_or(1000)) / 1000.0
 }
 
 fn rounded_div(value: u64, divisor: u64) -> u64 {
@@ -734,6 +806,11 @@ fn stat_color(pct: f32, hue: [f32; 4], colors: &StatusBarColors) -> [f32; 4] {
     } else {
         hue
     }
+}
+
+/// `color` with its alpha replaced.
+fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], alpha]
 }
 
 /// Channel-wise sRGB mix of `a` toward `b` by `t` (0 = a, 1 = b).
@@ -834,24 +911,80 @@ fn home_dir() -> Option<std::path::PathBuf> {
 pub fn measure_left_budget_cols(
     model: &StatusBarModel,
     action_glyphs: &str,
+    font_family: &str,
+    metrics: &StatusBarMetrics,
     window: &Window,
 ) -> usize {
-    let right: String = model.right.iter().map(|span| span.text.as_str()).collect();
+    let cell_width = status_text_width("0", font_family, metrics.text, window).max(1.0);
+    let right_width = right_group_width(&model.right, font_family, metrics, window);
     let center = model.center.as_ref().map_or("", |span| span.text.as_str());
-    let cell_width = status_text_width("0", window).max(1.0);
-    let text_width = status_text_width(&right, window)
-        + status_text_width(center, window)
-        + status_text_width(action_glyphs, window);
-    // `.px_2()` is 0.5rem per side; the CTA has the same padding, and each
-    // action contributes one `.pl_2()`.
-    let action_padding_rems = action_glyphs.graphemes(true).fold(0.0, |sum, _| sum + 0.5);
-    let center_padding_rems = if model.center.is_some() { 1.0 } else { 0.0 };
-    let padding_rems = 1.0 + center_padding_rems + action_padding_rems;
+    let center_width = status_text_width(center, font_family, metrics.text, window)
+        + if model.center.is_some() { f32::from(window.rem_size()) } else { 0.0 };
+    // Each action is a fixed `control`-wide button, and the trailing
+    // controls cluster adds its own zone gap and padding.
+    let action_count = action_glyphs.graphemes(true).count();
+    let actions_width = f32::from(u8::try_from(action_count).unwrap_or(u8::MAX)) * metrics.control
+        + if action_count > 0 { metrics.zone_gap + 2.0 * CONTROLS_PADDING } else { 0.0 };
     let available_px = (f32::from(window.bounds().size.width)
-        - text_width
-        - padding_rems * f32::from(window.rem_size()))
-    .max(0.0);
+        - 2.0 * metrics.edge
+        - right_width
+        - center_width
+        - actions_width)
+        .max(0.0);
     display_cols_in_px(available_px, cell_width)
+}
+
+/// The right group's painted width: every zone's spans at their own sizes,
+/// plus the chip, zone and pill spacing [`render`] lays them out with.
+fn right_group_width(
+    spans: &[Span],
+    font_family: &str,
+    metrics: &StatusBarMetrics,
+    window: &Window,
+) -> f32 {
+    let mut width = 0.0;
+    let mut zones = 0.0;
+    let mut pieces_in_chip = 0.0;
+    for span in spans {
+        width += match &span.kind {
+            SpanKind::Text => status_text_width(&span.text, font_family, metrics.text, window),
+            SpanKind::Label => status_text_width(&span.text, font_family, metrics.label, window),
+            SpanKind::Readout => readout_width(span, font_family, metrics, window),
+            SpanKind::Graph(bars) => metrics.graph_width(bars.len()),
+            SpanKind::Gauge { .. } => metrics.gauge_width,
+            SpanKind::ChipBreak => {
+                pieces_in_chip = 0.0;
+                metrics.chip_gap
+            }
+            SpanKind::ZoneBreak => {
+                zones += 1.0;
+                pieces_in_chip = 0.0;
+                metrics.zone_gap
+            }
+        };
+        if !matches!(span.kind, SpanKind::Text | SpanKind::ChipBreak | SpanKind::ZoneBreak) {
+            // Chip pieces are separated by `piece_gap`; the first piece of a
+            // chip has no gap before it.
+            if pieces_in_chip > 0.0 {
+                width += metrics.piece_gap;
+            }
+            pieces_in_chip += 1.0;
+        }
+    }
+    // Every zone pill pads 8px each side.
+    width + (zones + 1.0) * 16.0
+}
+
+/// A readout's reserved width: four cells at readout size, or the shaped
+/// text when it is wider (a `>1G` never is).
+fn readout_width(
+    span: &Span,
+    font_family: &str,
+    metrics: &StatusBarMetrics,
+    window: &Window,
+) -> f32 {
+    let cells = status_text_width("0000", font_family, metrics.readout, window);
+    cells.max(status_text_width(&span.text, font_family, metrics.readout, window))
 }
 
 fn display_cols_in_px(extent: f32, cell_width: f32) -> usize {
@@ -871,18 +1004,22 @@ fn display_cols_in_px(extent: f32, cell_width: f32) -> usize {
     usize::from(low)
 }
 
-fn status_text_width(text: &str, window: &Window) -> f32 {
+/// Shape `text` the way [`render`] paints it: same family, at `font_size`
+/// pixels. The family must be a real face name (the terminal font), never
+/// the generic `monospace`: cosmic-text has no face by that name, so GPUI
+/// would fall through its sans-serif fallback stack and shape the bar
+/// proportionally, with hairline spaces.
+fn status_text_width(text: &str, font_family: &str, font_size: f32, window: &Window) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
     let run = TextRun {
         len: text.len(),
-        font: Font { family: "monospace".into(), ..Font::default() },
+        font: Font { family: font_family.to_owned().into(), ..Font::default() },
         ..TextRun::default()
     };
-    let font_size = px(f32::from(window.rem_size()) * 0.75);
     f32::from(
-        window.text_system().shape_line(text.to_owned().into(), font_size, &[run], None).width,
+        window.text_system().shape_line(text.to_owned().into(), px(font_size), &[run], None).width,
     )
 }
 
@@ -906,6 +1043,8 @@ fn rgba(color: [f32; 4]) -> Rgba {
 struct SpanTooltip {
     text: String,
     colors: StatusBarColors,
+    font_family: gpui::SharedString,
+    text_size: f32,
 }
 
 impl gpui::Render for SpanTooltip {
@@ -917,48 +1056,33 @@ impl gpui::Render for SpanTooltip {
             .bg(rgba(self.colors.bg))
             .border_1()
             .border_color(rgba(self.colors.separator))
-            .font_family("monospace")
-            .text_xs()
+            .font_family(self.font_family.clone())
+            .text_size(px(self.text_size))
             .text_color(rgba(self.colors.text))
             .child(self.text.clone())
     }
 }
 
 /// Wrap one cluster in its zone container — spacing and rounding only, no
-/// fill: clusters sit flat on the band's base background. A `fixed_width`
-/// pins the zone's extent regardless of its live content.
-fn zone_pill(inner: gpui::AnyElement, fixed_width: Option<f32>) -> gpui::AnyElement {
+/// fill: clusters sit flat on the band's base background.
+fn zone_pill(inner: gpui::AnyElement) -> gpui::AnyElement {
     div()
         .rounded(px(6.0))
-        .px(px(6.0))
-        .py(px(2.0))
+        .px(px(8.0))
         .flex()
         .flex_row()
         .items_center()
-        .when_some(fixed_width, |zone, width| zone.w(px(width)).flex_none().overflow_hidden())
         .child(inner)
         .into_any_element()
 }
 
-/// Span texts that identify the stats cluster inside the right group.
-const STAT_ZONE_MARKS: [&str; 4] = ["CPU ", "MEM ", "GPU ", "\u{2191}"];
-
-fn is_stats_zone(zone: &[Span]) -> bool {
-    zone.iter().any(|span| STAT_ZONE_MARKS.contains(&span.text.as_str()))
-}
-
-/// Render a span group as zone containers split on [`Span::zone_break`]
+/// Render a span group as zone containers split on [`SpanKind::ZoneBreak`]
 /// boundaries, so each segment cluster keeps its own spacing on the flat
-/// band background. The stats cluster takes `stats_width` when supplied,
-/// pinning its extent.
-fn zoned_row(
-    spans: &[Span],
-    colors: &StatusBarColors,
-    stats_width: Option<f32>,
-) -> impl IntoElement {
+/// band background.
+fn zoned_row(spans: &[Span], geometry: &StatusBarGeometry<'_>) -> impl IntoElement {
     let mut zones: Vec<Vec<Span>> = vec![Vec::new()];
     for span in spans {
-        if span.zone_break {
+        if span.is_zone_break() {
             if zones.last().is_some_and(|zone| !zone.is_empty()) {
                 zones.push(Vec::new());
             }
@@ -966,59 +1090,138 @@ fn zoned_row(
             zone.push(span.clone());
         }
     }
-    div().flex().flex_row().items_center().gap(px(8.0)).children(
+    let colors = geometry.colors;
+    let metrics = geometry.metrics;
+    let font_family: gpui::SharedString = geometry.font_family.to_owned().into();
+    div().flex().flex_row().items_center().gap(px(metrics.zone_gap)).children(
         zones.into_iter().filter(|zone| !zone.is_empty()).map(move |zone| {
-            let fixed = stats_width.filter(|_| is_stats_zone(&zone));
-            // The pinned stats cluster paints as ONE shaped line: its pin is
-            // measured by shaping the worst-case text once, and a per-span
-            // element row lays every span out in its own rounded box — the
-            // accumulated drift across ~40 spans clipped the zone's tail.
-            // One StyledText shapes exactly like the measurement.
-            let inner = if fixed.is_some() {
-                div().whitespace_nowrap().child(stats_text(&zone)).into_any_element()
-            } else {
-                span_row(&zone, colors).into_any_element()
-            };
-            zone_pill(inner, fixed)
+            zone_pill(span_row(&zone, &colors, metrics, font_family.clone()).into_any_element())
         }),
     )
 }
 
-/// Join the stats cluster's spans into one shaped text with per-span color
-/// highlights. Stats spans never carry tooltips, so nothing is lost by
-/// leaving [`span_row`]'s per-span hover nodes behind.
-fn stats_text(spans: &[Span]) -> StyledText {
-    let mut text = String::new();
-    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    for span in spans {
-        let start = text.len();
-        text.push_str(&span.text);
-        highlights.push((
-            start..text.len(),
-            HighlightStyle { color: Some(rgba(span.color).into()), ..HighlightStyle::default() },
-        ));
-    }
-    StyledText::new(text).with_highlights(highlights)
+/// Paint a graph span as a row of quads: fixed-width bars rising from a
+/// hairline baseline in the stat's hue, so the graph still reads as a graph
+/// when every sample is idle.
+fn graph_row(hue: [f32; 4], bars: &[Bar], metrics: &StatusBarMetrics) -> gpui::AnyElement {
+    let min_height = (metrics.graph_height * 0.1).round().max(1.0);
+    div()
+        .flex()
+        .flex_row()
+        .items_end()
+        .flex_none()
+        .gap(px(metrics.bar_gap))
+        .h(px(metrics.graph_height + 1.0))
+        .border_b_1()
+        .border_color(rgba(with_alpha(hue, hue[3] * 0.25)))
+        .children(bars.iter().map(|bar| {
+            let height = (bar.level.clamp(0.0, 1.0) * metrics.graph_height).round().max(min_height);
+            div().w(px(metrics.bar_width)).h(px(height)).bg(rgba(bar.color))
+        }))
+        .into_any_element()
 }
 
-fn span_row(spans: &[Span], colors: &StatusBarColors) -> impl IntoElement {
+/// Paint a gauge span: a track in the hue at 18% alpha, filled from the left.
+fn gauge_row(
+    hue: [f32; 4],
+    level: f32,
+    color: [f32; 4],
+    metrics: &StatusBarMetrics,
+) -> gpui::AnyElement {
+    let fill = (level.clamp(0.0, 1.0) * metrics.gauge_width).round();
+    div()
+        .flex_none()
+        .w(px(metrics.gauge_width))
+        .h(px(metrics.gauge_height))
+        .bg(rgba(with_alpha(hue, hue[3] * 0.18)))
+        .child(div().w(px(fill)).h_full().bg(rgba(color)))
+        .into_any_element()
+}
+
+/// Lay one zone's spans out: chip pieces separated by `piece_gap`, chips by
+/// `chip_gap`, each kind at its own size and weight.
+fn span_row(
+    spans: &[Span],
+    colors: &StatusBarColors,
+    metrics: StatusBarMetrics,
+    font_family: gpui::SharedString,
+) -> impl IntoElement {
     let colors = *colors;
-    div().flex().flex_row().items_center().children(spans.iter().enumerate().map(|(ix, span)| {
-        let base = div().text_color(rgba(span.color)).child(span.text.clone());
-        if let Some(tooltip) = span.tooltip.clone() {
-            base.id(("status-span", ix))
-                .tooltip(move |_window, cx| {
-                    cx.new(|_| SpanTooltip { text: tooltip.clone(), colors }).into()
-                })
-                .into_any_element()
-        } else {
-            base.into_any_element()
+    let mut chips: Vec<Vec<&Span>> = vec![Vec::new()];
+    for span in spans {
+        if span.kind == SpanKind::ChipBreak {
+            chips.push(Vec::new());
+        } else if let Some(chip) = chips.last_mut() {
+            chip.push(span);
         }
-    }))
+    }
+    div().flex().flex_row().items_center().gap(px(metrics.chip_gap)).children(
+        chips.into_iter().filter(|chip| !chip.is_empty()).enumerate().map(
+            move |(chip_ix, chip)| {
+                let font_family = font_family.clone();
+                div().flex().flex_row().items_center().gap(px(metrics.piece_gap)).children(
+                    chip.into_iter().enumerate().map(move |(ix, span)| {
+                        span_element(span, chip_ix * 64 + ix, colors, metrics, font_family.clone())
+                    }),
+                )
+            },
+        ),
+    )
+}
+
+/// One span as an element: graphs and gauges paint, text kinds shape at
+/// their own size and weight, and a tooltip span gets its hover node.
+fn span_element(
+    span: &Span,
+    id: usize,
+    colors: StatusBarColors,
+    metrics: StatusBarMetrics,
+    font_family: gpui::SharedString,
+) -> gpui::AnyElement {
+    let element = match &span.kind {
+        SpanKind::Graph(bars) => return graph_row(span.color, bars, &metrics),
+        SpanKind::Gauge { level, color } => return gauge_row(span.color, *level, *color, &metrics),
+        SpanKind::Label => div()
+            .text_size(px(metrics.label))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgba(span.color))
+            .child(span.text.clone()),
+        SpanKind::Readout => div()
+            .text_size(px(metrics.readout))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgba(span.color))
+            .child(span.text.clone()),
+        _ => {
+            div().text_size(px(metrics.text)).text_color(rgba(span.color)).child(span.text.clone())
+        }
+    };
+    let Some(tooltip) = span.tooltip.clone() else { return element.into_any_element() };
+    element
+        .id(("status-span", id))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| SpanTooltip {
+                text: tooltip.clone(),
+                colors,
+                font_family: font_family.clone(),
+                text_size: metrics.text,
+            })
+            .into()
+        })
+        .into_any_element()
 }
 
 /// Shared update callback used by pointer and AccessKit activation.
 pub type UpdateActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+/// Everything [`render`] needs to lay the band out: its colours, the
+/// metrics scaled to the configured height, and the family it shapes text
+/// in (the terminal font, see [`status_text_width`]).
+#[derive(Debug, Clone, Copy)]
+pub struct StatusBarGeometry<'a> {
+    pub colors: StatusBarColors,
+    pub metrics: StatusBarMetrics,
+    pub font_family: &'a str,
+}
 
 /// Interactive wiring for the band's clickable surfaces: the centred update
 /// CTA, and the balance button and settings gear at the far right.
@@ -1081,23 +1284,25 @@ fn center_cta(
 
 /// Render the status bar model onto a full-width GPUI flex row.
 ///
-/// The bar is a monospace `height_px`-tall border-box band anchored at the
-/// window bottom with a 1px top hairline. Its clipping and full-height controls
-/// keep every action hit target inside the configured band. Left and right
-/// groups take natural width; the centred CTA lives in flex-grown space so it
-/// stays centred as the window resizes.
+/// The bar is a `height_px`-tall border-box band anchored at the window
+/// bottom with a 1px top hairline, shaped in `font_family`: the terminal's
+/// own monospace font, so the fixed-width readouts and the column budget
+/// actually line up (see [`status_text_width`]). Its clipping and full-height
+/// controls keep every action hit target inside the configured band. Left and
+/// right groups take natural width; the centred CTA lives in flex-grown space
+/// so it stays centred as the window resizes.
 pub fn render(
     model: &StatusBarModel,
-    height_px: f32,
-    colors: &StatusBarColors,
+    geometry: &StatusBarGeometry<'_>,
     actions: StatusBarActions<'_>,
-    stats_width: Option<f32>,
 ) -> impl IntoElement {
+    let colors = geometry.colors;
+    let metrics = geometry.metrics;
     let StatusBarActions { update_focus, on_update, on_equalize, on_settings } = actions;
     let center = model
         .center
         .as_ref()
-        .map(|span| center_cta(span, model.center_clickable, colors, update_focus, on_update));
+        .map(|span| center_cta(span, model.center_clickable, &colors, update_focus, on_update));
     div()
         .id("terminal-status-bar")
         .role(Role::Status)
@@ -1107,19 +1312,22 @@ pub fn render(
         // a flex-grown terminal grid, and a shrinkable band is what lets a
         // short window squeeze the bar off screen instead of clipping the grid.
         .flex_none()
-        .h(px(height_px))
+        .h(px(metrics.height))
         .overflow_hidden()
         .flex()
         .flex_row()
         .items_center()
-        .px_2()
+        .px(px(metrics.edge))
         .bg(rgba(colors.bg))
         .border_t_1()
         .border_color(rgba(colors.top_border))
-        .font_family("monospace")
-        .text_xs()
+        .font_family(geometry.font_family.to_owned())
+        .text_size(px(metrics.text))
         .text_color(rgba(colors.text))
-        .child(zoned_row(&model.left, colors, None))
+        // Every span is its own text node; a squeezed band must clip them at
+        // the edge, never fold a readout onto a second line.
+        .whitespace_nowrap()
+        .child(zoned_row(&model.left, geometry))
         .child(
             div()
                 .h_full()
@@ -1130,22 +1338,26 @@ pub fn render(
                 .items_center()
                 .children(center),
         )
-        .child(zoned_row(&model.right, colors, stats_width))
+        .child(zoned_row(&model.right, geometry))
         .when(on_equalize.is_some() || on_settings.is_some(), |bar| {
             // Window controls share one trailing cluster at the band's far
             // right, flat like the segment clusters; buttons stay full-height
-            // inside it so their hit targets keep the whole band.
+            // inside it so their hit targets keep the whole band. Glyphs sit
+            // at readout size so they weigh the same as the numbers.
             bar.child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h_full()
-                    .ml(px(8.0))
-                    .px(px(4.0))
+                    .ml(px(metrics.zone_gap))
+                    .px(px(CONTROLS_PADDING))
                     .rounded(px(6.0))
-                    .children(on_equalize.map(|action| equalize_button(colors, action)))
-                    .children(on_settings.map(|action| settings_gear(colors, action))),
+                    .text_size(px(metrics.readout))
+                    .children(
+                        on_equalize.map(|action| equalize_button(&colors, metrics.control, action)),
+                    )
+                    .children(on_settings.map(|action| settings_gear(&colors, metrics.control, action))),
             )
         })
 }
@@ -1153,7 +1365,11 @@ pub fn render(
 /// The balance button at the band's bottom-right corner, beside the gear —
 /// resets every workspace and pane split to equal space when clicked. Only
 /// rendered when the window holds more than one pane.
-fn equalize_button(colors: &StatusBarColors, action: UpdateActionHandler) -> gpui::AnyElement {
+fn equalize_button(
+    colors: &StatusBarColors,
+    width: f32,
+    action: UpdateActionHandler,
+) -> gpui::AnyElement {
     let accent = rgba(colors.accent);
     div()
         .id("status-bar-equalize")
@@ -1161,8 +1377,10 @@ fn equalize_button(colors: &StatusBarColors, action: UpdateActionHandler) -> gpu
         .aria_label("Balance panes")
         .flex()
         .items_center()
+        .justify_center()
         .h_full()
-        .pl_2()
+        .w(px(width))
+        .flex_none()
         .cursor_pointer()
         .text_color(rgba(colors.label))
         .hover(move |style| style.text_color(accent))
@@ -1173,7 +1391,11 @@ fn equalize_button(colors: &StatusBarColors, action: UpdateActionHandler) -> gpu
 
 /// The settings entry point at the band's far right — the gear moved here
 /// from the titlebar, which now holds only tabs and the equalize icon.
-fn settings_gear(colors: &StatusBarColors, action: UpdateActionHandler) -> gpui::AnyElement {
+fn settings_gear(
+    colors: &StatusBarColors,
+    width: f32,
+    action: UpdateActionHandler,
+) -> gpui::AnyElement {
     let accent = rgba(colors.accent);
     div()
         .id("status-bar-settings")
@@ -1181,8 +1403,10 @@ fn settings_gear(colors: &StatusBarColors, action: UpdateActionHandler) -> gpui:
         .aria_label("Open settings")
         .flex()
         .items_center()
+        .justify_center()
         .h_full()
-        .pl_2()
+        .w(px(width))
+        .flex_none()
         .cursor_pointer()
         .text_color(rgba(colors.label))
         .hover(move |style| style.text_color(accent))
@@ -1394,17 +1618,52 @@ mod tests {
         crate::assert_rgba_eq(warned[0].color, colors.warning);
     }
 
-    // @lat: [[test#GPUI Status Bar#Sparkline maps percentage to block height]]
+    // @lat: [[test#GPUI Status Bar#Sparkline maps percentage to bar level]]
     #[test]
-    fn sparkline_maps_percentage_to_block_height() {
-        assert_eq!(sparkline_char(0.0), '▁');
-        assert_eq!(sparkline_char(100.0), '█');
-        assert_eq!(sparkline_char(50.0), '▄');
-        // Non-finite input clamps to the lowest bar.
-        assert_eq!(sparkline_char(f32::NAN), '▁');
+    fn sparkline_maps_percentage_to_bar_level() {
+        assert!(usage_level(0.0).abs() < 1e-6);
+        assert!((usage_level(100.0) - 1.0).abs() < 1e-6);
+        assert!((usage_level(50.0) - 0.5).abs() < 1e-6);
+        assert!((usage_level(250.0) - 1.0).abs() < 1e-6);
+        // Non-finite input reads as idle.
+        assert!(usage_level(f32::NAN).abs() < 1e-6);
         // Network saturates at 100 MB/s.
-        assert_eq!(sparkline_char_for_network_rate(0), '▁');
-        assert_eq!(sparkline_char_for_network_rate(NET_SPARK_MAX_BYTES_PER_SEC), '█');
+        assert!(rate_level(0).abs() < 1e-6);
+        assert!((rate_level(NET_SPARK_MAX_BYTES_PER_SEC / 2) - 0.5).abs() < 1e-6);
+        assert!((rate_level(NET_SPARK_MAX_BYTES_PER_SEC * 10) - 1.0).abs() < 1e-6);
+    }
+
+    // @lat: [[test#GPUI Status Bar#Metrics scale with the band height]]
+    #[test]
+    fn metrics_scale_with_the_band_height() {
+        let reference = StatusBarMetrics::for_height(36.0);
+        assert!((reference.text - 14.0).abs() < 1e-6);
+        assert!((reference.readout - 16.0).abs() < 1e-6);
+        assert!((reference.graph_height - 22.0).abs() < 1e-6);
+        // 8 bars of 5px with 2px gaps.
+        assert!((reference.graph_width(8) - 54.0).abs() < 1e-6);
+        assert!(reference.graph_width(0).abs() < 1e-6);
+        // The legacy 24px band keeps legible type (the 72% floor) while its
+        // graphs scale all the way down to fit.
+        let compact = StatusBarMetrics::for_height(24.0);
+        assert!((compact.text - 10.0).abs() < 1e-6);
+        assert!((compact.readout - 12.0).abs() < 1e-6);
+        assert!((compact.graph_height - 15.0).abs() < 1e-6);
+        // Nothing collapses to zero at the 8px floor the settings allow, and
+        // the trailing controls keep the hit rects the E2E scripts click:
+        // `window-chrome-bands.sh` clicks `W-30` (balance) and `W-14` (gear)
+        // on the 8px band; `settings-entry.sh` clicks `W-32` on the default.
+        let floor = StatusBarMetrics::for_height(8.0);
+        assert!(floor.bar_gap >= 1.0 && floor.gauge_height >= 1.0 && floor.text >= 1.0);
+        let gear = |m: &StatusBarMetrics| {
+            let right = m.edge + CONTROLS_PADDING;
+            (right + m.control, right)
+        };
+        let (floor_left, floor_right) = gear(&floor);
+        assert!(floor_left > 14.0 && 14.0 > floor_right, "8px gear {floor_left}..{floor_right}");
+        assert!(floor_left + floor.control > 30.0 && 30.0 > floor_left, "8px balance");
+        let (ref_left, ref_right) = gear(&reference);
+        assert!(ref_left > 32.0 && 32.0 > ref_right, "36px gear spans {ref_left}..{ref_right}");
     }
 
     // @lat: [[test#GPUI Status Bar#Usage color escalates with load]]
@@ -1440,30 +1699,6 @@ mod tests {
         );
         assert_eq!(shorten_cwd_with_home(Path::new("/etc/hosts"), Some(home)), "/etc/hosts");
         assert_eq!(shorten_cwd_with_home(Path::new("/etc/hosts"), None), "/etc/hosts");
-    }
-
-    #[test]
-    fn stats_worst_case_gates_on_config_and_gpu_presence() {
-        let config = StatusBarStatsConfig {
-            usage: StatusBarUsageStatsConfig {
-                compute: StatusBarComputeStatsConfig { cpu: true, gpu: true },
-                memory: true,
-            },
-            network: true,
-        };
-        let all = stats_worst_case_text(&config, true);
-        assert!(all.contains("CPU") && all.contains("MEM") && all.contains("GPU"));
-        assert!(all.contains('\u{2191}') && all.contains('\u{2193}'));
-        // A GPU-less host reserves no phantom GPU segment even when enabled.
-        assert!(!stats_worst_case_text(&config, false).contains("GPU"));
-        let none = StatusBarStatsConfig {
-            usage: StatusBarUsageStatsConfig {
-                compute: StatusBarComputeStatsConfig { cpu: false, gpu: false },
-                memory: false,
-            },
-            network: false,
-        };
-        assert!(stats_worst_case_text(&none, true).is_empty());
     }
 
     // @lat: [[test#GPUI Status Bar#Right side stitches enabled segments in order]]
@@ -1562,9 +1797,23 @@ mod tests {
         };
         let mut spans = Vec::new();
         push_cpu(&mut spans, &stats, &colors);
-        // CPU shows 8 bars: 6 padding + 2 history, plus the label and percentage.
-        let bars = spans.iter().filter(|s| "▁▂▃▄▅▆▇█".contains(&s.text)).count();
-        assert_eq!(bars, CPU_SPARK_WIDTH);
+        // CPU is one graph of 8 bars: 6 idle pads in the label colour, then
+        // the 2 real samples in the CPU hue, between the label and readout.
+        let SpanKind::Graph(bars) = &spans[1].kind else { panic!("cpu graph span") };
+        assert_eq!(bars.len(), CPU_SPARK_WIDTH);
+        for pad in &bars[..6] {
+            assert!(pad.level.abs() < 1e-6);
+            crate::assert_rgba_eq(pad.color, colors.label);
+        }
+        assert!((bars[6].level - 0.1).abs() < 1e-6);
+        assert!((bars[7].level - 0.2).abs() < 1e-6);
+        for sample in &bars[6..] {
+            crate::assert_rgba_eq(sample.color, with_alpha(colors.stat_cpu, 0.72));
+        }
+        assert_eq!(spans[0].kind, SpanKind::Label);
+        assert_eq!(spans[0].text, "CPU");
+        assert_eq!(spans[2].kind, SpanKind::Readout);
+        assert_eq!(spans[2].text, " 50%");
 
         let full = build_right(
             &StatusBarData { sys_stats: Some(&stats), stats_config: Some(&config), ..data() },
@@ -1575,5 +1824,10 @@ mod tests {
         assert!(text.contains("MEM"));
         assert!(text.contains("GPU"));
         assert!(text.contains('\u{2191}'));
+        // MEM is a gauge at its fraction, and chips are separated by breaks.
+        assert!(full.iter().any(
+            |s| matches!(s.kind, SpanKind::Gauge { level, .. } if (level - 0.5).abs() < 1e-6)
+        ));
+        assert_eq!(full.iter().filter(|s| s.kind == SpanKind::ChipBreak).count(), 3);
     }
 }

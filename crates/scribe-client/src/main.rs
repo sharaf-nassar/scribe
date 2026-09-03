@@ -12207,9 +12207,19 @@ impl TerminalView {
         let equalize_visible = self.shell.pane_count(cx) >= 2;
         let action_glyphs = if equalize_visible { "\u{229E}\u{2699}" } else { "\u{2699}" };
         let mut model = self.build_status_model(None, 0);
+        // The band shapes in the terminal's own font so its fixed-width
+        // readouts stay monospace; `"monospace"` is not a face cosmic-text
+        // knows, and would fall through to a proportional sans fallback.
+        let font_family = self.font.family.clone();
+        let metrics = status_bar::StatusBarMetrics::for_height(self.status_bar_height);
         if let Some(uri) = hover_uri {
-            let left_budget_cols =
-                status_bar::measure_left_budget_cols(&model, action_glyphs, status_window);
+            let left_budget_cols = status_bar::measure_left_budget_cols(
+                &model,
+                action_glyphs,
+                &font_family,
+                &metrics,
+                status_window,
+            );
             model = self.build_status_model(Some(uri), left_budget_cols);
         }
         for message in &self.link_feedback.visible_messages {
@@ -12242,22 +12252,15 @@ impl TerminalView {
                 }
             });
         let on_equalize = equalize_visible.then_some(equalize_action);
-        // The GPU segment is present exactly when the model emitted it, so
-        // the reserved worst-case width never budgets a phantom segment.
-        let has_gpu = model.right.iter().any(|span| span.text == "GPU ");
-        let stats_width =
-            status_bar::stats_zone_width(Some(&self.stats_config), has_gpu, status_window);
         status_bar::render(
             &model,
-            self.status_bar_height,
-            &colors,
+            &status_bar::StatusBarGeometry { colors, metrics, font_family: &font_family },
             status_bar::StatusBarActions {
                 update_focus: Some(&self.focus.update),
                 on_update: Some(on_update),
                 on_equalize,
                 on_settings: Some(on_settings),
             },
-            stats_width,
         )
         .into_any_element()
     }

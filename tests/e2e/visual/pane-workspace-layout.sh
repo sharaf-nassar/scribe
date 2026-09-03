@@ -61,7 +61,7 @@ SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 # (the default `appearance.status_bar_height`). Everything between is the grid area
 # the pane layout owns, and is the only region these assertions look at.
 TITLEBAR_H=34
-BOTTOM_BANDS_H=24
+BOTTOM_BANDS_H=36
 
 # Ink a typed marker line must add to a half-pane. One `echo` command line plus
 # its echoed output is thousands of lit pixels; a pane that never received the

@@ -2874,7 +2874,7 @@ It runs on the . The script used to open with a phase 0 that killed the client, 
 
 The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. The phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. Before the first open, the test seeds a 3520×2424 physical-pixel legacy geometry and requires the mapped client to use the compact 1040×720 fallback instead of filling the work area. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the status-bar gear must reach the same handler with the same no-duplicate result.
 
-Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin and size, so a frame-relative gear click would be offset by the decoration and miss the band. The gear offset is derived from the bottom status bar's fixed 24px band and the 8px `px_2` edge padding that fixes the gear div's right edge at `width - 8` — the gear moved there when the titlebar button was retired during the status-bar consolidation. Because the gear div also carries an 8px `pl_2`, any inset between 1 and 15 from that right edge is inside its hit rect whatever advance the container's font gives `⚙`, so the phase fails on a real status-bar layout change rather than on font metrics.
+Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin and size, so a frame-relative gear click would be offset by the decoration and miss the band. The gear offset is derived from [[crates/scribe-client/src/status_bar.rs#StatusBarMetrics]] at the 36px default band: a 14px edge, 4px of controls padding, and a fixed 28px control width, which puts the gear div at `width - 18 - 28 .. width - 18` — the gear moved there when the titlebar button was retired during the status-bar consolidation. The phase clicks that rect's centre, so it depends on the band's declared geometry rather than on the advance the container's font gives `⚙`, and fails on a real status-bar layout change rather than on font metrics.
 
 #### Numeric steppers accept exact entry
 
@@ -3423,7 +3423,13 @@ Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` tha
 
 The run starts at `tab_height=16` / `tab_bar_padding=0` / `status_bar_height=8`, so the fresh 120x36 window must be 1008x705. In that client process it captures the bottom 100px, hot-reloads only `status_bar_height=48`, captures again, requires a non-zero ImageMagick AE delta, measures exactly 8px then 48px, and requires the published pane rows to decrease. The pre-fix status renderer produces `status_bar_height AE=0`. It restores the 8px band, then hot-reloads tab height 60 and padding 20, requiring non-zero top-band deltas and exact 16, 60, and 80px tab rows. Every edit must republish pane geometry while the client pid stays fixed.
 
-After restoring the 16px tab row and 8px status band, the suite fills the shared pane and proves row 36 plus the bottom status bar remain on screen, then raises a real prompt strip and requires its band to repaint without moving status. It finally restores the 80px tab row, creates a lower workspace through `ctrl+alt+-`, measures the lower bar at the same 80px, paints the lower pane red to locate its first content row, and enables application mouse tracking: a click inside the bar must emit no mouse report, while a click immediately below must reach the pane. Equalize and settings clicks at the compact status band's vertical centre must hit their controls. Captures use `import -window`, so every offset is window-relative and no WM decoration can shift the measurement.
+After restoring the 16px tab row and 8px status band, the suite fills the shared pane and proves row 36 plus the bottom status bar remain on screen, then raises a real prompt strip and requires its band to repaint without moving status. It finally restores the 80px tab row, creates a lower workspace through `ctrl+alt+-`, measures the lower bar at the same 80px, paints the lower pane red to locate its first content row, and enables application mouse tracking: a click inside the bar must emit no mouse report, while a click on painted grid must reach the pane. The lower bar's top is `PADDED_BAR_H + GRID_H / 2`, floored the way the paint floors it: [[crates/scribe-client/src/workspace_layout.rs#split_rect]] divides a region by `height * ratio` in floats, so an odd grid puts the boundary on a half pixel. Rounding up instead started the scan one row inside the bar. The pane's ink is expected `PANE_INK_INSET` (17px) below the bar rather than flush with it, because a region-edge pane paints a card inside its placement rect: `PANE_CARD_MARGIN` of window ground, the card's `PANE_BORDER_WIDTH` hairline, then `PANE_CONTENT_PADDING`. The placement rect still begins exactly at the bar's bottom, so a pane that stopped reserving the bar still fails — its ink would start above the rect. Equalize and settings clicks at the compact status band's vertical centre must hit their controls. Captures use `import -window`, so every offset is window-relative and no WM decoration can shift the measurement. `measure_bar_height` in `tests/e2e/visual/tab-geometry-common.bash` borders its mask with transparency before trimming: `-trim` removes edges matching the top-left pixel, so a scan whose first row is a chrome mark rather than background made trim treat the mark as the border and collapse the strip to a silent 0. The layered chrome made that reachable by dropping the hairline under the region bars, leaving a two-colour strip; the border keeps the corner background, so a mis-derived top now reports a wrong height instead of zero.
+
+### Titlebar paths stay compact
+
+`tests/e2e/visual/titlebar.sh` is the blocking smoke for both titlebar renderers: the window titlebar and a lower region's own bar must each paint a compact tab title, vertically centred in the bar.
+
+The title is located per bar rather than in a fixed crop, because the current chrome puts two other things in the same near-gray ink band. The focused tab's accent tick is a NEUTRAL muted gray whenever no project has named the workspace (see [[client#Client#Tab Bar]]), so it passes a "bright near-gray" filter and its full-width rule stretched the measured title box from 10px to 17px; rows spanning almost the whole scan are therefore dropped, since a title never does and a rule always does. A window holding more than one region also grows a workspace pill at each bar's left, whose label carries descenders a tab title does not, so a crop anchored at the bar's left edge measured the pill and read 4.5px low; the scan starts after the pill's filled card when one is present. Captures retry until the client has actually painted, because a debug-profile client can still be blank at a fixed sleep and an empty capture fails the assertions as though the titlebar had regressed.
 
 ### Published columns fit one rendered row
 
@@ -6245,9 +6251,15 @@ Transient connection and pane errors are log-only: the band renders no warning g
 
 The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::Degraded`; `Active` and absent states render nothing.
 
-### Sparkline maps percentage to block height
+### Sparkline maps percentage to bar level
 
- maps 0–100% onto the eight block glyphs, clamps non-finite input to the lowest bar, and the network variant saturates at 100 MB/s.
+[[crates/scribe-client/src/status_bar.rs#usage_level]] maps 0–100% onto a `0..=1` bar level, clamps overshoot, and reads non-finite input as idle; [[crates/scribe-client/src/status_bar.rs#rate_level]] saturates at 100 MB/s.
+
+### Metrics scale with the band height
+
+[[crates/scribe-client/src/status_bar.rs#StatusBarMetrics#for_height]] reproduces the 36px reference exactly and scales it for other bands, so a taller status bar grows its type and graphs instead of leaving the space empty.
+
+The test pins the reference sizes (14px text, 16px readouts, a 22px graph box, 54px for eight bars), the 72% type floor that keeps a 24px band legible at 10/12px while its graph shrinks to 15px, and that nothing collapses to zero at the 8px floor the Settings stepper allows. It also pins the two control click points the E2E scripts use — `width - 30` and `width - 14` at 8px in `window-chrome-bands.sh`, `width - 32` at the default in `settings-entry.sh` — inside the derived button rects, so a geometry change fails here before it silently misses a control in the container.
 
 ### Usage color escalates with load
 
@@ -6279,7 +6291,9 @@ The feature-015 presence badge reports the attached-participant count and names 
 
 ### Sparklines pad short history to fixed width
 
- left-pads a short CPU/GPU history to the fixed eight-bar width and renders the CPU, MEM, GPU, and network groups when their config flags are on.
+[[crates/scribe-client/src/status_bar.rs#push_cpu]] emits one graph span of exactly eight bars for a two-sample history, and the full right side renders the CPU, MEM, GPU, and network chips when their config flags are on.
+
+The eight bars are six idle stubs at level zero in the dim label colour, then the real samples at their levels in the CPU hue at 72% alpha, between a semibold `CPU` label span and a right-aligned percentage readout. MEM emits a gauge at its fraction rather than a one-bar graph, and the four chips are separated by three `SpanKind::ChipBreak` spans.
 
 ## GPUI Settings Window
 

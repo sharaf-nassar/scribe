@@ -92,7 +92,7 @@ IDLE_WATCH_SECS="${IDLE_WATCH_SECS:-4}"
 #   ROW_H_X10   terminal_element.rs `LINE_HEIGHT_RATIO` at the default font
 #               size 14 (14 * 1.35 = 18.9), x10 so row tops stay integral
 TITLEBAR_H=34
-BAR_H=24
+BAR_H=36
 ROW_H_X10=189
 
 # Pixels trimmed off each row band and off the grid's left/right edges before

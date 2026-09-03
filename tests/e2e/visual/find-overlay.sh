@@ -545,7 +545,7 @@ echo "PHASE 7 PASS: clicking the close control cleared visible highlights ($CLOS
 # here. This phase fails on that tree and passes once the box mounts inside
 # the focused pane's own grid slot.
 TITLEBAR_H=34
-BOTTOM_BANDS_H=24
+BOTTOM_BANDS_H=36
 SPLIT_INK_MIN="${SPLIT_INK_MIN:-150}"
 SPLIT_INK_NOISE_MAX="${SPLIT_INK_NOISE_MAX:-150}"
 

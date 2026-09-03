@@ -256,7 +256,7 @@ fn default_tab_bar_padding() -> f32 {
 }
 
 fn default_status_bar_height() -> f32 {
-    24.0
+    36.0
 }
 
 fn default_tab_height() -> f32 {

@@ -55,20 +55,21 @@ SETTINGS_CHANGE_MIN="${SETTINGS_CHANGE_MIN:-100}"
 
 # Status bar geometry, from crates/scribe-client/src/status_bar.rs: the gear
 # moved out of the retired titlebar button into the configured
-# `appearance.status_bar_height`=24px default band at the window bottom, the
-# last `flex_col` child of the window root, where `settings_gear` renders as the
-# band row's last child inside its px_2 (8px) edge padding.
+# `appearance.status_bar_height`=36px default band at the window bottom, the
+# last `flex_col` child of the window root, where `settings_gear` renders as
+# the band row's last child. `StatusBarMetrics::for_height(36)` gives the
+# band a 14px edge, the controls cluster 4px of padding, and each control a
+# fixed 28px-wide hit target (never the glyph's advance).
 #
-# The gear div's right edge is therefore `width - 8`, and its left edge is
-# `width - 8 - (8 + glyph_advance)` — pl_2 plus the `⚙` advance. Clicking
-# `width - 8 - GEAR_INSET` with an inset between 1 and 15 lands inside the
-# div's hit rect for ANY glyph advance, so the phase does not depend on how
-# the container's font measures U+2699. Half the 12px `text_xs` cell keeps
-# the click on the painted glyph as well. A status-bar layout change turns
-# into a failing phase here rather than a silent miss.
-STATUS_BAR_HEIGHT=24
-STATUS_BAR_EDGE_PADDING=8
-GEAR_INSET=6
+# The gear div therefore spans `width - 18 - 28 .. width - 18`; clicking its
+# centre, `width - 32`, lands inside the hit rect whatever the container's
+# font measures U+2699 as. A status-bar layout change turns into a failing
+# phase here rather than a silent miss.
+STATUS_BAR_HEIGHT=36
+STATUS_BAR_EDGE_PADDING=14
+CONTROLS_PADDING=4
+CONTROL_WIDTH=28
+GEAR_INSET=$(( CONTROLS_PADDING + CONTROL_WIDTH / 2 ))
 COMPACT_SETTINGS_WIDTH=1040
 COMPACT_SETTINGS_HEIGHT=720
 SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"

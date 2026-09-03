@@ -67,9 +67,9 @@ WS_NAME="WSINFO-RENDER-OK"
 WS_ACCENT="#a78bfa"
 
 # Height of the band at the very bottom of the painted window that the status
-# bar occupies (the default appearance.status_bar_height is 24 px), plus a little slack
+# bar occupies (the default appearance.status_bar_height is 36 px), plus a little slack
 # for whatever border the window manager draws under it.
-STATUS_BAND_H=34
+STATUS_BAND_H=46
 
 # Fraction of the window width the assertions look at, measured from the left
 # edge. The workspace name is the first variable-width segment of the status

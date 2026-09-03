@@ -38,6 +38,9 @@ ROW_H_X10=189
 ROW_CROP_H=18
 INK_MIN=40
 PROMPT_TEXT="chrome band probe prompt"
+# `PANE_CARD_MARGIN` + `PANE_BORDER_WIDTH` + `PANE_CONTENT_PADDING` from the
+# client: the distance from a region-edge pane's placement rect to its grid ink.
+PANE_INK_INSET=17
 PROMPT_DELTA_MIN="${PROMPT_DELTA_MIN:-200}"
 
 WID=""
@@ -331,7 +334,11 @@ wait_for_log_growth "lower-region tab bars changed" "$BARS_BEFORE" 20 \
 sleep 1.5
 shot /output/chrome-tabs-03-lower-bar.png
 GRID_H=$(( WIN_H - PADDED_BAR_H - STATUS_BAR_H ))
-LOWER_TOP=$(( PADDED_BAR_H + (GRID_H + 1) / 2 ))
+# `workspace_layout::split_rect` divides the region by `height * ratio` in
+# floats, so an odd grid puts the boundary on a half pixel and the paint lands
+# on the floor of it. Round the same way; rounding up starts the scan one row
+# inside the bar and measures one row short.
+LOWER_TOP=$(( PADDED_BAR_H + GRID_H / 2 ))
 LOWER_H=$(measure_bar_height /output/chrome-tabs-03-lower-bar.png "$LOWER_TOP" 120 lower)
 [ "$LOWER_H" -eq "$PADDED_BAR_H" ] \
     || fail "lower row measured ${LOWER_H}px, want ${PADDED_BAR_H}px"
@@ -341,18 +348,26 @@ echo "PHASE 5 PASS: top and lower rows both paint ${PADDED_BAR_H}px"
 # ── Phase 6: lower pane paint and hit testing begin below the row ─────────────
 # The newly split lower workspace is focused. Fill its erased cells red, enable
 # SGR mouse tracking, and block in cat so clicks can be observed in the client
-# log. A split pane has a 1px border, so red content starts one pixel after the
-# placement rect that begins exactly at the bar's bottom.
+# log.
+#
+# The pane's PLACEMENT rect still begins exactly at the bar's bottom — that is
+# the reservation under test — but the pane paints a card inside it, so its ink
+# starts PANE_INK_INSET lower: `PANE_CARD_MARGIN` (6) of window ground at the
+# region edge, the card's `PANE_BORDER_WIDTH` (1) hairline, then
+# `PANE_CONTENT_PADDING` (10) before the grid. Those three are the client's own
+# constants (pane_shell.rs, main.rs); a pane that stopped reserving the bar
+# still fails here, because the ink would start above the placement rect.
 focus
 xdotool type --delay 1 "printf '\\033[41m\\033[2J\\033[H\\033[?1000h\\033[?1006h'; stty -icanon -echo min 1 time 0; cat -v"
 xdotool key --clearmodifiers Return
 sleep 1.5
 shot /output/chrome-tabs-04-lower-content.png
 CONTENT_EXPECTED=$(( LOWER_TOP + PADDED_BAR_H ))
+INK_EXPECTED=$(( CONTENT_EXPECTED + PANE_INK_INSET ))
 RED_Y=$(first_red_row /output/chrome-tabs-04-lower-content.png \
     $(( WIN_W / 2 )) "$LOWER_TOP" $(( WIN_H - LOWER_TOP - STATUS_BAR_H )))
-[ "$RED_Y" -ge "$CONTENT_EXPECTED" ] && [ "$RED_Y" -le $(( CONTENT_EXPECTED + 2 )) ] \
-    || fail "lower pane ink began at y=$RED_Y, bar ends at y=$CONTENT_EXPECTED"
+[ "$RED_Y" -ge "$INK_EXPECTED" ] && [ "$RED_Y" -le $(( INK_EXPECTED + 2 )) ] \
+    || fail "lower pane ink began at y=$RED_Y, want ${INK_EXPECTED} (bar ends at y=$CONTENT_EXPECTED plus the ${PANE_INK_INSET}px card inset)"
 
 MOUSE_BEFORE=$(count_log "mouse input forwarded")
 xdotool mousemove --window "$WID" $(( WIN_W / 2 )) $(( LOWER_TOP + PADDED_BAR_H / 2 ))
@@ -361,7 +376,8 @@ sleep 0.5
 MOUSE_IN_BAR=$(count_log "mouse input forwarded")
 [ "$MOUSE_IN_BAR" -eq "$MOUSE_BEFORE" ] \
     || fail "lower bar click leaked into the pane hit-test ($MOUSE_BEFORE -> $MOUSE_IN_BAR)"
-xdotool mousemove --window "$WID" $(( WIN_W / 2 )) $(( CONTENT_EXPECTED + 12 ))
+# Click on painted grid, not on the card margin between the bar and the pane.
+xdotool mousemove --window "$WID" $(( WIN_W / 2 )) $(( RED_Y + 12 ))
 xdotool click 1
 wait_for_log_growth "mouse input forwarded" "$MOUSE_IN_BAR" 10 \
     || fail "click below the lower bar never reached the pane"
