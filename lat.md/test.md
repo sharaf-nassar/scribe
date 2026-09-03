@@ -6257,9 +6257,9 @@ The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::D
 
 ### Metrics scale with the band height
 
-[[crates/scribe-client/src/status_bar.rs#StatusBarMetrics#for_height]] reproduces the 36px reference exactly and scales it for other bands, so a taller status bar grows its type and graphs instead of leaving the space empty.
+[[crates/scribe-client/src/status_bar.rs#StatusBarMetrics#for_height]] reproduces the 36px reference exactly, repeats it unchanged on every band that can hold the chip, and grows it on taller ones.
 
-The test pins the reference sizes (14px text, 16px readouts, a 22px graph box, 54px for eight bars), the 72% type floor that keeps a 24px band legible at 10/12px while its graph shrinks to 15px, and that nothing collapses to zero at the 8px floor the Settings stepper allows. It also pins the two control click points the E2E scripts use — `width - 30` and `width - 14` at 8px in `window-chrome-bands.sh`, `width - 32` at the default in `settings-entry.sh` — inside the derived button rects, so a geometry change fails here before it silently misses a control in the container.
+The test pins the reference sizes (14px text, 16px readouts, a 22px graph box, 54px for eight bars), then asserts 24, 28, 30 and 35px bands all return those same sizes with the graph box still fitting under the top border — the regression it guards is a design that only appears at one height — that a 48px band grows past the reference, and that nothing collapses to zero at the 8px floor the Settings stepper allows. It also pins the two control click points the E2E scripts use — `width - 30` and `width - 14` at 8px in `window-chrome-bands.sh`, `width - 32` at the default in `settings-entry.sh` — inside the derived button rects, so a geometry change fails here before it silently misses a control in the container.
 
 ### Usage color escalates with load
 

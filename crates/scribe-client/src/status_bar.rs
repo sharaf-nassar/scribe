@@ -74,9 +74,12 @@ const NET_SPARK_MAX_BYTES_PER_SEC: u64 = 100_000_000;
 /// labels, 16px readouts, 8 bars of 5px with 2px gaps in a 22px box, 36px
 /// between chips, 20px between zones, 14px band edge, 28px-wide controls.
 ///
-/// Type scales down only to 72% of the reference (10/9/12px), so a 24px
-/// band stays legible; graphs and gaps scale all the way so they always
-/// fit the band. The E2E scripts that click the controls derive their
+/// The chip renders at those reference sizes for every band tall enough to
+/// hold it, grows past the 36px reference so a taller band is filled rather
+/// than padded, and shrinks only below [`MIN_FIT_HEIGHT`], where the graph
+/// box no longer fits. Scaling the type down with the band instead made the
+/// design appear at exactly one height and left every other band with a
+/// miniature of it. The E2E scripts that click the controls derive their
 /// offsets from these numbers (`tests/e2e/visual/settings-entry.sh`,
 /// `window-chrome-bands.sh`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,20 +113,32 @@ pub struct StatusBarMetrics {
 /// Horizontal padding on each side of the trailing controls cluster.
 pub const CONTROLS_PADDING: f32 = 4.0;
 
+/// The band the reference geometry is drawn for.
+const REFERENCE_HEIGHT: f32 = 36.0;
+
+/// The shortest band that still holds the reference chip: the 22px graph box
+/// plus its baseline rule, under the band's 1px top border. Below this the
+/// whole geometry scales down rather than clipping.
+const MIN_FIT_HEIGHT: f32 = 24.0;
+
 impl StatusBarMetrics {
     /// Scale the reference geometry to `height` pixels.
     #[must_use]
     pub fn for_height(height: f32) -> Self {
         let height = height.max(1.0);
-        let scale = height / 36.0;
+        let scale = if height >= REFERENCE_HEIGHT {
+            height / REFERENCE_HEIGHT
+        } else if height >= MIN_FIT_HEIGHT {
+            1.0
+        } else {
+            height / MIN_FIT_HEIGHT
+        };
         let at = |reference: f32| (reference * scale).round().max(1.0);
-        let type_scale = scale.max(0.72);
-        let type_at = |reference: f32| (reference * type_scale).round();
         Self {
             height,
-            text: type_at(14.0),
-            label: type_at(12.0),
-            readout: type_at(16.0),
+            text: at(14.0),
+            label: at(12.0),
+            readout: at(16.0),
             bar_width: at(5.0),
             bar_gap: at(2.0),
             graph_height: at(22.0),
@@ -1643,12 +1658,20 @@ mod tests {
         // 8 bars of 5px with 2px gaps.
         assert!((reference.graph_width(8) - 54.0).abs() < 1e-6);
         assert!(reference.graph_width(0).abs() < 1e-6);
-        // The legacy 24px band keeps legible type (the 72% floor) while its
-        // graphs scale all the way down to fit.
-        let compact = StatusBarMetrics::for_height(24.0);
-        assert!((compact.text - 10.0).abs() < 1e-6);
-        assert!((compact.readout - 12.0).abs() < 1e-6);
-        assert!((compact.graph_height - 15.0).abs() < 1e-6);
+        // Every band that can hold the chip renders it at the reference
+        // sizes: the design is not a 36px-only layout with miniatures
+        // everywhere else.
+        for band in [24.0_f32, 28.0, 30.0, 35.0] {
+            let fits = StatusBarMetrics::for_height(band);
+            assert!((fits.text - 14.0).abs() < 1e-6, "{band}px text {}", fits.text);
+            assert!((fits.readout - 16.0).abs() < 1e-6, "{band}px readout");
+            assert!((fits.graph_height - 22.0).abs() < 1e-6, "{band}px graph");
+            // The graph box and its baseline rule fit under the top border.
+            assert!(fits.graph_height + 1.0 <= band - 1.0, "{band}px graph overflows");
+        }
+        // A taller band grows the chip instead of padding around it.
+        let tall = StatusBarMetrics::for_height(48.0);
+        assert!(tall.text > 14.0 && tall.graph_height > 22.0);
         // Nothing collapses to zero at the 8px floor the settings allow, and
         // the trailing controls keep the hit rects the E2E scripts click:
         // `window-chrome-bands.sh` clicks `W-30` (balance) and `W-14` (gear)
