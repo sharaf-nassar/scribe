@@ -2667,7 +2667,7 @@ Grayscale pixel masks require each state to retain both its glyph and word witho
 
 #### Forty-pixel frame stability
 
-The running bar moves the terminal grid down by exactly 40px without changing its columns, marker cells, or shifted frame pixels. The band background and one-pixel ownership underline match the approved trace mockup.
+The single-row running fixture moves the grid down by 40px without changing its columns, marker cells, or shifted frame pixels. Its background and one-pixel ownership underline match the trace mockup; this fixture does not verify wrapping.
 
 `docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the *server* starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`); the shared-pane rig appends to the same file, which is why both are written up front rather than one clobbering the other. `SCRIBE_VISUAL_APP=settings` swaps the client launch for `scribe-client --settings` (logged to `/output/settings.log`) so the settings window can be driven as its own app, and `SCRIBE_SEED_TRUST=1` plants a trusted network and an approved device into the server's LAN trust stores before it starts.
 
@@ -6043,13 +6043,21 @@ Open and dismiss controls derive distinct GPUI element identities from each regi
 
 A trace beyond six workflows retains failed and active cells and reports the hidden count, keeping the useful part of a crowded run visible.
 
+### Crowded cells wrap onto balanced rows
+
+A pure fit/model regression checks a 40px single row, a 68px two-row grid, single-column fallback, and the hidden-workflow counter's slot.
+
+For 90px cells with 18px gaps, six slots occupy one row at 700px available width and three columns by two rows at 400px. Five slots stack at 100px; zero available width still yields one column, and zero slots retain a one-column, one-row layout. A retained running workflow plus the `+N more` counter consumes two slots.
+
+This test does not exercise live font shaping or terminal resizing after wrapping. Visual verification must narrow and widen a CI-bearing region with long names, owner/viewer chrome, and an expanded panel, checking aligned tracks, truncation, neighboring regions, and the three-row terminal floor.
+
 ### Theme drives every band color
 
 The palette derives its background, text, semantic status colors, and opacity from the active terminal theme instead of fixed mockup colors.
 
 ### Band reflows only its workspace region
 
-The 40px reservation keeps the owning region's x and width, moves its content down by exactly one band, and leaves neighboring regions outside the calculation.
+The single-row geometry fixture reserves 40px, keeps the owning region's x and width, shifts its content by that height, and leaves neighboring regions unchanged. Wrapped heights are covered separately by the fit/model regression.
 
 ### Dismissal carries repository and head
 
@@ -6259,7 +6267,7 @@ The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::D
 
 [[crates/scribe-client/src/status_bar.rs#StatusBarMetrics#for_height]] reproduces the 36px reference exactly, repeats it unchanged on every band that can hold the chip, and grows it on taller ones.
 
-The test pins the reference sizes (14px text, 16px readouts, a 22px graph box, 54px for eight bars), then asserts 24, 28, 30 and 35px bands all return those same sizes with the graph box still fitting under the top border — the regression it guards is a design that only appears at one height — that a 48px band grows past the reference, and that nothing collapses to zero at the 8px floor the Settings stepper allows. It also pins the two control click points the E2E scripts use — `width - 30` and `width - 14` at 8px in `window-chrome-bands.sh`, `width - 32` at the default in `settings-entry.sh` — inside the derived button rects, so a geometry change fails here before it silently misses a control in the container.
+The test pins the reference sizes (14px text, 16px readouts, a 22px graph box, 110px for the 16-sample CPU graph and 54px for the 8-sample network one), then asserts 24, 28, 30 and 35px bands all return those same sizes with the graph box still fitting under the top border — the regression it guards is a design that only appears at one height — that a 48px band grows past the reference, and that nothing collapses to zero at the 8px floor the Settings stepper allows. It also pins the two control click points the E2E scripts use — `width - 30` and `width - 14` at 8px in `window-chrome-bands.sh`, `width - 32` at the default in `settings-entry.sh` — inside the derived button rects, so a geometry change fails here before it silently misses a control in the container.
 
 ### Usage color escalates with load
 
@@ -6291,9 +6299,9 @@ The feature-015 presence badge reports the attached-participant count and names 
 
 ### Sparklines pad short history to fixed width
 
-[[crates/scribe-client/src/status_bar.rs#push_cpu]] emits one graph span of exactly eight bars for a two-sample history, and the full right side renders the CPU, MEM, GPU, and network chips when their config flags are on.
+[[crates/scribe-client/src/status_bar.rs#push_cpu]] emits one graph span of exactly `CPU_SPARK_WIDTH` bars for a two-sample history, and the full right side renders the CPU, MEM, GPU, and network chips when their config flags are on.
 
-The eight bars are six idle stubs at level zero in the dim label colour, then the real samples at their levels in the CPU hue at 72% alpha, between a semibold `CPU` label span and a right-aligned percentage readout. MEM emits a gauge at its fraction rather than a one-bar graph, and the four chips are separated by three `SpanKind::ChipBreak` spans.
+All but the last two bars are idle stubs at level zero in the dim label colour, then the real samples at their levels in the CPU hue at 72% alpha, between a semibold `CPU` label span and a right-aligned percentage readout. MEM emits a gauge at its fraction rather than a one-bar graph, and the four chips are separated by three `SpanKind::ChipBreak` spans.
 
 ## GPUI Settings Window
 

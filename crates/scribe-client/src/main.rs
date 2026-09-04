@@ -1990,6 +1990,13 @@ impl CursorBlink {
 
 type VisibleCiRun = (WorkspaceId, PathBuf, CiRunState, Option<CiRunDetails>);
 
+/// One frame's collapsed band, measured once so the strip a region reserves
+/// and the band it paints share a row count.
+struct CiBandFrame {
+    model: CiBarModel,
+    layout: ci_bar::CiBandLayout,
+}
+
 struct TerminalView {
     shared: Shared,
     sink: IpcSink,
@@ -2211,6 +2218,8 @@ struct TerminalView {
     row_focus: HashMap<WorkspaceId, HashMap<String, FocusHandle>>,
     /// CI snapshots matched to the regions that currently own their repository.
     visible_ci_runs: Vec<VisibleCiRun>,
+    /// This frame's measured collapsed bands, parallel to `visible_ci_runs`.
+    ci_band_frames: Vec<CiBandFrame>,
     /// Client-local open panel identity; the server sees only interest changes.
     ci_expanded: HashMap<WorkspaceId, (PathBuf, String)>,
     /// Stable tab stops for each region's toggle plus owner-only actions.
@@ -2925,6 +2934,7 @@ impl TerminalView {
             flow_focused_node: HashMap::new(),
             row_focus: HashMap::new(),
             visible_ci_runs: Vec::new(),
+            ci_band_frames: Vec::new(),
             ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
             jump_button_focus: HashMap::new(),
@@ -12111,6 +12121,21 @@ fn ci_panel_height(details: Option<&CiRunDetails>, stale: bool) -> f32 {
     })
 }
 
+/// The expanded job trace for `state`, frozen at its last refresh when stale.
+fn ci_trace_model(
+    state: &CiRunState,
+    details: Option<&CiRunDetails>,
+    now: u64,
+) -> Option<ci_bar::CiTraceModel> {
+    let trace_now = if state.stale {
+        state.workflows.iter().filter_map(|workflow| workflow.updated_at_epoch_secs).max()
+    } else {
+        None
+    };
+    details
+        .map(|details| ci_bar::CiTraceModel::build(details, trace_now.unwrap_or(now), state.stale))
+}
+
 impl TerminalView {
     /// Build the status-bar segment model from the live connection / stats
     /// state and the server-reported chrome metadata for the attached pane.
@@ -12791,7 +12816,7 @@ impl TerminalView {
     }
 
     /// Match repository-keyed CI snapshots to the regions that own them.
-    fn sync_ci_run_strips(&mut self, cx: &mut Context<Self>) {
+    fn sync_ci_run_strips(&mut self, window: &Window, cx: &mut Context<Self>) {
         let roots = self.shell.region_project_roots(cx);
         self.visible_ci_runs = self.shared.ci_runs.lock().map_or_else(
             |_| {
@@ -12832,18 +12857,43 @@ impl TerminalView {
         for (workspace_id, head_sha) in &bands {
             self.ensure_ci_action_focus(*workspace_id, head_sha.clone(), cx);
         }
+        // Measure each band against its region's width before reserving: a
+        // crowded run wraps its cells onto more rows, and the strip must
+        // reserve exactly the rows the band paints.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let viewport = self.pane_viewport();
+        let widths = self
+            .shell
+            .workspace_rects(viewport, cx)
+            .into_iter()
+            .map(|(workspace_id, rect)| (workspace_id, rect.width))
+            .collect::<HashMap<_, _>>();
+        self.ci_band_frames = self
+            .visible_ci_runs
+            .iter()
+            .map(|(workspace_id, _, state, _)| {
+                let model = CiBarModel::build(state, now, self.shared.ci_owner_controls);
+                let width = widths.get(workspace_id).copied().unwrap_or(viewport.width);
+                let layout = ci_bar::measure_layout(&model, &self.font.family, width, window);
+                CiBandFrame { model, layout }
+            })
+            .collect();
         let mut strips: HashMap<WorkspaceId, f32> = HashMap::new();
-        for (workspace_id, repo_root, state, details) in &self.visible_ci_runs {
+        for ((workspace_id, repo_root, state, details), frame) in
+            self.visible_ci_runs.iter().zip(&self.ci_band_frames)
+        {
             let expanded = self
                 .ci_expanded
                 .get(workspace_id)
                 .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
             let panel = if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
-            *strips.entry(*workspace_id).or_default() += ci_bar::CI_BAR_HEIGHT + panel;
+            *strips.entry(*workspace_id).or_default() += frame.layout.height() + panel;
         }
         // Stacked bands and an open panel yield before the terminal does, on
         // the same three-row floor a pinned Beads board reserves.
-        let viewport = self.pane_viewport();
         let floor = self.font.line_height * 3.0;
         for (workspace_id, rect) in self.shell.workspace_rects(viewport, cx) {
             if let Some(strip) = strips.get_mut(&workspace_id) {
@@ -12947,8 +12997,9 @@ impl TerminalView {
         let mut offsets: HashMap<WorkspaceId, f32> = HashMap::new();
         self.visible_ci_runs
             .iter()
-            .filter_map(|(workspace_id, repo_root, state, details)| {
-                let model = CiBarModel::build(state, now, self.shared.ci_owner_controls);
+            .zip(&self.ci_band_frames)
+            .filter_map(|((workspace_id, repo_root, state, details), frame)| {
+                let CiBandFrame { model, layout } = frame;
                 let (open_id, dismiss_id) = ci_action_ids(*workspace_id, &state.head_sha);
                 let (toggle_focus, open_focus, dismiss_focus) = self
                     .ci_action_focus
@@ -12959,26 +13010,14 @@ impl TerminalView {
                     .ci_expanded
                     .get(workspace_id)
                     .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
-                let height = ci_bar::CI_BAR_HEIGHT
+                let height = layout.height()
                     + if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
                 let offset = offsets.entry(*workspace_id).or_default();
                 let rect = self.ci_run_rect(*workspace_id, (*offset, height), cx);
                 *offset += height;
                 let rect = rect?;
-                let trace_now = if state.stale {
-                    state
-                        .workflows
-                        .iter()
-                        .filter_map(|workflow| workflow.updated_at_epoch_secs)
-                        .max()
-                        .unwrap_or(now)
-                } else {
-                    now
-                };
-                let trace = expanded
-                    .then_some(details.as_ref())
-                    .flatten()
-                    .map(|details| ci_bar::CiTraceModel::build(details, trace_now, state.stale));
+                let trace =
+                    expanded.then(|| ci_trace_model(state, details.as_ref(), now)).flatten();
                 let on_open = model.open_url.clone().map(Self::ci_open_handler);
                 let on_dismiss = self
                     .shared
@@ -12991,7 +13030,7 @@ impl TerminalView {
                     cx,
                 );
                 Some(ci_bar::render(
-                    &model,
+                    model,
                     &colors,
                     ci_bar::CiBarRender {
                         id: gpui::ElementId::Name(
@@ -13003,6 +13042,8 @@ impl TerminalView {
                         open_id,
                         dismiss_id,
                         rect,
+                        layout: *layout,
+                        font_family: self.font.family.clone(),
                         accent: self.region_accent(*workspace_id, cx),
                         animations,
                         expanded,
@@ -13571,7 +13612,7 @@ impl Render for TerminalView {
         self.sync_remote_connect();
         self.reconcile_panes(cx);
         self.sync_equalize_visibility(cx);
-        self.sync_ci_run_strips(cx);
+        self.sync_ci_run_strips(window, cx);
         self.sync_beads_board_strips(cx);
         self.sync_lane_tab_focus(window, cx);
         self.sync_row_focus(cx);

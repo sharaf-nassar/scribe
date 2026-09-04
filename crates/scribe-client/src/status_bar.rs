@@ -61,10 +61,13 @@ const FALLBACK_MAGENTA: [f32; 4] = [0.75, 0.55, 1.0, 1.0];
 /// Fallback cyan when ANSI index 6 is unavailable.
 const FALLBACK_CYAN: [f32; 4] = [0.45, 0.8, 1.0, 1.0];
 
-/// Number of sparkline bars for CPU and GPU displays.
-const CPU_SPARK_WIDTH: usize = 8;
-/// Number of sparkline bars for network displays.
-const NET_SPARK_WIDTH: usize = 4;
+/// Number of sparkline bars for CPU and GPU displays. Must match
+/// `sys_stats::CPU_HISTORY_CAP`, which is what fills them: at the sampler's
+/// 2s refresh this is 32s of history.
+const CPU_SPARK_WIDTH: usize = 16;
+/// Number of sparkline bars for network displays. Must match
+/// `sys_stats::NET_HISTORY_CAP`; 16s of history.
+const NET_SPARK_WIDTH: usize = 8;
 /// Network sparklines saturate at 100 MB/s.
 const NET_SPARK_MAX_BYTES_PER_SEC: u64 = 100_000_000;
 
@@ -1655,8 +1658,10 @@ mod tests {
         assert!((reference.text - 14.0).abs() < 1e-6);
         assert!((reference.readout - 16.0).abs() < 1e-6);
         assert!((reference.graph_height - 22.0).abs() < 1e-6);
-        // 8 bars of 5px with 2px gaps.
-        assert!((reference.graph_width(8) - 54.0).abs() < 1e-6);
+        // 16 bars of 5px with 2px gaps; the graph's length is set by the
+        // sample count, never by the band's height.
+        assert!((reference.graph_width(CPU_SPARK_WIDTH) - 110.0).abs() < 1e-6);
+        assert!((reference.graph_width(NET_SPARK_WIDTH) - 54.0).abs() < 1e-6);
         assert!(reference.graph_width(0).abs() < 1e-6);
         // Every band that can hold the chip renders it at the reference
         // sizes: the design is not a 36px-only layout with miniatures
@@ -1824,13 +1829,14 @@ mod tests {
         // the 2 real samples in the CPU hue, between the label and readout.
         let SpanKind::Graph(bars) = &spans[1].kind else { panic!("cpu graph span") };
         assert_eq!(bars.len(), CPU_SPARK_WIDTH);
-        for pad in &bars[..6] {
+        let samples = CPU_SPARK_WIDTH - 2;
+        for pad in &bars[..samples] {
             assert!(pad.level.abs() < 1e-6);
             crate::assert_rgba_eq(pad.color, colors.label);
         }
-        assert!((bars[6].level - 0.1).abs() < 1e-6);
-        assert!((bars[7].level - 0.2).abs() < 1e-6);
-        for sample in &bars[6..] {
+        assert!((bars[samples].level - 0.1).abs() < 1e-6);
+        assert!((bars[samples + 1].level - 0.2).abs() < 1e-6);
+        for sample in &bars[samples..] {
             crate::assert_rgba_eq(sample.color, with_alpha(colors.stat_cpu, 0.72));
         }
         assert_eq!(spans[0].kind, SpanKind::Label);

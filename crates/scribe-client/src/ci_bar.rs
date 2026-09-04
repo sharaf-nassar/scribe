@@ -8,8 +8,8 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, ElementId, FocusHandle, MouseButton, Rgba, Role, Window,
-    div, linear_color_stop, linear_gradient, prelude::*, px, relative,
+    Animation, AnimationExt as _, App, ElementId, FocusHandle, Font, MouseButton, Rgba, Role,
+    TextRun, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 use scribe_common::{
     protocol::{
@@ -23,8 +23,27 @@ use crate::{
     animation::AnimationSettings, button::stop_activation_key, layout::Rect, opacity::scale_slot,
 };
 
-/// Fixed height of the collapsed workspace-region band.
+/// Height of a single-row collapsed band. Every further cell row adds
+/// [`CI_BAR_ROW_HEIGHT`], so a crowded run wraps instead of overlapping.
 pub const CI_BAR_HEIGHT: f32 = 40.0;
+/// Pitch of one wrapped cell row: [`CELL_HEIGHT`] plus a [`CELL_ROW_GAP`].
+pub const CI_BAR_ROW_HEIGHT: f32 = 28.0;
+/// Band edge padding and the gap between its three clusters.
+const BAND_PADDING: f32 = 14.0;
+const BAND_GAP: f32 = 18.0;
+/// Column gap between cells, and the gutter between wrapped rows.
+const CELL_GAP: f32 = 18.0;
+const CELL_ROW_GAP: f32 = CI_BAR_ROW_HEIGHT - CELL_HEIGHT;
+/// Name row over its track: 11px name, 5px gap, 3px track.
+const CELL_HEIGHT: f32 = 19.0;
+/// Columns never shrink below the mock's 72px, and one long name cannot
+/// force a single column past 200px: past that it truncates instead.
+const CELL_MIN_WIDTH: f32 = 72.0;
+const CELL_MAX_WIDTH: f32 = 200.0;
+/// The live mark and its gap, so an active name has room to lead with it.
+const LIVE_DOT_WIDTH: f32 = 11.0;
+/// A branch label truncates past this so it cannot squeeze the cells out.
+const BRANCH_MAX_WIDTH: f32 = 160.0;
 /// Fixed panel chrome plus one 26px row per returned job.
 pub const CI_TRACE_BASE_HEIGHT: f32 = 38.0;
 pub const CI_TRACE_ROW_HEIGHT: f32 = 26.0;
@@ -245,6 +264,99 @@ impl CiBarModel {
             accessibility_label,
         }
     }
+
+    /// Every slot the cell grid seats: the cells plus the `+N` counter when
+    /// workflows were elided.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.cells.len() + usize::from(self.hidden_cells > 0)
+    }
+
+    /// The `@ sha · elapsed` suffix painted after the branch.
+    fn ref_suffix(&self) -> String {
+        format!(" @ {} · {}", self.short_sha, self.elapsed)
+    }
+}
+
+/// How the collapsed cells fill their band: `columns` equal-width slots per
+/// row, over `rows` rows. Measured once per frame so the strip a region
+/// reserves and the band it paints agree on the row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CiBandLayout {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+impl CiBandLayout {
+    /// Seat `slots` cells of `slot_width` in `available`: as many columns as
+    /// fit decide the row count, then the slots spread evenly over those rows
+    /// so a wrapped band reads as a balanced grid rather than one orphan cell
+    /// under a full row. A band too narrow for one cell keeps one column and
+    /// lets names truncate rather than overlap.
+    #[must_use]
+    pub fn fit(slots: usize, available: f32, slot_width: f32) -> Self {
+        let slots = u16::try_from(slots).unwrap_or(u16::MAX);
+        let mut fit: u16 = 1;
+        while fit < slots && f32::from(fit + 1) * (slot_width + CELL_GAP) - CELL_GAP <= available {
+            fit += 1;
+        }
+        let rows = slots.div_ceil(fit).max(1);
+        Self { columns: slots.div_ceil(rows).max(1), rows }
+    }
+
+    /// One row keeps the approved 40px band; each further row adds its pitch.
+    #[must_use]
+    pub fn height(self) -> f32 {
+        f32::from(self.rows.saturating_sub(1)).mul_add(CI_BAR_ROW_HEIGHT, CI_BAR_HEIGHT)
+    }
+}
+
+/// Fit `model`'s cells to a `band_width` band, shaping every label in the
+/// face and size the band paints it at, so the reserved row count is the
+/// painted one. Mirrors [`collapsed_band`]'s padding and gaps, the state and
+/// metadata clusters, and the action chrome exactly.
+#[must_use]
+pub fn measure_layout(
+    model: &CiBarModel,
+    font_family: &str,
+    band_width: f32,
+    window: &Window,
+) -> CiBandLayout {
+    let width = |text: &str, size: f32| text_width(text, font_family, size, window);
+    let state = width(model.state_glyph, 12.5) + 8.0 + width(model.state_word, 12.5);
+    let actions = match model.action_mode {
+        // 1px rule + 9px margin, then two 9px-padded buttons with 3px gaps.
+        CiActionMode::Owner => {
+            10.0 + 3.0 + 18.0 + width("open ↗", 11.5) + 3.0 + 18.0 + width("✕", 11.5)
+        }
+        // A 1px-bordered, 10px-padded chip.
+        CiActionMode::ReadOnly => 22.0 + width("viewing · read-only", 11.0),
+    };
+    let metadata = width(&model.branch, 11.5).min(BRANCH_MAX_WIDTH)
+        + width(&model.ref_suffix(), 11.5)
+        + 12.0
+        + actions;
+    let available = band_width - 2.0 * BAND_PADDING - state - BAND_GAP - metadata - BAND_GAP;
+    let longest = model.cells.iter().map(|cell| width(&cell.name, 10.5)).fold(0.0, f32::max);
+    let slot_width = (longest + LIVE_DOT_WIDTH).clamp(CELL_MIN_WIDTH, CELL_MAX_WIDTH);
+    CiBandLayout::fit(model.slots(), available, slot_width)
+}
+
+/// Shape `text` in the band's face at `font_size` pixels. The family is the
+/// terminal font, never the generic `monospace`, which cosmic-text does not
+/// know and would replace with a proportional sans fallback.
+fn text_width(text: &str, font_family: &str, font_size: f32, window: &Window) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: Font { family: font_family.to_owned().into(), ..Font::default() },
+        ..TextRun::default()
+    };
+    f32::from(
+        window.text_system().shape_line(text.to_owned().into(), px(font_size), &[run], None).width,
+    )
 }
 
 /// One time-positioned row in the expanded trace panel.
@@ -492,6 +604,10 @@ pub struct CiBarRender {
     pub open_id: ElementId,
     pub dismiss_id: ElementId,
     pub rect: Rect,
+    /// Cell rows and columns measured against `rect.width` by [`measure_layout`].
+    pub layout: CiBandLayout,
+    /// The terminal face the band shapes in; `"monospace"` is not a real one.
+    pub font_family: String,
     pub accent: [f32; 4],
     pub animations: AnimationSettings,
     pub expanded: bool,
@@ -524,26 +640,42 @@ pub fn render(model: &CiBarModel, colors: &CiBarColors, render: CiBarRender) -> 
         .into_any_element()
 }
 
-fn collapsed_cells(model: &CiBarModel, colors: &CiBarColors) -> gpui::AnyElement {
+/// The cell cluster as a `columns`-wide grid: every slot takes an equal share
+/// of the row, so tracks align down the band and a wrapped run reads as a
+/// table of workflows rather than a ragged line.
+fn collapsed_cells(
+    model: &CiBarModel,
+    layout: CiBandLayout,
+    colors: &CiBarColors,
+) -> gpui::AnyElement {
     let trace_cells = model
         .cells
         .iter()
         .enumerate()
         .map(|(index, cell)| trace_cell(cell, model.motion, index, colors));
     div()
-        .flex()
+        .grid()
+        .grid_cols(layout.columns)
         .flex_1()
-        .min_w(px(220.0))
-        .items_center()
-        .gap(px(18.0))
+        .min_w(px(0.0))
+        .gap_x(px(CELL_GAP))
+        .gap_y(px(CELL_ROW_GAP))
         .children(trace_cells)
-        .children((model.hidden_cells > 0).then(|| {
-            div()
-                .flex_none()
-                .text_size(px(10.5))
-                .text_color(rgba(colors.muted))
-                .child(format!("+{}", model.hidden_cells))
-        }))
+        .children((model.hidden_cells > 0).then(|| hidden_counter(model.hidden_cells, colors)))
+        .into_any_element()
+}
+
+/// The `+N` slot: sits on the name line of its row, like the cell it stands
+/// in for, and states what it hides so a crowded run is never silently short.
+fn hidden_counter(hidden: usize, colors: &CiBarColors) -> gpui::AnyElement {
+    div()
+        .h(px(CELL_HEIGHT))
+        .flex()
+        .items_start()
+        .text_size(px(10.5))
+        .line_height(px(11.0))
+        .text_color(rgba(colors.muted))
+        .child(format!("+{hidden} more"))
         .into_any_element()
 }
 
@@ -563,8 +695,14 @@ fn collapsed_metadata(
             div()
                 .flex()
                 .items_center()
-                .child(div().text_color(rgba(colors.text)).child(model.branch.clone()))
-                .child(format!(" @ {} · {}", model.short_sha, model.elapsed)),
+                .child(
+                    div()
+                        .max_w(px(BRANCH_MAX_WIDTH))
+                        .truncate()
+                        .text_color(rgba(colors.text))
+                        .child(model.branch.clone()),
+                )
+                .child(model.ref_suffix()),
         )
         .child(action_cluster(
             model.action_mode,
@@ -609,7 +747,7 @@ fn collapsed_toggle(
             toggle_click(window, cx);
         })
         .child(state_summary(model, tone_color(model.tone, colors)))
-        .child(collapsed_cells(model, colors))
+        .child(collapsed_cells(model, render.layout, colors))
         .into_any_element()
 }
 
@@ -620,15 +758,15 @@ fn collapsed_band(
 ) -> gpui::AnyElement {
     div()
         .relative()
-        .h(px(CI_BAR_HEIGHT))
+        .h(px(render.layout.height()))
         .flex()
         .items_center()
-        .gap(px(18.0))
-        .px(px(14.0))
+        .gap(px(BAND_GAP))
+        .px(px(BAND_PADDING))
         .bg(rgba(colors.background))
         .border_b_1()
         .border_color(rgba(underline_color(model.tone, colors, render.accent)))
-        .font_family("monospace")
+        .font_family(render.font_family.clone())
         .text_size(px(12.5))
         .text_color(rgba(colors.text))
         .child(collapsed_toggle(model, colors, render))
@@ -863,11 +1001,11 @@ fn trace_cell(
         .text_size(px(10.5))
         .text_color(rgba(name_color))
         .children(active.then(|| live_dot(index, colors.running, motion)))
-        .child(cell.name.clone());
+        .child(div().min_w(px(0.0)).truncate().child(cell.name.clone()));
     div()
+        .h(px(CELL_HEIGHT))
+        .min_w(px(0.0))
         .flex()
-        .flex_1()
-        .min_w(px(72.0))
         .flex_col()
         .gap(px(5.0))
         .child(name)
@@ -1038,7 +1176,10 @@ mod tests {
         CiWorkflowRun, CiWorkflowStatus,
     };
 
-    use super::{CiActionMode, CiBarColors, CiBarModel, CiRunBars, CiTraceModel, TraceCellKind};
+    use super::{
+        CI_BAR_HEIGHT, CI_BAR_ROW_HEIGHT, CiActionMode, CiBandLayout, CiBarColors, CiBarModel,
+        CiRunBars, CiTraceModel, TraceCellKind,
+    };
 
     fn workflow(
         run_id: u64,
@@ -1217,6 +1358,38 @@ mod tests {
             ["broken", "live"]
         );
         assert_eq!(model.hidden_cells, 7);
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Crowded cells wrap onto balanced rows]]
+    #[test]
+    fn crowded_cells_wrap_onto_balanced_rows() {
+        // Six 90px cells with 18px gaps need 630px; a 400px band fits four.
+        let roomy = CiBandLayout::fit(6, 700.0, 90.0);
+        assert_eq!((roomy.columns, roomy.rows), (6, 1));
+        assert!((roomy.height() - CI_BAR_HEIGHT).abs() < f32::EPSILON);
+
+        let wrapped = CiBandLayout::fit(6, 400.0, 90.0);
+        assert_eq!((wrapped.columns, wrapped.rows), (3, 2), "4+2 rebalances to 3+3");
+        assert!((wrapped.height() - (CI_BAR_HEIGHT + CI_BAR_ROW_HEIGHT)).abs() < f32::EPSILON);
+
+        let stacked = CiBandLayout::fit(5, 100.0, 90.0);
+        assert_eq!((stacked.columns, stacked.rows), (1, 5));
+
+        let squeezed = CiBandLayout::fit(3, 0.0, 90.0);
+        assert_eq!((squeezed.columns, squeezed.rows), (1, 3), "no room still yields one column");
+
+        let empty = CiBandLayout::fit(0, 400.0, 90.0);
+        assert_eq!((empty.columns, empty.rows), (1, 1));
+
+        let mut run = state(CiRunStatus::Running, false);
+        run.workflows = (0..9)
+            .map(|id| {
+                workflow(id, "done", CiWorkflowStatus::Completed, Some(CiRunConclusion::Success))
+            })
+            .collect();
+        run.workflows.push(workflow(90, "live", CiWorkflowStatus::InProgress, None));
+        let model = CiBarModel::build(&run, 220, true);
+        assert_eq!(model.slots(), 2, "the +N counter takes a slot beside the kept cell");
     }
 
     // @lat: [[test#GPUI CI Run Bar#Theme drives every band color]]

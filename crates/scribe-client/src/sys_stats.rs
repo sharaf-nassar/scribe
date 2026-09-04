@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
 
 /// Maximum number of CPU/GPU history entries.
-const CPU_HISTORY_CAP: usize = 8;
+const CPU_HISTORY_CAP: usize = 16;
 
 /// Maximum number of network history entries.
-const NET_HISTORY_CAP: usize = 4;
+const NET_HISTORY_CAP: usize = 8;
 
 /// Minimum elapsed time between refreshes.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
