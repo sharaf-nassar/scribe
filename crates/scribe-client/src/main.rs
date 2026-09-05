@@ -19063,19 +19063,7 @@ mod tests {
         let mut registry = session_lifecycle::SessionRegistry::new();
         let workspace = WorkspaceId::new();
         let session = SessionId::new();
-        let mut launch = SessionLaunch {
-            workspace_id: workspace,
-            cwd: None,
-            size: TerminalSize::default(),
-            command: None,
-            ai_launch: Some(scribe_common::protocol::AiLaunchSpec {
-                provider: AiProvider::Pi,
-                resume_mode: AiResumeMode::New,
-                conversation_id: None,
-            }),
-            shell_tool: None,
-            launch_id: "origin-test".into(),
-        };
+        let mut launch = suspend_test_launch(workspace, true);
         ctx.sink.create_session(launch.clone()).unwrap();
         dispatch_server_message(
             ServerMessage::SessionCreated {
