@@ -1868,6 +1868,21 @@ classifier, and an error stop reports `error` instead.
 The three context readings — 49.6, 100.6, and -4.8 — prove rounding and the
 0-100 clamp.
 
+### Background subagent activity
+
+A settled parent stays Processing while background subagents run, using the
+owner's version-1 fleet count rather than counting lifecycle events.
+
+The harness requires read-only status requests, coalesces event bursts, and
+verifies that active work starts no polling timer. Questionnaire waits take
+precedence over fleet changes, and an empty fleet cannot stop a parent that
+resumed processing. Once both parent and fleet settle, the retained assistant
+message reaches the normal stop classifier, or the latest error is restored.
+
+The ready event and a reloaded adapter's startup restore already-running work.
+Late replies and malformed fleet snapshots cannot change state, and shutdown
+removes liveness listeners so pending replies or later events emit nothing.
+
 ### Malformed messages and no polling
 
 A null message and a message whose content array holds junk are both absorbed
@@ -2860,13 +2875,13 @@ A single-line paste carrying an escape byte paints the confirmation and remains 
 
 ### Overlay actions run for real
 
-`tests/e2e/visual/overlay-actions.sh` is the scripted oracle for : it asserts the *effect* of a chosen palette or context-menu row, which no headless test over the overlay models can reach.
+`tests/e2e/visual/overlay-actions.sh` verifies that real palette and context-menu choices have observable effects, and that blank-grid menus contain no extra demo row.
 
-The overlay models passed their unit suites the whole time the shell was dropping their events, so a green `#[gpui::test]` proves nothing about reachability here. The script instead drives the live window once per action class. It right-clicks the grid and clicks the smart-selection row, then asserts the row's exact payload lands on the session's PTY (`scribe-test wait-output`) AND that the echoed command and the shell's answer appear as new lit pixels — the first names the bytes, the second proves they also reached the window on screen. It opens the palette, filters to "New Tab", confirms, and waits for a new `opened a new tab` line, which the client only ever writes after `CreateSession` comes back as `SessionCreated`. Finally it confirms "Open Settings", the palette's one row whose destination is a different top-level window, and requires both the client's `opened the settings window` line and a mapped X11 window named "Scribe Settings"; the full entry-point matrix lives in .
+The script right-clicks blank grid and requires no rendered text in the row below Copy / Paste / Select All. This catches the former unconditional demo row through the actual window, not just the pure menu model. It seeds the disposable X11 clipboard with a marker without a newline, clicks Paste, and requires both the exact PTY echo (`scribe-test wait-output`) and new lit pixels in the pane. Test data belongs in the test clipboard, never in production menu assembly.
 
-The context-menu row is clicked at a pixel offset calibrated against the captured frame, so a layout change to the menu box shows up as a failing phase rather than a silent miss.
+For [[client#GPUI Overlays#Overlay Action Routing]], the script also confirms the palette's "New Tab" row and waits for `opened a new tab`, which follows a real `CreateSession` / `SessionCreated` round trip. "Open Settings" must produce both `opened the settings window` and a mapped X11 window named "Scribe Settings".
 
-It runs on the . The script used to open with a phase 0 that killed the client, ran `scribe-test daemon stop` to release the window ownership hiding the session, and relaunched — the only way to get a pane in front of the camera before that rig existed, and one that cost every server-side assertion because `wait-output` needs the daemon it had just stopped. That preamble is gone; phase 0 now only confirms the shared pane is painted before any action is driven at it.
+The shared-pane rig keeps `scribe-test` and the client attached to the same session. Phase 0 confirms that pane is painted; menu coordinates are calibrated against the captured frame so a layout change fails rather than silently missing the target.
 
 ### In-app settings entry points
 

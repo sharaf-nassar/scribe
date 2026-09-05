@@ -410,13 +410,6 @@ const TOAST_ENTRANCE: Duration = Duration::from_millis(150);
 /// columns the padding consumed.
 const PANE_CONTENT_PADDING: f32 = 10.0;
 
-/// Label of the demo smart-selection row in the right-click context menu.
-const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
-
-/// Text the demo smart-selection row types into the attached pane. Chosen to be
-/// a harmless, greppable marker so the scripted E2E can assert the click
-/// actually reached the PTY.
-const DEMO_SMART_ACTION_TEXT: &str = "scribe-context-menu";
 const CELL_WIDTH: u16 = 8;
 const CELL_HEIGHT: u16 = 18;
 
@@ -10662,27 +10655,13 @@ impl TerminalView {
         }
     }
 
-    /// Open the right-click context menu at `position` with a representative item
-    /// set (selection + OSC 8 URL + one smart-selection row), subscribing so a
-    /// choice runs through [`Self::dispatch_context_menu_action`] and a dismiss
-    /// closes the overlay.
-    ///
-    /// The smart-selection row is a demo stand-in until the rule engine is on a
-    /// live path: it is the menu's one entry whose effect lands in the attached
-    /// pane, so the scripted E2E can assert that a clicked row actually reached
-    /// the PTY rather than only that the overlay closed.
+    /// Open the right-click menu from the current selection and the cell under
+    /// `position`. A choice runs through [`Self::dispatch_context_menu_action`];
+    /// dismissing closes the overlay.
     fn open_context_menu(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
         self.command_palette = None;
         let colors = ContextMenuColors::from(&self.chrome);
-        // The demo row stays first so the fixed-offset row assertions in the
-        // overlay E2E keep addressing the same row; the live smart-selection
-        // rows for the cell under the pointer are appended after it.
-        let mut smart_actions = vec![MenuItem {
-            label: DEMO_SMART_ACTION_LABEL.to_owned(),
-            action: ContextMenuAction::SendText(format!("{DEMO_SMART_ACTION_TEXT}\n")),
-            enabled: true,
-        }];
-        smart_actions.extend(self.smart_selection_rows(position));
+        let smart_actions = self.smart_selection_rows(position);
         // The open rows come from the same detector Ctrl+click uses, so the menu
         // can never offer to open something the pointer is not actually on — it
         // used to carry a hardcoded demo URI on every cell. No modifier is

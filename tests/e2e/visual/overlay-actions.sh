@@ -7,9 +7,9 @@
 # the payload. This test drives the real window and asserts the *effect* of a
 # chosen row, not that the overlay closed. One row per action class:
 #
-#   * a context-menu row that sends text reaches the attached pane, asserted on
-#     the session's PTY through `scribe-test` and again as new ink in the
-#     rendered grid;
+#   * the context menu has no demo row over blank grid, and its real Paste row
+#     reaches the attached pane, asserted on the session's PTY through
+#     `scribe-test` and again as new ink in the rendered grid;
 #   * a palette row that creates a tab produces a real server round trip,
 #     asserted through the client's own "opened a new tab" line, which the
 #     server only ever answers with after `CreateSession`;
@@ -43,26 +43,20 @@ CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 MENU_CLICK_X=300
 MENU_CLICK_Y=300
 
-# Offset of the last context-menu row ("Send Text: …") from the click point.
-# The box is anchored at the cursor with a 4px pad; above the last row sit the
-# three copy-head rows (31px each) and one divider (9px). The open rows are NOT
-# among them: this phase right-clicks blank grid, and "Open URL" / "Open File" /
-# "Copy hyperlink address" only appear over a cell that actually carries a link.
-# Calibrated against 01-context-menu-open.png — a menu layout change turns into
-# a failing phase here rather than a silent miss.
-MENU_ROW_SEND_DY=122
+# The box is anchored at the cursor with a 4px pad and 31px rows. Paste is
+# the second row. Blank grid must have only Copy / Paste / Select All, with
+# no extra row below the head. Coordinates match 01-context-menu-open.png.
+MENU_ROW_PASTE_DY=50
+MENU_HEAD_BOTTOM_DY=104
 MENU_ROW_DX=60
 
-# Extra lit pixels the echoed command must add to the grid. The row types
-# "scribe-context-menu" and the shell answers "command not found", together far
-# more than this; an unrouted click leaves the grid byte-identical.
+# Extra lit pixels the pasted text must add to the grid. An unrouted click
+# leaves the grid byte-identical.
 INK_DELTA_MIN="${INK_DELTA_MIN:-200}"
 
-# The exact text the demo "Send Text: …" row types into the focused pane
-# (DEMO_SMART_ACTION_TEXT in crates/scribe-client/src/main.rs). Asserted
-# on the PTY through `scribe-test`, which the shared-pane rig keeps attached to
-# the same session the client renders.
-SEND_TEXT_ROW_PAYLOAD="scribe-context-menu"
+# Test data belongs in the container's clipboard, never in the app's menu.
+# No newline: verify the shell's echo without submitting a command.
+PASTE_ROW_PAYLOAD="scribe-context-menu-paste"
 
 WIN_X=0
 WIN_Y=0
@@ -188,22 +182,30 @@ echo "PHASE 0 PASS: client attached to session $SESSION (grid ink $BASE_INK)"
 # ── Phase 1: the right-click menu opens over the grid ─────────────
 click_at "$MENU_CLICK_X" "$MENU_CLICK_Y" 3
 shot /output/01-context-menu-open.png
-echo "PHASE 1 PASS: right-click opened the context menu at the cursor"
+EXTRA_ROW_INK=$(convert /output/01-context-menu-open.png \
+    -crop "160x31+$(( WIN_X + MENU_CLICK_X ))+$(( WIN_Y + MENU_CLICK_Y + MENU_HEAD_BOTTOM_DY ))" \
+    +repage -colorspace Gray -threshold 35% -format "%[fx:mean*w*h]" info:)
+if [ "${EXTRA_ROW_INK%.*}" -ne 0 ]; then
+    fail "PHASE 1 FAIL: blank-grid context menu contains an extra row"
+fi
+echo "PHASE 1 PASS: blank-grid context menu has no extra row"
 
 # ── Phase 2: a context-menu row reaches the attached pane ─────────
-# The clicked row sends text to the focused pane. The shell echoes it and
-# answers, so a routed click shows up as new ink in the grid; a dropped one
-# leaves the pane exactly as phase 0 captured it.
+# Seed the disposable X11 clipboard and click the real Paste row. The shell's
+# echo shows up as new ink in the grid; a dropped action leaves the pane as
+# phase 0 captured it.
 #
 # Both halves are asserted. The PTY assertion is the precise one — it names the
 # exact bytes the row is supposed to have sent, through the daemon that the
 # shared-pane rig keeps attached alongside the client — and the ink delta is
 # what proves those bytes also reached the window on screen rather than only the
 # server.
+printf '%s' "$PASTE_ROW_PAYLOAD" | xclip -selection clipboard >/dev/null 2>&1
+sleep 0.3
 click_at "$(( MENU_CLICK_X + MENU_ROW_DX ))" \
-    "$(( MENU_CLICK_Y + MENU_ROW_SEND_DY ))" 1
-if ! scribe-test wait-output "$SESSION" "$SEND_TEXT_ROW_PAYLOAD" >/dev/null 2>&1; then
-    fail "PHASE 2 FAIL: '$SEND_TEXT_ROW_PAYLOAD' never reached the session's PTY"
+    "$(( MENU_CLICK_Y + MENU_ROW_PASTE_DY ))" 1
+if ! scribe-test wait-output "$SESSION" "$PASTE_ROW_PAYLOAD" >/dev/null 2>&1; then
+    fail "PHASE 2 FAIL: '$PASTE_ROW_PAYLOAD' never reached the session's PTY"
 fi
 sleep 1.0
 shot /output/02-context-menu-dispatched.png
@@ -212,7 +214,7 @@ DELTA=$(( AFTER_INK - BASE_INK ))
 if [ "$DELTA" -lt "$INK_DELTA_MIN" ]; then
     fail "PHASE 2 FAIL: the clicked row changed the pane by $DELTA px (min $INK_DELTA_MIN)"
 fi
-echo "PHASE 2 PASS: the clicked row typed into the attached pane (PTY echo + $DELTA px)"
+echo "PHASE 2 PASS: Paste reached the attached pane (PTY echo + $DELTA px)"
 
 # ── Phase 3: a palette row creates a real session ─────────────────
 # Confirming "New Tab" has to reach `CreateSession` on the wire and come back

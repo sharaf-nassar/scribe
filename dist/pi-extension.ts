@@ -2,6 +2,7 @@
 // Scribe lifecycle adapter for Pi. Installed at user scope by Scribe.
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const REGISTRATION = Symbol.for("scribe.pi.lifecycle-extension");
@@ -354,12 +355,74 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   let latestError = false;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
+  let parentState: { event: "state_changed" | "session_stopped"; payload: Payload } = {
+    event: "state_changed", payload: { state: "idle_prompt" },
+  };
+  let askingUser = false;
+  let subagentsRunning = false;
+  let refreshQueued = false;
+  let unsubscribeSubagentStatus: (() => void) | undefined;
+
+  function reportState() {
+    if (askingUser) enqueue("state_changed", { state: "waiting_for_input" });
+    else if (subagentsRunning) enqueue("state_changed", { state: "processing" });
+    else enqueue(parentState.event, parentState.payload);
+  }
+
+  function setParentState(event: typeof parentState.event, payload: Payload) {
+    parentState = { event, payload };
+    reportState();
+  }
+
+  // Ask the optional pi-subagents owner for its current-session projection.
+  // Events only invalidate it: counting start/complete edges loses restored
+  // workflows and detached foreground work.
+  function refreshSubagents() {
+    unsubscribeSubagentStatus?.();
+    unsubscribeSubagentStatus = undefined;
+    if (shuttingDown || refreshQueued) return;
+    refreshQueued = true;
+    queueMicrotask(() => {
+      refreshQueued = false;
+      if (shuttingDown) return;
+      const requestId = randomUUID();
+      unsubscribeSubagentStatus = pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (payload) => {
+        unsubscribeSubagentStatus?.();
+        unsubscribeSubagentStatus = undefined;
+        const reply = payload as {
+          version?: unknown;
+          requestId?: unknown;
+          success?: unknown;
+          data?: { fleet?: { version?: unknown; totalActive?: unknown } };
+        } | undefined;
+        const fleet = reply?.data?.fleet;
+        if (
+          reply?.version !== 1 || reply.requestId !== requestId || reply.success !== true ||
+          fleet?.version !== 1 || typeof fleet.totalActive !== "number" ||
+          !Number.isSafeInteger(fleet.totalActive) || fleet.totalActive < 0
+        ) return;
+        const running = fleet.totalActive > 0;
+        if (subagentsRunning === running) return;
+        subagentsRunning = running;
+        reportState();
+      });
+      pi.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method: "status" });
+    });
+  }
+
+  const unsubscribeSubagents = [
+    "subagents:rpc:v1:ready",
+    "subagent:async-started",
+    "subagent:async-complete",
+    "subagent:foreground-complete",
+    "subagent:process-terminal",
+    "subagent:child-status",
+  ].map((event) => pi.events.on(event, refreshSubagents));
 
   const unsubscribeAskUserBlocked = pi.events.on(ASK_USER_BLOCKED_EVENT, (payload) => {
     if (!payload || typeof payload !== "object" || typeof (payload as { active?: unknown }).active !== "boolean") return;
-    enqueue("state_changed", {
-      state: (payload as { active: boolean }).active ? "waiting_for_input" : "processing",
-    });
+    askingUser = (payload as { active: boolean }).active;
+    reportState();
   });
 
   function invoke(event: EventName, payload: Payload): Promise<void> {
@@ -420,7 +483,8 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     latestAssistant = "";
     latestError = false;
     enqueue("task_label_cleared");
-    enqueue("state_changed", { state: "idle_prompt" });
+    setParentState("state_changed", { state: "idle_prompt" });
+    refreshSubagents();
   });
 
   pi.on("input", (event) => {
@@ -428,7 +492,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     capturedInputs += 1;
     latestAssistant = "";
     latestError = false;
-    enqueue("state_changed", { state: "processing" });
+    setParentState("state_changed", { state: "processing" });
     if (typeof event.text === "string" && event.text) {
       enqueue("prompt_received", { text: event.text });
       const label = taskLabel(event.text);
@@ -439,7 +503,11 @@ export default function scribePiExtension(pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     if (capturedInputs > 0) capturedInputs -= 1;
-    else enqueue("state_changed", { state: "processing" });
+    else setParentState("state_changed", { state: "processing" });
+  });
+
+  pi.on("tool_result", (event) => {
+    if (event.toolName === "subagent") refreshSubagents();
   });
 
   pi.on("message_end", (event) => {
@@ -454,8 +522,9 @@ export default function scribePiExtension(pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     capturedInputs = 0;
-    if (latestError) enqueue("state_changed", { state: "error" });
-    else enqueue("session_stopped", { last_message: latestAssistant });
+    if (latestError) setParentState("state_changed", { state: "error" });
+    else setParentState("session_stopped", { last_message: latestAssistant });
+    refreshSubagents();
     const percent = contextPercent(ctx);
     if (percent !== undefined) enqueue("context_changed", { fill_percent: percent });
   });
@@ -479,6 +548,8 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     shutdownPromise ??= (async () => {
       shuttingDown = true;
       unsubscribeAskUserBlocked();
+      for (const unsubscribe of unsubscribeSubagents) unsubscribe();
+      unsubscribeSubagentStatus?.();
       generation += 1;
       pending = [];
       if (active) await active;

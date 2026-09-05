@@ -356,6 +356,154 @@ async function testRetryAndSettleBehavior() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Background subagent activity]]
+async function testBackgroundSubagentActivity() {
+  const logPath = join(tempDir, "subagents.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  const ctx = makeContext(10);
+  const requests = [];
+  let totalActive = 2;
+  let holdReplies = false;
+  const reply = (request, fleet = { version: 1, totalActive }) => {
+    api.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+      version: 1, requestId: request.requestId, success: true, data: { fleet },
+    });
+  };
+  api.events.on("subagents:rpc:v1:request", (request) => {
+    assert.equal(request.version, 1);
+    assert.equal(request.method, "status", "liveness must never launch or control work");
+    requests.push(request);
+    if (!holdReplies) queueMicrotask(() => reply(request));
+  });
+  extensionFactory(api);
+  const states = async () => parsedCalls(await starts(logPath))
+    .filter(({ event }) => event === "state_changed" || event === "session_stopped");
+  const processing = { event: "state_changed", payload: { state: "processing" } };
+  const waiting = { event: "state_changed", payload: { state: "waiting_for_input" } };
+  const stopped = { event: "session_stopped", payload: { last_message: "Research running." } };
+  const expectState = async (expected) => {
+    await waitFor(async () =>
+      JSON.stringify((await states()).at(-1)) === JSON.stringify(expected),
+    `expected subagent state ${JSON.stringify(expected)}`);
+  };
+  const refresh = async (event = "subagent:async-complete") => {
+    api.events.emit(event, {});
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  };
+
+  api.handler("input")({ type: "input", text: "Research this", source: "interactive" }, ctx);
+  api.handler("agent_start")({ type: "agent_start" }, ctx);
+  await refresh("subagent:async-started");
+  api.handler("message_end")({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "Research running." }], stopReason: "stop" },
+  }, ctx);
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await waitFor(async () => parsedCalls(await starts(logPath))
+    .some(({ event }) => event === "context_changed"), "settled context missing");
+  assert.deepEqual((await states()).at(-1), processing,
+    "settled parent must stay processing while background subagents run");
+  assert.ok(!(await states()).some(({ event }) => event === "session_stopped"));
+
+  // Counts come from the owner, not duplicate or foreign event payloads.
+  totalActive = 1;
+  await refresh();
+  await expectState(processing);
+  const beforeBurst = requests.length;
+  for (let index = 0; index < 100; index += 1) api.events.emit("subagent:child-status", {});
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(requests.length, beforeBurst + 1, "coalesce one synchronous event burst");
+  const beforeIdle = requests.length;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(requests.length, beforeIdle, "active work must not start a polling timer");
+
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: true });
+  await expectState(waiting);
+  totalActive = 0;
+  await refresh();
+  await expectState(waiting);
+  totalActive = 1;
+  await refresh("subagent:async-started");
+  await expectState(waiting);
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: false });
+  await expectState(processing);
+  totalActive = 0;
+  await refresh();
+  await expectState(stopped);
+
+  // An empty snapshot must not stop a parent that has resumed processing.
+  totalActive = 1;
+  await refresh("subagent:async-started");
+  await expectState(processing);
+  api.handler("agent_start")({ type: "agent_start" }, ctx);
+  totalActive = 0;
+  await refresh();
+  await expectState(processing);
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await expectState(stopped);
+
+  // Restore already-running work through ready, without a new launch event.
+  totalActive = 1;
+  await refresh("subagents:rpc:v1:ready");
+  await expectState(processing);
+  holdReplies = true;
+  await refresh();
+  const staleRequest = requests.at(-1);
+  await refresh();
+  reply(requests.at(-1), { version: 1, totalActive: 0 });
+  await expectState(stopped);
+  reply(staleRequest, { version: 1, totalActive: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual((await states()).at(-1), stopped, "late replies cannot revive old work");
+
+  for (const fleet of [null, {}, { version: 2, totalActive: 1 },
+    ...["1", -1, 0.5, NaN, Infinity].map((totalActive) => ({ version: 1, totalActive }))]) {
+    await refresh();
+    reply(requests.at(-1), fleet);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual((await states()).at(-1), stopped, "malformed snapshots must not change state");
+
+  holdReplies = false;
+  totalActive = 1;
+  await refresh("subagent:async-started");
+  api.handler("message_end")({
+    type: "message_end", message: { role: "assistant", content: [], stopReason: "error" },
+  }, ctx);
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await refresh();
+  assert.deepEqual((await states()).at(-1), processing);
+  totalActive = 0;
+  await refresh();
+  await expectState({ event: "state_changed", payload: { state: "error" } });
+
+  holdReplies = true;
+  await refresh();
+  const pendingRequest = requests.at(-1);
+  await shutdown(api, "reload");
+  const beforeShutdown = (await starts(logPath)).length;
+  reply(pendingRequest, { version: 1, totalActive: 1 });
+  await refresh("subagent:async-started");
+  assert.equal((await starts(logPath)).length, beforeShutdown, "shutdown must remove liveness listeners");
+  for (const [name, handlers] of api.events.handlers) {
+    if (name !== "subagents:rpc:v1:request") assert.equal(handlers.size, 0, `leaked ${name} listener`);
+  }
+
+  const reloaded = new FakeExtensionAPI();
+  reloaded.events.on("subagents:rpc:v1:request", (request) => {
+    reloaded.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+      version: 1, requestId: request.requestId, success: true,
+      data: { fleet: { version: 1, totalActive: 1 } },
+    });
+  });
+  extensionFactory(reloaded);
+  reloaded.handler("session_start")({ type: "session_start", reason: "reload" }, ctx);
+  await expectState(processing);
+  await shutdown(reloaded);
+  return starts(logPath);
+}
+
 // @lat: [[test#Test Harness#Pi Extension Harness#Malformed messages and no polling]]
 async function testMalformedMessagesAndNoPolling() {
   const logPath = join(tempDir, "malformed.jsonl");
@@ -653,6 +801,7 @@ try {
   allStarts.push(...await testInputSourcesAndOrder());
   allStarts.push(...await testSharedQuestionnaireWait());
   allStarts.push(...await testRetryAndSettleBehavior());
+  allStarts.push(...await testBackgroundSubagentActivity());
   allStarts.push(...await testMalformedMessagesAndNoPolling());
   allStarts.push(...await testIssueFocusedFromBdClaim());
   allStarts.push(...await testCallbacksDoNotAwaitHelper());

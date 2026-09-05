@@ -1159,11 +1159,35 @@ slot, so the successor load after a reload registers normally.
 
 The adapter also consumes the shared `rpiv:ask-user:blocked` event by its
 stable literal channel name, without importing the optional questionnaire
-package. Only an object payload with boolean `active` is accepted: `true` emits
-`state_changed { waiting_for_input }` and `false` emits `state_changed {
-processing }` through the same bounded serial queue. This records a real
-mid-tool human wait rather than inferring it from `tool_call`; malformed
-payloads emit nothing. The subscription is released during shutdown.
+package. Only an object payload with boolean `active` is accepted: `true`
+overrides the indicator with `state_changed { waiting_for_input }`; `false`
+restores Processing for ongoing work or the retained parent state otherwise.
+Both use the same bounded serial queue. This records a real mid-tool human
+wait rather than inferring it from `tool_call`; malformed payloads emit
+nothing. The subscription is released during shutdown.
+
+Background subagents outlive the parent's `agent_settled` edge. The adapter
+keeps that parent's state separately and reports Processing while
+pi-subagents' current-session fleet has active work. A questionnaire wait takes
+precedence over both. When the fleet becomes empty, the adapter restores the
+parent's latest state, which may still be Processing, an error, or a retained
+assistant message for stop classification.
+
+The optional integration uses Pi's shared event bus and pi-subagents' public
+version-1 `status` RPC. It consumes only `fleet.version` and `fleet.totalActive`,
+not child text, paths, or guessed start/completion counts. Startup, RPC-ready,
+subagent tool results, parent settling, and async/foreground completion,
+launch, process-terminal, and child-status events request fresh snapshots.
+Ready/startup also recovers work retained across reload. Microtasks coalesce
+synchronous event bursts and allow the owner to update its projection first.
+
+Only one reply listener is retained. A newer request removes the old listener,
+so late snapshots cannot restore stale work; shutdown removes all listeners
+and cancels queued refreshes. Absent pi-subagents or malformed/unsupported
+replies leave ordinary Pi lifecycle behavior intact. No polling, filesystem
+scanning, dependency import, or extra Scribe transport is added. The active
+work and race checks live in
+[[test#Test Harness#Pi Extension Harness#Background subagent activity]].
 
 Only documented Pi lifecycle events are used:
 
@@ -1181,11 +1205,13 @@ Only documented Pi lifecycle events are used:
   the text has to be held from the message that produced it.
   [[dist/pi-extension.ts#assistantText]] tolerates a malformed message by
   returning nothing rather than throwing into Pi's event loop.
-- `agent_settled` → `state_changed { error }` for an error stop, otherwise
+- `agent_settled` records `state_changed { error }` for an error stop, otherwise
   `session_stopped { last_message }` for the server's stop classifier to resolve
-  into `IdlePrompt` or `WaitingForInput`. [[dist/pi-extension.ts#contextPercent]]
-  then adds `context_changed` from `ctx.getContextUsage()`, rounded and clamped
-  to 0-100 so an out-of-range reading cannot paint an impossible gauge.
+  into `IdlePrompt` or `WaitingForInput`. Active background work or an open
+  questionnaire overrides emission until it ends.
+  [[dist/pi-extension.ts#contextPercent]] still adds `context_changed` from
+  `ctx.getContextUsage()`, rounded and clamped to 0-100 so an out-of-range
+  reading cannot paint an impossible gauge.
 - `session_shutdown` → a final `state_cleared` after the queue is retired.
 
 `PermissionPrompt` is never emitted. Pi exposes no documented permission event,
