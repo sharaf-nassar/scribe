@@ -5643,6 +5643,28 @@ Locks the  hook that decides whether this client claims a window of its own or j
 
 A full UUID (with or without surrounding whitespace) parses to that `WindowId`; empty, blank, non-UUID, and the short `Display` label (`win-1234abcd`) all yield `None`, which leaves explicit join intent false rather than failing the launch. The env read itself is not exercised — the workspace lints ban `set_var` — so the parser is called directly. Server coverage checks that a local connected-window claim assigns a different window without the bit and joins with it, while remote and takeover outcomes remain unchanged. Protocol coverage decodes a `Hello` missing the field as false.
 
+## Workspace Move Topology Adoption
+
+Reader-to-shell regressions distinguish authoritative workspace moves from cached reconnect echoes, preserving rendered regions and session reachability after a round trip.
+
+### Round trips restore every requested edge
+
+A headless GPUI regression returns a workspace at each of the four edges, both as a live arrival and after reconnect, while its tree remains in report history.
+
+The reader parks the returning inventory, the production adoption predicate accepts it, and the pane shell restores exactly two regions at the requested edge. Both tab roots and a split child retain their session IDs, the active tab remains selected, and selecting either tab restores the correct panes and focus. The regression fails with the old history-only predicate because the returning region remains absent.
+
+### Repeated swaps restore cached layouts
+
+Repeated live and reconnect swap inventories keep the region count fixed while replacing the workspace identity in one slot, even when both layouts appear in report history.
+
+The shell must render only the incoming workspace, retain the original split ratio, preserve the exact live session set, and allow the incoming tab to take focus.
+
+### Reconnect echoes and ownership changes stay distinct
+
+An authored reconnect echo preserves a used layout when all live workspace regions exist. An unused shell, unfamiliar tree, or missing region restores. A live tab re-file must adopt even when its layout is cached.
+
+Ordinary metadata refreshes, source-only departures, empty inventories, and absent trees return no parked replacement. This keeps those updates from clobbering a pending arrival before the foreground consumes it.
+
 ## GPUI Workspace Drag
 
 Pure tests in [[crates/scribe-client/src/workspace_drag.rs]] cover the complete client-local lifecycle and five-zone geometry without constructing a window.
@@ -5683,12 +5705,18 @@ pointer tear-out keeps source-collapse plus any exact atomic target report, and
 palette keeps its final exact target-leaf contract.
 
 `tests/e2e/visual/workspace-cross-window.sh`
-(`just e2e-visual-workspace-cross-window`) creates two live GPUI windows and
-keeps the text contract split at the right boundary: shared unit coverage pins
+(`just e2e-visual-workspace-cross-window`) waits for the initial mapped window,
+then creates its sibling. It keeps the text contract split at the right boundary: shared unit coverage pins
 the centre sentence and edge-text absence, while the visual recipe proves the
 palette's edge/swap rows and measured X11 pointer edge/swap reach the matching
-wire operations with no replacement session. It also holds sibling previews
-through Escape and blur, requiring no `MoveWorkspace` on either cancellation.
+wire operations with no replacement session. Two round trips return a workspace
+to its exact original layout while that layout is still cached by the destination.
+The moved session is focused by UUID before each palette action, avoiding
+wrapped directional focus selecting the wrong region. Each return must produce
+a matching client `ReportWorkspaceTree`, not merely a successful server result
+or `SessionList`, proving the receiving UI adopted it.
+The script also holds sibling previews through Escape and blur, requiring no
+`MoveWorkspace` on either cancellation.
 
 Wayland proof is palette-only: launch two windows under nested Mutter, use the
 same palette edge and swap rows, confirm both `WorkspaceMoveResult::Moved`

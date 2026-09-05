@@ -634,10 +634,79 @@ impl AiChrome {
     }
 }
 
-/// A parked server workspace tree plus the live session ids of the
-/// `SessionList` that carried it; see the `server_topology` field of
-/// [`Shared`].
-type ServerTopologySlot = Arc<Mutex<Option<(WorkspaceTreeNode, HashSet<SessionId>)>>>;
+/// Why the reader parked a server layout for the foreground to adopt.
+#[derive(Clone, Copy)]
+enum ServerTopologyOrigin {
+    Reconnect,
+    OwnershipChange,
+}
+
+/// A layout and its live sessions retain the reason they crossed threads.
+struct ServerTopology {
+    tree: WorkspaceTreeNode,
+    live: HashSet<SessionId>,
+    workspaces: HashSet<WorkspaceId>,
+    origin: ServerTopologyOrigin,
+}
+
+type ServerTopologySlot = Arc<Mutex<Option<ServerTopology>>>;
+
+impl ServerTopology {
+    fn from_session_list(
+        registry: &session_lifecycle::SessionRegistry,
+        sessions: &[SessionInfo],
+        tree: Option<WorkspaceTreeNode>,
+        first_on_connection: bool,
+    ) -> Option<Self> {
+        if sessions.is_empty() {
+            return None;
+        }
+        let adopted = sessions.iter().any(|session| !registry.tracks(session.session_id));
+        let tracked_workspaces: HashMap<SessionId, WorkspaceId> = registry
+            .reconnect_topology()
+            .into_iter()
+            .flat_map(|(workspace_id, tracked_sessions)| {
+                tracked_sessions.into_iter().map(move |session_id| (session_id, workspace_id))
+            })
+            .collect();
+        let refiled = sessions.iter().any(|session| {
+            tracked_workspaces
+                .get(&session.session_id)
+                .is_some_and(|workspace_id| *workspace_id != session.workspace_id)
+        });
+        if !first_on_connection && !adopted && !refiled {
+            return None;
+        }
+        Some(Self {
+            tree: tree?,
+            live: sessions.iter().map(|session| session.session_id).collect(),
+            workspaces: sessions.iter().map(|session| session.workspace_id).collect(),
+            origin: if first_on_connection {
+                ServerTopologyOrigin::Reconnect
+            } else {
+                ServerTopologyOrigin::OwnershipChange
+            },
+        })
+    }
+
+    fn should_adopt(
+        &self,
+        unused: bool,
+        reported: &VecDeque<WorkspaceTreeNode>,
+        local_workspaces: &HashSet<WorkspaceId>,
+    ) -> bool {
+        match self.origin {
+            ServerTopologyOrigin::Reconnect => {
+                unused
+                    || !reported.contains(&self.tree)
+                    // A move may commit immediately before the stream drops.
+                    // Its cached layout is not an echo if a live region is absent.
+                    || !self.workspaces.is_subset(local_workspaces)
+            }
+            ServerTopologyOrigin::OwnershipChange => true,
+        }
+    }
+}
 
 /// Coordinates one graceful process exit across every hosted terminal view.
 ///
@@ -808,12 +877,11 @@ struct Shared {
     /// the server's answer and the next reconcile pass applies it on the thread
     /// that owns the layout.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
-    /// The server's persisted workspace split tree, parked together with the
-    /// live session ids of the `SessionList` that carried it. The reader parks
-    /// it on the first list of a connection (before it rebuilds the tab
-    /// strip, so no frame can see the sessions without the tree); the GPUI
-    /// thread's reconcile pass adopts it when this window has no layout of its
-    /// own yet, which is what restores splits across a client restart.
+    /// A server layout, its live sessions, and its adoption reason. The reader
+    /// parks reconnect layouts and live ownership changes before rebuilding
+    /// the tab strip. The foreground may retain its authored reconnect layout,
+    /// but a workspace or tab arrival must adopt the server's placement even
+    /// when that tree matches an earlier local report.
     server_topology: ServerTopologySlot,
     /// Spec-010 OSC 52 state. The IPC reader records the negotiated gating bit,
     /// parks a confirmation request, and queues the host clipboard jobs the
@@ -7469,46 +7537,44 @@ impl TerminalView {
         .unwrap_or(false)
     }
 
-    /// Rebuild this window's regions, splits, and pane sessions from the
-    /// workspace tree the server shipped with the first `SessionList` of a
-    /// (re)connect.
+    /// Rebuild regions, splits, and pane sessions from a server layout.
     ///
-    /// The server persists each window's tree from `ReportWorkspaceTree` and
-    /// ships it back precisely so a freshly started client can rebuild its
-    /// splits instead of flattening every session into one region — which is
-    /// what an upgrade restart used to do. The parked tree is taken exactly
-    /// once and adopted when the shell is still the untouched startup layout
-    /// ([`PaneShell::is_unused`]) or when the tree is not one this view
-    /// recently reported (a stale claim; see below). Sessions named in the
-    /// tree but gone from the list are pruned by the shell, as on the cold
-    /// path; sessions in the list but not in the tree stay ordinary tabs.
+    /// Reconnect trees restore an unused shell or replace a layout this view
+    /// did not author. Live workspace arrivals and tab re-files always adopt:
+    /// moving away and back can legitimately reproduce a previously reported
+    /// tree, but its region may no longer exist locally. The parked layout is
+    /// consumed once. Dead sessions are pruned by the shell, while sessions
+    /// absent from the tree remain ordinary tabs.
     ///
     /// Returns `true` when a tree was adopted this frame, so the caller can
     /// hold its retain/close pass until the tab strip catches up.
     fn adopt_server_topology(&mut self, cx: &mut Context<Self>) -> bool {
         let parked = self.shared.server_topology.lock().ok().and_then(|mut slot| slot.take());
-        let Some((tree, live)) = parked else { return false };
+        let Some(topology) = parked else { return false };
         if self.restore.replaying {
             tracing::info!("cold-restart replay in flight; ignoring the server workspace tree");
             return false;
         }
-        // A live layout wins only while this view is the tree's author: a
-        // mid-session redial parks the very tree we last reported (possibly a
-        // few queued reports back), so keeping the local layout is keeping the
-        // truth. A parked tree we never reported means another client owned
-        // and reshaped this window since — a stale claim. Imposing our layout
-        // then is how a leftover pre-update client once closed every rebuilt
-        // workspace of the reconnecting window; adopt the server's tree
-        // instead.
-        if !self.shell.is_unused(cx) {
-            if self.reported_trees.contains(&tree) {
-                tracing::info!("window already has a layout; ignoring the server workspace tree");
-                return false;
-            }
-            tracing::warn!(
-                "another client reshaped this window; adopting the server tree over the stale local layout"
-            );
+        // Authorship history only identifies reconnect echoes. A live move is
+        // a new server decision even if its tree matches the layout before an
+        // earlier departure; retaining the collapsed local tree would strand
+        // its returning tabs without a region.
+        let unused = self.shell.is_unused(cx);
+        if !topology.should_adopt(unused, &self.reported_trees, &self.shell.region_workspaces(cx)) {
+            tracing::info!("window already has a layout; ignoring the server workspace tree");
+            return false;
         }
+        if !unused {
+            match topology.origin {
+                ServerTopologyOrigin::Reconnect => tracing::warn!(
+                    "another client reshaped this window; adopting the server tree over the stale local layout"
+                ),
+                ServerTopologyOrigin::OwnershipChange => {
+                    tracing::info!("adopting the server workspace tree after an ownership change");
+                }
+            }
+        }
+        let ServerTopology { tree, live, .. } = topology;
         let visible = self.shell.adopt_server_tree(&tree, &live, cx);
         if visible.is_empty() {
             tracing::info!("server workspace tree pruned to nothing; keeping the flat layout");
@@ -17283,12 +17349,11 @@ async fn dispatch_server_message(
 /// Park the server's persisted split tree for the GPUI thread's reconcile
 /// pass.
 ///
-/// Runs *before* [`on_session_list`] rebuilds the tab strip, so no reconcile
-/// pass can see the sessions without the tree and lay them out flat first.
-/// Only the first list of a connection carries a layout worth adopting — a
-/// later refresh describes sessions the window already shows — and the GPUI
-/// thread additionally ignores the tree when the window already has a layout
-/// of its own.
+/// Runs before [`on_session_list`] rebuilds the tab strip. Reconnect snapshots
+/// and later lists with new or re-filed sessions carry layouts worth adopting.
+/// The reason travels with the tree so the foreground cannot mistake a live
+/// ownership change for a stale reconnect echo. Ordinary refreshes and source
+/// departures leave any already-parked destination layout untouched.
 fn park_server_topology(
     ctx: &ReaderCtx,
     registry: &session_lifecycle::SessionRegistry,
@@ -17296,34 +17361,13 @@ fn park_server_topology(
     workspace_tree: Option<WorkspaceTreeNode>,
     first_on_connection: bool,
 ) {
-    if sessions.is_empty() {
+    let Some(topology) =
+        ServerTopology::from_session_list(registry, sessions, workspace_tree, first_on_connection)
+    else {
         return;
-    }
-    // A connection's first list rebuilds the window. A later one is parked when
-    // it names a session this window has never held (a cross-window workspace
-    // arrival) or re-files an existing session into another region (an atomic
-    // tab-subtree move). Adoption itself remains
-    // [`TerminalView::adopt_server_topology`]'s authorship decision.
-    let adopted = sessions.iter().any(|session| !registry.tracks(session.session_id));
-    let tracked_workspaces: HashMap<SessionId, WorkspaceId> = registry
-        .reconnect_topology()
-        .into_iter()
-        .flat_map(|(workspace_id, tracked_sessions)| {
-            tracked_sessions.into_iter().map(move |session_id| (session_id, workspace_id))
-        })
-        .collect();
-    let refiled = sessions.iter().any(|session| {
-        tracked_workspaces
-            .get(&session.session_id)
-            .is_some_and(|workspace_id| *workspace_id != session.workspace_id)
-    });
-    if !first_on_connection && !adopted && !refiled {
-        return;
-    }
-    let Some(tree) = workspace_tree else { return };
-    let live: HashSet<SessionId> = sessions.iter().map(|session| session.session_id).collect();
+    };
     if let Ok(mut parked) = ctx.server_topology.lock() {
-        *parked = Some((tree, live));
+        *parked = Some(topology);
     } else {
         tracing::warn!("server topology mutex poisoned; dropping workspace tree");
     }
@@ -18803,6 +18847,268 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    fn topology_session(session_id: SessionId, workspace_id: WorkspaceId) -> SessionInfo {
+        SessionInfo {
+            session_id,
+            workspace_id,
+            launch_id: None,
+            shell_name: "bash".to_owned(),
+            title: None,
+            icon_title: None,
+            context: None,
+            task_label: None,
+            codex_task_label: None,
+            cwd: None,
+            git_branch: None,
+            ai_state: None,
+            ai_provider_hint: None,
+            shell_tool: None,
+            prompt_state: None,
+        }
+    }
+
+    fn topology_leaf(workspace_id: WorkspaceId, session_ids: Vec<SessionId>) -> WorkspaceTreeNode {
+        WorkspaceTreeNode::Leaf {
+            workspace_id,
+            pane_trees: vec![None; session_ids.len()],
+            session_ids,
+            active_tab_index: 0,
+        }
+    }
+
+    fn topology_split_leaf(
+        workspace_id: WorkspaceId,
+        [hidden, active, split]: [SessionId; 3],
+    ) -> WorkspaceTreeNode {
+        use scribe_common::protocol::{LayoutDirection, PaneTreeNode};
+        WorkspaceTreeNode::Leaf {
+            workspace_id,
+            session_ids: vec![hidden, active],
+            pane_trees: vec![
+                None,
+                Some(PaneTreeNode::Split {
+                    direction: LayoutDirection::Horizontal,
+                    ratio: 0.35,
+                    first: Box::new(PaneTreeNode::Leaf { session_id: active }),
+                    second: Box::new(PaneTreeNode::Leaf { session_id: split }),
+                }),
+            ],
+            active_tab_index: 1,
+        }
+    }
+
+    // @lat: [[test#Workspace Move Topology Adoption#Round trips restore every requested edge]]
+    #[gpui::test]
+    fn workspace_round_trip_restores_every_requested_edge(cx: &mut gpui::TestAppContext) {
+        use scribe_common::protocol::WorkspaceTreeEdge;
+
+        cx.update(|cx| {
+            for edge in [
+                WorkspaceTreeEdge::Left,
+                WorkspaceTreeEdge::Right,
+                WorkspaceTreeEdge::Top,
+                WorkspaceTreeEdge::Bottom,
+            ] {
+                let staying = WorkspaceId::new();
+                let moving = WorkspaceId::new();
+                let [stay, hidden, active, split] = std::array::from_fn(|_| SessionId::new());
+                let source_leaf = topology_split_leaf(moving, [hidden, active, split]);
+                let departed = topology_leaf(staying, vec![stay]);
+                let mut returned = departed.clone();
+                returned.insert_workspace_at_edge(staying, edge, source_leaf).unwrap();
+                let sessions = vec![
+                    topology_session(stay, staying),
+                    topology_session(hidden, moving),
+                    topology_session(active, moving),
+                    topology_session(split, moving),
+                ];
+                let live: HashSet<_> = [stay, hidden, active, split].into_iter().collect();
+                let history = VecDeque::from([returned.clone(), departed]);
+                let mut registry = session_lifecycle::SessionRegistry::new();
+                let mut shell = PaneShell::new([0.4, 0.5, 0.6, 1.0], cx);
+                shell.adopt_server_tree(&returned, &live, cx);
+
+                for first_on_connection in [false, true] {
+                    registry.rebuild_from_session_list(&sessions[..1]);
+                    shell.retain_sessions(
+                        &[stay].into_iter().collect(),
+                        &[staying].into_iter().collect(),
+                        cx,
+                    );
+                    assert!(!shell.has_region(moving, cx));
+                    let pending = ServerTopology::from_session_list(
+                        &registry,
+                        &sessions,
+                        Some(returned.clone()),
+                        first_on_connection,
+                    )
+                    .expect("a returning workspace parks its authoritative tree");
+                    assert!(history.contains(&pending.tree), "reproduce the old-tree collision");
+                    if pending.should_adopt(
+                        shell.is_unused(cx),
+                        &history,
+                        &shell.region_workspaces(cx),
+                    ) {
+                        shell.adopt_server_tree(&pending.tree, &pending.live, cx);
+                    }
+                    registry.rebuild_from_session_list(&sessions);
+                    assert!(
+                        shell.has_region(moving, cx),
+                        "{edge:?} return must restore its region"
+                    );
+                    assert_eq!(shell.region_count(cx), 2);
+                    assert_eq!(shell.assigned_sessions(), live);
+                    assert_eq!(shell.region_shown_session(moving), Some(active));
+                    assert_eq!(
+                        shell.shown_sessions(cx),
+                        [stay, active, split].into_iter().collect()
+                    );
+
+                    let viewport = Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+                    let moved = shell.workspace_rect(moving, viewport, cx).unwrap();
+                    let target = shell.workspace_rect(staying, viewport, cx).unwrap();
+                    assert!(
+                        match edge {
+                            WorkspaceTreeEdge::Left => moved.x + moved.width <= target.x,
+                            WorkspaceTreeEdge::Right => moved.x >= target.x + target.width,
+                            WorkspaceTreeEdge::Top => moved.y + moved.height <= target.y,
+                            WorkspaceTreeEdge::Bottom => moved.y >= target.y + target.height,
+                        },
+                        "{edge:?} must retain the server's requested placement"
+                    );
+                    assert_eq!(shell.show_tab(moving, hidden, cx), vec![hidden]);
+                    assert_eq!(shell.show_tab(moving, active, cx), vec![active, split]);
+                    assert_eq!(shell.focused_workspace_id(cx), moving);
+                    assert_eq!(shell.focused_session(cx), Some(active));
+                }
+            }
+        });
+    }
+
+    // @lat: [[test#Workspace Move Topology Adoption#Repeated swaps restore cached layouts]]
+    #[gpui::test]
+    fn workspace_round_trip_swaps_restore_cached_layouts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let staying = WorkspaceId::new();
+            let stay = SessionId::new();
+            let workspace_ids = [WorkspaceId::new(), WorkspaceId::new()];
+            let session_ids = [SessionId::new(), SessionId::new()];
+            let trees = std::array::from_fn::<_, 2, _>(|index| WorkspaceTreeNode::Split {
+                direction: scribe_common::protocol::LayoutDirection::Vertical,
+                ratio: 0.35,
+                first: Box::new(topology_leaf(staying, vec![stay])),
+                second: Box::new(topology_leaf(workspace_ids[index], vec![session_ids[index]])),
+            });
+            let inventories = std::array::from_fn::<_, 2, _>(|index| {
+                vec![
+                    topology_session(stay, staying),
+                    topology_session(session_ids[index], workspace_ids[index]),
+                ]
+            });
+            let history = VecDeque::from(trees.clone());
+            let mut registry = session_lifecycle::SessionRegistry::new();
+            registry.rebuild_from_session_list(&inventories[0]);
+            let mut shell = PaneShell::new([0.4, 0.5, 0.6, 1.0], cx);
+            shell.adopt_server_tree(&trees[0], &[stay, session_ids[0]].into_iter().collect(), cx);
+            for (index, first_on_connection) in [(1, false), (0, true), (1, true), (0, false)] {
+                let pending = ServerTopology::from_session_list(
+                    &registry,
+                    &inventories[index],
+                    Some(trees[index].clone()),
+                    first_on_connection,
+                )
+                .unwrap();
+                assert!(pending.should_adopt(
+                    shell.is_unused(cx),
+                    &history,
+                    &shell.region_workspaces(cx)
+                ));
+                shell.adopt_server_tree(&pending.tree, &pending.live, cx);
+                registry.rebuild_from_session_list(&inventories[index]);
+                assert_eq!(shell.region_count(cx), 2, "swaps keep the region count unchanged");
+                assert!(shell.has_region(workspace_ids[index], cx));
+                assert!(!shell.has_region(workspace_ids[1 - index], cx));
+                assert_eq!(shell.assigned_sessions(), pending.live);
+                assert_eq!(
+                    shell.show_tab(workspace_ids[index], session_ids[index], cx),
+                    vec![session_ids[index]]
+                );
+                assert_eq!(shell.focused_session(cx), Some(session_ids[index]));
+                let rect = shell
+                    .workspace_rect(
+                        workspace_ids[index],
+                        Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 },
+                        cx,
+                    )
+                    .unwrap();
+                assert!((rect.y - 210.0).abs() < 0.001, "swap retains the original split ratio");
+            }
+        });
+    }
+
+    // @lat: [[test#Workspace Move Topology Adoption#Reconnect echoes and ownership changes stay distinct]]
+    #[test]
+    fn server_topology_distinguishes_reconnect_echoes_from_ownership_changes() {
+        let workspace = WorkspaceId::new();
+        let other_workspace = WorkspaceId::new();
+        let session = SessionId::new();
+        let other_session = SessionId::new();
+        let sessions = vec![
+            topology_session(session, workspace),
+            topology_session(other_session, other_workspace),
+        ];
+        let mut registry = session_lifecycle::SessionRegistry::new();
+        registry.rebuild_from_session_list(&sessions);
+        let mut tree = topology_leaf(workspace, vec![session]);
+        tree.insert_workspace_at_edge(
+            workspace,
+            scribe_common::protocol::WorkspaceTreeEdge::Right,
+            topology_leaf(other_workspace, vec![other_session]),
+        )
+        .unwrap();
+        let local_workspaces = [workspace, other_workspace].into_iter().collect();
+        let history = VecDeque::from([tree.clone()]);
+        let reconnect =
+            ServerTopology::from_session_list(&registry, &sessions, Some(tree.clone()), true)
+                .unwrap();
+        assert!(
+            !reconnect.should_adopt(false, &history, &local_workspaces),
+            "a reconnect retains an authored layout"
+        );
+        assert!(
+            reconnect.should_adopt(true, &history, &local_workspaces),
+            "startup still restores its layout"
+        );
+        assert!(
+            reconnect.should_adopt(false, &VecDeque::new(), &local_workspaces),
+            "an unfamiliar server tree wins"
+        );
+        assert!(
+            ServerTopology::from_session_list(&registry, &sessions, Some(tree.clone()), false)
+                .is_none()
+        );
+        assert!(
+            ServerTopology::from_session_list(&registry, &sessions[..1], Some(tree.clone()), false)
+                .is_none()
+        );
+        assert!(
+            ServerTopology::from_session_list(&registry, &[], Some(tree.clone()), true).is_none()
+        );
+        assert!(ServerTopology::from_session_list(&registry, &sessions, None, true).is_none());
+
+        let refiled =
+            vec![topology_session(session, workspace), topology_session(other_session, workspace)];
+        let moved_tree = topology_leaf(workspace, vec![session, other_session]);
+        let moved_history = VecDeque::from([moved_tree.clone()]);
+        let pending =
+            ServerTopology::from_session_list(&registry, &refiled, Some(moved_tree), false)
+                .unwrap();
+        assert!(
+            pending.should_adopt(false, &moved_history, &local_workspaces),
+            "a tab move cannot be suppressed by history"
+        );
+    }
 
     #[test]
     fn pane_ground_stays_distinct_on_black() {

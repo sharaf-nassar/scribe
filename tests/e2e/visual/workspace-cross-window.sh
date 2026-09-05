@@ -60,7 +60,7 @@ send_keys() {
 }
 
 palette() {
-    focus_window "$SOURCE_WID"
+    focus_window "${2:-$SOURCE_WID}"
     send_keys ctrl+shift+p
     xdotool type --clearmodifiers --delay 8 "$1"
     sleep 0.3
@@ -123,12 +123,22 @@ drag_to_target() {
 # Give the first window two regions, then create a sibling process-window. The
 # sibling remains a real GPUI client in the same process, which is exactly the
 # enumeration the palette and X11 pointer route use.
-SOURCE_WID=$(windows | head -1)
+SOURCE_WID=""
+for _ in $(seq 1 75); do
+    SOURCE_WID=$(windows | head -1)
+    [ -n "$SOURCE_WID" ] && break
+    sleep 0.2
+done
 [ -n "$SOURCE_WID" ] || fail "initial Scribe window never mapped"
 focus_window "$SOURCE_WID"
 oracle wait-leaves 1 1 >/dev/null || fail "initial workspace never became live"
 send_keys ctrl+alt+backslash
 read -r SOURCE_A SOURCE_B <<<"$(oracle wait-leaves 2 1)" || fail "source split never became live"
+ORIGINAL_TREE=/output/workspace-round-trip-original.json
+oracle wait-report >"$ORIGINAL_TREE" || fail "original source layout was never reported"
+SOURCE_B_SESSION=$(oracle leaf "$SOURCE_B" | python3 -c 'import json, sys; print(json.load(sys.stdin)["session_ids"][0])')
+SOURCE_WINDOW_ID=$(scribe windows | awk '$2 == 2 { print $1 }')
+[ -n "$SOURCE_WINDOW_ID" ] || fail "source window identity missing"
 send_keys ctrl+shift+n
 for _ in $(seq 1 60); do
     mapfile -t mapped < <(windows)
@@ -155,7 +165,40 @@ remember_target_geometry
 reset_record
 palette "Move workspace right of workspace"
 assert_move "$SOURCE_B" right
+TARGET_WINDOW_ID=$(oracle first-frame-field client MoveWorkspace target_window_id)
 echo "PHASE 1 PASS: palette edge move reached the sibling window"
+
+# Reinsert B at its original edge while that exact tree is still in the source
+# client's authorship history. Server success alone missed this regression:
+# require the destination client to adopt and report the complete tree too.
+for round in 1 2; do
+    # Focus the transferred session by identity. Directional focus wraps and
+    # would select the wrong region when the arrival already holds focus.
+    scribe action --window "$TARGET_WINDOW_ID" focus-session "$SOURCE_B_SESSION"
+    reset_record
+    palette "Move workspace right of workspace" "$TARGET_WID"
+    assert_move "$SOURCE_B" right
+    python3 - "$RECORD" "$ORIGINAL_TREE" <<'PY' || fail "round-trip destination did not restore its original layout"
+import json, runpy, sys, time
+oracle = runpy.run_path("/tests/visual/workspace-tree-oracle.py")
+with open(sys.argv[2]) as file:
+    expected = json.load(file)
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    for row in oracle["rows"](sys.argv[1]):
+        msg = oracle["message"](row)
+        if row.get("dir") == "client" and msg.get("type") == "ReportWorkspaceTree" and msg.get("tree") == expected:
+            raise SystemExit(0)
+    time.sleep(0.2)
+raise SystemExit(1)
+PY
+    # Leave the next phases' original one-region source fixture intact.
+    scribe action --window "$SOURCE_WINDOW_ID" focus-session "$SOURCE_B_SESSION"
+    reset_record
+    palette "Move workspace right of workspace"
+    assert_move "$SOURCE_B" right
+    echo "PHASE 1.$round PASS: cached-tree round trip restored and re-reported the source layout"
+done
 
 # A centre swap cannot empty a source shell, so restore a second source region
 # before exercising the palette's swap row.
