@@ -1288,6 +1288,9 @@ pub enum ServerMessage {
         workspace_id: WorkspaceId,
         /// Basename of the shell binary (e.g. "zsh", "bash").
         shell_name: String,
+        /// Original typed AI launch, independent of observed provider state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ai_launch_origin: Option<bool>,
     },
     SessionExited {
         session_id: SessionId,
@@ -2303,6 +2306,9 @@ pub struct SessionInfo {
     /// predate the field.
     #[serde(default)]
     pub prompt_state: Option<SessionPromptState>,
+    /// Original typed AI launch. Absent metadata from old peers is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_launch_origin: Option<bool>,
 }
 
 impl SessionInfo {
@@ -3344,6 +3350,7 @@ mod tests {
                 git_branch: None,
                 ai_state: Some(ai_state),
                 ai_provider_hint: Some(AiProvider::Pi),
+                ai_launch_origin: None,
                 shell_tool: None,
                 prompt_state: Some(SessionPromptState::default()),
             }],
@@ -4145,6 +4152,54 @@ mod tests {
 
         let redacted = rmp_serde::to_vec_named(&decoded).expect("serialize redacted SessionInfo");
         assert!(!redacted.windows(b"launch_id".len()).any(|key| key == b"launch_id"));
+    }
+
+    #[test]
+    fn ai_launch_origin_session_created_and_info_are_additive() {
+        #[derive(Serialize, Deserialize)]
+        #[serde(tag = "type")]
+        enum OldCreated {
+            SessionCreated { session_id: SessionId, workspace_id: WorkspaceId, shell_name: String },
+        }
+        let session_id = SessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let old =
+            OldCreated::SessionCreated { session_id, workspace_id, shell_name: "bash".into() };
+        let legacy_bytes = rmp_serde::to_vec_named(&old).unwrap();
+        assert!(matches!(
+            rmp_serde::from_slice::<ServerMessage>(&legacy_bytes).unwrap(),
+            ServerMessage::SessionCreated { ai_launch_origin: None, .. }
+        ));
+        let old_info = SessionInfoWithoutLaunchIdentity {
+            session_id,
+            workspace_id,
+            shell_name: "bash".into(),
+            title: None,
+            cwd: None,
+        };
+        let mut info: SessionInfo =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&old_info).unwrap()).unwrap();
+        assert_eq!(info.ai_launch_origin, None);
+        for origin in [None, Some(false), Some(true)] {
+            let message = ServerMessage::SessionCreated {
+                session_id,
+                workspace_id,
+                shell_name: "bash".into(),
+                ai_launch_origin: origin,
+            };
+            let bytes = rmp_serde::to_vec_named(&message).unwrap();
+            assert!(
+                matches!(rmp_serde::from_slice::<ServerMessage>(&bytes).unwrap(), ServerMessage::SessionCreated { ai_launch_origin, .. } if ai_launch_origin == origin)
+            );
+            rmp_serde::from_slice::<OldCreated>(&bytes).unwrap();
+            info.ai_launch_origin = origin;
+            info.ai_provider_hint = Some(AiProvider::Pi);
+            info.make_pi_provider_compatible(false);
+            assert_eq!(info.ai_launch_origin, origin);
+            let roundtrip: SessionInfo =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&info).unwrap()).unwrap();
+            assert_eq!(roundtrip.ai_launch_origin, origin);
+        }
     }
 
     fn sample_release() -> Release {

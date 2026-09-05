@@ -243,6 +243,16 @@ The shell's live key path runs the configured bindings before the PTY encoder, s
 
 The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send  into the focused workspace (the AI variants through , which the server turns into a plain-tab shell that runs the CLI in command position and exits with its status), `next_tab` / `prev_tab` / `select_tab_N` move the selection and re-, and `close_tab` sends . Every tab shortcut names the region the user is in — the shell's, not the strip's — and [[crates/scribe-client/src/tab_session.rs#TabSessions#select]] counts only that region's tabs, so a digit cannot reach a neighbouring region's. The same switch/close paths are what the titlebar's tab buttons emit, resolved from a row position to a tab through [[crates/scribe-client/src/main.rs#TerminalView#titlebar_slot]], so pointer activation and keyboard shortcuts stay in lockstep instead of maintaining a second tab-only code path.
 
+#### Launch-only suspend protection
+
+Bare Ctrl+Z is silently suppressed only for the focused session proven to have been launched or replayed as AI by Scribe. Plain, custom, manually observed AI and unknown old-origin sessions stay native.
+
+[[crates/scribe-client/src/main.rs#TerminalView#on_key_down]] checks Control with no Alt, Shift, platform or function modifiers after configured bindings and all existing keyboard owners, including share control. It uses only the focused session and a fixed map lookup before encoding or terminal effects. [[crates/scribe-client/src/main.rs#TerminalView#on_key_up]] consumes the paired Z release even after focus or modifiers change. A new initial Z press retires a stale pairing; window teardown drops it. Paste and automation byte paths are unchanged.
+
+[[crates/scribe-client/src/main.rs#open_created_tab]] records optional `ai_launch_origin` before adoption. [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#enqueue_create_session]] captures actual typed intent in the existing FIFO before enqueue and rolls it back on local enqueue refusal. Known attach echoes cannot claim it. An uncorrelated server Error or the end of a served connection permanently invalidates pending-origin fallback for that shared sink. Neither reconnect nor draining the FIFO proves alignment again. Delivery and pane/tab completions remain unchanged; only a new sink starts with trusted fallback. Every [[crates/scribe-client/src/main.rs#on_session_list]] reconciles origins independently of first-list chrome seeding: server true/false wins, absence retains independently proven intent for the same live session, and inventory removal or SessionExited forgets it. Hooks, disabled visual integrations and mutable restore bindings never establish or clear origin.
+
+Old peers can lose metadata across downgrade. A fresh client cannot protect unknown-origin sessions; retained authoritative client intent is the only absent-field fallback. Cold replay derives origin from its actual outgoing launch, without a disk schema change. See [[test#Visual E2E Tests#Tab and window chords reach their actions#Launch-only Ctrl+Z routing and lifecycle]].
+
 #### A tool tab binds to its tool
 
 `new_pi_tab` is Pi's launch-only AI shortcut; capability negotiation chooses its wire representation without changing its working-directory policy.

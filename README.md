@@ -196,6 +196,7 @@ verbatim in a bug report.
 |--------|-----------------|
 | New tab | `Ctrl+Shift+T` |
 | New Pi tab | `Ctrl+Alt+Z` |
+| Suspend foreground job | `Ctrl+Z` (silently suppressed in Scribe-launched AI tabs unless configured as an action) |
 | Close tab | `Ctrl+Shift+Q` |
 | Next/Previous tab | `Ctrl+PageDown/Up` |
 | Select tab 1-9 | `Ctrl+1-9` |
@@ -231,6 +232,13 @@ prompt/task labels, and context usage. Claude Code and Codex can also report
 permission waits; Pi exposes no permission lifecycle event, so Scribe never
 invents a Pi `PermissionPrompt`. The extension talks only to Scribe's local
 Unix socket and makes no network requests.
+
+Bare `Ctrl+Z` is protected only for AI sessions launched or replayed by Scribe.
+Configured bindings and modal, editor, overlay and vi owners keep precedence.
+Alt, Shift, platform and function modifiers are excluded. Plain/custom sessions
+and AI started manually in a shell retain native suspend/`fg` job control.
+Older peers can lose launch metadata across a downgrade: a fresh client leaves
+unknown-origin sessions native unless it independently retained the launch intent.
 
 ### Pi integration
 

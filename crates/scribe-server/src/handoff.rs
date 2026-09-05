@@ -283,6 +283,9 @@ pub struct HandoffSession {
     /// image state while accepting the payload as compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_state: Option<crate::terminal_image_handoff::SessionImageHandoff>,
+    /// Original launch intent, appended to preserve older positional fields.
+    #[serde(default)]
+    pub ai_launch_origin: Option<bool>,
 }
 
 fn default_shell_name() -> String {

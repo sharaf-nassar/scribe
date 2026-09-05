@@ -128,6 +128,14 @@ That means the same [[crates/scribe-common/src/shell.rs#default_shell_program|de
 
 Zsh and fish are the one exception carried in the appended command. Both schedule their restore-delta apply for the first `precmd` so it lands after user rc, and an AI tab runs its provider before any prompt, so the `-c` command consumes and deletes the staged delta itself — still after rc, still before the provider, satisfying spec-006 FR-008. Bash needs no equivalent because `scribe.bash` applies the delta inline while being sourced, which is already post-rc. Nushell takes `-i -c` because it rejects the grouped short form, and gets no integration under any `-c` variant (its vendor autoload is REPL-only). PowerShell speaks neither `-i` nor `exec`, so it runs the provider through `-NoLogo -Command` and drops the `-File` integration attachment, whose argument has to come last; pwsh exits when that command returns, so the tab still ends with the CLI even without an exec to replace the process. Prompt OSC marks, per-prompt env-delta emission, and baseline emission still install on an AI tab exactly as on a plain one — they simply never fire, because the shell exits before its first prompt. The server-injected absolute `SCRIBE_HOOK_HELPER` is independent of `PATH` ordering, so hook delivery does not depend on which flavor a profile puts first. If the requested AI binary is absent, the shell prints its normal command-not-found diagnostic and the tab exits; no separate client error protocol is added.
 
+#### Authoritative AI launch origin
+
+`ai_launch_origin: Option<bool>` retains original typed launch intent, independently of observed AI identity. Fresh structured AI or legacy Pi intent is true; plain/custom commands are false, even when their binary names a provider.
+
+[[crates/scribe-server/src/session_manager.rs#SessionManager#prepare_session_launch]] captures normalized intent before consuming launch fields. PreparedSessionLaunch, ManagedSession and [[crates/scribe-server/src/ipc_server.rs#start_session]] carry it into LiveSession. SessionCreated, SessionInfo and [[crates/scribe-server/src/ipc_server.rs#LiveSession#prepare_attach_data]] expose that same value; the attach acknowledgement never re-derives it from hints. Provider observations, attention dismissal and explicit AI clear cannot mutate it. Invoke-then-exit shell wrappers and genuine SessionExited cleanup remain unchanged.
+
+The optional named fields require no protocol version or capability change. Missing metadata means unknown, not a shell-tool inference. A downgrade can lose metadata; only independently retained client launch intent can protect an unknown old-peer session. See [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#Launch-only suspend protection]].
+
 #### Tool tabs are plain tabs that run through their shell
 
 A launch-only [[protocol#Protocol#Client Messages#Session Lifecycle#Launch-only tool intent|ShellTool]] tab reuses that same path rather than adding a third session class.
@@ -813,6 +821,12 @@ service main process under `KillMode=process`, waits for every exact PID/start
 identity captured before installation, then escalates TERM to KILL for an older
 detached server wedged in runtime teardown. These signals never target the
 successor or handed-off PTY children.
+
+#### Launch origin compatibility
+
+Handoff appends optional `ai_launch_origin` after existing fields. Production sends named maps only; old omitted metadata decodes as unknown and known true/false survives restoration independently of provider hints.
+
+[[crates/scribe-server/src/ipc_server.rs#serialize_live_for_handoff]] exports the live value and [[crates/scribe-server/src/session_manager.rs#restored_managed_session]] restores it unchanged. Image-state omission and existing image/Pi version gates are unchanged. Lower-level legacy positional decoding remains best-effort, including an omitted trailing image slot; pre-v6 transport is still rejected. Direct positional serialization of the current struct is not a supported writer: optional image omission can shift later fields. Named maps are the operational compatibility guarantee.
 
 ### Socket Takeover
 

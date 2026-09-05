@@ -803,6 +803,7 @@ struct Shared {
     initial_session: Arc<InitialSessionBootstrap>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
     ai: Arc<Mutex<AiChrome>>,
+    ai_launch_origin: Arc<Mutex<HashMap<SessionId, bool>>>,
     /// Sessions with a server-owned agent activity lease, driving the leading
     /// tab indicator until the server sends its post-dwell clear transition.
     agent_activity: Arc<Mutex<HashSet<SessionId>>>,
@@ -2291,6 +2292,8 @@ struct TerminalView {
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
     x11_focus: Option<X11FocusGuard>,
+    /// Pair a swallowed press with its release even after focus/modifiers change.
+    swallowed_suspend_z: bool,
     /// IME composition state, handed to the platform by the focused pane's
     /// paint pass. Owning it here (rather than per pane) matches the platform:
     /// a window has exactly one input handler, and it belongs to whichever pane
@@ -2451,6 +2454,12 @@ struct ExternalDropTarget {
     /// The destination region's usable display name, kept for logging and for
     /// the wording the destination paints.
     name: Option<String>,
+}
+
+struct WindowRuntime {
+    seed: WindowSeed,
+    config: ConfigRuntime,
+    x11_focus: (Option<X11FocusGuard>, Option<Task<()>>),
 }
 
 impl TerminalView {
@@ -2883,7 +2892,6 @@ impl TerminalView {
         )
     }
 
-    #[allow(clippy::too_many_lines, reason = "view construction lists its owned surfaces once")]
     fn new(
         shared: Shared,
         sink: IpcSink,
@@ -2891,14 +2899,30 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let x11_focus = Self::start_x11_focus_guard(window, cx);
+        Self::new_with_runtime(
+            shared,
+            sink,
+            WindowRuntime { seed, config: ConfigRuntime::start(), x11_focus },
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, reason = "view construction lists its owned surfaces once")]
+    fn new_with_runtime(
+        shared: Shared,
+        sink: IpcSink,
+        runtime: WindowRuntime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let WindowRuntime { seed, config, x11_focus: (x11_focus, x11_focus_task) } = runtime;
         shared.process_shutdown.register_view();
-        let (bounds_observer, (x11_focus, x11_focus_task)) =
-            (Self::start_geometry_tracking(window, cx), Self::start_x11_focus_guard(window, cx));
+        let bounds_observer = Self::start_geometry_tracking(window, cx);
         let activation_observer = cx.observe_window_activation(window, TerminalView::on_activation);
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         Self::register_close_veto(window, cx);
-        // Start config watching before constructing surfaces that consume it.
-        let config = ConfigRuntime::start();
         let notifications = Self::start_notifications(&shared, &config, window, cx);
         let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
@@ -3000,6 +3024,7 @@ impl TerminalView {
             ci_action_focus: HashMap::new(),
             jump_button_focus: HashMap::new(),
             x11_focus,
+            swallowed_suspend_z: false,
             ime: Self::start_ime(cx),
             bell,
             notifications,
@@ -11630,6 +11655,24 @@ impl TerminalView {
         if self.run_share_key(event, cx) {
             return;
         }
+        let key = &event.keystroke;
+        let modifiers = key.modifiers;
+        if key.key.eq_ignore_ascii_case("z")
+            && modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.platform
+            && !modifiers.function
+            && self.focused_session().is_some_and(|session| {
+                self.shared
+                    .ai_launch_origin
+                    .lock()
+                    .is_ok_and(|origins| origins.get(&session) == Some(&true))
+            })
+        {
+            self.swallowed_suspend_z = true;
+            return;
+        }
         let mode = self.focused_terminal_mode();
         let codex = self.focused_pane_is_codex();
         let bytes = KeyInput::from_key_down(event)
@@ -11665,7 +11708,11 @@ impl TerminalView {
     /// Releases never enter the press-only overlay/binding/share router. They
     /// produce bytes only when the focused application negotiated Kitty event
     /// types; legacy mode and every other Kitty flag continue to swallow them.
-    fn on_key_up(&self, event: &KeyUpEvent) {
+    fn on_key_up(&mut self, event: &KeyUpEvent) {
+        if event.keystroke.key.eq_ignore_ascii_case("z") && self.swallowed_suspend_z {
+            self.swallowed_suspend_z = false;
+            return;
+        }
         let mode = self.focused_terminal_mode();
         if let Some(bytes) = encode_key_up(event, mode) {
             self.send_key_bytes(bytes);
@@ -13514,6 +13561,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !event.is_held && event.keystroke.key.eq_ignore_ascii_case("z") {
+            self.swallowed_suspend_z = false;
+        }
         if self.focus.cursor_blink.show_now() {
             cx.notify();
         }
@@ -14164,6 +14214,7 @@ fn prepare_window_backend(
             initial_session,
             initial_action_completion,
         )),
+        ai_launch_origin: Arc::new(Mutex::new(HashMap::new())),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
@@ -15738,10 +15789,14 @@ where
         adopt_lan_surface(&reader_ctx, probes.lan_env);
         adopt_remote_surface(&reader_ctx, probes.remote_env);
     }
-    tokio::select! {
+    let result = tokio::select! {
         result = run_reader(reader, reader_ctx) => result,
         result = run_writer(writer, &mut ctx.out_rx) => result,
-    }
+    };
+    // A fully written create may never have been acknowledged. Invalidate
+    // before any redial can dispatch replies against the surviving FIFO.
+    ctx.sink.invalidate_pending_create_origin();
+    result
 }
 
 /// Clone the durable per-window handles for one connection reader.
@@ -15758,6 +15813,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         active_session: Arc::clone(&ctx.shared.active_session),
         focused_size: Arc::clone(&ctx.shared.focused_size),
         ai: Arc::clone(&ctx.shared.ai),
+        ai_launch_origin: Arc::clone(&ctx.shared.ai_launch_origin),
         agent_activity: Arc::clone(&ctx.shared.agent_activity),
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
@@ -16232,6 +16288,7 @@ struct ReaderCtx {
     focused_size: Arc<Mutex<TerminalSize>>,
     /// AI state + prompt history the chrome renders from.
     ai: Arc<Mutex<AiChrome>>,
+    ai_launch_origin: Arc<Mutex<HashMap<SessionId, bool>>>,
     /// Server-owned agent activity leases the tab strip renders from.
     agent_activity: Arc<Mutex<HashSet<SessionId>>>,
     /// Server-reported terminal chrome the status bar renders from.
@@ -16945,6 +17002,9 @@ fn on_session_exited(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     let existed = registry.on_session_exited(session_id);
+    if let Ok(mut origins) = ctx.ai_launch_origin.lock() {
+        origins.remove(&session_id);
+    }
     update_ai_chrome(ctx, |ai| ai.forget(session_id));
     on_agent_activity(ctx, session_id, false);
     update_chrome_metadata(ctx, |metadata| metadata.forget_session(session_id));
@@ -17114,9 +17174,14 @@ async fn dispatch_server_message(
             park_server_topology(ctx, registry, &sessions, workspace_tree, first_session_list);
             on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
         }
-        ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
+        ServerMessage::SessionCreated {
+            session_id,
+            workspace_id,
+            shell_name,
+            ai_launch_origin,
+        } => {
             registry.on_session_created(session_id, workspace_id);
-            open_created_tab(ctx, session_id, workspace_id, shell_name)?;
+            open_created_tab(ctx, session_id, workspace_id, shell_name, ai_launch_origin)?;
         }
         ServerMessage::SessionExited { session_id, .. } => {
             on_session_exited(ctx, registry, session_id, attached)?;
@@ -17366,6 +17431,15 @@ fn on_session_list(
     first_on_connection: bool,
 ) -> Result<(), String> {
     registry.rebuild_from_session_list(sessions);
+    if let Ok(mut origins) = ctx.ai_launch_origin.lock() {
+        let live: HashSet<_> = sessions.iter().map(|session| session.session_id).collect();
+        origins.retain(|session, _| live.contains(session));
+        for session in sessions {
+            if let Some(origin) = session.ai_launch_origin {
+                origins.insert(session.session_id, origin);
+            }
+        }
+    }
     // Latched before anything else folds the list in: the cold-restart replay
     // reads this to tell "the server has nothing" from "the server has not
     // answered yet", and only the former may replay a persisted snapshot.
@@ -17705,6 +17779,7 @@ fn on_workspace_move_result(ctx: &ReaderCtx, move_id: u64, result: WorkspaceMove
 
 /// Surface one server rejection on the status line.
 fn on_server_error(ctx: &ReaderCtx, message: String) {
+    ctx.sink.invalidate_pending_create_origin();
     set_status(&ctx.status, &ctx.generation, message);
 }
 
@@ -18612,6 +18687,7 @@ fn open_created_tab(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     shell_name: String,
+    ai_launch_origin: Option<bool>,
 ) -> Result<(), String> {
     // The tab's label tracks the OSC 0/2 title once one arrives, so the shell a
     // pane actually runs is recorded separately — that, not the label, is what a
@@ -18619,7 +18695,15 @@ fn open_created_tab(
     update_chrome_metadata(ctx, |metadata| {
         metadata.set_shell_name(session_id, shell_name.clone());
     });
-    let pending = ctx.sink.claim_pending_create();
+    let existing = ctx.tabs.lock().is_ok_and(|tabs| tabs.workspace_of(session_id).is_some());
+    let pending = if existing { None } else { ctx.sink.claim_pending_create() };
+    if let Some(origin) =
+        ai_launch_origin.or_else(|| pending.as_ref().and_then(|(_, origin)| *origin))
+        && let Ok(mut origins) = ctx.ai_launch_origin.lock()
+    {
+        origins.insert(session_id, origin);
+    }
+    let pending = pending.map(|(pending, _)| pending);
     // A split's answer is a pane inside the tab that asked for it, never a tab
     // of its own: it is filed in the strip's pane set and adopted straight into
     // the pending pane, and the "opened a new tab" insert below is skipped.
@@ -18827,6 +18911,419 @@ mod tests {
 
     use super::*;
 
+    fn suspend_test_backend() -> PreparedWindowBackend {
+        PROCESS_SHUTDOWN.get_or_init(ProcessShutdown::for_test);
+        prepare_window_backend(TerminalSize::default(), WindowBackend::claimed(WindowId::new()))
+    }
+
+    struct SuspendRouterProbe(Entity<TerminalView>);
+
+    impl Render for SuspendRouterProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.update(cx, |view, cx| {
+                TerminalView::attach_root_interactions(div().track_focus(&view.focus.root), cx)
+            })
+        }
+    }
+
+    fn suspend_probe(
+        backend: &PreparedWindowBackend,
+        window: &mut Window,
+        app: &mut App,
+    ) -> Entity<SuspendRouterProbe> {
+        let runtime = WindowRuntime {
+            seed: WindowSeed {
+                terminal_size: TerminalSize::default(),
+                restored: None,
+                restore_siblings: 0,
+                restore_geometry: None,
+            },
+            config: ConfigRuntime::detached(scribe_client::config::ClientConfig::from_config(
+                scribe_common::config::ScribeConfig::default(),
+            )),
+            x11_focus: (None, None),
+        };
+        let view = app.new(|ctx| {
+            TerminalView::new_with_runtime(
+                backend.shared.clone(),
+                backend.sink.clone(),
+                runtime,
+                window,
+                ctx,
+            )
+        });
+        app.new(|_| SuspendRouterProbe(view))
+    }
+
+    fn suspend_test_window(
+        cx: &mut gpui::TestAppContext,
+        backend: &PreparedWindowBackend,
+    ) -> WindowHandle<SuspendRouterProbe> {
+        cx.update(|app| {
+            app.open_window(WindowOptions::default(), |window, app| {
+                suspend_probe(backend, window, app)
+            })
+            .unwrap()
+        })
+    }
+
+    #[gpui::test]
+    fn handle_root_key_down_ctrl_z_press_repeat_and_release(cx: &mut gpui::TestAppContext) {
+        let mut backend = suspend_test_backend();
+        let shared = backend.shared.clone();
+        let session = SessionId::new();
+        let shell = SessionId::new();
+        let workspace = WorkspaceId::new();
+        shared.tabs.lock().unwrap().insert_active(TabEntry::new(session, workspace, "bash".into()));
+        *shared.active_session.lock().unwrap() = Some(session);
+        shared.ai_launch_origin.lock().unwrap().insert(session, true);
+        let window = suspend_test_window(cx, &backend);
+        window.update(cx, |probe, window, cx| probe.0.update(cx, |view, cx| {
+            let ctrl = gpui::Modifiers { control: true, ..Default::default() };
+            for kitty in [false, true] {
+                for focused in [session, shell] {
+                    let pane = view.pane_for(focused).unwrap();
+                    pane.with_terminal(|terminal| terminal.feed_output(if kitty { b"\x1b[>3u" } else { b"\x1b[<u" }));
+                }
+                *shared.active_session.lock().unwrap() = Some(session);
+                assert_eq!(view.focused_terminal_mode().kitty.report_event_types(), kitty);
+                let before = shared.tabs.lock().unwrap().live_session_ids();
+                let mut event = key_down("z", ctrl);
+                view.handle_root_key_down(&event, window, cx);
+                event.is_held = true;
+                for _ in 0..128 { view.handle_root_key_down(&event, window, cx); }
+                assert!(backend.ipc.out_rx.try_recv().is_none(), "protected press/repeat emitted IPC");
+                assert_eq!(shared.tabs.lock().unwrap().live_session_ids(), before);
+                assert_eq!(view.focused_session(), Some(session));
+                *shared.active_session.lock().unwrap() = Some(shell);
+                view.on_key_up(&KeyUpEvent { keystroke: key_down("z", gpui::Modifiers::default()).keystroke });
+                assert!(backend.ipc.out_rx.try_recv().is_none(), "paired release leaked after focus/modifier change");
+                assert!(!view.swallowed_suspend_z);
+                view.handle_root_key_down(&key_down("z", ctrl), window, cx);
+                let expected = encode_key_down(&key_down("z", ctrl), view.focused_terminal_mode()).unwrap();
+                assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::KeyInput { session_id, data, .. }) if session_id == shell && data == expected));
+                if !kitty { assert_eq!(expected, b"\x1a"); }
+            }
+        })).unwrap();
+    }
+
+    #[gpui::test]
+    fn handle_root_key_down_ctrl_z_preserves_native_boundaries_and_owners(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut backend = suspend_test_backend();
+        let shared = backend.shared.clone();
+        let session = SessionId::new();
+        shared.tabs.lock().unwrap().insert_active(TabEntry::new(
+            session,
+            WorkspaceId::new(),
+            "bash".into(),
+        ));
+        *shared.active_session.lock().unwrap() = Some(session);
+        let window = suspend_test_window(cx, &backend);
+        window.update(cx, |probe, window, cx| probe.0.update(cx, |view, cx| {
+            let ctrl = gpui::Modifiers { control: true, ..Default::default() };
+            // Neither a custom provider name nor an observed hook can supply launch authority.
+            for origin in [None, Some(false)] {
+                for provider in [None, Some(AiProvider::Pi), Some(AiProvider::ClaudeCode)] {
+                    if let Some(origin) = origin { shared.ai_launch_origin.lock().unwrap().insert(session, origin); }
+                    if let Some(provider) = provider { shared.ai.lock().unwrap().tracker.update(session, scribe_common::ai_state::AiProcessState::new_with_provider(provider, AiState::Processing)); }
+                    view.handle_root_key_down(&key_down("z", ctrl), window, cx);
+                    assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::KeyInput { session_id, data, .. }) if session_id == session && data == b"\x1a"));
+                }
+            }
+            shared.ai_launch_origin.lock().unwrap().insert(session, true);
+            for modifiers in [gpui::Modifiers { shift: true, ..ctrl }, gpui::Modifiers { platform: true, ..ctrl }, gpui::Modifiers { function: true, ..ctrl }] {
+                let event = key_down("z", modifiers);
+                view.handle_root_key_down(&event, window, cx);
+                assert!(!view.swallowed_suspend_z, "an extra modifier was guarded");
+                while backend.ipc.out_rx.try_recv().is_some() {}
+            }
+            view.handle_root_key_down(&key_down("z", gpui::Modifiers { alt: true, ..ctrl }), window, cx);
+            assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::CreateSession { shell_tool: Some(ShellTool::Pi), .. })));
+            assert!(backend.ipc.out_rx.try_recv().is_none());
+            let mut config = scribe_common::config::ScribeConfig::default();
+            config.keybindings.new_tab = scribe_common::config::KeyComboList::single("ctrl+z");
+            view.config = ConfigRuntime::detached(scribe_client::config::ClientConfig::from_config(config));
+            view.handle_root_key_down(&key_down("z", ctrl), window, cx);
+            assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::CreateSession { .. })));
+            assert!(backend.ipc.out_rx.try_recv().is_none(), "configured action executes exactly once");
+            assert!(!view.swallowed_suspend_z);
+            view.open_find_overlay(cx);
+            view.handle_root_key_down(&key_down("z", ctrl), window, cx);
+            assert!(backend.ipc.out_rx.try_recv().is_none(), "overlay must retain keyboard ownership");
+            assert!(!view.swallowed_suspend_z);
+        })).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_server_message_ai_launch_origin_reconciles_every_inventory_and_exit() {
+        let mut backend = suspend_test_backend();
+        let ctx = reader_ctx(&backend.ipc, false);
+        let mut registry = session_lifecycle::SessionRegistry::new();
+        let workspace = WorkspaceId::new();
+        let session = SessionId::new();
+        let mut launch = SessionLaunch {
+            workspace_id: workspace,
+            cwd: None,
+            size: TerminalSize::default(),
+            command: None,
+            ai_launch: Some(scribe_common::protocol::AiLaunchSpec {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }),
+            shell_tool: None,
+            launch_id: "origin-test".into(),
+        };
+        ctx.sink.create_session(launch.clone()).unwrap();
+        dispatch_server_message(
+            ServerMessage::SessionCreated {
+                session_id: session,
+                workspace_id: workspace,
+                shell_name: "bash".into(),
+                ai_launch_origin: None,
+            },
+            &ctx,
+            &mut registry,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.ai_launch_origin.lock().unwrap().get(&session), Some(&true));
+        launch.ai_launch = None;
+        ctx.sink.create_session(launch).unwrap();
+        // An attach acknowledgement cannot steal the next create's plain-shell intent.
+        open_created_tab(&ctx, session, workspace, "bash".into(), None).unwrap();
+        assert_eq!(ctx.ai_launch_origin.lock().unwrap().get(&session), Some(&true));
+        assert!(matches!(
+            ctx.sink.claim_pending_create(),
+            Some((PendingCreate::Tab(_), Some(false)))
+        ));
+        let mut info = topology_session(session, workspace);
+        for (wire, retained) in
+            [(None, true), (Some(false), false), (None, false), (Some(true), true)]
+        {
+            info.ai_launch_origin = wire;
+            on_session_list(&ctx, &mut registry, &[info.clone()], &[], false).unwrap();
+            assert_eq!(ctx.ai_launch_origin.lock().unwrap().get(&session), Some(&retained));
+        }
+        on_ai_message(&ctx, ServerMessage::AiStateCleared { session_id: session });
+        assert_eq!(ctx.ai_launch_origin.lock().unwrap().get(&session), Some(&true));
+        on_session_exited(&ctx, &mut registry, session, Some(session)).unwrap();
+        assert!(!ctx.ai_launch_origin.lock().unwrap().contains_key(&session));
+        ctx.ai_launch_origin.lock().unwrap().insert(session, true);
+        on_session_list(&ctx, &mut registry, &[], &[], false).unwrap();
+        assert!(ctx.ai_launch_origin.lock().unwrap().is_empty());
+        info.ai_launch_origin = None;
+        info.ai_provider_hint = Some(AiProvider::Pi);
+        info.make_pi_provider_compatible(false);
+        on_session_list(&ctx, &mut registry, &[info], &[], true).unwrap();
+        assert!(
+            ctx.ai_launch_origin.lock().unwrap().is_empty(),
+            "observed or compatibility Pi is not launch authority"
+        );
+        while backend.ipc.out_rx.try_recv().is_some() {}
+    }
+
+    fn suspend_test_launch(workspace_id: WorkspaceId, ai: bool) -> SessionLaunch {
+        SessionLaunch {
+            workspace_id,
+            cwd: None,
+            size: TerminalSize::default(),
+            command: None,
+            ai_launch: ai.then_some(scribe_common::protocol::AiLaunchSpec {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }),
+            shell_tool: None,
+            launch_id: "uncertain-origin-test".into(),
+        }
+    }
+
+    fn assert_rejected_create_origin(cx: &mut gpui::TestAppContext, rejected_ai: bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut backend = suspend_test_backend();
+        let ctx = reader_ctx(&backend.ipc, false);
+        let mut registry = session_lifecycle::SessionRegistry::new();
+        let workspace = WorkspaceId::new();
+        ctx.sink.create_session(suspend_test_launch(workspace, rejected_ai)).unwrap();
+        assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::CreateSession { .. })));
+        runtime
+            .block_on(dispatch_server_message(
+                ServerMessage::Error { message: "create refused".into() },
+                &ctx,
+                &mut registry,
+                None,
+                false,
+            ))
+            .unwrap();
+        let window = suspend_test_window(cx, &backend);
+        // Keep requesting after the rejection: clearing only the current tuples
+        // must not make a later request authoritative against a skewed FIFO.
+        for ai in [!rejected_ai, rejected_ai, !rejected_ai, rejected_ai] {
+            ctx.sink.create_session(suspend_test_launch(workspace, ai)).unwrap();
+            assert!(matches!(
+                backend.ipc.out_rx.try_recv(),
+                Some(ClientMessage::CreateSession { .. })
+            ));
+            let session = SessionId::new();
+            runtime
+                .block_on(dispatch_server_message(
+                    ServerMessage::SessionCreated {
+                        session_id: session,
+                        workspace_id: workspace,
+                        shell_name: "bash".into(),
+                        ai_launch_origin: None,
+                    },
+                    &ctx,
+                    &mut registry,
+                    None,
+                    false,
+                ))
+                .unwrap();
+            assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::Subscribe { .. })));
+            assert!(backend.ipc.out_rx.try_recv().is_none(), "create adoption stays unchanged");
+            window.update(cx, |probe, window, cx| probe.0.update(cx, |view, cx| {
+                assert_eq!(view.focused_session(), Some(session));
+                view.handle_root_key_down(&key_down("z", gpui::Modifiers { control: true, ..Default::default() }), window, cx);
+                assert!(matches!(backend.ipc.out_rx.try_recv(), Some(ClientMessage::KeyInput { session_id, data, .. }) if session_id == session && data == b"\x1a"), "uncertain origin must retain native Ctrl+Z");
+            })).unwrap();
+            assert_eq!(
+                ctx.ai_launch_origin.lock().unwrap().get(&session),
+                None,
+                "neither true nor false can come from an ambiguous claim"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn dispatch_server_message_rejected_ai_then_plain_ctrl_z_stays_native(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_rejected_create_origin(cx, true);
+    }
+
+    #[gpui::test]
+    fn dispatch_server_message_rejected_plain_then_ai_origin_stays_unknown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_rejected_create_origin(cx, false);
+    }
+
+    async fn serve_connection_origin_test_create(
+        ipc: &mut IpcThread,
+        launch: SessionLaunch,
+        acknowledgement: Option<(SessionId, Vec<SessionInfo>)>,
+    ) {
+        let workspace_id = launch.workspace_id;
+        let expected_ai = launch.ai_launch.is_some();
+        ipc.sink.create_session(launch).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client, mut server) = tokio::io::duplex(65536);
+            let (reader, writer) = tokio::io::split(client);
+            let (result, ()) = tokio::join!(
+                serve_connection(
+                    ipc, reader, writer,
+                    Transport::Local(Box::new(LocalProbes { lan_env: None, remote_env: None }))
+                ),
+                async move {
+                    assert!(matches!(
+                        read_message::<ClientMessage, _>(&mut server).await.unwrap(),
+                        ClientMessage::Hello { .. }
+                    ));
+                    assert!(matches!(
+                        read_message::<ClientMessage, _>(&mut server).await.unwrap(),
+                        ClientMessage::ListSessions
+                    ));
+                    assert!(matches!(
+                        read_message::<ClientMessage, _>(&mut server).await.unwrap(),
+                        ClientMessage::CreateSession { ai_launch, .. } if ai_launch.is_some() == expected_ai
+                    ), "queued create is still delivered");
+                    // With no ACK, the complete frame left the writer queue but
+                    // its pending claim survives into the next connection.
+                    let Some((session_id, sessions)) = acknowledgement else { return };
+                    write_message(&mut server, &ServerMessage::SessionList {
+                        sessions, workspaces: vec![], workspace_tree: None,
+                    }).await.unwrap();
+                    write_message(&mut server, &ServerMessage::SessionCreated {
+                        session_id, workspace_id, shell_name: "bash".into(), ai_launch_origin: None,
+                    }).await.unwrap();
+                    loop {
+                        if let ClientMessage::Subscribe { session_ids } =
+                            read_message::<ClientMessage, _>(&mut server).await.unwrap()
+                            && session_ids == vec![session_id] { break; }
+                    }
+                }
+            );
+            assert!(result.is_err());
+        }).await.expect("production connection dispatch timed out");
+    }
+
+    #[gpui::test]
+    fn serve_connection_lost_create_ack_reconnect_keeps_only_proven_origin(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut backend = suspend_test_backend();
+        let ctx = reader_ctx(&backend.ipc, false);
+        let workspace = WorkspaceId::new();
+        let known = SessionId::new();
+        let server_ai = SessionId::new();
+        let server_plain = SessionId::new();
+        let created = SessionId::new();
+        let mut registry = session_lifecycle::SessionRegistry::new();
+        runtime
+            .block_on(dispatch_server_message(
+                ServerMessage::SessionCreated {
+                    session_id: known,
+                    workspace_id: workspace,
+                    shell_name: "bash".into(),
+                    ai_launch_origin: Some(true),
+                },
+                &ctx,
+                &mut registry,
+                None,
+                false,
+            ))
+            .unwrap();
+        while backend.ipc.out_rx.try_recv().is_some() {}
+        runtime.block_on(serve_connection_origin_test_create(
+            &mut backend.ipc,
+            suspend_test_launch(workspace, true),
+            None,
+        ));
+        assert!(backend.ipc.out_rx.try_recv().is_none(), "written create is not replayed");
+        assert_eq!(ctx.ai_launch_origin.lock().unwrap().get(&known), Some(&true));
+        let mut ai_info = topology_session(server_ai, workspace);
+        ai_info.ai_launch_origin = Some(true);
+        let mut plain_info = topology_session(server_plain, workspace);
+        plain_info.ai_launch_origin = Some(false);
+        runtime.block_on(serve_connection_origin_test_create(
+            &mut backend.ipc,
+            suspend_test_launch(workspace, false),
+            Some((created, vec![topology_session(known, workspace), ai_info, plain_info])),
+        ));
+        let window = suspend_test_window(cx, &backend);
+        while backend.ipc.out_rx.try_recv().is_some() {}
+        window.update(cx, |probe, window, cx| probe.0.update(cx, |view, cx| {
+            for (session, protected) in [(created, false), (known, true), (server_ai, true), (server_plain, false)] {
+                *ctx.active_session.lock().unwrap() = Some(session);
+                view.handle_root_key_down(&key_down("z", gpui::Modifiers { control: true, ..Default::default() }), window, cx);
+                let message = backend.ipc.out_rx.try_recv();
+                if protected { assert!(message.is_none()); }
+                else { assert!(matches!(message, Some(ClientMessage::KeyInput { session_id, data, .. }) if session_id == session && data == b"\x1a")); }
+            }
+        })).unwrap();
+        let origins = ctx.ai_launch_origin.lock().unwrap();
+        assert_eq!(origins.get(&created), None);
+        assert_eq!(origins.get(&known), Some(&true));
+        assert_eq!(origins.get(&server_ai), Some(&true));
+        assert_eq!(origins.get(&server_plain), Some(&false));
+    }
+
     fn topology_session(session_id: SessionId, workspace_id: WorkspaceId) -> SessionInfo {
         SessionInfo {
             session_id,
@@ -18842,6 +19339,7 @@ mod tests {
             git_branch: None,
             ai_state: None,
             ai_provider_hint: None,
+            ai_launch_origin: None,
             shell_tool: None,
             prompt_state: None,
         }
@@ -20139,6 +20637,7 @@ mod tests {
             git_branch: None,
             ai_state: None,
             ai_provider_hint: provider,
+            ai_launch_origin: None,
             shell_tool: None,
             prompt_state: None,
         }
@@ -20482,6 +20981,7 @@ mod tests {
             git_branch: None,
             ai_state: Some(ai_state),
             ai_provider_hint: Some(scribe_common::ai_state::AiProvider::ClaudeCode),
+            ai_launch_origin: None,
             shell_tool: None,
             prompt_state: Some(scribe_common::protocol::SessionPromptState {
                 prompt_count: 2,
@@ -20555,6 +21055,7 @@ mod tests {
             git_branch: None,
             ai_state: None,
             ai_provider_hint: None,
+            ai_launch_origin: None,
             shell_tool: Some(ShellTool::Pi),
             prompt_state: None,
         };

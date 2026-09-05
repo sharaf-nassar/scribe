@@ -198,6 +198,7 @@ pub struct ManagedSession {
     pub ai_state: Option<AiProcessState>,
     /// Launch-time AI provider hint derived from the session command.
     pub ai_provider_hint: Option<AiProvider>,
+    pub ai_launch_origin: Option<bool>,
     /// Launch-only tool identity retained across warm and handoff restore.
     pub shell_tool: Option<ShellTool>,
     /// Prompt history from handoff, kept next to `ai_state` so a restored
@@ -282,6 +283,7 @@ fn restored_managed_session(
         context: handoff_session.context.clone(),
         ai_state: handoff_session.ai_state.clone(),
         ai_provider_hint: handoff_session.ai_provider_hint,
+        ai_launch_origin: handoff_session.ai_launch_origin,
         shell_tool: handoff_session.shell_tool,
         prompt_state: handoff_session.prompt_state.clone(),
         cell_width: handoff_session.cell_width.max(1),
@@ -359,6 +361,7 @@ struct PreparedSessionLaunch {
     session_id: SessionId,
     workspace_id: WorkspaceId,
     ai_provider_hint: Option<AiProvider>,
+    ai_launch_origin: Option<bool>,
     shell_tool: Option<ShellTool>,
     term: Term<ScribeEventListener>,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
@@ -426,6 +429,7 @@ impl PreparedSessionLaunch {
             context: None,
             ai_state: None,
             ai_provider_hint: self.ai_provider_hint,
+            ai_launch_origin: self.ai_launch_origin,
             shell_tool: self.shell_tool,
             prompt_state: None,
             cell_width: self.geometry.cell_width,
@@ -560,6 +564,8 @@ impl SessionManager {
         shell: &ResolvedShell,
         env: EnvLaunchContext<'_>,
     ) -> PreparedSessionLaunch {
+        let ai_launch_origin =
+            Some(request.ai_launch.is_some() || request.shell_tool == Some(ShellTool::Pi));
         let shell_binary = shell.binary.as_str();
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
         let ai_provider_hint = request
@@ -606,6 +612,7 @@ impl SessionManager {
             session_id,
             workspace_id: request.workspace_id,
             ai_provider_hint,
+            ai_launch_origin,
             shell_tool: request.shell_tool,
             term,
             event_rx,
@@ -1454,6 +1461,7 @@ mod tests_session_cap {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                ai_launch_origin: None,
                 shell_tool: None,
                 prompt_state: None,
                 env_window_id: None,
@@ -1579,6 +1587,59 @@ mod tests {
     const MACOS_BASELINE_PATH: &str =
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     const ZSH_UNAME_PROBE: &str = "$(uname -s 2>/dev/null)";
+
+    #[test]
+    fn prepare_session_launch_retains_only_normalized_typed_ai_origin() {
+        let manager = super::SessionManager::default();
+        let shell = super::ResolvedShell { binary: "/bin/bash".into(), kind: ShellKind::Bash };
+        let mut intents = vec![
+            (None, None, None, false),
+            (None, None, Some(vec!["pi".into()]), false),
+            (None, Some(ShellTool::Pi), None, true),
+        ];
+        for (provider, resume_mode) in [
+            (AiProvider::ClaudeCode, AiResumeMode::New),
+            (AiProvider::ClaudeCode, AiResumeMode::Resume),
+            (AiProvider::CodexCode, AiResumeMode::New),
+            (AiProvider::CodexCode, AiResumeMode::Resume),
+            (AiProvider::Pi, AiResumeMode::New),
+        ] {
+            intents.push((
+                Some(AiLaunchSpec {
+                    provider,
+                    resume_mode,
+                    conversation_id: Some("conversation".into()),
+                }),
+                None,
+                Some(vec!["ignored".into()]),
+                true,
+            ));
+        }
+        for (ai_launch, shell_tool, command, expected) in intents {
+            let request = SessionLaunchRequest {
+                workspace_id: WorkspaceId::new(),
+                window_id: WindowId::new(),
+                cwd: None,
+                size: None,
+                command,
+                ai_launch,
+                shell_tool,
+                env_envelope_id: None,
+            }
+            .normalize();
+            let prepared = manager.prepare_session_launch(
+                SessionId::new(),
+                request,
+                &shell,
+                EnvLaunchContext {
+                    restore_file: None,
+                    persistence_enabled: false,
+                    integration_enabled: false,
+                },
+            );
+            assert_eq!(prepared.ai_launch_origin, Some(expected));
+        }
+    }
 
     #[test]
     fn macos_path_baseline_covers_empty_and_unset_path() {

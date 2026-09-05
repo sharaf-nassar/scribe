@@ -383,6 +383,7 @@ mod tests {
             context: None,
             ai_state: None,
             ai_provider_hint: None,
+            ai_launch_origin: None,
             shell_tool: None,
             prompt_state: None,
             env_window_id: None,

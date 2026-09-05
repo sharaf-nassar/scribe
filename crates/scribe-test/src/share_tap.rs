@@ -225,6 +225,7 @@ mod tests {
     #[test]
     fn only_session_created_frames_take_the_configured_delay() {
         let created = ServerMessage::SessionCreated {
+            ai_launch_origin: None,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             shell_name: "bash".to_owned(),

@@ -310,8 +310,40 @@ echo "PHASE 3 PASS: the close dialog opens on its relocated chord (+$DIFF px)"
 # also exports a marker, then forwards through `command pi` to the existing stub.
 rm -f "$PI_RECORD" "$PI_CWD_PROBE"
 mkdir -p "$PI_CWD"
+mkdir -p /tmp/scribe-suspend-bin
+cat >/tmp/scribe-suspend-bin/pi <<'PYTHON'
+#!/usr/bin/python3
+import os
+import signal
+import sys
+import termios
+import tty
+from pathlib import Path
+
+record = Path("/tmp/pi-invocation.txt")
+record.write_text("".join(arg + "\n" for arg in sys.argv[1:]) + "--ENV--\n" +
+                  "".join(f"{key}={value}\n" for key, value in sorted(os.environ.items())))
+original = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    while True:
+        key = os.read(0, 1)
+        if key in (b"", b"\x03"):
+            break
+        if key == b"\x1a":
+            Path("/tmp/pi-suspend-received").write_text(os.environ["SCRIBE_SESSION_ID"])
+            assert os.getpgrp() != os.getpgid(os.getppid()), "must own the foreground job group"
+            os.kill(0, signal.SIGTSTP)
+        if key == b"r":
+            Path("/tmp/pi-responsive").write_text(os.environ["SCRIBE_SESSION_ID"])
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, original)
+PYTHON
+chmod +x /tmp/scribe-suspend-bin/pi
+rm -f /tmp/pi-responsive /tmp/pi-suspend-received
+
 # shellcheck disable=SC2016 # $PATH and $@ are written literally for Bash.
-printf 'export %s\nexport PATH="/tests/bin:$PATH"\npi() { export %s; command pi "$@"; }\n' \
+printf 'export %s\nexport PATH="/tmp/scribe-suspend-bin:/tests/bin:$PATH"\npi() { export %s; command pi "$@"; }\n' \
     "$PI_RC_MARKER" "$PI_WRAPPER_MARKER" >>"$HOME/.bashrc"
 
 # Give the focused pane a CWD of its own, and report it the way a shell would.
@@ -397,6 +429,23 @@ PI_SESSION_LOG_ID="session-$(printf '%s' "$PI_SESSION_UUID" | cut -c1-8)"
 if [ "$(count_server_log "$PI_SESSION_LOG_ID")" -eq 0 ]; then
     fail "PHASE 5 FAIL: the server never logged the pi session $PI_SESSION_LOG_ID"
 fi
+# Press, hold and release must not deliver a suspend byte to this exact job.
+focus
+xdotool keydown ctrl keydown z
+sleep 1
+xdotool keyup z keyup ctrl
+send_keys r
+for _ in $(seq 1 60); do
+    [ -s /tmp/pi-responsive ] && break
+    sleep 0.1
+done
+[ ! -e /tmp/pi-suspend-received ] || fail "PHASE 5 FAIL: Pi received Ctrl+Z"
+[ "$(cat /tmp/pi-responsive 2>/dev/null)" = "$PI_SESSION_UUID" ] ||
+    fail "PHASE 5 FAIL: protected Pi is not responsive"
+if grep -aF "session exit finalized" "$SERVER_LOG" | grep -aqF "$PI_SESSION_LOG_ID"; then
+    fail "PHASE 5 FAIL: Ctrl+Z finalized the protected session"
+fi
+echo "PHASE 5 PASS: press/hold/release preserved responsive $PI_SESSION_LOG_ID"
 focus
 send_keys ctrl+c
 EXIT_FOUND=0

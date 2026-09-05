@@ -50,6 +50,7 @@ struct AttachEntry {
     session_id: SessionId,
     workspace_id: scribe_common::ids::WorkspaceId,
     shell_name: String,
+    ai_launch_origin: Option<bool>,
     client_writer: ClientWriter,
     attachment: SessionAttachment,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
@@ -69,6 +70,7 @@ impl From<AttachSessionData> for AttachEntry {
             session_id: data.session_id,
             workspace_id: data.workspace_id,
             shell_name: data.shell_name,
+            ai_launch_origin: data.ai_launch_origin,
             client_writer: data.client_writer,
             attachment: data.attachment,
             term: data.term,
@@ -297,6 +299,7 @@ async fn send_attach_replay(
             session_id,
             workspace_id: entry.workspace_id,
             shell_name: entry.shell_name.clone(),
+            ai_launch_origin: entry.ai_launch_origin,
         },
     )
     .await;
@@ -440,6 +443,7 @@ mod tests {
             session_id,
             workspace_id,
             shell_name: String::from("zsh"),
+            ai_launch_origin: Some(true),
             client_writer: Arc::new(std::sync::Mutex::new(
                 crate::ipc_server::AttachedSinks::default(),
             )),
@@ -482,11 +486,16 @@ mod tests {
         assert!(crate::ipc_server::lock_sinks(&entry.client_writer).is_empty());
 
         let msg1 = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
-        let ServerMessage::SessionCreated { session_id: got_id, workspace_id: got_ws, shell_name } =
-            msg1
+        let ServerMessage::SessionCreated {
+            session_id: got_id,
+            workspace_id: got_ws,
+            shell_name,
+            ai_launch_origin,
+        } = msg1
         else {
             panic!("expected SessionCreated, got {msg1:?}");
         };
+        assert_eq!(ai_launch_origin, Some(true));
         assert_eq!(got_id, session_id);
         assert_eq!(got_ws, workspace_id);
         assert_eq!(shell_name, "zsh");

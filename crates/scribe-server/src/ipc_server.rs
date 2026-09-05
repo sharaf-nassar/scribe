@@ -1666,6 +1666,7 @@ pub struct LiveSession {
     /// Launch-time AI provider hint used when the session CLI does not emit
     /// explicit provider metadata.
     ai_provider_hint: Option<AiProvider>,
+    ai_launch_origin: Option<bool>,
     /// Launch-only tool identity retained for `SessionList` and handoff restore.
     shell_tool: Option<ShellTool>,
     /// Prompt history for the running conversation, retained alongside
@@ -1755,6 +1756,7 @@ pub struct AttachSessionData {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
     pub shell_name: String,
+    pub ai_launch_origin: Option<bool>,
     pub client_writer: ClientWriter,
     pub attachment: SessionAttachment,
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
@@ -1790,6 +1792,7 @@ impl LiveSession {
             session_id,
             workspace_id: self.workspace_id,
             shell_name: self.shell_name.clone(),
+            ai_launch_origin: self.ai_launch_origin,
             client_writer: Arc::clone(&self.client_writer),
             attachment: Arc::clone(&self.attachment),
             term: Arc::clone(&self.term),
@@ -8641,6 +8644,7 @@ async fn handle_create_session(
         session_id,
         workspace_id: request.workspace_id,
         shell_name: session.shell_name.clone(),
+        ai_launch_origin: session.ai_launch_origin,
     };
     send_message(context.writer, &creation_msg).await;
 
@@ -8876,7 +8880,7 @@ async fn start_session(
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, icon_title, cwd,
-        context, ai_state, ai_provider_hint, shell_tool, prompt_state, cell_width, cell_height,
+        context, ai_state, ai_provider_hint, ai_launch_origin, shell_tool, prompt_state, cell_width, cell_height,
         env_window_id, env_envelope_id, image_state, ..
     } = session;
     let shared = SharedSessionHandles::new(pty_fd, initial_attachment).await;
@@ -8893,7 +8897,7 @@ async fn start_session(
         image_sharing: Arc::clone(&shared.image_sharing), attachment: Arc::clone(&shared.attachment),
         workspace_id, shell_name, title, icon_title, task_label, cwd,
         last_cwd_report: None, git_branch_cache: GitBranchCache::default(),
-        context, ai_state, ai_provider_hint, shell_tool, prompt_state, focused_issue: None,
+        context, ai_state, ai_provider_hint, ai_launch_origin, shell_tool, prompt_state, focused_issue: None,
         cell_width, cell_height, resize_pacer: std::sync::Mutex::default(),
         pty, handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
@@ -10361,6 +10365,7 @@ async fn handle_list_sessions(
         }),
         ai_state: s.ai_state.clone(),
         ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
+        ai_launch_origin: s.ai_launch_origin,
         shell_tool: s.shell_tool,
         prompt_state: s.prompt_state.clone(),
     };
@@ -14621,6 +14626,7 @@ pub async fn serialize_live_for_handoff(
                 .as_ref()
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
+            ai_launch_origin: live.ai_launch_origin,
             shell_tool: live.shell_tool,
             prompt_state: live.prompt_state.clone(),
             env_window_id: Some(live.env_window_id),
@@ -15406,6 +15412,7 @@ mod tests {
                     git_branch: None,
                     ai_state: Some(ai_state),
                     ai_provider_hint: Some(AiProvider::Pi),
+                    ai_launch_origin: None,
                     shell_tool: None,
                     prompt_state: Some(scribe_common::protocol::SessionPromptState::default()),
                 }],
@@ -16839,6 +16846,7 @@ mod tests {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                ai_launch_origin: None,
                 shell_tool: None,
                 prompt_state: None,
                 env_window_id: None,
@@ -17119,6 +17127,7 @@ mod tests {
 
         {
             let mut sessions = live_sessions.write().await;
+            sessions.get_mut(&session_id).unwrap().ai_launch_origin = Some(true);
             dismiss_persisted_attention_state(sessions.get_mut(&session_id).unwrap());
         }
         persist_session_metadata(
@@ -17130,6 +17139,7 @@ mod tests {
 
         let sessions = live_sessions.read().await;
         let retained = sessions.get(&session_id).unwrap();
+        assert_eq!(retained.ai_launch_origin, Some(true));
         assert!(retained.ai_state.is_none());
         assert!(retained.ai_provider_hint.is_none());
         assert!(retained.prompt_state.is_none());
@@ -18617,6 +18627,7 @@ mod tests {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                ai_launch_origin: None,
                 shell_tool: None,
                 prompt_state: None,
                 env_window_id: Some(window_id),

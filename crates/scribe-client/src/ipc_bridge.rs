@@ -1131,14 +1131,21 @@ pub struct IpcSink {
     /// `CreateSession` frames this window has enqueued and not yet seen
     /// answered, in writer order. Shared by every clone because the GPUI thread
     /// mints the request and the IPC reader consumes the answer.
-    pending_creates: Arc<Mutex<VecDeque<PendingCreate>>>,
+    pending_creates: Arc<Mutex<PendingCreates>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingCreates {
+    // The bool records typed launch intent before the request leaves this client.
+    requests: VecDeque<(PendingCreate, bool)>,
+    origin_uncertain: bool,
 }
 
 impl IpcSink {
     /// Wraps the IPC-writer channel sender.
     #[must_use]
     pub fn new(tx: OutboundSender) -> Self {
-        Self { tx, pending_creates: Arc::new(Mutex::new(VecDeque::new())) }
+        Self { tx, pending_creates: Arc::new(Mutex::new(PendingCreates::default())) }
     }
 
     /// Enqueues encoded key bytes for `session_id`.
@@ -1234,7 +1241,10 @@ impl IpcSink {
         pending_create: PendingCreate,
     ) -> Result<(), SinkError> {
         let mut pending = self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner);
-        pending.push_back(pending_create);
+        pending.requests.push_back((
+            pending_create,
+            launch.ai_launch.is_some() || launch.shell_tool == Some(ShellTool::Pi),
+        ));
         let result = self.enqueue(ClientMessage::CreateSession {
             workspace_id: launch.workspace_id,
             split_direction: None,
@@ -1246,7 +1256,7 @@ impl IpcSink {
             env_envelope_id: Some(launch.launch_id),
         });
         if result.is_err() {
-            pending.pop_back();
+            pending.requests.pop_back();
         }
         result
     }
@@ -1264,8 +1274,22 @@ impl IpcSink {
     ///
     /// A `SessionCreated` with no claim outstanding is the server acknowledging
     /// an `AttachSessions`, which has to keep attaching.
-    pub fn claim_pending_create(&self) -> Option<PendingCreate> {
-        self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+    pub fn claim_pending_create(&self) -> Option<(PendingCreate, Option<bool>)> {
+        let mut pending = self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner);
+        pending
+            .requests
+            .pop_front()
+            .map(|(create, origin)| (create, (!pending.origin_uncertain).then_some(origin)))
+    }
+
+    /// Retire origin authority, not queued delivery or pane/tab completions.
+    ///
+    /// Errors carry no request identity, and a disconnected stream may have lost
+    /// a create acknowledgement. Neither draining this FIFO nor reconnecting
+    /// proves alignment again. Only a new sink starts with trusted fallback;
+    /// session-keyed retained origin and server metadata remain independent.
+    pub fn invalidate_pending_create_origin(&self) {
+        self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner).origin_uncertain = true;
     }
 
     /// Attaches `session_ids` at `dimensions`, switching which sessions stream
@@ -2180,13 +2204,68 @@ mod tests {
         sink.create_session_for_action(sample_launch(), sink.action_completion(41)).unwrap();
         // A clone shares the FIFO: the reader holds one, the GPUI view another.
         let reader = sink.clone();
-        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Tab(None))));
-        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Pane(None))));
         assert!(matches!(
             reader.claim_pending_create(),
-            Some(PendingCreate::Tab(Some(completion))) if completion.correlation_id() == 41
+            Some((PendingCreate::Tab(None), Some(false)))
+        ));
+        assert!(matches!(
+            reader.claim_pending_create(),
+            Some((PendingCreate::Pane(None), Some(false)))
+        ));
+        assert!(matches!(
+            reader.claim_pending_create(),
+            Some((PendingCreate::Tab(Some(completion)), Some(false))) if completion.correlation_id() == 41
         ));
         assert!(reader.claim_pending_create().is_none(), "an attach echo must not claim a create");
+    }
+
+    #[test]
+    fn pending_create_origin_tracks_replay_values_and_rolls_back() {
+        use crate::restore_replay::{ReplayCommand, replay_launch_values};
+        use scribe_common::ai_state::AiProvider;
+        let mut commands = vec![
+            (ReplayCommand::Shell, false),
+            (ReplayCommand::Custom(vec!["claude".into()]), false),
+            (ReplayCommand::Tool(ShellTool::Pi), true),
+            (ReplayCommand::AiFresh { provider: AiProvider::Pi }, true),
+        ];
+        for provider in [AiProvider::ClaudeCode, AiProvider::CodexCode] {
+            commands.extend([
+                (ReplayCommand::AiFresh { provider }, true),
+                (ReplayCommand::AiGeneric { provider }, true),
+                (
+                    ReplayCommand::AiTargeted { provider, conversation_id: "conversation".into() },
+                    true,
+                ),
+            ]);
+        }
+        let (tx, mut rx) = outbound_channel();
+        let sink = IpcSink::new(tx);
+        for (command, expected) in commands {
+            let values = replay_launch_values(&command);
+            let launch = SessionLaunch {
+                command: values.command,
+                ai_launch: values.ai_launch,
+                shell_tool: values.shell_tool,
+                ..sample_launch()
+            };
+            sink.create_pane_session(launch).unwrap();
+            assert!(
+                matches!(sink.claim_pending_create(), Some((PendingCreate::Pane(_), origin)) if origin == Some(expected))
+            );
+            assert!(matches!(rx.try_recv(), Some(ClientMessage::CreateSession { .. })));
+        }
+        sink.create_session(SessionLaunch { shell_tool: Some(ShellTool::Pi), ..sample_launch() })
+            .unwrap();
+        for _ in 1..OUTBOUND_QUEUE_FRAMES {
+            sink.key_input(SessionId::new(), vec![0], false).unwrap();
+        }
+        assert!(sink.create_session(sample_launch()).is_err());
+        assert!(matches!(sink.claim_pending_create(), Some((PendingCreate::Tab(_), Some(true)))));
+        assert!(
+            sink.claim_pending_create().is_none(),
+            "failed enqueue must roll back only its intent"
+        );
     }
 
     // @lat: [[test#GPUI IPC Bridge#Refused create leaves nothing to claim]]

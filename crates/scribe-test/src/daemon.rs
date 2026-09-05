@@ -825,7 +825,7 @@ async fn dispatch_session_message(
         ServerMessage::IconTitleChanged { session_id, title } => {
             handle_icon_title_changed(session_id, title, state).await;
         }
-        ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
+        ServerMessage::SessionCreated { session_id, workspace_id, shell_name, .. } => {
             handle_session_created(session_id, workspace_id, &shell_name, state, notifiers).await;
         }
         ServerMessage::SessionExited { session_id, exit_code, signal } => {

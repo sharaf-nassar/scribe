@@ -90,6 +90,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         context: None,
         ai_state: None,
         ai_provider_hint: None,
+        ai_launch_origin: None,
         shell_tool: None,
         prompt_state: None,
         env_window_id: None,
@@ -172,6 +173,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             }),
             ai_state: None,
             ai_provider_hint: None,
+            ai_launch_origin: None,
             shell_tool: None,
             prompt_state: None,
             env_window_id: None,
@@ -359,6 +361,7 @@ async fn serialize_live_returns_activated_sessions() {
     let (mut state, masters, _slaves) = make_handoff_state(1);
     state.sessions[0].title = Some(String::from("window"));
     state.sessions[0].icon_title = Some(String::from("icon"));
+    state.sessions[0].ai_launch_origin = Some(true);
     let expected_id = state.sessions[0].session_id;
 
     let sm = Arc::new(SessionManager::restore_from_handoff(&state, masters, 100).unwrap());
@@ -370,7 +373,15 @@ async fn serialize_live_returns_activated_sessions() {
     ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares, &git_ref_watcher).await;
     wait_registry_count(&registry, 1).await;
 
+    let attach = registry
+        .write()
+        .await
+        .get_mut(&expected_id)
+        .unwrap()
+        .prepare_attach_data(expected_id, None);
+    assert_eq!(attach.ai_launch_origin, Some(true));
     let (sessions, fds) = ipc_server::serialize_live_for_handoff(&registry).await;
+    assert_eq!(sessions[0].ai_launch_origin, Some(true));
 
     assert_eq!(sessions.len(), 1);
     assert_eq!(fds.len(), 1);
@@ -701,6 +712,99 @@ fn current_version_payload_round_trips_child_identity() {
 
     assert_eq!(decoded.sessions.first().expect("one session").child_identity, recorded);
     assert_eq!(decoded.sessions.first().expect("one session").icon_title.as_deref(), Some("icon"));
+}
+
+#[tokio::test]
+async fn handoff_ai_launch_origin_round_trips_and_restores_independently_of_hints() {
+    for origin in [None, Some(false), Some(true)] {
+        let (mut state, masters, _slaves) = make_handoff_state(1);
+        let session = state.sessions.first_mut().unwrap();
+        session.ai_launch_origin = origin;
+        session.ai_provider_hint = Some(AiProvider::Pi);
+        let session_id = session.session_id;
+        let bytes = rmp_serde::to_vec_named(&state).unwrap();
+        let restored: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.sessions[0].ai_launch_origin, origin);
+        let manager = SessionManager::restore_from_handoff(&restored, masters, 100).unwrap();
+        assert_eq!(manager.take_session(session_id).await.unwrap().ai_launch_origin, origin);
+    }
+}
+
+#[test]
+fn handoff_ai_launch_origin_named_maps_preserve_optional_image_state() {
+    use crate::terminal_image_state::{PtyTerminalImageState, TerminalImageProcessPolicy};
+    let images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1())
+        .export_handoff(&mut |_| None)
+        .state;
+    let (mut state, _masters, _slaves) = make_handoff_state(1);
+    for (origin, image_state) in [None, Some(false), Some(true)]
+        .into_iter()
+        .flat_map(|origin| [None, Some(images.clone())].map(|images| (origin, images)))
+    {
+        state.sessions[0].ai_launch_origin = origin;
+        state.sessions[0].image_state = image_state;
+        let bytes = rmp_serde::to_vec_named(&state).unwrap();
+        let restored: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.sessions[0].ai_launch_origin, origin);
+        assert_eq!(
+            restored.sessions[0].image_state.is_some(),
+            state.sessions[0].image_state.is_some()
+        );
+    }
+}
+
+#[test]
+fn handoff_ai_launch_origin_accepts_prior_named_and_positional_fields() {
+    struct PriorPositional<'a>(&'a HandoffSession, bool);
+    impl serde::Serialize for PriorPositional<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeTuple;
+            let mut tuple = serializer.serialize_tuple(if self.1 { 24 } else { 23 })?;
+            macro_rules! fields {
+                ($($field:ident),+ $(,)?) => { $(tuple.serialize_element(&self.0.$field)?;)+ };
+            }
+            fields!(
+                session_id,
+                workspace_id,
+                child_pid,
+                child_identity,
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+                snapshot,
+                session_replay,
+                title,
+                icon_title,
+                shell_name,
+                task_label,
+                codex_task_label,
+                cwd,
+                context,
+                ai_state,
+                ai_provider_hint,
+                shell_tool,
+                prompt_state,
+                env_window_id,
+                env_envelope_id
+            );
+            if self.1 {
+                tuple.serialize_element(&self.0.image_state)?;
+            }
+            tuple.end()
+        }
+    }
+    let prior = prior_session(4242);
+    let decoded: HandoffSession =
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&prior).unwrap()).unwrap();
+    assert_eq!(decoded.ai_launch_origin, None);
+    // Current pre-origin positional layout, including its optional image slot.
+    for image_slot in [false, true] {
+        let bytes = rmp_serde::to_vec(&PriorPositional(&decoded, image_slot)).unwrap();
+        let positional: HandoffSession = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(positional.ai_launch_origin, None);
+        assert_eq!(positional.child_pid, 4242);
+    }
 }
 
 // @lat: [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]]
