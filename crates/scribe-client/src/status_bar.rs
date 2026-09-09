@@ -11,7 +11,8 @@
 //! The layout logic splits in two: [`build_model`] is a pure function turning
 //! [`StatusBarData`] into a [`StatusBarModel`] of coloured [`Span`]s (left /
 //! centre / right groups), unit-tested without a live window; [`render`] maps
-//! that model onto GPUI elements. The sparklines are graph spans painted as
+//! that model onto GPUI elements, after [`fit_right`] has degraded the right
+//! group to the width the window leaves it. The sparklines are graph spans painted as
 //! quads by [`render`], not block glyphs in the text run: at the band's text
 //! size the `▁▂▃` run was a few pixels of smear at the baseline, shaped by
 //! whichever fallback face supplied the glyphs. Every size in the band is a
@@ -68,6 +69,9 @@ const CPU_SPARK_WIDTH: usize = 16;
 /// Number of sparkline bars for network displays. Must match
 /// `sys_stats::NET_HISTORY_CAP`; 16s of history.
 const NET_SPARK_WIDTH: usize = 8;
+/// The shortest graph the band paints before it starts dropping sections:
+/// four bars still show a trend; fewer read as noise.
+const MIN_SPARK_WIDTH: usize = 4;
 /// Network sparklines saturate at 100 MB/s.
 const NET_SPARK_MAX_BYTES_PER_SEC: u64 = 100_000_000;
 
@@ -316,6 +320,9 @@ pub enum SpanKind {
     Graph(Vec<Bar>),
     /// A horizontal gauge filled to `level`; `Span::color` is the hue.
     Gauge { level: f32, color: [f32; 4] },
+    /// A muted ` · ` between segments of one zone, and the boundary
+    /// [`fit_right`] drops a segment at.
+    Separator,
     /// Invisible boundary between two chips in the stats zone.
     ChipBreak,
     /// Invisible boundary between two zones: [`render`] starts a new zone
@@ -601,7 +608,7 @@ fn build_right(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> 
 /// Push a quiet " · " separator between segments inside one zone.
 fn push_sep(spans: &mut Vec<Span>, colors: &StatusBarColors) {
     if !spans.is_empty() {
-        spans.push(Span::new(" \u{00B7} ", colors.separator));
+        spans.push(Span::kind(SpanKind::Separator, " \u{00B7} ", colors.separator));
     }
 }
 
@@ -923,6 +930,12 @@ fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+/// Horizontal padding inside each zone container.
+const ZONE_PADDING: f32 = 8.0;
+
+/// Half a pixel of overflow is shaping rounding, not a clipped bar.
+const FIT_SLACK: f32 = 0.5;
+
 /// Measure the display-column budget left after the current right group,
 /// centred CTA, action glyphs, and their GPUI paddings reserve their space.
 #[must_use]
@@ -933,76 +946,155 @@ pub fn measure_left_budget_cols(
     metrics: &StatusBarMetrics,
     window: &Window,
 ) -> usize {
-    let cell_width = status_text_width("0", font_family, metrics.text, window).max(1.0);
-    let right_width = right_group_width(&model.right, font_family, metrics, window);
-    let center = model.center.as_ref().map_or("", |span| span.text.as_str());
-    let center_width = status_text_width(center, font_family, metrics.text, window)
-        + if model.center.is_some() { f32::from(window.rem_size()) } else { 0.0 };
+    let text_width = |text: &str, size: f32| status_text_width(text, font_family, size, window);
+    let cell_width = text_width("0", metrics.text).max(1.0);
+    // The hover group is one zone of two pieces: its own padding and the
+    // gap between the arrow and the URI come off the top.
+    let available_px = (f32::from(window.bounds().size.width)
+        - reserved_width(model, action_glyphs, metrics, window, &text_width)
+        - group_width(&model.right, metrics, &text_width)
+        - 2.0 * ZONE_PADDING
+        - metrics.piece_gap)
+        .max(0.0);
+    display_cols_in_px(available_px, cell_width)
+}
+
+/// Fit the right group into the width the band leaves beside the left
+/// group, the centred CTA and the trailing controls (see [`fit_right`]).
+pub fn fit_right_group(
+    model: &mut StatusBarModel,
+    action_glyphs: &str,
+    font_family: &str,
+    metrics: &StatusBarMetrics,
+    window: &Window,
+) {
+    let text_width = |text: &str, size: f32| status_text_width(text, font_family, size, window);
+    let available_px = f32::from(window.bounds().size.width)
+        - reserved_width(model, action_glyphs, metrics, window, &text_width)
+        - group_width(&model.left, metrics, &text_width);
+    fit_right(&mut model.right, available_px, metrics, &text_width);
+}
+
+/// Fit the right group's spans into `available_px`.
+///
+/// Graphs shorten first: the longest ones lose their oldest bar together,
+/// so CPU and GPU come down to the network graphs' length before all four
+/// shorten in step, until every graph is at [`MIN_SPARK_WIDTH`]. Sections
+/// then drop from the right (stat chips, then metadata segments) until the
+/// group fits. The graphs stay at the floor while sections drop, so a
+/// resize never bounces them back to full length between drops.
+pub fn fit_right(
+    spans: &mut Vec<Span>,
+    available_px: f32,
+    metrics: &StatusBarMetrics,
+    text_width: &dyn Fn(&str, f32) -> f32,
+) {
+    let per_bar = metrics.bar_width + metrics.bar_gap;
+    let mut overflow = group_width(spans, metrics, text_width) - available_px;
+    while overflow > FIT_SLACK {
+        let longest = spans
+            .iter()
+            .filter_map(|span| match &span.kind {
+                SpanKind::Graph(bars) if bars.len() > MIN_SPARK_WIDTH => Some(bars.len()),
+                _ => None,
+            })
+            .max();
+        let Some(longest) = longest else { break };
+        for bars in spans.iter_mut().filter_map(|span| match &mut span.kind {
+            SpanKind::Graph(bars) if bars.len() == longest => Some(bars),
+            _ => None,
+        }) {
+            bars.remove(0);
+            overflow -= per_bar;
+        }
+    }
+    while overflow > FIT_SLACK && !spans.is_empty() {
+        pop_section(spans);
+        overflow = group_width(spans, metrics, text_width) - available_px;
+    }
+}
+
+/// Drop the group's rightmost section (a stat chip, a metadata segment, or
+/// the clock) together with the break or separator that led into it.
+fn pop_section(spans: &mut Vec<Span>) {
+    while let Some(span) = spans.pop() {
+        if matches!(span.kind, SpanKind::ChipBreak | SpanKind::ZoneBreak | SpanKind::Separator) {
+            break;
+        }
+    }
+}
+
+/// Pixels the band's edge padding, the centred CTA, the trailing controls
+/// and one zone gap of breathing room between the groups reserve.
+fn reserved_width(
+    model: &StatusBarModel,
+    action_glyphs: &str,
+    metrics: &StatusBarMetrics,
+    window: &Window,
+    text_width: &dyn Fn(&str, f32) -> f32,
+) -> f32 {
+    let center_width = model
+        .center
+        .as_ref()
+        .map_or(0.0, |span| text_width(&span.text, metrics.text) + f32::from(window.rem_size()));
     // Each action is a fixed `control`-wide button, and the trailing
     // controls cluster adds its own zone gap and padding.
     let action_count = action_glyphs.graphemes(true).count();
     let actions_width = f32::from(u8::try_from(action_count).unwrap_or(u8::MAX)) * metrics.control
         + if action_count > 0 { metrics.zone_gap + 2.0 * CONTROLS_PADDING } else { 0.0 };
-    let available_px = (f32::from(window.bounds().size.width)
-        - 2.0 * metrics.edge
-        - right_width
-        - center_width
-        - actions_width)
-        .max(0.0);
-    display_cols_in_px(available_px, cell_width)
+    2.0 * metrics.edge + metrics.zone_gap + center_width + actions_width
 }
 
-/// The right group's painted width: every zone's spans at their own sizes,
-/// plus the chip, zone and pill spacing [`render`] lays them out with.
-fn right_group_width(
+/// A span group's painted width: every zone's spans at their own sizes,
+/// plus the piece, chip, zone and pill spacing [`render`] lays them out with.
+fn group_width(
     spans: &[Span],
-    font_family: &str,
     metrics: &StatusBarMetrics,
-    window: &Window,
+    text_width: &dyn Fn(&str, f32) -> f32,
 ) -> f32 {
+    if spans.is_empty() {
+        return 0.0;
+    }
     let mut width = 0.0;
-    let mut zones = 0.0;
-    let mut pieces_in_chip = 0.0;
+    let mut zones = 1.0;
+    let mut first_in_chip = true;
     for span in spans {
-        width += match &span.kind {
-            SpanKind::Text => status_text_width(&span.text, font_family, metrics.text, window),
-            SpanKind::Label => status_text_width(&span.text, font_family, metrics.label, window),
-            SpanKind::Readout => readout_width(span, font_family, metrics, window),
-            SpanKind::Graph(bars) => metrics.graph_width(bars.len()),
-            SpanKind::Gauge { .. } => metrics.gauge_width,
+        let piece = match &span.kind {
             SpanKind::ChipBreak => {
-                pieces_in_chip = 0.0;
-                metrics.chip_gap
+                width += metrics.chip_gap;
+                first_in_chip = true;
+                continue;
             }
             SpanKind::ZoneBreak => {
+                width += metrics.zone_gap;
                 zones += 1.0;
-                pieces_in_chip = 0.0;
-                metrics.zone_gap
+                first_in_chip = true;
+                continue;
             }
+            SpanKind::Text | SpanKind::Separator => text_width(&span.text, metrics.text),
+            SpanKind::Label => text_width(&span.text, metrics.label),
+            SpanKind::Readout => readout_width(span, metrics, text_width),
+            SpanKind::Graph(bars) => metrics.graph_width(bars.len()),
+            SpanKind::Gauge { .. } => metrics.gauge_width,
         };
-        if !matches!(span.kind, SpanKind::Text | SpanKind::ChipBreak | SpanKind::ZoneBreak) {
-            // Chip pieces are separated by `piece_gap`; the first piece of a
-            // chip has no gap before it.
-            if pieces_in_chip > 0.0 {
-                width += metrics.piece_gap;
-            }
-            pieces_in_chip += 1.0;
+        // `span_row` gaps every piece of a chip, text runs included.
+        if !first_in_chip {
+            width += metrics.piece_gap;
         }
+        first_in_chip = false;
+        width += piece;
     }
-    // Every zone pill pads 8px each side.
-    width + (zones + 1.0) * 16.0
+    width + zones * 2.0 * ZONE_PADDING
 }
 
 /// A readout's reserved width: four cells at readout size, or the shaped
 /// text when it is wider (a `>1G` never is).
 fn readout_width(
     span: &Span,
-    font_family: &str,
     metrics: &StatusBarMetrics,
-    window: &Window,
+    text_width: &dyn Fn(&str, f32) -> f32,
 ) -> f32 {
-    let cells = status_text_width("0000", font_family, metrics.readout, window);
-    cells.max(status_text_width(&span.text, font_family, metrics.readout, window))
+    text_width("0000", metrics.readout).max(text_width(&span.text, metrics.readout))
 }
 
 fn display_cols_in_px(extent: f32, cell_width: f32) -> usize {
@@ -1086,7 +1178,7 @@ impl gpui::Render for SpanTooltip {
 fn zone_pill(inner: gpui::AnyElement) -> gpui::AnyElement {
     div()
         .rounded(px(6.0))
-        .px(px(8.0))
+        .px(px(ZONE_PADDING))
         .flex()
         .flex_row()
         .items_center()
@@ -1097,7 +1189,7 @@ fn zone_pill(inner: gpui::AnyElement) -> gpui::AnyElement {
 /// Render a span group as zone containers split on [`SpanKind::ZoneBreak`]
 /// boundaries, so each segment cluster keeps its own spacing on the flat
 /// band background.
-fn zoned_row(spans: &[Span], geometry: &StatusBarGeometry<'_>) -> impl IntoElement {
+fn zoned_row(spans: &[Span], geometry: &StatusBarGeometry<'_>) -> gpui::Div {
     let mut zones: Vec<Vec<Span>> = vec![Vec::new()];
     for span in spans {
         if span.is_zone_break() {
@@ -1345,7 +1437,10 @@ pub fn render(
         // Every span is its own text node; a squeezed band must clip them at
         // the edge, never fold a readout onto a second line.
         .whitespace_nowrap()
-        .child(zoned_row(&model.left, geometry))
+        // The right group is already fitted to the band; the left group is
+        // the one that yields (clips at its own edge) if the window is
+        // narrower than it alone, so the controls keep their corner.
+        .child(zoned_row(&model.left, geometry).min_w_0().overflow_hidden())
         .child(
             div()
                 .h_full()
@@ -1368,6 +1463,7 @@ pub fn render(
                     .flex_row()
                     .items_center()
                     .h_full()
+                    .flex_none()
                     .ml(px(metrics.zone_gap))
                     .px(px(CONTROLS_PADDING))
                     .rounded(px(6.0))
@@ -1858,5 +1954,83 @@ mod tests {
             |s| matches!(s.kind, SpanKind::Gauge { level, .. } if (level - 0.5).abs() < 1e-6)
         ));
         assert_eq!(full.iter().filter(|s| s.kind == SpanKind::ChipBreak).count(), 3);
+    }
+
+    // @lat: [[test#GPUI Status Bar#Right group fits the band by trimming graphs then dropping sections]]
+    #[test]
+    fn right_group_fits_by_trimming_graphs_then_dropping_sections() {
+        let colors = colors();
+        let stats = SystemStats {
+            cpu_percent: 50.0,
+            mem_used_gb: 8.0,
+            mem_total_gb: 16.0,
+            gpu_percent: Some(25.0),
+            net_up_bytes_sec: 1_000,
+            net_down_bytes_sec: 2_000,
+            cpu_history: VecDeque::from(vec![10.0; CPU_SPARK_WIDTH]),
+            gpu_history: VecDeque::from(vec![25.0; CPU_SPARK_WIDTH]),
+            net_up_history: VecDeque::from(vec![1_000; NET_SPARK_WIDTH]),
+            net_down_history: VecDeque::from(vec![2_000; NET_SPARK_WIDTH]),
+        };
+        let config = StatusBarStatsConfig {
+            usage: StatusBarUsageStatsConfig {
+                compute: StatusBarComputeStatsConfig { cpu: true, gpu: true },
+                memory: true,
+            },
+            network: true,
+        };
+        let mut d = data();
+        d.git_branch = Some("main");
+        d.session_count = 9;
+        d.host_label = "local";
+        d.sys_stats = Some(&stats);
+        d.stats_config = Some(&config);
+        let full = build_right(&d, &colors);
+        let metrics = StatusBarMetrics::for_height(36.0);
+        // A monospace stand-in for the window's shaper: 0.6em per character.
+        let measure = |text: &str, size: f32| text.chars().map(|_| size * 0.6).sum::<f32>();
+        let width = |spans: &[Span]| group_width(spans, &metrics, &measure);
+        let graph_lens = |spans: &[Span]| {
+            spans
+                .iter()
+                .filter_map(|span| match &span.kind {
+                    SpanKind::Graph(bars) => Some(bars.len()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let fit = |available: f32| {
+            let mut spans = full.clone();
+            fit_right(&mut spans, available, &metrics, &measure);
+            assert!(width(&spans) <= available + FIT_SLACK, "{available}px: {}", joined(&spans));
+            spans
+        };
+        let full_width = width(&full);
+        let per_bar = metrics.bar_width + metrics.bar_gap;
+
+        // Room enough: untouched.
+        assert_eq!(fit(full_width), full);
+        // A little short: CPU and GPU lose bars before the shorter network
+        // graphs, and nothing drops.
+        let trimmed = fit(full_width - 3.0 * per_bar);
+        assert_eq!(graph_lens(&trimmed), [14, 8, 8, 14]);
+        assert_eq!(trimmed.len(), full.len());
+        // At the floor every graph is MIN_SPARK_WIDTH bars and nothing drops.
+        let floor_width = full_width - 32.0 * per_bar;
+        let at_floor = fit(floor_width);
+        assert_eq!(graph_lens(&at_floor), [4, 4, 4, 4]);
+        assert_eq!(at_floor.len(), full.len());
+        // Past it, sections drop from the right: GPU first, while the graphs
+        // stay at the floor.
+        let dropped = fit(floor_width - 1.0);
+        let text = joined(&dropped);
+        assert!(!text.contains("GPU"), "{text}");
+        assert!(text.contains("CPU") && text.contains("MEM") && text.contains('\u{2191}'));
+        assert!(text.contains("main") && text.contains("9 sessions") && text.contains("local"));
+        assert_eq!(graph_lens(&dropped), [4, 4, 4]);
+        // Metadata segments go host-first and the branch last.
+        let branch_only = fit(width(&[Span::new("main", colors.accent)]));
+        assert_eq!(joined(&branch_only), "main");
+        assert!(fit(0.0).is_empty());
     }
 }

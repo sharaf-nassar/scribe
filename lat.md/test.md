@@ -6358,6 +6358,12 @@ The feature-015 presence badge reports the attached-participant count and names 
 
 All but the last two bars are idle stubs at level zero in the dim label colour, then the real samples at their levels in the CPU hue at 72% alpha, between a semibold `CPU` label span and a right-aligned percentage readout. MEM emits a gauge at its fraction rather than a one-bar graph, and the four chips are separated by three `SpanKind::ChipBreak` spans.
 
+### Right group fits the band by trimming graphs then dropping sections
+
+[[crates/scribe-client/src/status_bar.rs#fit_right]] is covered by `right_group_fits_by_trimming_graphs_then_dropping_sections`, fitting a full right group (branch, sessions, host, all four stat chips) into shrinking widths under a monospace stand-in shaper.
+
+The full width leaves the group untouched. Three bars short, CPU and GPU each lose bars while the shorter network graphs keep theirs and nothing drops. Thirty-two bars short every graph sits at the four-bar `MIN_SPARK_WIDTH` floor with every section still present; one pixel past that the GPU chip drops while the surviving graphs stay at the floor. A width that only holds the branch keeps exactly the branch, and zero width empties the group. Every fitted group measures within half a pixel of the width it was given.
+
 ## GPUI Settings Window
 
 Unit tests for the GPUI settings window that replaces the deleted `scribe-settings` GTK/wry app, proving the current page model routes controls correctly and that a second launch hands off focus rather than opening a duplicate. See .

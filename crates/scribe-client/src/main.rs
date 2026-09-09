@@ -12329,6 +12329,15 @@ impl TerminalView {
         // knows, and would fall through to a proportional sans fallback.
         let font_family = self.font.family.clone();
         let metrics = status_bar::StatusBarMetrics::for_height(self.status_bar_height);
+        // Shorten the graphs, then drop sections from the right, until the
+        // right group fits beside the left group and the controls.
+        status_bar::fit_right_group(
+            &mut model,
+            action_glyphs,
+            &font_family,
+            &metrics,
+            status_window,
+        );
         if let Some(uri) = hover_uri {
             let left_budget_cols = status_bar::measure_left_budget_cols(
                 &model,
@@ -12337,7 +12346,11 @@ impl TerminalView {
                 &metrics,
                 status_window,
             );
+            // The fitted right group carries over: hover replaces the left
+            // group and must not bounce the graphs.
+            let right = std::mem::take(&mut model.right);
             model = self.build_status_model(Some(uri), left_budget_cols);
+            model.right = right;
         }
         for message in &self.link_feedback.visible_messages {
             model.accessibility_label.push_str("; ");
