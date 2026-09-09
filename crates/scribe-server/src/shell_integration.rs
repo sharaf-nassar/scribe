@@ -365,6 +365,8 @@ mod tests {
             .arg("--no-config")
             .arg(&driver)
             .env("SCRIBE_RECORD_PATH", &record)
+            // Fish 3.7 lists SHLVL in `set -nx` even when it was not inherited.
+            .env_remove("SHLVL")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         seal_child(&mut command);
@@ -428,6 +430,7 @@ mod tests {
         let body = format!(
             "set -gx SCRIBE_PROBE_EMPTY ''\n\
              set -gx SCRIBE_PROBE_LIST a b c\n\
+             set -gx SHLVL_PROBE tracked\n\
              set -gx SCRIBE_PROBE_MULTI 'one\ntwo'\n\
              source '{}'\n\
              set -gx SCRIBE_PROBE_DELTA_EMPTY ''\n\
@@ -459,6 +462,8 @@ mod tests {
         }
 
         let base = payload(baseline[0]);
+        assert!(!base.added.contains_key("SHLVL"), "shell depth must not enter the snapshot");
+        assert_eq!(base.added.get("SHLVL_PROBE").map(String::as_str), Some("tracked"));
         assert_eq!(base.added.get("SCRIBE_PROBE_EMPTY").map(String::as_str), Some(""));
         assert_eq!(base.added.get("SCRIBE_PROBE_LIST").map(String::as_str), Some("a b c"));
         assert_eq!(base.added.get("SCRIBE_PROBE_MULTI").map(String::as_str), Some("one\ntwo"));

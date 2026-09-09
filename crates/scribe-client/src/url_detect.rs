@@ -1285,6 +1285,9 @@ fn target_for_path(resolved: &str) -> OpenTarget {
 }
 
 fn target_for_uri(uri: &str) -> OpenTarget {
+    if Path::new(uri).is_absolute() {
+        return target_for_path(uri);
+    }
     OpenTarget { scheme: extract_scheme(uri), resolved_path: resolved_file_uri_path(uri) }
 }
 
@@ -1414,21 +1417,14 @@ fn parse_path_line_suffix(raw: &str) -> (&str, Option<u32>) {
     (raw, None)
 }
 
-/// Returns `true` when `uri` starts with one of the outbound URL
-/// allowlist **prefixes** (`https://`, `http://`, `ftp://`, `file://`,
-/// `mailto:`, `ssh:`, `telnet:`).
+/// Whether an OSC 8 target may open without a scheme confirmation.
 ///
-/// Used by the OSC 8 activation router (spec 009 FR-009 / FR-015) to
-/// decide whether an OSC 8 URI may open directly or must first prompt
-/// the user via the disallowed-scheme dialog.
-///
-/// **Note:** despite the name, the check is a prefix match — each entry
-/// in `PREFIXES` includes its scheme delimiter (`://` or `:`). As long as
-/// `PREFIXES` only contains scheme+delimiter entries, this is
-/// functionally identical to a scheme-name check; the short name is kept
-/// to match the call sites.
-pub fn is_allowed_scheme(uri: &str) -> bool {
-    PREFIXES.iter().any(|p| uri.starts_with(p))
+/// Absolute filesystem paths have no URI scheme and go to the OS handler
+/// unchanged, including spaces and colons in filenames. Other targets must
+/// match the existing outbound URL prefixes; missing schemes alone are not
+/// sufficient to bypass confirmation.
+pub fn is_allowed_osc8_target(uri: &str) -> bool {
+    Path::new(uri).is_absolute() || PREFIXES.iter().any(|p| uri.starts_with(p))
 }
 
 /// Extract the URI scheme (everything up to the first `:`) when present.
@@ -1455,9 +1451,8 @@ pub fn open_url(url: &str) {
 
 /// Open `uri` with the OS handler without the scheme-allowlist guard.
 ///
-/// Used by the OSC 8 disallowed-scheme confirmation dialog (spec 009
-/// FR-015) after the user has explicitly chosen "Open Anyway". Allowed
-/// schemes go through `open_url` instead.
+/// Used after the OSC 8 target gate allows a URL or absolute path, or after
+/// the user chooses "Open Anyway" in the disallowed-scheme dialog.
 pub fn open_uri_unguarded(uri: &str) {
     #[cfg(target_os = "linux")]
     let cmd = "xdg-open";
@@ -1728,6 +1723,27 @@ mod tests {
             OpenTarget { scheme: None, resolved_path: Some(PathBuf::from("/tmp/example.txt")) }
         );
         assert_eq!(target_for_path("relative/example.txt").resolved_path, None);
+
+        for uri in ["https://example.test", "file:///tmp/example.png", "mailto:user@example.test"] {
+            assert!(super::is_allowed_osc8_target(uri), "{uri}");
+        }
+        for uri in ["javascript:alert(1)", "custom://host/tmp/image.png", "", "--help"] {
+            assert!(!super::is_allowed_osc8_target(uri), "{uri}");
+        }
+        for path in [
+            "/tmp/roasted-ui-mocks/graphite-brews-375.png",
+            "/tmp/preview with spaces.png",
+            "/tmp/preview:42",
+        ] {
+            let output = format!("\x1b]8;;{path}\x1b\\Mobile preview\x1b]8;;\x1b\\");
+            let term = term_with_output(40, 2, output.as_bytes());
+            assert_eq!(osc8_spans(&term)[0].0, path);
+            assert!(super::is_allowed_osc8_target(path), "{path}");
+            assert_eq!(
+                target_for_uri(path),
+                OpenTarget { scheme: None, resolved_path: Some(PathBuf::from(path)) }
+            );
+        }
     }
 
     // @lat: [[test#GPUI URL Detection#Delimited absolute paths retain their root]]

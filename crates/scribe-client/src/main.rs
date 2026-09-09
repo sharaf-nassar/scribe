@@ -4683,9 +4683,9 @@ impl TerminalView {
         origin: Osc8ActivationOrigin,
         cx: &mut Context<Self>,
     ) {
-        if url_detect::is_allowed_scheme(&uri) {
+        if url_detect::is_allowed_osc8_target(&uri) {
             match origin {
-                Osc8ActivationOrigin::FireAndForget => url_detect::open_url(&uri),
+                Osc8ActivationOrigin::FireAndForget => url_detect::open_uri_unguarded(&uri),
                 Osc8ActivationOrigin::Observed { pane, anchor } => {
                     let open = url_detect::open_uri_unguarded_observed(&uri);
                     self.observe_link_open(pane, anchor, open, cx);

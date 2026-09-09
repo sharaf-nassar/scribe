@@ -242,6 +242,8 @@ function __scribe_json_escape
 end
 
 # Names of the exported variables the delta tracks, in `set -nx` order.
+# Drop SHLVL, already excluded from persistence server-side: fish 3.7 lists
+# it even when absent, so a later removal sweep would report a false deletion.
 # Scribe's own markers are dropped, and so is any name fish cannot spell
 # as an identifier: indirect expansion stops at the first character
 # outside `[A-Za-z0-9_]`, so a `BASH_FUNC_x%%` inherited from bash reads
@@ -249,7 +251,7 @@ end
 # as a cache key outright. One `string match` call filters the whole
 # list, so the pass stays O(N) with a single builtin invocation.
 function __scribe_env_names
-    string match -r '^(?!__scribe_|_SCRIBE_)[A-Za-z0-9_]+$' -- (set -nx)
+    string match -r '^(?!__scribe_|_SCRIBE_|SHLVL$)[A-Za-z0-9_]+$' -- (set -nx)
 end
 
 # Env-delta emit. One pass over the exported environment both diffs
