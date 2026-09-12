@@ -402,9 +402,14 @@ impl SessionRegistry {
 
     /// Retire a `SessionExited` pane. Returns whether it was tracked.
     pub fn on_session_exited(&mut self, session_id: SessionId) -> bool {
-        let existed = self.workspace.remove(&session_id).is_some();
+        let Some(workspace_id) = self.workspace.remove(&session_id) else {
+            return false;
+        };
         self.session_order.retain(|id| *id != session_id);
-        existed
+        if !self.workspace.values().any(|ws| *ws == workspace_id) {
+            self.workspace_order.retain(|ws| *ws != workspace_id);
+        }
+        true
     }
 
     /// Record the window id a takeover `Hello`'s `Welcome` adopted.
@@ -765,6 +770,14 @@ mod tests {
         assert!(registry.reconnect_topology().is_empty());
         // Exiting an unknown session is a no-op.
         assert!(!registry.on_session_exited(SessionId::new()));
+
+        // A drained workspace leaves the order; a re-created session in it
+        // lands last, not at its old slot, and the order cannot grow unbounded.
+        let other = WorkspaceId::new();
+        registry.on_session_created(SessionId::new(), other);
+        assert_eq!(registry.workspace_order, vec![other]);
+        registry.on_session_created(session, ws);
+        assert_eq!(registry.workspace_order, vec![other, ws]);
     }
 
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Takeover adoption]]

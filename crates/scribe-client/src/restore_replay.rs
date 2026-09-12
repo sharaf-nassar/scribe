@@ -541,7 +541,7 @@ fn restore_tab_snapshot(
         if let Some(tab_placeholder_session_id) = tab_placeholder_session_id {
             restored_tab.session_id = tab_placeholder_session_id;
         }
-        restored_tab.focused_pane = focused_pane_id;
+        restored_tab.restored_focused_pane = focused_pane_id;
     }
 }
 
@@ -664,7 +664,7 @@ fn snapshot_workspaces<S: BuildHasher>(
                 .iter()
                 .map(|tab| TabSnapshot {
                     focused_launch_id: panes
-                        .get(&tab.focused_pane)
+                        .get(&tab.restored_focused_pane)
                         .map(|pane| pane.launch_binding.launch_id.clone())
                         .unwrap_or_default(),
                     pane_tree: snapshot_pane_tree(tab.pane_layout.root(), panes),

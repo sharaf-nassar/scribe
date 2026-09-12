@@ -283,6 +283,10 @@ impl RestoreStore {
             match create_private_file(&tmp_path) {
                 Ok(mut file) => {
                     file.write_all(content)?;
+                    // Rename is only atomic for data already on disk: without
+                    // this, a power cut after the rename can publish an
+                    // empty inode, and cold restart replays nothing.
+                    file.sync_all()?;
                     return Ok(tmp_path);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

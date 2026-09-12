@@ -17086,6 +17086,9 @@ fn on_session_exited(
     if existed && Some(session_id) == attached {
         set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
     }
+    // A background tab's exit reaches neither `set_status` nor `attach_session`,
+    // so nothing above would repaint the tab strip until an unrelated tick.
+    ctx.generation.fetch_add(1, Ordering::Release);
     Ok(())
 }
 

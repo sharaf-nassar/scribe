@@ -64,7 +64,10 @@ pub struct WorkspaceSlot {
 pub struct TabState {
     pub session_id: SessionId,
     pub pane_layout: LayoutTree,
-    pub focused_pane: PaneId,
+    /// Snapshot-only: written by `PaneShell::snapshot_layout` and read on
+    /// restore. The live focused pane is `PaneShell::focused`; reading this
+    /// field at runtime returns whatever the last snapshot recorded.
+    pub restored_focused_pane: PaneId,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +170,11 @@ impl WindowLayout {
         let layout = LayoutTree::new();
         let focused_pane = layout.initial_pane_id();
         let pane_id = focused_pane;
-        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane });
+        ws.tabs.push(TabState {
+            session_id,
+            pane_layout: layout,
+            restored_focused_pane: focused_pane,
+        });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pane_id)
     }
@@ -188,7 +195,11 @@ impl WindowLayout {
         let first_pane_id = pairs.first().map(|&(_, pid)| pid)?;
         let layout = LayoutTree::from_root(layout_root, first_pane_id);
         let ws = self.find_workspace_mut(workspace_id)?;
-        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane: first_pane_id });
+        ws.tabs.push(TabState {
+            session_id,
+            pane_layout: layout,
+            restored_focused_pane: first_pane_id,
+        });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pairs)
     }

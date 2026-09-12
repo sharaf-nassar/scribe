@@ -82,7 +82,9 @@ accept legacy `prompt_bar_bg` as an alias for `prompt_bar_second_row_bg`.
 
 The snapshot exists for callers that resolve config on a per-sequence basis. Dynamic color queries are the motivating case: an OSC 4 probe over all 256 palette indices used to cost one `config.toml` read and parse per index, plus a second read and parse of the external theme file when the active theme is not a built-in preset. Warm, the same probe costs zero disk reads.
 
-A load failure is not cached, so a transiently unreadable config does not pin an error for the life of the process. Two paths drop the snapshot: [[crates/scribe-common/src/config.rs#save_config]] after it writes the file, and the server's `ConfigReloaded` handler before it re-reads. Callers that must observe the freshly-on-disk bytes — the env-persistence transition check, the settings round-trip — keep using [[crates/scribe-common/src/config.rs#load_config]] directly.
+A load failure is not cached, so a transiently unreadable config does not pin an error for the life of the process. Two paths drop the snapshot: [[crates/scribe-common/src/config.rs#save_config]] after it writes the file, and the server's `ConfigReloaded` handler before it re-reads. Callers that must observe the freshly-on-disk bytes (the settings round-trip) keep using [[crates/scribe-common/src/config.rs#load_config]] directly; the server's reload handler loads once and threads that one snapshot into every sub-step, including the env-persistence transition, so a single reload can never apply two different generations of the file.
+
+`save_config` and the profile-store writers go through [[crates/scribe-common/src/config.rs#write_atomic]]: a same-directory temp file, `sync_all`, then `rename`. A plain `fs::write` truncates first, so a crash or full disk mid-write left an empty `config.toml` that the next load parsed as defaults and the next save persisted as the user's config.
 
 ### Appearance
 
@@ -152,7 +154,7 @@ On macOS, config load also migrates stale legacy non-mac defaults when a saved k
 
 Named config profiles are stored separately from `config.toml` so switching profiles can atomically rewrite the active config without losing the saved variants.
 
- keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml` for stable installs or `$XDG_CONFIG_HOME/scribe-dev/profiles.toml` for the dev flavor. , , , and  back the CLI profile commands and the client command palette's profile switcher.
+ keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml` for stable installs or `$XDG_CONFIG_HOME/scribe-dev/profiles.toml` for the dev flavor. , , , and  back the CLI profile commands and the client command palette's profile switcher. The store and profile-export writers share [[crates/scribe-common/src/config.rs#write_atomic]] with `save_config`, so a crash mid-write cannot leave a truncated `profiles.toml`.
 
 ### Unicode Width
 

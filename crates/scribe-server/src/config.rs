@@ -46,6 +46,9 @@ pub struct ScribeConfig {
     pub github_ci: GithubCiConfig,
     /// Live policy and bounds for the local agent control surface.
     pub agent_api: AgentApiConfig,
+    /// `[terminal.env_persistence]`, carried on the same snapshot as every
+    /// other reloaded setting so a reload never re-reads disk for it.
+    pub env_persistence: scribe_common::config::TerminalEnvPersistenceConfig,
 }
 
 impl Default for ScribeConfig {
@@ -61,6 +64,7 @@ impl Default for ScribeConfig {
             images_enabled: true,
             github_ci: GithubCiConfig::default(),
             agent_api: AgentApiConfig::default(),
+            env_persistence: scribe_common::config::TerminalEnvPersistenceConfig::default(),
         }
     }
 }
@@ -109,6 +113,7 @@ fn project_config(full: scribe_common::config::ScribeConfig) -> ScribeConfig {
     let images_enabled = full.terminal.images.enabled;
     let github_ci = full.github_ci;
     let agent_api = full.agent_api;
+    let env_persistence = full.terminal.env_persistence;
 
     let config = ScribeConfig {
         workspace_roots,
@@ -121,6 +126,7 @@ fn project_config(full: scribe_common::config::ScribeConfig) -> ScribeConfig {
         images_enabled,
         github_ci,
         agent_api,
+        env_persistence,
     };
 
     info!(

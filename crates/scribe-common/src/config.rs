@@ -2284,13 +2284,32 @@ pub fn save_config(config: &ScribeConfig) -> Result<(), ScribeError> {
     let content = toml::to_string_pretty(config)
         .map_err(|e| ScribeError::ConfigError { reason: format!("TOML serialize error: {e}") })?;
 
-    std::fs::write(&config_path, content).map_err(|e| ScribeError::ConfigError {
-        reason: format!("failed to write {}: {e}", config_path.display()),
-    })?;
+    write_atomic(&config_path, content.as_bytes())?;
 
     tracing::info!(?config_path, "config saved");
     invalidate_config_snapshot();
     Ok(())
+}
+
+/// Replace `path` with `content` through a same-directory temp file, fsync,
+/// and rename, so a crash or full disk mid-write can never leave a truncated
+/// file that the next load parses as defaults and the next save persists.
+pub fn write_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), ScribeError> {
+    use std::io::Write as _;
+    let io_err = |e: std::io::Error| ScribeError::ConfigError {
+        reason: format!("failed to write {}: {e}", path.display()),
+    };
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        drop(std::fs::remove_file(&tmp));
+    }
+    result.map_err(io_err)
 }
 
 // ---------------------------------------------------------------------------

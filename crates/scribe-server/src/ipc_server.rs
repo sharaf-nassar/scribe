@@ -6694,11 +6694,18 @@ async fn detach_sessions(
     ids: &HashSet<SessionId>,
     writer: &SharedWriter,
 ) {
-    let sessions = live_sessions.read().await;
-    for id in ids {
-        if let Some(session) = sessions.get(id) {
-            detach_one_session(session, *id, writer).await;
-        }
+    // The sink and pacer work is sync and runs under the registry guard; the
+    // attachment clear awaits a tokio mutex, so it runs after the guard drops
+    // (the registry must never be held across an `.await`, see
+    // [`LiveSessionRegistry`]).
+    let to_clear: Vec<SessionAttachment> = {
+        let sessions = live_sessions.read().await;
+        ids.iter()
+            .filter_map(|id| sessions.get(id).and_then(|s| detach_one_session(s, *id, writer)))
+            .collect()
+    };
+    for attachment in to_clear {
+        clear_session_attachment(&attachment).await;
     }
 }
 
@@ -6714,19 +6721,27 @@ async fn detach_sessions(
 /// pre-detach report mature would overwrite that grid up to an interval later.
 /// A detach that leaves other sinks attached keeps the pending size, since the
 /// drag it belongs to is still someone's.
-async fn detach_one_session(session: &LiveSession, id: SessionId, writer: &SharedWriter) {
+///
+/// Returns the attachment to clear when the set emptied; the caller clears it
+/// once the registry guard is released.
+fn detach_one_session(
+    session: &LiveSession,
+    id: SessionId,
+    writer: &SharedWriter,
+) -> Option<SessionAttachment> {
     let now_empty = {
         let mut client_writer = lock_sinks(&session.client_writer);
         if !client_writer.detach(writer) {
-            return;
+            return None;
         }
         client_writer.is_empty()
     };
+    info!(%id, "session detached (client disconnected)");
     if now_empty {
         lock_resize_pacer(&session.resize_pacer).discard_pending();
-        clear_session_attachment(&session.attachment).await;
+        return Some(Arc::clone(&session.attachment));
     }
-    info!(%id, "session detached (client disconnected)");
+    None
 }
 
 /// Close the singleton settings window once the client registry stays empty
@@ -11183,7 +11198,7 @@ async fn handle_config_reloaded(server: &IpcServerState) {
         "config reload applied to live sessions"
     );
 
-    apply_env_persistence_transition(env_store, live_sessions).await;
+    apply_env_persistence_transition(env_store, live_sessions, cfg.env_persistence.enabled).await;
 
     // Feature 013 (T007): poke the remote-control supervisor so it re-reads the
     // reloaded `[remote]` config and starts, stops, or rebinds the listener live.
@@ -11278,25 +11293,15 @@ async fn apply_reload_to_sessions(
 /// state, but a partial-delete failure must not poison the rest of the
 /// reload path.
 ///
-/// Reads the freshly-on-disk feature flag via
-/// `scribe_common::config::load_config()` and atomically swaps it into
-/// [`EnvStoreState`]'s cached `last_enabled`. No-op when the flag did
-/// not change.
+/// `new_enabled` comes from the same config snapshot the rest of the reload
+/// applied (a second disk read here could disagree with it). It is atomically
+/// swapped into [`EnvStoreState`]'s cached `last_enabled`. No-op when the flag
+/// did not change.
 async fn apply_env_persistence_transition(
     env_store: &Arc<crate::env_store::EnvStoreState>,
     live_sessions: &LiveSessionRegistry,
+    new_enabled: bool,
 ) {
-    let new_enabled = match scribe_config::load_config() {
-        Ok(cfg) => cfg.terminal.env_persistence.enabled,
-        Err(e) => {
-            warn!(
-                target: "scribe_server::ipc_server",
-                error = %e,
-                "skipping env-persistence transition check: config load failed"
-            );
-            return;
-        }
-    };
     let old_enabled = env_store.swap_last_enabled(new_enabled);
 
     if old_enabled == new_enabled {
@@ -14557,6 +14562,60 @@ pub fn new_window_shares() -> WindowShares {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// One session's handoff record plus the lock handles that finish it off the
+/// registry guard: its `Term`, image seam, and resize fd.
+type StagedHandoffSession = (
+    HandoffSession,
+    Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    SessionImageState,
+    Arc<OwnedFd>,
+);
+
+impl LiveSession {
+    /// Copy this session's sync metadata and clone its lock handles, so the
+    /// handoff walk can await the Term and image-seam locks with the registry
+    /// guard already released.
+    fn stage_for_handoff(&self, session_id: SessionId) -> StagedHandoffSession {
+        let handoff = HandoffSession {
+            session_id,
+            workspace_id: self.workspace_id,
+            child_pid: self.child_pid,
+            child_identity: self.child_identity,
+            cols: 0,
+            rows: 0,
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
+            snapshot: None,
+            session_replay: None,
+            title: self.title.clone(),
+            icon_title: self.icon_title.clone(),
+            shell_name: self.shell_name.clone(),
+            task_label: self.task_label.clone(),
+            codex_task_label: self.task_label.clone(),
+            cwd: self.cwd.clone(),
+            context: self.context.clone(),
+            ai_state: self.ai_state.clone(),
+            ai_provider_hint: self
+                .ai_state
+                .as_ref()
+                .map(|state| state.provider)
+                .or(self.ai_provider_hint),
+            ai_launch_origin: self.ai_launch_origin,
+            shell_tool: self.shell_tool,
+            prompt_state: self.prompt_state.clone(),
+            env_window_id: Some(self.env_window_id),
+            env_envelope_id: self.env_envelope_id.clone(),
+            image_state: None,
+        };
+        (
+            handoff,
+            Arc::clone(&self.term),
+            Arc::clone(&self.terminal_images),
+            Arc::clone(&self.resize_fd),
+        )
+    }
+}
+
 /// Serialise all live sessions for a hot-reload handoff.
 ///
 /// Returns `(sessions, fds)` where the fds are in the same order as the
@@ -14564,9 +14623,17 @@ pub fn new_window_shares() -> WindowShares {
 pub async fn serialize_live_for_handoff(
     live_sessions: &LiveSessionRegistry,
 ) -> (Vec<HandoffSession>, Vec<Arc<OwnedFd>>) {
-    let sessions = live_sessions.read().await;
-    let mut handoff_sessions = Vec::with_capacity(sessions.len());
-    let mut fds = Vec::with_capacity(sessions.len());
+    // Copy the sync metadata and clone the per-session lock handles under the
+    // registry guard, then release it: the Term and image-seam locks below are
+    // awaited, and the registry must never be held across an `.await` (see
+    // [`LiveSessionRegistry`]), or every attach/create/close stalls for the
+    // whole snapshot walk.
+    let staged: Vec<StagedHandoffSession> = {
+        let sessions = live_sessions.read().await;
+        sessions.iter().map(|(&id, live)| live.stage_for_handoff(id)).collect()
+    };
+    let mut handoff_sessions = Vec::with_capacity(staged.len());
+    let mut fds = Vec::with_capacity(staged.len());
     // One export per payload, so the shared image-byte ceiling is charged
     // across every session rather than per session. With the master switch off
     // nothing is exported and the payload stays v6, which is what makes a
@@ -14574,17 +14641,19 @@ pub async fn serialize_live_for_handoff(
     let mut images =
         crate::terminal_image_handoff::HandoffImageExport::new(images_master_enabled());
 
-    for (&session_id, live) in sessions.iter() {
-        let term = live.term.lock().await;
+    for (mut handoff, term, terminal_images, resize_fd) in staged {
+        let session_id = handoff.session_id;
+        let term = term.lock().await;
         let snapshot = snapshot_term(&term);
-        let cols = u16::try_from(term.grid().columns()).unwrap_or(u16::MAX);
-        let rows = u16::try_from(term.grid().screen_lines()).unwrap_or(u16::MAX);
+        handoff.cols = u16::try_from(term.grid().columns()).unwrap_or(u16::MAX);
+        handoff.rows = u16::try_from(term.grid().screen_lines()).unwrap_or(u16::MAX);
         drop(term);
 
         // Encode as a v5 replay (compressed ANSI). If encoding fails, log and
         // leave session_replay None — the receiver will fall back to the
         // legacy snapshot field and still produce a working session.
-        let session_replay = match scribe_common::screen_replay::build_session_replay(&snapshot) {
+        handoff.session_replay = match scribe_common::screen_replay::build_session_replay(&snapshot)
+        {
             Ok(replay) => Some(replay),
             Err(e) => {
                 tracing::warn!(%session_id, "build_session_replay failed: {e}");
@@ -14592,49 +14661,18 @@ pub async fn serialize_live_for_handoff(
             }
         };
 
-        let has_ai_state = live.ai_state.is_some();
+        let has_ai_state = handoff.ai_state.is_some();
         tracing::debug!(%session_id, has_ai_state, "serializing live session for handoff");
 
         // Reads are already paused, so the seam is quiescent and this lock is
         // uncontended: whatever the last read committed is the whole scene.
-        let seam = live.terminal_images.lock().await;
-        let image_state =
+        let seam = terminal_images.lock().await;
+        handoff.image_state =
             images.session(seam.session(), &mut |definition| seam.canonical_rgba(definition));
         drop(seam);
 
-        handoff_sessions.push(HandoffSession {
-            session_id,
-            workspace_id: live.workspace_id,
-            child_pid: live.child_pid,
-            child_identity: live.child_identity,
-            cols,
-            rows,
-            cell_width: live.cell_width,
-            cell_height: live.cell_height,
-            snapshot: None,
-            session_replay,
-            title: live.title.clone(),
-            icon_title: live.icon_title.clone(),
-            shell_name: live.shell_name.clone(),
-            task_label: live.task_label.clone(),
-            codex_task_label: live.task_label.clone(),
-            cwd: live.cwd.clone(),
-            context: live.context.clone(),
-            ai_state: live.ai_state.clone(),
-            ai_provider_hint: live
-                .ai_state
-                .as_ref()
-                .map(|state| state.provider)
-                .or(live.ai_provider_hint),
-            ai_launch_origin: live.ai_launch_origin,
-            shell_tool: live.shell_tool,
-            prompt_state: live.prompt_state.clone(),
-            env_window_id: Some(live.env_window_id),
-            env_envelope_id: live.env_envelope_id.clone(),
-            image_state,
-        });
-
-        fds.push(Arc::clone(&live.resize_fd));
+        handoff_sessions.push(handoff);
+        fds.push(resize_fd);
     }
 
     let counters = images.counters();

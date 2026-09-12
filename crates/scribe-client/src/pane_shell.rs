@@ -208,7 +208,7 @@ impl TabTrees {
         cx: &mut App,
     ) {
         let placeholder = tab.session_id;
-        let wanted_focus = tab.focused_pane;
+        let wanted_focus = tab.restored_focused_pane;
         let pane_layout = std::mem::replace(&mut tab.pane_layout, LayoutTree::new());
         let tree = cx.new(|_| PaneTree::from_tree(pane_layout));
         let panes = tree.read(cx);
@@ -1508,7 +1508,7 @@ impl PaneShell {
         if let (Some(pane), Some(saved_tab)) =
             (focused_pane, layout.active_tab_for_workspace_mut(workspace_id))
         {
-            saved_tab.focused_pane = pane;
+            saved_tab.restored_focused_pane = pane;
         }
     }
 

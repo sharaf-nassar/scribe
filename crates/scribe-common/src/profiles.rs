@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app::current_config_dir;
-use crate::config::{ScribeConfig, load_config, save_config};
+use crate::config::{ScribeConfig, load_config, save_config, write_atomic};
 use crate::error::ScribeError;
 
 const DEFAULT_PROFILE_NAME: &str = "default";
@@ -122,9 +122,7 @@ pub fn save_profile_store(store: &ProfileStore) -> Result<(), ScribeError> {
     let content = toml::to_string_pretty(&normalized).map_err(|e| ScribeError::ConfigError {
         reason: format!("profile store serialize error: {e}"),
     })?;
-    std::fs::write(&path, content).map_err(|e| ScribeError::ConfigError {
-        reason: format!("failed to write {}: {e}", path.display()),
-    })?;
+    write_atomic(&path, content.as_bytes())?;
     Ok(())
 }
 
@@ -171,9 +169,7 @@ pub fn export_profile(name: &str, path: &Path) -> Result<PathBuf, ScribeError> {
             reason: format!("failed to create export directory {}: {e}", parent.display()),
         })?;
     }
-    std::fs::write(path, content).map_err(|e| ScribeError::ConfigError {
-        reason: format!("failed to write {}: {e}", path.display()),
-    })?;
+    write_atomic(path, content.as_bytes())?;
     Ok(path.to_path_buf())
 }
 
