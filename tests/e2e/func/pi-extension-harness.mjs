@@ -504,6 +504,34 @@ async function testBackgroundSubagentActivity() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Mid-run context and compaction]]
+async function testMidRunContextAndCompaction() {
+  const logPath = join(tempDir, "context.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  extensionFactory(api);
+  const turnEnd = api.handler("turn_end");
+  const contexts = async () => parsedCalls(await starts(logPath))
+    .filter(({ event }) => event === "context_changed").map(({ payload }) => payload.fill_percent);
+
+  api.handler("input")({ type: "input", text: "Long task", source: "interactive" }, makeContext());
+  api.handler("agent_start")({ type: "agent_start" }, makeContext());
+  // Turns inside one run report as they happen; unchanged readings are not repeated.
+  turnEnd({ type: "turn_end" }, makeContext(96.8));
+  turnEnd({ type: "turn_end" }, makeContext(97.2));
+  // Auto-compaction: Pi reports null until the next assistant response.
+  turnEnd({ type: "turn_end" }, makeContext(null));
+  turnEnd({ type: "turn_end" }, makeContext(11.5));
+  api.handler("agent_settled")({ type: "agent_settled" }, makeContext(11.5));
+  await waitFor(async () => (await starts(logPath)).some((e) => e.argv[1] === "--event=session_stopped"),
+    "settle missing");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(await contexts(), [97, 12], "context must track turns and drop after compaction");
+
+  await shutdown(api);
+  return starts(logPath);
+}
+
 // @lat: [[test#Test Harness#Pi Extension Harness#Malformed messages and no polling]]
 async function testMalformedMessagesAndNoPolling() {
   const logPath = join(tempDir, "malformed.jsonl");
@@ -802,6 +830,7 @@ try {
   allStarts.push(...await testSharedQuestionnaireWait());
   allStarts.push(...await testRetryAndSettleBehavior());
   allStarts.push(...await testBackgroundSubagentActivity());
+  allStarts.push(...await testMidRunContextAndCompaction());
   allStarts.push(...await testMalformedMessagesAndNoPolling());
   allStarts.push(...await testIssueFocusedFromBdClaim());
   allStarts.push(...await testCallbacksDoNotAwaitHelper());

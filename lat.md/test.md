@@ -1868,6 +1868,16 @@ classifier, and an error stop reports `error` instead.
 The three context readings — 49.6, 100.6, and -4.8 — prove rounding and the
 0-100 clamp.
 
+### Mid-run context and compaction
+
+Regression for a gauge stuck at 97% through an auto-compaction: one run with
+four `turn_end` readings — 96.8, 97.2, null, 11.5 — then a settle at 11.5
+emits exactly `[97, 12]`.
+
+96.8 and 97.2 round to the same 97 and are not repeated, the null reading Pi
+returns right after compaction is skipped, and the settle does not resend the
+12 the last turn already reported.
+
 ### Background subagent activity
 
 A settled parent stays Processing while background subagents run, using the

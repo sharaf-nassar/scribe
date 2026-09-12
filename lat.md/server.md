@@ -1223,9 +1223,16 @@ Only documented Pi lifecycle events are used:
   `session_stopped { last_message }` for the server's stop classifier to resolve
   into `IdlePrompt` or `WaitingForInput`. Active background work or an open
   questionnaire overrides emission until it ends.
-  [[dist/pi-extension.ts#contextPercent]] still adds `context_changed` from
-  `ctx.getContextUsage()`, rounded and clamped to 0-100 so an out-of-range
-  reading cannot paint an impossible gauge.
+- `turn_end` and `agent_settled` → `context_changed` from
+  `ctx.getContextUsage()` through [[dist/pi-extension.ts#contextPercent]]
+  (rounded and clamped to 0-100 so an out-of-range reading cannot paint an
+  impossible gauge), skipping a reading equal to the last one sent. Reading at every turn, not only at
+  settle, is what makes compaction visible: a long tool-calling run used to
+  pin the gauge at its pre-run value, and an auto-compaction inside that run
+  (usage drops from ~97% to ~12%) stayed hidden until the run ended. No
+  `session_compact` handler is needed — Pi reports `percent: null` until the
+  first assistant response after a compaction, so that reading is skipped and
+  the next `turn_end` carries the post-compaction value.
 - `session_shutdown` → a final `state_cleared` after the queue is retired.
 
 `PermissionPrompt` is never emitted. Pi exposes no documented permission event,

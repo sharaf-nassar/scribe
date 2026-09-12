@@ -360,6 +360,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   };
   let askingUser = false;
   let subagentsRunning = false;
+  let lastPercent: number | undefined;
   let refreshQueued = false;
   let unsubscribeSubagentStatus: (() => void) | undefined;
 
@@ -372,6 +373,19 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   function setParentState(event: typeof parentState.event, payload: Payload) {
     parentState = { event, payload };
     reportState();
+  }
+
+  // Context is read at every turn boundary, not only at settle: a long run
+  // otherwise pins the gauge at its pre-run value, and an auto-compaction
+  // inside that run (which drops usage by ~90%) stays invisible until the run
+  // ends. Right after compaction Pi reports `percent: null` until the next
+  // assistant response, so the compaction itself emits nothing and the next
+  // `turn_end` carries the post-compaction reading.
+  function reportContext(ctx: Parameters<typeof contextPercent>[0]) {
+    const percent = contextPercent(ctx);
+    if (percent === undefined || percent === lastPercent) return;
+    lastPercent = percent;
+    enqueue("context_changed", { fill_percent: percent });
   }
 
   // Ask the optional pi-subagents owner for its current-session projection.
@@ -482,6 +496,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     capturedInputs = 0;
     latestAssistant = "";
     latestError = false;
+    lastPercent = undefined;
     enqueue("task_label_cleared");
     setParentState("state_changed", { state: "idle_prompt" });
     refreshSubagents();
@@ -510,6 +525,8 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     if (event.toolName === "subagent") refreshSubagents();
   });
 
+  pi.on("turn_end", (_event, ctx) => reportContext(ctx));
+
   pi.on("message_end", (event) => {
     const text = assistantText(event.message);
     if (text === undefined) return;
@@ -525,8 +542,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     if (latestError) setParentState("state_changed", { state: "error" });
     else setParentState("session_stopped", { last_message: latestAssistant });
     refreshSubagents();
-    const percent = contextPercent(ctx);
-    if (percent !== undefined) enqueue("context_changed", { fill_percent: percent });
+    reportContext(ctx);
   });
 
   // The exact issue-to-session join behind Flow's live-agent halo: the id
