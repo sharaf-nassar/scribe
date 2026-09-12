@@ -202,6 +202,23 @@ Each run carries `FontWeight` from `appearance.font_weight` / `font_weight_bold`
 
 Every run carries an explicit ordered fallback chain, Nerd Font symbol families first, so GPUI's platform text system cannot substitute its own ordering.
 
+The primary family is self-contained as well:
+[[crates/scribe-client/src/fonts.rs#register_embedded_fonts]] registers the
+unmodified JetBrains Mono 2.304 regular, bold, italic and bold-italic faces before
+GPUI can cache any family lookup, in both terminal and settings startup paths.
+The default therefore works without any host font installation or runtime
+network request. Debian stable/dev and macOS packages ship the upstream OFL
+notice alongside the embedded fonts' own metadata.
+
+A per-glyph fallback chain does not protect a missing primary-family lookup.
+[[crates/scribe-client/src/terminal_element.rs#GridFont#resolve_family]] calls
+[[crates/scribe-client/src/fonts.rs#terminal_font_family]] once at window creation
+and each font/zoom reload, retaining an available user family (with canonical
+case) or selecting the bundled primary with a warning. It never rewrites the
+saved config or enumerates fonts on the row/frame hot path. The 0.1.14 failure
+and clean-font reproduction are recorded in
+[the fresh-install incident](../docs/solutions/runtime-errors/fresh-install-missing-font-and-wayland-controls.md).
+
 The list mirrors the legacy cosmic-text atlas (`SCRIBE_COMMON_FALLBACKS` in `crates/scribe-renderer/src/atlas.rs`): `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, `Nerd Font Symbols`, then the generic sans / mono / symbol / emoji families. `Unifont Sample` is deliberately excluded — its private-use mappings turn an unavailable icon into an unrelated sample glyph, which is worse than a visible tofu box. `specs/016-gpui-client-rebuild/spikes/nerd-font-fallback-ordering.md` records the capability spike.
 
 #### Embedded Symbols Font Defeats GPUI Face Eviction
@@ -225,6 +242,19 @@ The setting is read by  on the live config-load path, and `font_params_changed` 
 GPUI owns chrome layout, clipping, scene batching, and presentation;
 `scribe-client` supplies theme-derived element styles and terminal-specific
 canvas primitives.
+
+The terminal's outer frame belongs to the OS, not an imitation titlebar.
+[[crates/scribe-client/src/native_window.rs#relaunch_command]] checks Linux
+Wayland decoration capability before GPUI or session IPC starts. Compositors
+advertising `zxdg_decoration_manager_v1` keep native Wayland. Without it (GNOME),
+a verified EWMH-managed X11 display supplies the desktop's actual native frame
+through a one-time re-exec with `WAYLAND_DISPLAY` removed only from that process.
+The two-second-bounded probe refuses startup with an actionable error when
+neither native-frame path exists, rather than opening another borderless window.
+X11/headless and non-Linux paths are unchanged; settings retains its independently
+owned client decorations. No launcher override, environment mutation, custom
+terminal controls or server restart is required. See
+[the fresh-install incident](../docs/solutions/runtime-errors/fresh-install-missing-font-and-wayland-controls.md).
 
 [[crates/scribe-client/src/main.rs#TerminalView#render]] builds the window shell
 from GPUI elements for title bars, panes, dividers, prompts, status bands, and

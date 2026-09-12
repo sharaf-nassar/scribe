@@ -38,5 +38,11 @@ Version 2.0, at your option. Its source is available at
 https://github.com/image-rs/image-png and both license texts are retained in
 that directory.
 
+The client embeds unmodified JetBrains Mono 2.304 primary text faces,
+copyright 2020 The JetBrains Mono Project Authors, under the SIL Open Font
+License 1.1. Source: https://github.com/JetBrains/JetBrainsMono. The license
+is retained at crates/scribe-client/assets/fonts/jetbrains-mono/OFL.txt and
+shipped as JetBrainsMono-OFL.txt with Debian and macOS packages.
+
 third_party/unix-ancillary/ is a compile-fix fork of unix-ancillary 0.1.0,
 licensed under the MIT license, whose text is retained in that directory.

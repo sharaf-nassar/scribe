@@ -2934,7 +2934,8 @@ impl TerminalView {
         );
         let beads_editor =
             cx.new(|ctx| BeadsEditor::new(Arc::clone(&shared.beads_panels), window, ctx));
-        let (zoom, font) = Self::opening_font(&config, &seed);
+        let (zoom, mut font) = Self::opening_font(&config, &seed);
+        font.resolve_family(cx);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
@@ -4079,6 +4080,7 @@ impl TerminalView {
     fn rebuild_font(&mut self, cx: &mut Context<Self>) {
         let appearance = self.config.config().config.appearance.clone();
         self.font = zoomed_font(&appearance, self.zoom);
+        self.font.resolve_family(cx);
         self.report_cell_metrics(cx);
         cx.notify();
     }
@@ -14926,8 +14928,37 @@ fn flow_band_control(
     }
 }
 
+/// Select native window-decoration ownership before hooks, singleton claims,
+/// IPC or GPUI initialization. Exec preserves PID/arguments without mutating
+/// environment variables in a process that may already have library threads.
+#[cfg(target_os = "linux")]
+fn native_window_exit() -> Option<std::process::ExitCode> {
+    use std::os::unix::process::CommandExt as _;
+
+    match scribe_client::native_window::relaunch_command() {
+        Ok(None) => None,
+        Ok(Some(mut command)) => {
+            write_client_stderr(
+                "Scribe: Wayland compositor has no native window decorations; using its X11 native frame.",
+            );
+            let error = command.exec();
+            write_client_stderr(&format!("Scribe: cannot launch native-frame backend: {error}"));
+            Some(std::process::ExitCode::FAILURE)
+        }
+        Err(error) => {
+            write_client_stderr(&format!("Scribe: {error}"));
+            Some(std::process::ExitCode::FAILURE)
+        }
+    }
+}
+
 fn main() -> std::process::ExitCode {
     if let Some(exit) = client_argument_exit() {
+        return exit;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(exit) = native_window_exit() {
         return exit;
     }
 

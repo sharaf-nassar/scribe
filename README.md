@@ -89,6 +89,14 @@ just client     # launch the GPU client
 just install    # builds, packages .deb, and installs
 ```
 
+Scribe keeps the desktop's native terminal window frame. On GNOME/Ubuntu
+Wayland, which does not offer native Wayland decorations, it automatically uses
+XWayland after verifying the window manager. No launcher override is needed.
+Wayland compositors advertising native decorations keep the Wayland backend.
+If neither native-frame path is available, startup reports how to enable one
+rather than opening a window without controls. Settings has its own designed
+client-side frame and is unchanged.
+
 ### Install on macOS
 
 ```bash
@@ -132,6 +140,11 @@ roots = ["~/work", "~/projects"]
 ```
 
 Open the graphical settings editor with `Ctrl+,` to modify configuration without editing the file directly.
+
+JetBrains Mono's regular, bold, italic and bold-italic faces are bundled in the
+client; no font installation or runtime download is needed. An unavailable
+configured font falls back to the bundled face without changing your saved
+configuration.
 
 `terminal.focus_follows_mouse` defaults to `false`, keeping click-to-focus.
 Turn on the Terminal page's **Focus follows mouse** toggle to let button-free

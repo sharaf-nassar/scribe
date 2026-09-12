@@ -10,7 +10,6 @@ COPY --from=beads-release /usr/local/bin/bd /usr/local/bin/bd
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        fonts-jetbrains-mono \
         ca-certificates \
         clang \
         dbus \

@@ -431,9 +431,11 @@ pub fn platform_start_server() -> Result<(), ServerConnectError> {
     }
 }
 
-/// Push the current GUI environment into the systemd user manager so a server
+/// Push the desktop GUI environment into the systemd user manager so a server
 /// it starts inherits `DISPLAY`/`WAYLAND_DISPLAY`/etc., and clears any that are
-/// absent so a stale value from a previous session is not reused.
+/// absent so a stale value from a previous session is not reused. Recover the
+/// original Wayland socket after the terminal's native-frame X11 re-exec; the
+/// client's backend choice must not remove Wayland from future server shells.
 #[cfg(target_os = "linux")]
 pub fn sync_linux_service_environment() {
     const GUI_ENV_VARS: &[&str] = &[
@@ -445,29 +447,36 @@ pub fn sync_linux_service_environment() {
         "XAUTHORITY",
     ];
 
-    let present: Vec<&str> =
-        GUI_ENV_VARS.iter().copied().filter(|name| std::env::var_os(name).is_some()).collect();
+    let present: Vec<(&str, std::ffi::OsString)> = GUI_ENV_VARS
+        .iter()
+        .copied()
+        .filter_map(|name| crate::native_window::desktop_env(name).map(|value| (name, value)))
+        .collect();
     if !present.is_empty() {
         match std::process::Command::new("systemctl")
             .arg("--user")
             .arg("import-environment")
-            .args(&present)
+            .args(present.iter().map(|(name, _)| name))
+            .envs(present.iter().map(|(name, value)| (name, value)))
             .status()
         {
             Ok(status) if status.success() => {
-                tracing::debug!(vars = ?present, "refreshed user systemd GUI environment");
+                tracing::debug!(vars = ?present.iter().map(|(name, _)| name).collect::<Vec<_>>(), "refreshed user systemd GUI environment");
             }
             Ok(status) => {
-                tracing::warn!(vars = ?present, %status, "systemctl import-environment failed");
+                tracing::warn!(%status, "systemctl import-environment failed");
             }
             Err(e) => {
-                tracing::warn!(vars = ?present, "failed to run systemctl import-environment: {e}");
+                tracing::warn!("failed to run systemctl import-environment: {e}");
             }
         }
     }
 
-    let missing: Vec<&str> =
-        GUI_ENV_VARS.iter().copied().filter(|name| std::env::var_os(name).is_none()).collect();
+    let missing: Vec<&str> = GUI_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| !present.iter().any(|(available, _)| available == name))
+        .collect();
     if !missing.is_empty() {
         match std::process::Command::new("systemctl")
             .arg("--user")

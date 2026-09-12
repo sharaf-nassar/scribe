@@ -2,7 +2,6 @@ FROM rust:1.95-trixie
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        fonts-jetbrains-mono \
         fonts-noto-color-emoji \
         fonts-noto-cjk \
         ca-certificates \

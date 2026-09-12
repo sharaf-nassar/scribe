@@ -70,6 +70,7 @@ arboard = { version = "3", default-features = false, features = [
 futures-util.workspace = true
 raw-window-handle.workspace = true
 x11rb.workspace = true
+wayland-client = "0.31.13"
 zbus.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

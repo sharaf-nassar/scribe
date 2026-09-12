@@ -92,6 +92,8 @@ pub mod lost_control;
 pub mod monitor;
 pub mod mouse_reporting;
 pub mod mouse_state;
+#[cfg(target_os = "linux")]
+pub mod native_window;
 pub mod notification_dispatcher;
 pub mod notifications;
 pub mod opacity;

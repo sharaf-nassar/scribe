@@ -6036,6 +6036,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "vte",
+ "wayland-client",
  "wgpu",
  "x11rb",
  "zbus 5.14.0",

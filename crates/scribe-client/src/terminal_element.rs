@@ -129,6 +129,12 @@ impl GridFont {
         }
     }
 
+    /// Resolve the primary family once, before creating any shaped runs.
+    /// Missing user fonts must never silently become GPUI's proportional UI font.
+    pub fn resolve_family(&mut self, cx: &App) {
+        self.family = scribe_client::fonts::terminal_font_family(&self.family, cx);
+    }
+
     /// The per-cell advance width reported to the server in `TerminalSize`.
     #[must_use]
     pub fn cell_width(&self) -> f32 {

@@ -21,6 +21,11 @@ path-aware workspaces, and first-class AI process awareness. \
 Supports zero-downtime server upgrades via fd handoff."""
 assets = [
   [
+    "../scribe-client/assets/fonts/jetbrains-mono/OFL.txt",
+    "usr/share/doc/scribe/JetBrainsMono-OFL.txt",
+    "644",
+  ],
+  [
     "target/release/scribe-server",
     "usr/bin/",
     "755",
@@ -143,6 +148,11 @@ name = "scribe-dev"
 # The dev flavor uses the same GPUI client runtime as stable.
 depends = "libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1, libxcb-shape0, libxcb-xfixes0, libxcb-render0, libxcb-randr0"
 assets = [
+  [
+    "../scribe-client/assets/fonts/jetbrains-mono/OFL.txt",
+    "usr/share/doc/scribe-dev/JetBrainsMono-OFL.txt",
+    "644",
+  ],
   [
     "target/release/scribe-server",
     "usr/bin/scribe-dev-server",

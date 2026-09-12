@@ -24,12 +24,15 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 78
-counts modules-wired 78
+counts modules-total 79
+counts modules-wired 79
 counts server-messages-total 76
 counts server-messages-handled 69
 counts layout-actions-total 38
 counts layout-actions-handled 38
+
+# native_window is wired into pre-GPUI startup and service environment import;
+# the fresh-install incident records the native-frame regression and repair.
 
 # scribe-lpi2.9 wires the pure Flow layout module into the renderer.
 

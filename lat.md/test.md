@@ -5422,11 +5422,47 @@ Backs the other half of the Font fallback row: naming the chain is useless if GP
 
 Parsing , the test asserts the family name is exactly `Symbols Nerd Font Mono` (the chain's first entry), that `U+006D` maps to a glyph — the property gpui `f96212f` requires to keep a face at all, added by `tools/patch-nerd-symbols-font.py` — and that the powerline and Font Awesome codepoints the visual capture relies on (`U+E0A0`, `U+E0B0`, `U+E0B2`, `U+F09B`, `U+F121`) are all covered.
 
+#### Bundled primary terminal font
+
+The `fonts::tests` suite checks that the default terminal font is bundled and
+that an unavailable configured family never falls back to proportional UI text.
+
+It parses all four bundled JetBrains Mono faces, checking the default config
+family, 400/700 weights, roman/italic styles, monospace metadata, GPUI's `m`
+admission glyph and equal advances for printable ASCII. The missing-family test retains
+available user choices and canonical case, but resolves unavailable names to
+the bundled primary instead of proportional UI fallback.
+
+Both Docker images deliberately omit host JetBrains Mono.
+`tests/e2e/visual/config-reload.sh` rejects contaminated fontconfig state, paints
+regular/bold/italic fixture rows, requires visible text, then live-reloads an
+unavailable family and requires identical grid pixels with the same client PID.
+The native workstation A/B run is recorded in
+[the fresh-install report](../docs/solutions/runtime-errors/fresh-install-missing-font-and-wayland-controls.md).
+
 #### Box-drawing cells leave the shaped text
 
 Pins the substitution that makes the overlay authoritative: a box-drawing codepoint must not also be shaped from the font, or the glyph's bearing gaps reappear on top of the quads.
 
 The test asserts box-drawing and block codepoints become spaces before shaping while ordinary and Nerd Font codepoints pass through, that a control character is blanked so `shape_line` can never see a newline, and that a row's blank tail is trimmed except where an underline or strikeout must still be drawn.
+
+### Native window backend selection
+
+The `native_window::tests` suite checks backend selection before GPUI or session
+IPC exists, preserving OS-owned controls without launcher overrides.
+
+Only interactive Wayland terminal launches probe; native Wayland wins
+without consulting X11; GNOME's missing decoration protocol uses a verified X11
+window manager; neither path available produces an explicit refusal, not missing
+controls. Re-exec preserves the executable and all arguments, removing
+`WAYLAND_DISPLAY` from the new process while carrying its original value in a
+private marker; that makes the next launch idempotent. Service-environment
+tests recover that socket for systemd, prefer a current desktop value to an
+inherited marker, and never synthesize unrelated absent variables.
+Probe work has a two-second total deadline. These tests do not claim compositor
+pixels: the real GNOME launch with no overrides, native controls, font fallback,
+settings and session continuity is documented in
+[the fresh-install report](../docs/solutions/runtime-errors/fresh-install-missing-font-and-wayland-controls.md).
 
 ### Window chrome geometry
 

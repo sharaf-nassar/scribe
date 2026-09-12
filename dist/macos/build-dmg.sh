@@ -123,8 +123,10 @@ cp "${BUILD_DIR}/scribe-server"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-cli"      "${MACOS_DIR}/scribe"
 cp "${BUILD_DIR}/scribe-hook-helper" "${MACOS_DIR}/"
 
-# Copy icon
+# Copy icon and the license for the primary font embedded in the client.
 cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"
+cp "${REPO_ROOT}/crates/scribe-client/assets/fonts/jetbrains-mono/OFL.txt" \
+    "${RESOURCES_DIR}/JetBrainsMono-OFL.txt"
 
 # Copy AI tool hook adapter scripts. The Mach-O helper binary lives in
 # Contents/MacOS so notarization treats it as code, not a resource.

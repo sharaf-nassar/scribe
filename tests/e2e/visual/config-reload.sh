@@ -62,3 +62,44 @@ cmp -s /output/01-config-baseline.png /output/02-config-reloaded.png \
     && { echo "FAIL: window is pixel-identical after the theme edit"; exit 1; }
 
 echo "PASS: external config edit hot-reloaded and repainted the existing client"
+
+# The Docker image must not supply the default face behind the package's back.
+# Embedded fonts are private to GPUI and must not appear in fontconfig.
+if fc-list : family | grep -q 'JetBrains Mono'; then
+    echo "FAIL: clean-font fixture contaminated by a host JetBrains Mono installation"
+    exit 1
+fi
+cat > "$CONFIG_FILE" <<'EOF'
+[appearance]
+theme = "dracula"
+font = "JetBrains Mono"
+cursor_blink = false
+EOF
+sleep 0.6
+WID=$(xdotool search --name '^Scribe$' | head -1)
+xdotool windowfocus --sync "$WID"
+xdotool type --clearmodifiers --delay 2 'printf "\033[2J\033[H0123456789 0123456789\nMMMMMMMMMM iiiiiiiiii\n\033[1mBOLD       BOLD\033[0m\n\033[3mITALIC     ITALIC\033[0m\n"'
+xdotool key --clearmodifiers Return
+sleep 0.8
+import -window "$WID" /output/03-bundled-font.png
+# Skip chrome and the shell cursor. This captures only the four fixture rows.
+convert /output/03-bundled-font.png -crop 350x72+8+40 +repage /output/bundled-font-grid.png
+INK=$(convert /output/bundled-font-grid.png -colorspace Gray -threshold 50% -format '%[fx:mean*w*h]' info:)
+[ "${INK%.*}" -ge 100 ] || { echo "FAIL: bundled-font fixture did not paint text"; exit 1; }
+
+cat > "$CONFIG_FILE" <<'EOF'
+[appearance]
+theme = "dracula"
+font = "Scribe Deliberately Missing Font"
+cursor_blink = false
+EOF
+wait_for_log 'terminal font is unavailable' 10 \
+    || { echo "FAIL: missing configured font did not take the safe fallback"; exit 1; }
+sleep 0.6
+import -window "$WID" /output/04-missing-font.png
+convert /output/04-missing-font.png -crop 350x72+8+40 +repage /output/missing-font-grid.png
+compare -metric AE /output/bundled-font-grid.png /output/missing-font-grid.png null: 2>/output/font-diff.txt \
+    || { echo "FAIL: missing-family fallback changed terminal text pixels"; exit 1; }
+[ "$(pgrep -f '(^|/)scribe-client$' | head -1)" = "$PID_BEFORE" ] \
+    || { echo "FAIL: font reload restarted the client"; exit 1; }
+echo "PASS: bundled primary and missing-family fallback paint identical text without host fonts"

@@ -7,6 +7,23 @@ IPC, binary, and session-continuity contracts after the client cutover.
 
 The regular client opens GPUI windows over the unchanged local IPC protocol. `--settings` opens the integrated settings window and `--vulkan-probe` verifies hardware or lavapipe before package relaunches.
 
+On Linux, [[crates/scribe-client/src/main.rs#native_window_exit]] runs before
+tracing, hook repair, singleton claims, or session restore. The terminal requires
+an OS-owned frame: [[crates/scribe-client/src/native_window.rs#relaunch_command]]
+retains Wayland when its compositor advertises native decorations, otherwise
+verifies the X11 window manager and re-execs the same binary/arguments using
+XWayland. The new process's `WAYLAND_DISPLAY` is removed and retained in the
+private `SCRIBE_DESKTOP_WAYLAND_DISPLAY` marker. Service-environment import uses
+[[crates/scribe-client/src/native_window.rs#desktop_env]] to restore that original
+socket for `systemctl`, so starting a server cannot clear Wayland from the user
+manager or its future shells. The desktop's session identity, launcher files,
+configuration and running server remain unchanged.
+A missing/unresponsive native-frame backend gives a typed startup error within
+the two-second probe deadline instead of a borderless window. Help/version,
+settings, hardware/image probes, native X11 and headless launches do not probe.
+Settings continues to own its designed client frame. See [[rendering#Chrome Rendering]]
+and [[test#GPUI Client Headless Suites#Native window backend selection]].
+
 The GPUI rebuild keeps `appearance.opacity`:  proves that the pinned GPUI revision opens a transparent Wayland/X11 surface and repaints root alpha live. The decision is recorded in `specs/016-gpui-client-rebuild/spikes/window-opacity-wayland-x11.md`, and  documents how the client paints it.
 
 The follow-on image-protocol decision is recorded in `specs/016-gpui-client-rebuild/spikes/terminal-image-protocols.md`: Sixel uses `icy_sixel`, Kitty control data uses a narrowed WezTerm-derived parser, and both feed one bounded placement renderer.
@@ -2230,7 +2247,13 @@ The renderer receives the live set as `FlowRender::live_issue_ids` and stays pur
 
 ## GPUI Titlebar
 
-The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.
+The terminal retains OS-owned outer window decorations and renders its integrated
+tab bar below them. The pure layout/decay math lives in a testable module; the
+interactive tab chrome is a `gpui::Entity`.
+
+Linux backend selection preserves
+native decoration ownership on GNOME rather than drawing a replacement frame;
+see [[rendering#Chrome Rendering]].
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Known context is always visible: Ok uses fixed `#5fa05f`, while Warn and Danger keep their existing colors. Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 

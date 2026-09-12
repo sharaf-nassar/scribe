@@ -1,4 +1,8 @@
-//! Embedded fallback fonts registered with GPUI's text system at startup.
+//! Self-contained terminal fonts registered before GPUI resolves any family.
+//!
+//! The primary `JetBrains Mono` faces ship in the binary, not in an installer
+//! dependency or the developer's font directory. A missing configured family
+//! is resolved to this known terminal face before GPUI can substitute a UI font.
 //!
 //! The terminal grid's [`FONT_FALLBACKS`] chain names `Symbols Nerd Font
 //! Mono` first, but GPUI's cosmic-text backend (rev `f96212f`,
@@ -25,6 +29,16 @@ use std::borrow::Cow;
 
 use gpui::App;
 
+/// The primary family shipped with every client, including raw binaries.
+pub const TERMINAL_FONT_FAMILY: &str = "JetBrains Mono";
+
+const TERMINAL_FONTS: [&[u8]; 4] = [
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf"),
+];
+
 /// `Symbols Nerd Font Mono` (MIT, <https://github.com/ryanoasis/nerd-fonts>)
 /// with the `U+006D` cmap alias applied by `tools/patch-nerd-symbols-font.py`.
 /// Its family name is unchanged, so the [`GridFont`] fallback chain resolves
@@ -34,23 +48,90 @@ use gpui::App;
 pub const SYMBOLS_NERD_FONT_MONO: &[u8] =
     include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular-scribe.ttf");
 
-/// Register the embedded fallback fonts with the app's text system.
+/// Register the primary and symbol faces before the first family is resolved.
 ///
-/// Must run before the first frame is shaped: `load_family` caches per-family
-/// resolutions, so a font added after the terminal has painted once would
-/// never displace the cached miss. Registration failure is logged, not fatal —
-/// the grid still paints, only private-use icons degrade to tofu.
+/// GPUI caches family misses. Runtime installation after the first frame is
+/// too late, so both the terminal and settings startup paths call this first.
 pub fn register_embedded_fonts(cx: &App) {
-    if let Err(error) = cx.text_system().add_fonts(vec![Cow::Borrowed(SYMBOLS_NERD_FONT_MONO)]) {
-        tracing::warn!("failed to register embedded Symbols Nerd Font Mono: {error:#}");
+    let fonts = TERMINAL_FONTS
+        .into_iter()
+        .chain(std::iter::once(SYMBOLS_NERD_FONT_MONO))
+        .map(Cow::Borrowed)
+        .collect();
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        tracing::error!("failed to register bundled terminal fonts: {error:#}");
     }
+}
+
+/// Resolve a configured family without letting a missing name become UI text.
+///
+/// Called only at window creation and font/zoom reload, never per row or frame.
+/// The saved configuration is untouched, so an unavailable user font can still
+/// be selected after installation and a client restart. Preserve the platform's
+/// canonical spelling when the user's name differs only in ASCII case.
+pub fn terminal_font_family(requested: &str, cx: &App) -> String {
+    family_or_default(requested, cx.text_system().all_font_names())
+}
+
+fn family_or_default(requested: &str, available: Vec<String>) -> String {
+    if let Some(family) =
+        available.into_iter().find(|family| family.eq_ignore_ascii_case(requested))
+    {
+        return family;
+    }
+    tracing::warn!(requested, fallback = TERMINAL_FONT_FAMILY, "terminal font is unavailable");
+    TERMINAL_FONT_FAMILY.to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use ttf_parser::Face;
 
-    use super::SYMBOLS_NERD_FONT_MONO;
+    use super::{SYMBOLS_NERD_FONT_MONO, TERMINAL_FONT_FAMILY, TERMINAL_FONTS, family_or_default};
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Bundled primary terminal font]]
+    #[test]
+    fn bundled_primary_faces_cover_default_text_and_styles() {
+        assert_eq!(scribe_common::config::AppearanceConfig::default().font, TERMINAL_FONT_FAMILY);
+        for (bytes, (weight, italic)) in
+            TERMINAL_FONTS.into_iter().zip([(400, false), (700, false), (400, true), (700, true)])
+        {
+            let face = Face::parse(bytes, 0).expect("bundled primary face parses");
+            let family = face
+                .names()
+                .into_iter()
+                .filter(|name| name.name_id == ttf_parser::name_id::FAMILY)
+                .find_map(|name| name.to_string())
+                .expect("family name");
+            assert_eq!(family, TERMINAL_FONT_FAMILY);
+            assert_eq!(face.weight().to_number(), weight);
+            assert_eq!(face.is_italic(), italic);
+            assert!(face.is_monospaced());
+            let advance =
+                face.glyph_hor_advance(face.glyph_index('m').expect("GPUI admission glyph"));
+            for ch in ' '..='~' {
+                let glyph = face.glyph_index(ch).expect("printable ASCII coverage");
+                assert_eq!(face.glyph_hor_advance(glyph), advance, "fixed cell width for {ch:?}");
+            }
+        }
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Bundled primary terminal font]]
+    #[test]
+    fn missing_primary_uses_bundled_font_not_a_proportional_ui_fallback() {
+        let available = vec!["Noto Sans".to_owned(), TERMINAL_FONT_FAMILY.to_owned()];
+        assert_eq!(
+            family_or_default("uninstalled custom font", available.clone()),
+            TERMINAL_FONT_FAMILY
+        );
+        assert_eq!(family_or_default("jetbrains mono", available.clone()), TERMINAL_FONT_FAMILY);
+        assert_eq!(
+            family_or_default("Noto Sans", available),
+            "Noto Sans",
+            "do not override an explicitly available user choice"
+        );
+        assert_eq!(family_or_default("missing", Vec::new()), TERMINAL_FONT_FAMILY);
+    }
 
     /// The embedded symbols font must keep the exact family name the
     /// `FONT_FALLBACKS` chain resolves, map `'m'` to a nonzero glyph so

@@ -129,6 +129,7 @@ fi
 # manifest is the producer; this independent consumer catches omitted or stale
 # assets before a human installs the package.
 assets=(
+    "crates/scribe-client/assets/fonts/jetbrains-mono/OFL.txt|usr/share/doc/scribe-dev/JetBrainsMono-OFL.txt"
     "target/release/scribe-client|usr/bin/scribe-dev"
     "target/release/scribe-server|usr/bin/scribe-dev-server"
     "target/release/scribe-cli|usr/bin/scribe-dev-cli"
