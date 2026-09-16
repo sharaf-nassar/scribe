@@ -9,7 +9,9 @@ use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
 
-use crate::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
+use crate::screen::{
+    CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot, UnderlineStyle,
+};
 
 // ── Wire type for hot-reload handoff ────────────────────────────────
 
@@ -206,7 +208,7 @@ impl SgrState {
             && self.flags.bold() == cell.flags.bold()
             && self.flags.dim() == cell.flags.dim()
             && self.flags.italic() == cell.flags.italic()
-            && self.flags.underline() == cell.flags.underline()
+            && self.flags.underline_style() == cell.flags.underline_style()
             && self.flags.inverse() == cell.flags.inverse()
             && self.flags.hidden() == cell.flags.hidden()
             && self.flags.strikethrough() == cell.flags.strikethrough()
@@ -220,6 +222,7 @@ impl SgrState {
         self.flags.set_dim(cell.flags.dim());
         self.flags.set_italic(cell.flags.italic());
         self.flags.set_underline(cell.flags.underline());
+        self.flags.set_underline_style(cell.flags.decoration.underline_style);
         self.flags.set_inverse(cell.flags.inverse());
         self.flags.set_hidden(cell.flags.hidden());
         self.flags.set_strikethrough(cell.flags.strikethrough());
@@ -403,8 +406,14 @@ fn write_sgr(buf: &mut String, cell: &ScreenCell) {
     if f.italic() {
         buf.push_str(";3");
     }
-    if f.underline() {
-        buf.push_str(";4");
+    match f.underline_style() {
+        // Subparameters, not `21`: this parser reads SGR 21 as cancel-bold.
+        Some(UnderlineStyle::Single) => buf.push_str(";4"),
+        Some(UnderlineStyle::Double) => buf.push_str(";4:2"),
+        Some(UnderlineStyle::Curly) => buf.push_str(";4:3"),
+        Some(UnderlineStyle::Dotted) => buf.push_str(";4:4"),
+        Some(UnderlineStyle::Dashed) => buf.push_str(";4:5"),
+        None => {}
     }
     if f.inverse() {
         buf.push_str(";7");
@@ -688,6 +697,68 @@ mod tests {
         b"\x1b[?1h",    // app_cursor (DECCKM)
         b"\x1b=",       // app_keypad (DECPAM)
     ];
+
+    #[test]
+    fn snapshot_to_ansi_distinguishes_every_underline_style() {
+        // A reattaching client rebuilds its grid from these bytes, so a style
+        // missing here is a style the session loses on reconnect.
+        let expected: [(UnderlineStyle, &[u8]); 5] = [
+            (UnderlineStyle::Single, b"\x1b[0;4;"),
+            (UnderlineStyle::Double, b"\x1b[0;4:2;"),
+            (UnderlineStyle::Curly, b"\x1b[0;4:3;"),
+            (UnderlineStyle::Dotted, b"\x1b[0;4:4;"),
+            (UnderlineStyle::Dashed, b"\x1b[0;4:5;"),
+        ];
+        for (style, seq) in expected {
+            let mut snapshot = snapshot_with_text("u");
+            snapshot.cells[0].flags.set_underline(true);
+            snapshot.cells[0].flags.set_underline_style(style);
+
+            let ansi = snapshot_to_ansi(&snapshot);
+            assert!(
+                contains_seq(&ansi, seq),
+                "expected {seq:?} for {style:?}, got {:?}",
+                String::from_utf8_lossy(&ansi)
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_diff_reemits_when_only_the_underline_style_changes() {
+        // Both cells are underlined, so comparing the boolean alone would
+        // suppress the escape and silently redraw the second cell curly.
+        let mut snapshot = snapshot_with_text("ab");
+        for (index, style) in
+            [UnderlineStyle::Curly, UnderlineStyle::Dotted].into_iter().enumerate()
+        {
+            snapshot.cells[index].flags.set_underline(true);
+            snapshot.cells[index].flags.set_underline_style(style);
+        }
+
+        let ansi = snapshot_to_ansi(&snapshot);
+        assert!(contains_seq(&ansi, b"\x1b[0;4:3;"), "first cell keeps its curly underline");
+        assert!(contains_seq(&ansi, b"\x1b[0;4:4;"), "second cell re-emits as dotted");
+    }
+
+    #[test]
+    fn an_unstyled_snapshot_still_decodes_as_a_single_underline() {
+        // Snapshots written before styles were carried have no style field.
+        // Encode a v9-shaped named map; a tuple would encode as an array and
+        // fail to decode entirely, proving nothing about the missing key.
+        #[derive(serde::Serialize)]
+        struct V9Decoration {
+            underline: bool,
+            strikethrough: bool,
+        }
+        let bytes =
+            rmp_serde::to_vec_named(&V9Decoration { underline: true, strikethrough: false })
+                .unwrap();
+        let decoration: crate::screen::CellDecorationFlags =
+            rmp_serde::from_slice(&bytes).expect("a style-less map must still decode");
+        assert!(decoration.underline);
+        assert!(!decoration.strikethrough);
+        assert_eq!(decoration.underline_style, UnderlineStyle::Single);
+    }
 
     #[test]
     fn snapshot_to_ansi_emits_enabled_dec_private_modes() {

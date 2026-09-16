@@ -1,12 +1,9 @@
-//! Terminal cell colour semantics, ported from the retired renderer.
+//! Terminal cell colours in GPUI's native sRGB space.
 //!
-//! This module owns the pure colour logic the GPUI paint path needs: sRGB↔
-//! linear conversions, the DIM (0.67) round-trip, bold→bright promotion, the
-//! `BrightForeground` brightness boost, and per-cell foreground/background
-//! resolution (bold-bright, INVERSE, HIDDEN, DIM). [`TerminalColors`] holds
-//! the theme-derived default colours plus the xterm-256 [`ColorPalette`] and
-//! resolves an alacritty cell's raw colour fields to linear RGBA, byte-for-
-//! byte identical to the legacy renderer.
+//! Keep theme, palette and truecolor values in sRGB from input to paint. GPUI
+//! owns the GPU color-space conversion; a CPU linear intermediate would add
+//! redundant transfer functions to every visible cell on every repaint.
+//! [`TerminalColors`] owns the shared BOLD, INVERSE, HIDDEN and DIM semantics.
 
 use alacritty_terminal_gpui::term::cell::Flags;
 use scribe_common::theme::Theme;
@@ -16,48 +13,6 @@ use crate::palette::ColorPalette;
 
 /// Dimming factor applied to foreground when the DIM flag is set.
 pub const DIM_FACTOR: f32 = 0.67;
-
-/// Convert a single sRGB channel to linear space.
-#[inline]
-fn srgb_channel_to_linear(s: f32) -> f32 {
-    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-}
-
-/// Convert a single linear channel to sRGB space.
-///
-/// This is the inverse of [`srgb_channel_to_linear`].
-#[inline]
-fn linear_to_srgb_channel(l: f32) -> f32 {
-    if l <= 0.003_130_8 { l * 12.92 } else { l.powf(1.0 / 2.4).mul_add(1.055, -0.055) }
-}
-
-/// Convert an sRGB `[f32; 4]` colour to linear space (alpha unchanged).
-///
-/// Use this for any sRGB colors (e.g. theme colors) that will be passed to
-/// the GPU pipeline, which expects linear colors.
-pub fn srgb_to_linear_rgba(c: [f32; 4]) -> [f32; 4] {
-    [
-        srgb_channel_to_linear(c.first().copied().unwrap_or(0.0)),
-        srgb_channel_to_linear(c.get(1).copied().unwrap_or(0.0)),
-        srgb_channel_to_linear(c.get(2).copied().unwrap_or(0.0)),
-        c.get(3).copied().unwrap_or(1.0),
-    ]
-}
-
-/// Convert a linear `[f32; 4]` colour back to sRGB space (alpha unchanged).
-///
-/// The inverse of [`srgb_to_linear_rgba`]. The legacy renderer kept everything
-/// linear because its wgpu pipeline wrote into an sRGB framebuffer; GPUI's
-/// `Rgba` is already sRGB, so the paint path converts back at the boundary
-/// rather than duplicating the SGR resolution rules in a second colour space.
-pub fn linear_to_srgb_rgba(c: [f32; 4]) -> [f32; 4] {
-    [
-        linear_to_srgb_channel(c.first().copied().unwrap_or(0.0)),
-        linear_to_srgb_channel(c.get(1).copied().unwrap_or(0.0)),
-        linear_to_srgb_channel(c.get(2).copied().unwrap_or(0.0)),
-        c.get(3).copied().unwrap_or(1.0),
-    ]
-}
 
 /// Boost an sRGB colour toward full brightness for the bold-bright foreground.
 ///
@@ -73,15 +28,10 @@ pub fn boost_srgb_brightness(srgb: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-/// Apply the DIM effect in sRGB space, then convert back to linear.
-///
-/// Terminal convention applies DIM by multiplying sRGB channel values by
-/// [`DIM_FACTOR`]. Because our pipeline stores linear colours, we round-trip
-/// through sRGB so the perceptual result matches other terminal emulators.
+/// Apply DIM to sRGB channels, leaving alpha unchanged.
 pub fn apply_dim(color: &mut [f32; 4]) {
-    for c in color.get_mut(..3).into_iter().flatten() {
-        let srgb = linear_to_srgb_channel(*c);
-        *c = srgb_channel_to_linear(srgb * DIM_FACTOR);
+    for channel in color.get_mut(..3).into_iter().flatten() {
+        *channel *= DIM_FACTOR;
     }
 }
 
@@ -112,9 +62,8 @@ pub fn bold_to_bright(color: Color) -> Color {
 
 /// Theme-derived default colours plus the xterm-256 palette.
 ///
-/// Resolves an alacritty cell's raw colour fields to linear RGBA, applying
-/// the same bold-bright / INVERSE / HIDDEN / DIM rules as the legacy
-/// `TerminalRenderer`.
+/// Resolves an alacritty cell's raw colour fields to sRGB RGBA, applying
+/// the terminal's bold-bright / INVERSE / HIDDEN / DIM rules once.
 pub struct TerminalColors {
     palette: ColorPalette,
     default_fg: [f32; 4],
@@ -132,77 +81,53 @@ impl TerminalColors {
     pub fn new() -> Self {
         Self {
             palette: ColorPalette::new(),
-            default_fg: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
-            default_bright_fg: srgb_to_linear_rgba(boost_srgb_brightness([0.8, 0.8, 0.8, 1.0])),
-            default_bg: srgb_to_linear_rgba([0.0, 0.0, 0.0, 1.0]),
-            default_fg_dim: {
-                // Apply DIM in sRGB space: multiply the sRGB value by DIM_FACTOR,
-                // then convert to linear for the GPU pipeline.
-                let srgb = [0.8_f32, 0.8, 0.8, 1.0];
-                [
-                    srgb_channel_to_linear(srgb[0] * DIM_FACTOR),
-                    srgb_channel_to_linear(srgb[1] * DIM_FACTOR),
-                    srgb_channel_to_linear(srgb[2] * DIM_FACTOR),
-                    srgb[3],
-                ]
-            },
-            cursor_color: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
-            selection_bg: srgb_to_linear_rgba([0.25, 0.25, 0.28, 1.0]),
-            selection_fg: srgb_to_linear_rgba([1.0, 1.0, 1.0, 1.0]),
+            default_fg: [0.8, 0.8, 0.8, 1.0],
+            default_bright_fg: boost_srgb_brightness([0.8, 0.8, 0.8, 1.0]),
+            default_bg: [0.0, 0.0, 0.0, 1.0],
+            default_fg_dim: [0.8 * DIM_FACTOR, 0.8 * DIM_FACTOR, 0.8 * DIM_FACTOR, 1.0],
+            cursor_color: [0.8, 0.8, 0.8, 1.0],
+            selection_bg: [0.25, 0.25, 0.28, 1.0],
+            selection_fg: [1.0, 1.0, 1.0, 1.0],
         }
     }
 
-    /// Apply a theme, updating the palette and default colours.
-    ///
-    /// Theme colors are sRGB; we convert to linear for the GPU pipeline (the
-    /// sRGB framebuffer applies the inverse transform on output).
+    /// Copy the theme's sRGB colours and precompute its semantic variants.
     pub fn set_theme(&mut self, theme: &Theme) {
-        self.default_fg = srgb_to_linear_rgba(theme.foreground);
-        self.default_bright_fg = srgb_to_linear_rgba(boost_srgb_brightness(theme.foreground));
-        self.default_bg = srgb_to_linear_rgba(theme.background);
-        self.cursor_color = srgb_to_linear_rgba(theme.cursor);
-        // Apply DIM in sRGB space: use the raw sRGB theme foreground values,
-        // multiply by DIM_FACTOR, then convert to linear for the GPU pipeline.
-        let srgb_fg = theme.foreground;
-        self.default_fg_dim = [
-            srgb_channel_to_linear(srgb_fg.first().copied().unwrap_or(0.0) * DIM_FACTOR),
-            srgb_channel_to_linear(srgb_fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR),
-            srgb_channel_to_linear(srgb_fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR),
-            srgb_fg.get(3).copied().unwrap_or(1.0),
-        ];
-        let mut linear_ansi = [[0.0_f32; 4]; 16];
-        for (i, color) in theme.ansi_colors.iter().enumerate() {
-            if let Some(dest) = linear_ansi.get_mut(i) {
-                *dest = srgb_to_linear_rgba(*color);
-            }
-        }
-        self.palette.override_ansi(&linear_ansi);
-        self.selection_bg = srgb_to_linear_rgba(theme.selection);
-        self.selection_fg = srgb_to_linear_rgba(theme.selection_foreground);
+        self.default_fg = theme.foreground;
+        self.default_bright_fg = boost_srgb_brightness(theme.foreground);
+        self.default_bg = theme.background;
+        self.cursor_color = theme.cursor;
+        self.default_fg_dim = theme.foreground;
+        apply_dim(&mut self.default_fg_dim);
+        self.palette.override_ansi(&theme.ansi_colors);
+        self.selection_bg = theme.selection;
+        self.selection_fg = theme.selection_foreground;
     }
 
-    /// Current default background colour (linear space; usable as clear colour).
+    /// Current default background colour in sRGB space.
     pub const fn default_bg(&self) -> [f32; 4] {
         self.default_bg
     }
 
-    /// Current cursor colour (linear space).
+    /// Current cursor colour in sRGB space.
     pub const fn cursor_color(&self) -> [f32; 4] {
         self.cursor_color
     }
 
-    /// Current selection background colour (linear space).
+    /// Current selection background colour in sRGB space.
     pub const fn selection_bg(&self) -> [f32; 4] {
         self.selection_bg
     }
 
-    /// Current selection foreground colour (linear space).
+    /// Current selection foreground colour in sRGB space.
     pub const fn selection_fg(&self) -> [f32; 4] {
         self.selection_fg
     }
 
-    /// Resolve foreground and background colours from raw cell fields,
-    /// applying BOLD-bright, INVERSE, HIDDEN, and DIM flags.
+    /// Resolve sRGB foreground and background from raw cell fields.
+    ///
+    /// Order is significant: BOLD promotion, INVERSE swap, HIDDEN, then DIM.
+    /// DIM therefore affects the post-swap/post-HIDDEN foreground only.
     pub fn resolve_cell_colors(
         &self,
         fg_color: Color,
@@ -227,22 +152,6 @@ impl TerminalColors {
         }
 
         (fg, bg)
-    }
-
-    /// Resolve foreground and background colours for one cell in sRGB space,
-    /// ready to hand straight to GPUI.
-    ///
-    /// Identical rules to [`Self::resolve_cell_colors`] — the SGR semantics
-    /// live in exactly one place — with the result converted out of the linear
-    /// space the legacy wgpu pipeline needed.
-    pub fn resolve_cell_colors_srgb(
-        &self,
-        fg_color: Color,
-        bg_color: Color,
-        flags: Flags,
-    ) -> ([f32; 4], [f32; 4]) {
-        let (fg, bg) = self.resolve_cell_colors(fg_color, bg_color, flags);
-        (linear_to_srgb_rgba(fg), linear_to_srgb_rgba(bg))
     }
 
     /// Resolve an alacritty colour to RGBA floats, using sensible defaults for
@@ -272,8 +181,7 @@ mod tests {
     use super::*;
     use crate::assert_rgba_eq;
 
-    /// A theme fixture with distinct sRGB channels so byte-exact conversions
-    /// are easy to assert, built by overriding a preset's colour fields.
+    /// Distinct sRGB channels make accidental color-space conversions visible.
     fn test_theme() -> Theme {
         let mut theme = minimal_dark();
         theme.foreground = [0.5, 0.6, 0.7, 1.0];
@@ -304,15 +212,6 @@ mod tests {
         assert_eq!(bold_to_bright(spec), spec);
     }
 
-    /// sRGB→linear conversion matches the piecewise sRGB transfer function at
-    /// a mid-tone value, byte-for-byte.
-    #[test]
-    fn srgb_to_linear_matches_transfer_function() {
-        let c = srgb_to_linear_rgba([0.5, 0.5, 0.5, 0.3]);
-        let expected = ((0.5_f32 + 0.055) / 1.055).powf(2.4);
-        assert_rgba_eq(c, [expected, expected, expected, 0.3]);
-    }
-
     /// The brightness boost pushes each channel 30 % toward 1.0, leaving alpha.
     #[test]
     fn brightness_boost_pushes_channels_toward_white() {
@@ -320,15 +219,12 @@ mod tests {
         assert_rgba_eq(boosted, [0.3, 0.5 + 0.5 * 0.30, 1.0, 0.7]);
     }
 
-    /// DIM round-trips through sRGB: a linear channel is converted to sRGB,
-    /// multiplied by 0.67, and converted back.
+    /// DIM is an sRGB multiplication and must not change theme alpha.
     #[test]
-    fn apply_dim_round_trips_through_srgb() {
-        let mut c = [0.5, 0.5, 0.5, 1.0];
+    fn apply_dim_scales_srgb_without_changing_alpha() {
+        let mut c = [0.5, 0.25, 1.0, 0.3];
         apply_dim(&mut c);
-        let srgb = linear_to_srgb_channel(0.5);
-        let expected = srgb_channel_to_linear(srgb * DIM_FACTOR);
-        assert_rgba_eq(c, [expected, expected, expected, 1.0]);
+        assert_rgba_eq(c, [0.5 * DIM_FACTOR, 0.25 * DIM_FACTOR, DIM_FACTOR, 0.3]);
     }
 
     /// The default (unthemed) colours match the renderer's neutral 0.8 grey
@@ -336,30 +232,39 @@ mod tests {
     #[test]
     fn default_colors_match_neutral_renderer_defaults() {
         let colors = TerminalColors::new();
-        assert_rgba_eq(colors.default_bg(), srgb_to_linear_rgba([0.0, 0.0, 0.0, 1.0]));
+        assert_rgba_eq(colors.default_bg(), [0.0, 0.0, 0.0, 1.0]);
         let fg = colors.resolve_color(Color::Named(NamedColor::Foreground));
-        assert_rgba_eq(fg, srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]));
+        assert_rgba_eq(fg, [0.8, 0.8, 0.8, 1.0]);
     }
 
-    /// After a theme is applied, semantic Foreground/Background resolve to the
-    /// linearised theme colours and `BrightForeground` to the boosted foreground.
+    /// Semantic colours stay in sRGB after a theme reload, including alpha.
     #[test]
     fn theme_drives_semantic_color_resolution() {
         let mut colors = TerminalColors::new();
-        colors.set_theme(&test_theme());
+        let mut theme = test_theme();
+        colors.set_theme(&theme);
+        theme.foreground[3] = 0.4;
+        theme.background[3] = 0.7;
+        theme.ansi_colors[0] = [0.3, 0.2, 0.1, 0.6];
+        colors.set_theme(&theme);
         assert_rgba_eq(
             colors.resolve_color(Color::Named(NamedColor::Foreground)),
-            srgb_to_linear_rgba([0.5, 0.6, 0.7, 1.0]),
+            theme.foreground,
         );
         assert_rgba_eq(
             colors.resolve_color(Color::Named(NamedColor::Background)),
-            srgb_to_linear_rgba([0.02, 0.03, 0.04, 1.0]),
+            theme.background,
         );
         assert_rgba_eq(
             colors.resolve_color(Color::Named(NamedColor::BrightForeground)),
-            srgb_to_linear_rgba(boost_srgb_brightness([0.5, 0.6, 0.7, 1.0])),
+            boost_srgb_brightness(theme.foreground),
         );
-        assert_rgba_eq(colors.default_bg(), srgb_to_linear_rgba([0.02, 0.03, 0.04, 1.0]));
+        assert_rgba_eq(
+            colors.resolve_color(Color::Named(NamedColor::DimForeground)),
+            [0.5 * DIM_FACTOR, 0.6 * DIM_FACTOR, 0.7 * DIM_FACTOR, 0.4],
+        );
+        assert_rgba_eq(colors.resolve_color(Color::Indexed(0)), theme.ansi_colors[0]);
+        assert_rgba_eq(colors.default_bg(), theme.background);
     }
 
     /// A BOLD cell with the semantic foreground resolves to the boosted
@@ -373,7 +278,7 @@ mod tests {
             Color::Named(NamedColor::Background),
             Flags::BOLD,
         );
-        assert_rgba_eq(fg, srgb_to_linear_rgba(boost_srgb_brightness([0.5, 0.6, 0.7, 1.0])));
+        assert_rgba_eq(fg, boost_srgb_brightness([0.5, 0.6, 0.7, 1.0]));
     }
 
     /// INVERSE swaps foreground and background before other adjustments.
@@ -396,7 +301,7 @@ mod tests {
         assert_rgba_eq(fg, bg);
     }
 
-    /// DIM dims the foreground via the sRGB round-trip, leaving background.
+    /// DIM scales only the foreground's sRGB channels.
     #[test]
     fn dim_flag_dims_foreground_only() {
         let colors = TerminalColors::new();
@@ -407,13 +312,99 @@ mod tests {
         assert_rgba_eq(bg, colors.resolve_color(Color::Indexed(4)));
     }
 
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Cell-accurate paint path#Combined color flags preserve order and alpha]]
+    #[test]
+    fn combined_color_flags_preserve_order_and_alpha() {
+        let mut theme = test_theme();
+        theme.foreground[3] = 0.4;
+        theme.background[3] = 0.7;
+        let mut colors = TerminalColors::new();
+        colors.set_theme(&theme);
+        let bright = boost_srgb_brightness(theme.foreground);
+        let dim_bright =
+            [bright[0] * DIM_FACTOR, bright[1] * DIM_FACTOR, bright[2] * DIM_FACTOR, 0.4];
+        let dim_background = [0.02 * DIM_FACTOR, 0.03 * DIM_FACTOR, 0.04 * DIM_FACTOR, 0.7];
+        for (flags, expected_fg, expected_bg) in [
+            (Flags::BOLD | Flags::DIM, dim_bright, theme.background),
+            (Flags::INVERSE | Flags::DIM, dim_background, theme.foreground),
+            (Flags::HIDDEN | Flags::DIM, dim_background, theme.background),
+            (Flags::BOLD | Flags::INVERSE | Flags::HIDDEN | Flags::DIM, dim_bright, bright),
+        ] {
+            let (fg, bg) = colors.resolve_cell_colors(
+                Color::Named(NamedColor::Foreground),
+                Color::Named(NamedColor::Background),
+                flags,
+            );
+            assert_rgba_eq(fg, expected_fg);
+            assert_rgba_eq(bg, expected_bg);
+        }
+    }
+
+    fn color_resolution_sample(colors: &TerminalColors, cells: &[(Color, Color, Flags)]) -> u128 {
+        use std::{hint::black_box, time::Instant};
+
+        const PASSES: usize = 64;
+        let start = Instant::now();
+        for _ in 0..PASSES {
+            for &(fg, bg, flags) in black_box(cells) {
+                black_box(black_box(colors).resolve_cell_colors(fg, bg, flags));
+            }
+        }
+        start.elapsed().as_nanos() / (cells.len() * PASSES) as u128
+    }
+
+    /// Repeatable optimized hot-path measurement, not a wall-clock CI assertion.
+    #[test]
+    #[ignore = "manual color-resolution benchmark; run with package opt-level=3 and --nocapture"]
+    fn benchmark_cell_color_resolution() {
+        use std::{hint::black_box, io::Write as _};
+
+        const CELLS: usize = 4096;
+        let mut colors = TerminalColors::new();
+        colors.set_theme(&test_theme());
+        for workload in ["default", "indexed", "truecolor"] {
+            let cells: Vec<_> = (0..CELLS)
+                .map(|i| {
+                    let v = u8::try_from(i % 256).unwrap();
+                    let (fg, bg) = match workload {
+                        "default" => (
+                            Color::Named(NamedColor::Foreground),
+                            Color::Named(NamedColor::Background),
+                        ),
+                        "indexed" => (Color::Indexed(v), Color::Indexed(v.wrapping_add(73))),
+                        _ => (
+                            Color::Spec(Rgb {
+                                r: v,
+                                g: v.wrapping_add(91),
+                                b: v.wrapping_add(173),
+                            }),
+                            Color::Spec(Rgb { r: v.wrapping_add(37), g: v, b: v.wrapping_add(19) }),
+                        ),
+                    };
+                    let flags = [Flags::empty(), Flags::BOLD, Flags::DIM, Flags::INVERSE][i % 4];
+                    (fg, bg, flags)
+                })
+                .collect();
+            black_box(color_resolution_sample(&colors, &cells));
+            let mut samples: Vec<_> =
+                (0..7).map(|_| color_resolution_sample(&colors, &cells)).collect();
+            samples.sort_unstable();
+            writeln!(
+                std::io::stdout(),
+                "{workload}: median_ns_per_cell={} samples={samples:?}",
+                samples[3]
+            )
+            .unwrap();
+        }
+    }
+
     /// Selection colours track the theme.
     #[test]
     fn selection_colors_track_theme() {
         let mut colors = TerminalColors::new();
         colors.set_theme(&test_theme());
-        assert_rgba_eq(colors.selection_bg(), srgb_to_linear_rgba([0.2, 0.2, 0.25, 1.0]));
-        assert_rgba_eq(colors.selection_fg(), srgb_to_linear_rgba([1.0, 1.0, 1.0, 1.0]));
-        assert_rgba_eq(colors.cursor_color(), srgb_to_linear_rgba([0.9, 0.9, 0.9, 1.0]));
+        assert_rgba_eq(colors.selection_bg(), [0.2, 0.2, 0.25, 1.0]);
+        assert_rgba_eq(colors.selection_fg(), [1.0, 1.0, 1.0, 1.0]);
+        assert_rgba_eq(colors.cursor_color(), [0.9, 0.9, 0.9, 1.0]);
     }
 }

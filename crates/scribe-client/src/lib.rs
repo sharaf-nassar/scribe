@@ -3,9 +3,9 @@
 //! Holds the display-independent building blocks the GPUI paint path consumes
 //! — the xterm-256 [`palette`], terminal cell [`color`] semantics, and the
 //! procedural [`box_drawing`] rasterizer — alongside the terminal [`input`]
-//! byte encoder. Each of those modules is ported byte-for-byte from the legacy
-//! client so terminal output stays identical across the cutover. The
-//! [`mouse_reporting`] byte encoder (X10 / SGR-1006, modes 1000/1002/1003) and
+//! byte encoder. Terminal color semantics preserve the legacy output while
+//! storing colors in GPUI-native sRGB; the other ports retain byte-for-byte
+//! behavior. The [`mouse_reporting`] byte encoder (X10 / SGR-1006, modes 1000/1002/1003) and
 //! the [`mouse_state`] click-count / selection-mode classifier are ported the
 //! same way.
 //!
@@ -136,10 +136,9 @@ pub mod workspace_tree;
 pub mod x11_focus;
 pub mod zoom;
 
-/// Assert two linear RGBA colours are bit-for-bit identical.
+/// Assert two stored RGBA colours are bit-for-bit identical.
 ///
-/// The rendering-parity tests require byte-exact matches against the legacy
-/// renderer, so channels are compared by their raw IEEE-754 bit patterns
+/// Color tests compare channels by their raw IEEE-754 bit patterns
 /// (`f32::to_bits`) rather than with `==`, which also keeps the strict
 /// `clippy::float_cmp` lint satisfied without a suppression.
 #[cfg(test)]

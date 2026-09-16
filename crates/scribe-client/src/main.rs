@@ -743,8 +743,28 @@ impl ProcessShutdown {
     }
 }
 
-/// Shared handles threaded from the app entry into the background IPC thread and
-/// the foreground GPUI view.
+/// Coalesced per-window state wake. Ordered terminal bytes use separate queues.
+#[derive(Default)]
+struct RedrawSignal {
+    generation: AtomicU64,
+    wake: Notify,
+    visible: Mutex<HashSet<SessionId>>,
+}
+
+impl RedrawSignal {
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    fn grid_changed(&self, session: SessionId) {
+        if self.visible.lock().is_ok_and(|visible| visible.contains(&session)) {
+            self.bump();
+        }
+    }
+}
+
+/// Shared handles for the IPC thread and foreground GPUI view.
 #[derive(Clone)]
 struct Shared {
     /// One display grid per session the window shows in a pane. The IPC drain
@@ -758,7 +778,7 @@ struct Shared {
     /// Actionable warning/error shown in the existing window status bar. Empty
     /// means routine healthy state, which leaves the normal path visible.
     status: Arc<Mutex<String>>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<RedrawSignal>,
     /// The session in the focused pane: what keystrokes reach and what the
     /// status bar, prompt bar, and tab-context suffix describe.
     active_session: Arc<Mutex<Option<SessionId>>>,
@@ -1021,9 +1041,9 @@ const BEADS_UNAVAILABLE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// alongside the ported per-cell SGR resolver the paint path uses for every
 /// colour a cell can carry.
 ///
-/// [`CellColors`] is built once per theme rather than per frame: it linearises
-/// the whole xterm-256 palette on construction, and every render hands the
-/// paint path a cheap `Arc` clone of the result.
+/// [`CellColors`] builds its sRGB xterm-256 palette and semantic theme colors
+/// once per theme rather than per frame. Every render hands the paint path a
+/// cheap `Arc` clone of the result, with no color-space conversion.
 #[derive(Clone)]
 struct GridPalette {
     background: [f32; 4],
@@ -1153,7 +1173,7 @@ fn annotation_demo_busy_target_row(content: &Content) -> usize {
 
 fn annotation_demo_clicked_run(state: AnnotationDemo, content: &Content) -> SelectionSpan {
     let rows = content.rows.len();
-    let cols = content.rows.first().map_or(0, Vec::len);
+    let cols = content.rows.first().map_or(0, |row| row.len());
     let head = cols / 4;
     let run_end = head.saturating_add(23).min(cols.saturating_sub(1));
     let (row, start_col, end_col) = match state {
@@ -1282,13 +1302,9 @@ fn prepare_pane_bounds(
 
 /// Everything the *focused* pane alone gets for one frame.
 ///
-/// The three travel together because each is driven by something the window
-/// resolves against exactly one pane — the split-scroll pin, the platform's
-/// single input-method slot, and the shell cursor. Every other pane paints its
-/// own untouched grid.
+/// The platform has one input-method slot and one focused shell cursor.
+/// Terminal content itself comes from the per-placement publication.
 struct FocusedPanePaint {
-    /// The snapshot [`TerminalView::sync_split_scroll`] already pinned.
-    content: Arc<Content>,
     ime: ImePaint,
     cursor: CursorPaint,
 }
@@ -2128,6 +2144,11 @@ struct TerminalView {
     pane_sizes: HashMap<SessionId, TerminalSize>,
     /// One projected-GPU-bounded source cache shared by every pane in this view.
     image_cache: Rc<RefCell<GpuiImageCache>>,
+    pane_content_views: HashMap<PaneId, Entity<terminal_element::PaneContentView>>,
+    render_frames: Option<HashMap<SessionId, Arc<PaneFrame>>>,
+    render_focused_session: Option<SessionId>,
+    last_chrome_frame: Instant,
+    visible_ai_sessions: HashMap<WorkspaceId, Vec<SessionId>>,
     /// Geometry of the focused pane, which is where a new tab or a split's
     /// session opens. Starts at the whole window and shrinks with the layout.
     focused_pane_size: TerminalSize,
@@ -2491,6 +2512,20 @@ impl TerminalView {
         (guard, Some(task))
     }
 
+    /// This view's native window id, when the X11 focus guard owns one.
+    ///
+    /// `None` off X11, where the guard never starts.
+    fn x11_window_id(&self) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            self.x11_focus.as_ref().map(X11FocusGuard::window_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Veto every platform close so the in-app dialog decides what happens.
     ///
     /// The WM's close button must raise the close dialog instead of destroying
@@ -2558,7 +2593,7 @@ impl TerminalView {
     /// mapped already-maximized arrives here windowed. `_NET_WM_STATE_ADD` is
     /// idempotent, so doing it after a move that already restored the state
     /// costs one ignored client message.
-    fn apply_saved_window_state(&mut self, window: &Window) {
+    fn apply_saved_window_state(&mut self, window: &Window, cx: &mut Context<Self>) {
         if let Some(state) = self.restore.pending_state.take() {
             if monitor::assert_window_state(window, state) {
                 tracing::info!(?state, "asserting the restored window's saved state");
@@ -2569,7 +2604,7 @@ impl TerminalView {
             }
             return;
         }
-        self.verify_restored_state(window);
+        self.verify_restored_state(window, cx);
     }
 
     /// Check that the asserted state actually took, re-asserting until it does.
@@ -2585,7 +2620,7 @@ impl TerminalView {
     /// that asked for windowed here is the race. [`STATE_ASSERT_ATTEMPTS`]
     /// bounds the argument, and the give-up is logged so a refusing window
     /// manager is visible rather than silent.
-    fn verify_restored_state(&mut self, window: &Window) {
+    fn verify_restored_state(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(StateAssert { state, asked_at, attempts }) = self.restore.state_target else {
             return;
         };
@@ -2604,24 +2639,35 @@ impl TerminalView {
             ObservedWindowState { state: fallback, ..ObservedWindowState::default() },
         )
         .state;
-        if observed == state {
-            tracing::info!(?state, attempts, "the restored window's saved state landed");
-            self.restore.state_target = None;
+        if self.complete_restored_state(observed, cx) {
             return;
         }
-        if attempts >= STATE_ASSERT_ATTEMPTS {
+        monitor::assert_window_state(window, state);
+        self.restore.state_target =
+            Some(StateAssert { state, asked_at: Instant::now(), attempts: attempts + 1 });
+    }
+
+    /// Release deferred pane sizing on either an observed landing or bounded give-up.
+    fn complete_restored_state(&mut self, observed: WindowState, cx: &mut Context<Self>) -> bool {
+        let Some(StateAssert { state, attempts, .. }) = self.restore.state_target else {
+            return false;
+        };
+        if observed == state {
+            tracing::info!(?state, attempts, "the restored window's saved state landed");
+        } else if attempts >= STATE_ASSERT_ATTEMPTS {
             tracing::warn!(
                 ?state,
                 ?observed,
                 attempts,
                 "the window manager kept the restored window out of its saved state; giving up"
             );
-            self.restore.state_target = None;
-            return;
+        } else {
+            return false;
         }
-        monitor::assert_window_state(window, state);
-        self.restore.state_target =
-            Some(StateAssert { state, asked_at: Instant::now(), attempts: attempts + 1 });
+        self.restore.state_target = None;
+        // A quiet cursor-hidden pane may have no other frame deadline.
+        cx.notify();
+        true
     }
 
     /// Put a restored window back on its saved virtual desktop, once.
@@ -2881,7 +2927,7 @@ impl TerminalView {
     ///
     /// Each is held by the view, so dropping the view cancels all three.
     fn start_drivers(
-        generation: Arc<AtomicU64>,
+        generation: Arc<RedrawSignal>,
         config_signal: ConfigChangeSignal,
         cx: &mut Context<Self>,
     ) -> (Task<()>, Task<()>, Task<()>) {
@@ -2918,6 +2964,11 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let WindowRuntime { seed, config, x11_focus: (x11_focus, x11_focus_task) } = runtime;
+        // Publish before the first paint, so the opening frame already honours
+        // the saved setting instead of painting once on the default path.
+        crate::terminal_element::set_retained_gpu_bases(
+            config.config().config.appearance.retained_gpu_bases,
+        );
         shared.process_shutdown.register_view();
         let bounds_observer = Self::start_geometry_tracking(window, cx);
         let activation_observer = cx.observe_window_activation(window, TerminalView::on_activation);
@@ -2972,6 +3023,11 @@ impl TerminalView {
             shell: PaneShell::new(chrome.accent, cx),
             pane_sizes: HashMap::new(),
             image_cache: Rc::new(RefCell::new(GpuiImageCache::new())),
+            pane_content_views: HashMap::new(),
+            render_frames: None,
+            render_focused_session: None,
+            last_chrome_frame: Instant::now(),
+            visible_ai_sessions: HashMap::new(),
             focused_pane_size: seed.terminal_size,
             reported_trees: VecDeque::new(),
             titlebar,
@@ -3346,6 +3402,11 @@ impl TerminalView {
     /// read them fresh on each keystroke, so a saved shortcut edit is live
     /// immediately.
     fn apply_config_reload(&mut self, plan: ConfigReloadPlan, cx: &mut Context<Self>) {
+        // Republished unconditionally: the renderer reads this flag per frame,
+        // and it is one atomic store, so it needs no change signal of its own.
+        crate::terminal_element::set_retained_gpu_bases(
+            self.config.config().config.appearance.retained_gpu_bases,
+        );
         if plan.theme_changed() {
             let theme = self.config.config().theme.clone();
             self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
@@ -3930,6 +3991,9 @@ impl TerminalView {
 
     /// The session the focused pane is showing.
     fn focused_session(&self) -> Option<SessionId> {
+        if self.render_frames.is_some() {
+            return self.render_focused_session;
+        }
         *self.shared.active_session.lock().ok()?
     }
 
@@ -3938,7 +4002,37 @@ impl TerminalView {
     /// Every per-frame read goes through here rather than through the pane's
     /// own lock: a paint must never queue behind a VTE parse.
     fn pane_frame(&self, session_id: SessionId) -> Option<Arc<PaneFrame>> {
+        if let Some(frames) = &self.render_frames {
+            return frames.get(&session_id).cloned();
+        }
         self.shared.panes.lock().ok()?.frame(session_id)
+    }
+
+    /// Freeze one publication per placement before assembling any paint inputs.
+    /// Missing panes remain missing for this render, even if output arrives mid-render.
+    fn capture_pane_frames(&mut self, cx: &App) {
+        self.sync_split_scroll();
+        self.render_focused_session = self.shell.focused_session(cx);
+        let viewport = self.pane_viewport();
+        let placements = if viewport.width > 0.0 && viewport.height > 0.0 {
+            self.shell.placements(viewport, self.tab_bar_height, cx)
+        } else {
+            Vec::new()
+        };
+        // Publish visibility before reading any frame: a concurrent commit is
+        // either captured below or wakes the next render, including on reveal.
+        if let Ok(mut visible) = self.shared.generation.visible.lock() {
+            *visible = placements.iter().filter_map(|placement| placement.session_id).collect();
+        }
+        self.render_frames = Some(
+            placements
+                .into_iter()
+                .filter_map(|placement| {
+                    let session = placement.session_id?;
+                    Some((session, self.shared.panes.lock().ok()?.frame(session)?))
+                })
+                .collect(),
+        );
     }
 
     /// Move the display viewport and repaint.
@@ -5886,8 +5980,10 @@ impl TerminalView {
     /// thread, and the server-dispatched automation actions are executed here
     /// because the entities they drive are owned by this thread too.
     fn poll_window_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.verify_restored_position(window);
+        self.verify_restored_state(window, cx);
         if let Ok(mut ai) = self.shared.ai.lock()
-            && ai.tracker.clear_stale_processing()
+            && (ai.tracker.advance_wall_clock() | ai.tracker.clear_stale_processing())
         {
             cx.notify();
         }
@@ -6079,16 +6175,77 @@ impl TerminalView {
     /// window-wide redraw loop alive.
     fn tick_ai_animation(&mut self, cx: &mut Context<Self>) {
         let terminal = &self.config.config().config.terminal;
-        let animating = self.shared.ai.lock().is_ok_and(|mut ai| {
-            if !ai.tracker.needs_animation(terminal) {
-                return false;
-            }
-            ai.tracker.tick(0.016);
-            true
+        let changed = self.shared.ai.lock().is_ok_and(|mut ai| {
+            ai.tracker.set_motion_enabled(self.animations().enabled());
+            let due = self
+                .visible_ai_sessions
+                .values()
+                .any(|sessions| ai.tracker.redraw_delay(terminal, sessions).is_some());
+            ai.tracker.advance_wall_clock() || due
         });
-        if animating {
+        if changed {
             cx.notify();
         }
+    }
+
+    fn chrome_redraw_interval(&self) -> Option<Duration> {
+        let live_prompt = self.prompt_bar.enabled
+            && self.shared.ai.lock().is_ok_and(|ai| {
+                self.pane_bounds.keys().filter_map(|session| ai.visible_prompts(*session)).any(
+                    |data| {
+                        data.prompts.prompt_count > 0
+                            && data.prompts.latest_prompt_at.is_some()
+                            && data.prompts.latest_prompt_finished_at.is_none()
+                    },
+                )
+            });
+        let live_ci = self
+            .visible_ci_runs
+            .iter()
+            .any(|(_, _, state, _)| !state.stale && !ci_bar::terminal(state.rollup));
+        if live_prompt || live_ci {
+            return Some(Duration::from_secs(1));
+        }
+        let stats = &self.stats_config;
+        (stats.usage.compute.cpu || stats.usage.compute.gpu || stats.usage.memory || stats.network)
+            .then_some(Duration::from_secs(2))
+    }
+
+    fn redraw_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let ai = self
+            .shared
+            .ai
+            .lock()
+            .ok()
+            .and_then(|ai| {
+                self.visible_ai_sessions
+                    .values()
+                    .filter_map(|sessions| {
+                        ai.tracker.redraw_delay(&self.config.config().config.terminal, sessions)
+                    })
+                    .min()
+            })
+            .map(|delay| now + delay);
+        let cursor = (self.config.config().config.appearance.cursor_blink
+            && self.focus.cursor_blink.window_active
+            && self
+                .focused_session()
+                .and_then(|s| self.pane_frame(s))
+                .is_some_and(|frame| frame.content.shell_cursor.is_some()))
+        .then_some(self.focus.cursor_blink.last_toggle + CURSOR_BLINK_INTERVAL);
+        let scrollbar = self
+            .scrollbars
+            .panes
+            .iter()
+            .filter(|(session, _)| self.pane_bounds.contains_key(session))
+            .filter_map(|(_, state)| state.borrow().redraw_delay(now))
+            .min()
+            .map(|delay| now + delay);
+        let hint = self.shared.share.lock().ok().and_then(|share| share.hint_deadline());
+        let chrome =
+            self.chrome_redraw_interval().map(|interval| self.last_chrome_frame + interval);
+        [ai, cursor, scrollbar, hint, chrome].into_iter().flatten().min()
     }
 
     /// Advance the focused cursor's 530 ms blink phase and invalidate only
@@ -6101,7 +6258,11 @@ impl TerminalView {
             }
             return;
         }
-        if !self.focus.cursor_blink.window_active
+        if self
+            .focused_session()
+            .and_then(|s| self.pane_frame(s))
+            .is_none_or(|frame| frame.content.shell_cursor.is_none())
+            || !self.focus.cursor_blink.window_active
             || self.focus.cursor_blink.last_toggle.elapsed() < CURSOR_BLINK_INTERVAL
         {
             return;
@@ -7512,12 +7673,28 @@ impl TerminalView {
             if let Err(error) = result {
                 tracing::warn!(%error, "pane resize dropped: IPC writer closed");
             }
+            // The native window id and the painted grid rect travel with this
+            // line because nothing else ties a pane to where it is on screen. A
+            // client that reopens several windows logs each window's focus
+            // guard and each session attach on its own schedule, so log order
+            // cannot say which window shows this pane; and the grid rect is
+            // quantised to whole cells, so it cannot be derived from the window
+            // size and the card insets either. Every pane publishes its size on
+            // both the fresh and the restored path, which the adoption line
+            // does not. The rect is the last painted one, so it is zero until
+            // the first frame.
+            let grid = self.pane_grid_bounds(session_id).unwrap_or_default();
             tracing::info!(
                 %session_id,
                 %placement.workspace_id,
                 pane = placement.pane_id.raw(),
                 cols = size.cols,
                 rows = size.rows,
+                window = self.x11_window_id().unwrap_or_default(),
+                grid_x = f32::from(grid.origin.x),
+                grid_y = f32::from(grid.origin.y),
+                grid_w = f32::from(grid.size.width),
+                grid_h = f32::from(grid.size.height),
                 "published a pane's grid size"
             );
         }
@@ -7992,7 +8169,7 @@ impl TerminalView {
 
     /// Resolve one animated AI border colour per workspace for this frame.
     fn workspace_ai_borders(
-        &self,
+        &mut self,
         placements: &[pane_shell::PanePlacement],
     ) -> HashMap<WorkspaceId, gpui::Rgba> {
         let mut sessions: HashMap<WorkspaceId, Vec<SessionId>> = HashMap::new();
@@ -8003,7 +8180,7 @@ impl TerminalView {
         }
         let terminal = &self.config.config().config.terminal;
         let ansi = &self.config.config().theme.ansi_colors;
-        self.shared.ai.lock().ok().map_or_else(HashMap::new, |ai| {
+        let colors = self.shared.ai.lock().ok().map_or_else(HashMap::new, |ai| {
             sessions
                 .iter()
                 .filter_map(|(workspace_id, sessions)| {
@@ -8012,7 +8189,9 @@ impl TerminalView {
                         .map(|color| (*workspace_id, opaque_slot(color)))
                 })
                 .collect()
-        })
+        });
+        self.visible_ai_sessions = sessions;
+        colors
     }
 
     fn terminal_images_paint(
@@ -8046,8 +8225,14 @@ impl TerminalView {
         let sessions: HashSet<_> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
         prepare_pane_bounds(&mut self.pane_bounds, &sessions);
+        let motion_enabled = self.animations().enabled();
         for session_id in &sessions {
-            self.scrollbars.panes.entry(*session_id).or_default();
+            self.scrollbars
+                .panes
+                .entry(*session_id)
+                .or_default()
+                .borrow_mut()
+                .set_motion_enabled(motion_enabled);
             self.jump_button_focus
                 .entry(*session_id)
                 .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true));
@@ -8162,23 +8347,30 @@ impl TerminalView {
     ///
     /// Find matches and the split-scroll pin belong to the focused pane: the
     /// overlay searched the pane the query was typed against, and the pin
-    /// follows that pane's viewport. `focused` is therefore the snapshot
-    /// [`Self::sync_split_scroll`] already pinned, and every other pane paints
-    /// its own untouched grid. The recorded grid bounds are *not* in that set —
+    /// follows that pane's viewport. Each placement reads the publication frozen
+    /// by `capture_pane_frames`, including its image scene and overlays.
+    /// The recorded grid bounds are not in that set:
     /// every pane records its own, because the pointer gestures that read them
     /// pick their pane by position rather than by focus.
     fn render_panes(
         &mut self,
         focused: FocusedPanePaint,
         link: Option<LinkUnderlinePaint>,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let FocusedPanePaint { content: focused, ime, cursor } = focused;
+        let FocusedPanePaint { ime, cursor } = focused;
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
+            if let Ok(mut visible) = self.shared.generation.visible.lock() {
+                visible.clear();
+            }
+            self.pane_bounds.clear();
+            self.visible_ai_sessions.clear();
+            self.pane_content_views.clear();
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
+        self.pane_content_views.retain(|pane, _| placements.iter().any(|p| p.pane_id == *pane));
         let (active_sessions, annotations) = self.prepare_pane_paint(&placements, cx);
         let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
@@ -8198,7 +8390,6 @@ impl TerminalView {
         // alpha, so a resting seam reads as a card edge, not a drawn line.
         let edge = self.chrome.divider;
         let idle_border = surface([edge[0], edge[1], edge[2], edge[3] * 0.4], opacity);
-        let mut focused = Some(focused);
         placements
             .into_iter()
             .enumerate()
@@ -8206,11 +8397,7 @@ impl TerminalView {
                 let session_id = placement.session_id;
                 let image_paint =
                     self.terminal_images_paint(session_id, Rc::clone(&active_sessions));
-                let content = if placement.focused {
-                    focused.take().unwrap_or_default()
-                } else {
-                    placement.session_id.and_then(|s| self.pane_content(s)).unwrap_or_default()
-                };
+                let content = session_id.and_then(|s| self.pane_content(s)).unwrap_or_default();
                 let accent = self.region_accent(placement.workspace_id, cx);
                 let border = pane_border(&placement, idle_border, accent, opacity);
                 let mut pane = pane_card(&placement, viewport, colors.background, border);
@@ -8231,7 +8418,7 @@ impl TerminalView {
                 }
                 let (underline_rows, underline_style) =
                     underline.map_or_else(|| (Vec::new(), None), |paint| (paint.rows, paint.style));
-                let element = TerminalElement::new(
+                let mut element = TerminalElement::new(
                     content,
                     self.font.clone(),
                     colors.clone(),
@@ -8250,7 +8437,7 @@ impl TerminalView {
                 // A pane still waiting on its session paints skeleton bars
                 // instead of an empty grid.
                 let grid_el = if placement.session_id.is_some() {
-                    element.paint().into_any_element()
+                    self.mount_pane_content(placement.pane_id, &mut element, cx)
                 } else {
                     pane_skeleton(self.chrome.status_bar_text, self.animations(), pane_ix)
                 };
@@ -8262,6 +8449,26 @@ impl TerminalView {
                 pane.into_any_element()
             })
             .collect()
+    }
+
+    fn mount_pane_content(
+        &mut self,
+        pane: PaneId,
+        element: &mut TerminalElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = self
+            .pane_content_views
+            .entry(pane)
+            .or_insert_with(|| cx.new(|_| terminal_element::PaneContentView::new(element.clone())))
+            .clone();
+        let changed = view.update(cx, |view, _| view.sync(element));
+        div()
+            .relative()
+            .size_full()
+            .child(mount_synced_view(view, changed))
+            .child(div().absolute().inset_0().child(element.clone().paint_overlay()))
+            .into_any_element()
     }
 
     /// Hang the wheel off one pane, so GPUI's own hit test decides which
@@ -10170,7 +10377,7 @@ impl TerminalView {
     /// another thread and the element outlives this call.
     fn scrollbar_paint(&self, session_id: SessionId) -> Option<ScrollbarPaint> {
         let state = Rc::clone(self.scrollbars.panes.get(&session_id)?);
-        let metrics = self.shared.panes.lock().ok()?.scroll_metrics(session_id)?;
+        let metrics = self.pane_frame(session_id)?.metrics;
         let marks = self
             .shared
             .prompt_marks
@@ -10211,28 +10418,27 @@ impl TerminalView {
             },
         );
         for (session_id, state) in &self.scrollbars.panes {
+            if !self.pane_bounds.contains_key(session_id) {
+                continue;
+            }
             let display_offset = offsets.get(session_id).copied().unwrap_or(0);
             let mut state = state.borrow_mut();
             let before = state.opacity;
+            let width_before = state.current_width(0.0);
             // `tick_fade` reports whether the scrollbar is still on screen, and
             // the tick that finally takes it to zero reports `false` — while
             // still owing exactly one more frame, the one that clears it.
             // Without the opacity comparison the window would keep the last
             // barely-visible thumb painted until something else repainted it.
-            let visible = state.tick_fade(display_offset);
-            animating |= visible || (state.opacity - before).abs() > f32::EPSILON;
+            state.tick_fade(display_offset);
+            animating |= (state.opacity - before).abs() > f32::EPSILON
+                || (state.current_width(0.0) - width_before).abs() > f32::EPSILON;
         }
         animating
     }
 
-    /// Idle-tick hook: re-run the hover pass, advance the fades, and repaint
-    /// while any is still on screen. Returning early when nothing is
-    /// animating keeps a rested window from repainting sixty times a second.
-    ///
-    /// Hover is re-evaluated here, ahead of the fade tick, because both
-    /// controls depend on live pane state that can change with the pointer
-    /// still. This is the same 16 ms wake already visiting every scrollbar
-    /// state, so re-testing both level conditions here adds no new timer.
+    /// On a state wake or animation deadline, re-evaluate hover against live
+    /// geometry and advance fades. Stationary visible thumbs need no frame.
     fn poll_scrollbar_fades(&mut self, cx: &mut Context<Self>) {
         self.update_scrollbar_hover(self.pointer.last_position, cx);
         self.update_jump_hover(self.pointer.last_position, cx);
@@ -10289,9 +10495,9 @@ impl TerminalView {
     /// no motion has ever been seen), which forces `inside` false for every
     /// pane instead of hit-testing a stale in-window position. Called both from
     /// `move_over_grid`, edge-triggered on motion, and from
-    /// [`Self::poll_scrollbar_fades`], level-triggered off the idle tick — the
-    /// hit test is a level condition over live metrics and pane rects, not just
-    /// the pointer, so it has to be re-run on a clock as well as on motion.
+    /// [`Self::poll_scrollbar_fades`] on state wakes and animation deadlines.
+    /// Hit testing also follows live metrics and pane rects when the pointer
+    /// itself has not moved.
     fn update_scrollbar_hover(&mut self, position: Option<Point<Pixels>>, cx: &mut Context<Self>) {
         let hovered = position.and_then(|position| self.pane_at(position));
         let mut changed = false;
@@ -10327,7 +10533,7 @@ impl TerminalView {
     /// Repaint only when the pointer enters or leaves a visible jump control.
     ///
     /// The control's visibility and geometry can change while the pointer is
-    /// still, so this level check runs from the idle tick as well as motion.
+    /// still, so this check runs on state wakes as well as pointer motion.
     fn update_jump_hover(&mut self, position: Option<Point<Pixels>>, cx: &mut Context<Self>) {
         let hovered = position.and_then(|position| {
             self.pane_at(position).and_then(|session_id| {
@@ -10603,7 +10809,7 @@ impl TerminalView {
             return Vec::new();
         };
         let rows = content.rows.len();
-        let cols = content.rows.first().map_or(0, Vec::len);
+        let cols = content.rows.first().map_or(0, |row| row.len());
         overlay.read(cx).highlights(rows, cols, content.display_offset)
     }
 
@@ -11065,7 +11271,7 @@ impl TerminalView {
                 let point = terminal.revalidate_anchor(anchor.content)?;
                 let content = terminal.content();
                 let rows = content.rows.len();
-                let cols = content.rows.first().map_or(0, Vec::len);
+                let cols = content.rows.first().map_or(0, |row| row.len());
                 Some((point, rows, cols))
             })
             .flatten()
@@ -12145,50 +12351,49 @@ async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncA
     }
 }
 
-/// The redraw pump's tick, and therefore the interval one paced burst is
-/// presented on: the drain and [`run_frame_pacer`] hand the grid one committed
-/// burst per turn of this clock, so "one burst per redraw" is a single number
-/// rather than two that can drift apart.
+/// Minimum background-frame spacing, also used by committed-burst pacing.
+/// No timer runs at this cadence while the window has no eligible work.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Repaints the view whenever the IPC drain bumps the shared generation counter.
-///
-/// The same 16 ms tick is the idle-wake boundary two wall-clock surfaces expire
-/// on: the feature-015 control hint (a hint set five seconds ago must clear even
-/// on a window whose output has gone quiet, which by definition never bumps the
-/// generation) and the overlay scrollbar's fade, which has to run its 1.5 s idle
-/// delay and 0.3 s ramp down to nothing after the last scroll.
+/// One coalesced state wake or nearest visible animation deadline per window.
+/// Lifecycle/config polling remains independent of rendering.
 async fn drive_redraws(
     view: WeakEntity<TerminalView>,
     app: &mut AsyncApp,
-    generation: Arc<AtomicU64>,
+    signal: Arc<RedrawSignal>,
 ) {
-    let mut rendered = generation.load(Ordering::Acquire);
+    let mut rendered = 0;
+    let mut last_frame = Instant::now().checked_sub(REDRAW_INTERVAL).unwrap_or_else(Instant::now);
     loop {
-        app.background_executor().timer(REDRAW_INTERVAL).await;
-        let current = generation.load(Ordering::Acquire);
-        if current == rendered {
-            let idle = view.update(app, |view, view_cx| {
-                view.expire_share_hint(view_cx);
-                view.poll_scrollbar_fades(view_cx);
-                view.tick_ai_animation(view_cx);
-                view.tick_cursor_blink(view_cx);
-            });
-            if idle.is_err() {
-                return;
+        let Ok(deadline) = view.update(app, |view, _| view.redraw_deadline()) else { return };
+        if let Some(deadline) = deadline {
+            let timer =
+                app.background_executor().timer(deadline.saturating_duration_since(Instant::now()));
+            let wake = signal.wake.notified();
+            futures_util::pin_mut!(timer, wake);
+            futures_util::future::select(timer, wake).await;
+        } else {
+            signal.wake.notified().await;
+        }
+        // Input handlers notify immediately; background output and animation
+        // work coalesce into at most one request per frame interval.
+        app.background_executor().timer(REDRAW_INTERVAL.saturating_sub(last_frame.elapsed())).await;
+        let current = signal.generation.load(Ordering::Acquire);
+        let Ok(()) = view.update(app, |view, cx| {
+            view.expire_share_hint(cx);
+            view.poll_scrollbar_fades(cx);
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                view.tick_ai_animation(cx);
             }
-            continue;
-        }
-        rendered = current;
-        if view
-            .update(app, |view, view_cx| {
-                view.tick_cursor_blink(view_cx);
-                view_cx.notify();
-            })
-            .is_err()
-        {
+            view.tick_cursor_blink(cx);
+            if current != rendered || deadline.is_some_and(|at| Instant::now() >= at) {
+                cx.notify();
+            }
+        }) else {
             return;
-        }
+        };
+        rendered = current;
+        last_frame = Instant::now();
     }
 }
 
@@ -12589,14 +12794,13 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         self.link_feedback.visible_messages.clear();
-        let content = self.sync_split_scroll();
         let appearance = &self.config.config().config.appearance;
         let cursor = CursorPaint {
             visible: self.focus.cursor_blink.window_active
                 && (!appearance.cursor_blink || self.focus.cursor_blink.visible),
             shape: appearance.cursor_shape,
         };
-        let panes = self.render_panes(FocusedPanePaint { content, ime, cursor }, link, cx);
+        let panes = self.render_panes(FocusedPanePaint { ime, cursor }, link, cx);
         let dividers = self.render_dividers(cx);
         let region_bars = self.render_region_tab_bars(cx);
         let ci_bars = self.render_ci_run_bars(cx);
@@ -12919,7 +13123,7 @@ impl TerminalView {
         if let Ok(mut panels) = self.shared.beads_panels.lock() {
             panels.write_send_failed(workspace_id, &issue_id, &error.to_string());
         }
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.generation.bump();
     }
 
     /// Match repository-keyed CI snapshots to the regions that own them.
@@ -13704,18 +13908,19 @@ fn mount_synced_view<V: Render>(view: Entity<V>, changed: bool) -> gpui::AnyElem
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.last_chrome_frame = Instant::now();
+        self.shared.generation.wake.notify_one();
+        if let Ok(mut ai) = self.shared.ai.lock() {
+            ai.tracker.set_motion_enabled(self.animations().enabled());
+            ai.tracker.advance_wall_clock();
+        }
         log_first_frame_timing();
         self.report_perf_frame();
         self.ensure_focus(window, cx);
         self.apply_saved_position(window);
-        self.apply_saved_window_state(window);
+        self.apply_saved_window_state(window, cx);
         self.apply_saved_desktop(window);
         self.apply_pending_minimize(window);
-        // Driven from the frame loop rather than only from the bounds observer:
-        // the observer stops firing once the window settles, and the check
-        // deliberately waits for that. The focused window's cursor blink keeps
-        // frames coming well inside the wait.
-        self.verify_restored_position(window);
         self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
@@ -13733,6 +13938,7 @@ impl Render for TerminalView {
         // affected PTYs exactly the rows their strips leave visible.
         // Per-session no-change checks inside make this idempotent.
         self.publish_pane_sizes(cx);
+        self.capture_pane_frames(cx);
         let ime = self.sync_ime(cx);
         let modifiers = window.modifiers();
         let pointer = window.mouse_position();
@@ -13753,6 +13959,8 @@ impl Render for TerminalView {
             })
         };
         let grid = self.render_grid(ime, link, cx);
+        self.render_frames = None;
+        self.render_focused_session = None;
         let status_bar =
             self.render_status_bar(hover.as_ref().map(|preview| preview.uri.as_str()), window, cx);
         let share = self.build_share_overlay();
@@ -14214,7 +14422,7 @@ fn prepare_window_backend(
         panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
         attached: Arc::new(Mutex::new(HashSet::new())),
         status: Arc::new(Mutex::new(String::new())),
-        generation: Arc::new(AtomicU64::new(0)),
+        generation: Arc::new(RedrawSignal::default()),
         active_session: Arc::new(Mutex::new(None)),
         focused_size: Arc::new(Mutex::new(terminal_size)),
         tabs: Arc::new(Mutex::new(TabSessions::new())),
@@ -15431,7 +15639,7 @@ async fn supervise_connection(mut ctx: IpcThread) {
             let moved =
                 ctx.shared.workspace_moves.lock().is_ok_and(|mut moves| moves.disconnected());
             if torn || moved {
-                ctx.shared.generation.fetch_add(1, Ordering::Release);
+                ctx.shared.generation.bump();
             }
         }
 
@@ -15618,7 +15826,7 @@ async fn run_remote_connection(ctx: &mut IpcThread, host: String, port: u16) -> 
 fn publish_remote_status(
     remote: &Arc<Mutex<RemoteChrome>>,
     status: &Arc<Mutex<String>>,
-    generation: &Arc<AtomicU64>,
+    generation: &Arc<RedrawSignal>,
     publish: bool,
     mutate: impl FnOnce(&mut RemoteChrome),
 ) {
@@ -15689,7 +15897,7 @@ async fn run_lan_connection(ctx: &mut IpcThread, host: String, port: u16) -> Res
 fn publish_lan_status(
     lan: &Arc<Mutex<LanChrome>>,
     status: &Arc<Mutex<String>>,
-    generation: &Arc<AtomicU64>,
+    generation: &Arc<RedrawSignal>,
     publish: bool,
     mutate: impl FnOnce(&mut LanChrome),
 ) {
@@ -15995,7 +16203,7 @@ where
 /// What applying one batch left behind on the panes it touched.
 struct BatchOutcome {
     /// Repaints the batch owes the redraw generation.
-    redraws: usize,
+    changed_sessions: HashSet<SessionId>,
     /// A synchronized update is open somewhere and needs the expiry task.
     sync_armed: bool,
     /// A pane still has committed bursts queued, so the pacer has work.
@@ -16026,7 +16234,7 @@ fn spawn_drain(
     in_rx: InboundReceiver,
     sink: IpcSink,
     panes: Arc<Mutex<PaneGrids>>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<RedrawSignal>,
     prompt_marks: Arc<Mutex<PromptMarks>>,
 ) {
     let expiry_wake = Arc::new(Notify::new());
@@ -16038,8 +16246,8 @@ fn spawn_drain(
     let pacer_task = Arc::clone(&pacer_wake);
     tokio::spawn(run_drain(in_rx, sink, move |batch| {
         let outcome = apply_batch(&batch, &panes_task, &prompt_marks);
-        for _ in 0..outcome.redraws {
-            generation_task.fetch_add(1, Ordering::Release);
+        for session in outcome.changed_sessions {
+            generation_task.grid_changed(session);
         }
         if outcome.sync_armed {
             expiry_task.notify_one();
@@ -16060,7 +16268,8 @@ fn apply_batch(
     panes: &Arc<Mutex<PaneGrids>>,
     prompt_marks: &Arc<Mutex<PromptMarks>>,
 ) -> BatchOutcome {
-    let mut outcome = BatchOutcome { redraws: 0, sync_armed: false, frames_queued: false };
+    let mut outcome =
+        BatchOutcome { changed_sessions: HashSet::new(), sync_armed: false, frames_queued: false };
     if batch.is_empty() {
         return outcome;
     }
@@ -16074,7 +16283,9 @@ fn apply_batch(
             (redraws, stream.sync_armed(), stream.queue.has_frames())
         });
         let Some((redraws, sync_armed, frames_queued)) = applied else { continue };
-        outcome.redraws += redraws;
+        if redraws > 0 {
+            outcome.changed_sessions.insert(session);
+        }
         outcome.sync_armed |= sync_armed;
         outcome.frames_queued |= frames_queued;
     }
@@ -16092,7 +16303,7 @@ fn apply_batch(
 /// a caught-up pane is actually paced.
 async fn run_frame_pacer(
     panes: Arc<Mutex<PaneGrids>>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<RedrawSignal>,
     wake: Arc<Notify>,
 ) {
     loop {
@@ -16101,9 +16312,11 @@ async fn run_frame_pacer(
             continue;
         }
         tokio::time::sleep(REDRAW_INTERVAL).await;
-        let redraws: usize = live_panes(&panes).iter().map(|pane| pane.present_next_burst()).sum();
-        for _ in 0..redraws {
-            generation.fetch_add(1, Ordering::Release);
+        let entries = panes.lock().map(|panes| panes.entries()).unwrap_or_default();
+        for (session, pane) in entries {
+            if pane.present_next_burst() > 0 {
+                generation.grid_changed(session);
+            }
         }
     }
 }
@@ -16277,7 +16490,7 @@ fn apply_prompt_mark(
 /// the drain task arms a fresh deadline.
 async fn run_sync_expiry(
     panes: Arc<Mutex<PaneGrids>>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<RedrawSignal>,
     wake: Arc<Notify>,
 ) {
     loop {
@@ -16296,11 +16509,13 @@ async fn run_sync_expiry(
 
 /// Commits every raw-frame and parser synchronized update whose deadline has
 /// passed, bumping the redraw generation once per committed burst.
-fn flush_expired_sync(panes: &Arc<Mutex<PaneGrids>>, generation: &Arc<AtomicU64>) {
+fn flush_expired_sync(panes: &Arc<Mutex<PaneGrids>>, generation: &Arc<RedrawSignal>) {
     let now = Instant::now();
-    let redraws: usize = live_panes(panes).iter().map(|pane| pane.flush_expired_sync(now)).sum();
-    for _ in 0..redraws {
-        generation.fetch_add(1, Ordering::Release);
+    let entries = panes.lock().map(|panes| panes.entries()).unwrap_or_default();
+    for (session, pane) in entries {
+        if pane.flush_expired_sync(now) > 0 {
+            generation.grid_changed(session);
+        }
     }
 }
 
@@ -16326,7 +16541,7 @@ struct ReaderCtx {
     /// Sessions the client has attached; the pane-output gate reads it.
     attached: Arc<Mutex<HashSet<SessionId>>>,
     status: Arc<Mutex<String>>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<RedrawSignal>,
     active_session: Arc<Mutex<Option<SessionId>>>,
     /// The focused pane's live grid; see the `focused_size` field of `Shared`.
     focused_size: Arc<Mutex<TerminalSize>>,
@@ -16450,9 +16665,10 @@ fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
         tracing::warn!("AI chrome mutex poisoned; dropping update");
         return;
     };
+    guard.tracker.advance_wall_clock();
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Apply one server-owned activity transition to the active session set.
@@ -16473,7 +16689,7 @@ fn on_agent_activity(ctx: &ReaderCtx, session_id: SessionId, active: bool) {
     let changed = apply_agent_activity(&mut active_sessions, session_id, active);
     drop(active_sessions);
     if changed {
-        ctx.generation.fetch_add(1, Ordering::Release);
+        ctx.generation.bump();
     }
 }
 
@@ -16504,7 +16720,7 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
             // prompt history the next conversation never clears.
             update_ai_chrome(ctx, |ai| ai.clear(session_id));
             if label_changed {
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::PromptReceived { session_id, text, .. } => {
@@ -16526,7 +16742,7 @@ fn update_chrome_metadata(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ChromeMetada
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Apply `mutate` to the shared feature-015 share chrome and request a repaint.
@@ -16540,7 +16756,7 @@ fn update_share_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ShareChrome)) {
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Apply `mutate` to the shared update state and request a repaint.
@@ -16555,7 +16771,7 @@ fn update_update_state(ctx: &ReaderCtx, mutate: impl FnOnce(&mut UpdateState)) {
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Apply `mutate` to the shared window-lifecycle state and request a repaint.
@@ -16571,7 +16787,7 @@ fn update_lifecycle(ctx: &ReaderCtx, mutate: impl FnOnce(&mut WindowLifecycle)) 
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Ask the server to permanently close this window through the one shared
@@ -16610,7 +16826,7 @@ fn update_lan_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Fold a LAN warning/error and mirror it onto the status bar.
@@ -16634,7 +16850,7 @@ fn update_remote_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut RemoteChrome))
     };
     mutate(&mut guard);
     drop(guard);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Fold a tailnet warning/error and mirror it onto the status bar.
@@ -17088,7 +17304,7 @@ fn on_session_exited(
     }
     // A background tab's exit reaches neither `set_status` nor `attach_session`,
     // so nothing above would repaint the tab strip until an unrelated tick.
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
     Ok(())
 }
 
@@ -17279,7 +17495,7 @@ async fn dispatch_server_message(
                 |_| Vec::new(),
                 |mut boards| {
                     let classifier_won = boards.update(workspace_id, state);
-                    ctx.generation.fetch_add(1, Ordering::Release);
+                    ctx.generation.bump();
                     classifier_won
                 },
             );
@@ -17299,7 +17515,7 @@ async fn dispatch_server_message(
         ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail } => {
             if let Ok(mut panels) = ctx.beads_panels.lock() {
                 panels.update(workspace_id, &issue_id, detail);
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::BeadsEpicGraph { workspace_id, epic_id, outcome } => {
@@ -17309,7 +17525,7 @@ async fn dispatch_server_message(
             if let Ok(mut boards) = ctx.beads_boards.lock()
                 && boards.apply_epic_graph(workspace_id, &epic_id, outcome)
             {
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::IssueFocused { session_id, issue_id } => {
@@ -17320,7 +17536,7 @@ async fn dispatch_server_message(
             if let Ok(mut boards) = ctx.beads_boards.lock()
                 && boards.set_focused_issue(session_id, issue_id)
             {
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
@@ -17329,7 +17545,7 @@ async fn dispatch_server_message(
             }
             if let Ok(mut panels) = ctx.beads_panels.lock() {
                 panels.finish_write(workspace_id, &issue_id, result);
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::WorkspaceTransferResult { transfer_id, result } => {
@@ -17776,7 +17992,7 @@ fn on_search_results(
     tracing::info!(%session_id, %query, matches = matches.len(), "search results received");
     results.accept(query, matches);
     drop(results);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 fn on_workspace_transfer_result(
@@ -17793,7 +18009,7 @@ fn on_workspace_transfer_result(
     match disposition {
         WorkspaceTransferResultDisposition::Accepted => {
             tracing::info!(transfer_id, ?result, "workspace transfer result accepted");
-            ctx.generation.fetch_add(1, Ordering::Release);
+            ctx.generation.bump();
         }
         WorkspaceTransferResultDisposition::Ignored => {
             tracing::debug!(transfer_id, "workspace transfer result ignored");
@@ -17816,7 +18032,7 @@ fn on_workspace_move_result(ctx: &ReaderCtx, move_id: u64, result: WorkspaceMove
     match disposition {
         WorkspaceTransferResultDisposition::Accepted => {
             tracing::info!(move_id, ?result, "workspace move result accepted");
-            ctx.generation.fetch_add(1, Ordering::Release);
+            ctx.generation.bump();
         }
         WorkspaceTransferResultDisposition::Ignored => {
             tracing::debug!(move_id, "workspace move result ignored");
@@ -17864,7 +18080,7 @@ fn on_workspace_info(ctx: &ReaderCtx, message: ServerMessage) {
     });
     tracing::info!(%workspace_id, ?name, accent_color, "workspace info received");
     park_workspace_info(ctx, [WorkspaceInfo { workspace_id, name, accent, project_root }]);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Park server-owned workspace metadata for the GPUI thread, asking for the
@@ -17906,12 +18122,12 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::TitleChanged { session_id, title } => {
             if ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_title(session_id, Some(title))) {
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::IconTitleChanged { session_id, title } => {
             if ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_icon_title(session_id, Some(title))) {
-                ctx.generation.fetch_add(1, Ordering::Release);
+                ctx.generation.bump();
             }
         }
         ServerMessage::CwdChanged { session_id, cwd } => {
@@ -17967,7 +18183,16 @@ async fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
                 // Perf gate: count drained bytes and close the echo round-trip
                 // clock before the frame queue takes ownership of the payload.
                 scribe_common::perf_probe::record_pty_output(session_id, data.len());
-                update_ai_chrome(ctx, |ai| ai.tracker.note_activity(session_id));
+                // Activity is continuity state, not a chrome change. The
+                // committed visible burst below owns the redraw wake.
+                let expired = ctx.ai.lock().is_ok_and(|mut ai| {
+                    let expired = ai.tracker.advance_wall_clock();
+                    ai.tracker.note_activity(session_id);
+                    expired
+                });
+                if expired {
+                    ctx.generation.bump();
+                }
                 forward_output(&ctx.in_tx, session_id, data);
             }
         }
@@ -18088,7 +18313,7 @@ fn on_task_label_message(ctx: &ReaderCtx, message: ServerMessage) {
     let changed =
         ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_task_label(session_id, label.as_deref()));
     if changed {
-        ctx.generation.fetch_add(1, Ordering::Release);
+        ctx.generation.bump();
     }
     // The tab strip is pixels only, so log the transition: a scripted E2E can
     // then prove the label reached the strip and not just the socket.
@@ -18141,7 +18366,7 @@ fn on_ci_run_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
     }
     drop(runs);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Queue a terminal bell for the foreground's [`BellController`] gate.
@@ -18160,7 +18385,7 @@ fn on_bell_message(ctx: &ReaderCtx, session_id: SessionId) {
     queued.push(session_id);
     drop(queued);
     tracing::info!(%session_id, "terminal bell received");
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Fold one feature-014 LAN answer onto the shared [`LanChrome`].
@@ -18534,7 +18759,7 @@ fn on_clipboard_message(ctx: &ReaderCtx, message: ServerMessage) {
         other => unhandled_server_message(&other),
     }
     drop(bridge);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Spec 027 — persist the capability mode an `Always*` consent choice settled.
@@ -18615,7 +18840,7 @@ fn on_agent_prompt_request(ctx: &ReaderCtx, prompt: AgentConsentDialog) {
     };
     slot.parked = Some(prompt);
     drop(slot);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Withdraw one spec-027 agent capability prompt the server can no longer
@@ -18637,7 +18862,7 @@ fn on_agent_prompt_dismiss(ctx: &ReaderCtx, prompt_id: PromptId) {
         return;
     }
     tracing::info!(prompt_id = prompt_id.0, "agent capability prompt withdrawn by the server");
-    ctx.generation.fetch_add(1, Ordering::Release);
+    ctx.generation.bump();
 }
 
 /// Fold one window-lifecycle answer into the shared [`WindowLifecycle`].
@@ -18807,12 +19032,12 @@ fn sync_tab_strip(
     match focused {
         Some(session_id) if Some(session_id) != attached => {
             attach_session(ctx, session_id)?;
-            ctx.generation.fetch_add(1, Ordering::Release);
+            ctx.generation.bump();
         }
         // Already attached to the focused tab (or nothing focused); just
         // repaint so any label change carried by the list lands in the tab row.
         Some(_) | None => {
-            ctx.generation.fetch_add(1, Ordering::Release);
+            ctx.generation.bump();
         }
     }
     Ok(())
@@ -18935,7 +19160,7 @@ fn forward_inbound(in_tx: &InboundSender, event: InboundEvent) {
     }
 }
 
-fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: String) {
+fn set_status(status: &Arc<Mutex<String>>, generation: &RedrawSignal, message: String) {
     // The status string is deliberately not rendered anywhere: transient
     // connection / pane errors are internal plumbing noise, so the log is
     // their only user-reachable surface.
@@ -18944,7 +19169,7 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
     }
     if let Ok(mut status) = status.lock() {
         *status = message;
-        generation.fetch_add(1, Ordering::Release);
+        generation.bump();
     }
 }
 
@@ -20437,6 +20662,18 @@ mod tests {
     // @lat: [[test#Test Harness#GPUI Client Headless Suites#Root-synced child invalidation]]
     #[gpui::test]
     fn a_root_synced_child_repaints_in_the_frame_that_changed_it(cx: &mut gpui::TestAppContext) {
+        use futures_util::FutureExt as _;
+        let signal = RedrawSignal::default();
+        let visible = SessionId::new();
+        let hidden = SessionId::new();
+        signal.visible.lock().unwrap().insert(visible);
+        signal.grid_changed(hidden);
+        assert!(signal.wake.notified().now_or_never().is_none());
+        signal.grid_changed(visible);
+        signal.bump();
+        assert_eq!(signal.generation.load(Ordering::Acquire), 2);
+        assert!(signal.wake.notified().now_or_never().is_some());
+        assert!(signal.wake.notified().now_or_never().is_none(), "one coalesced wake");
         let window = cx.update(|app| {
             app.open_window(WindowOptions::default(), |_, app| {
                 let child = app.new(|_| SyncedChildProbe { input: 0, painted: u32::MAX });
@@ -20463,6 +20700,70 @@ mod tests {
                 "the child replayed its recorded subtree, and no later frame is coming to fix it"
             );
         });
+    }
+
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Root-synced child invalidation]]
+    #[gpui::test]
+    fn capture_pane_frames_preserves_a_late_visibility_regain_wake(cx: &mut gpui::TestAppContext) {
+        use futures_util::FutureExt as _;
+        let backend = suspend_test_backend();
+        let session = SessionId::new();
+        backend.shared.tabs.lock().unwrap().insert_active(TabEntry::new(
+            session,
+            WorkspaceId::new(),
+            "bash".into(),
+        ));
+        *backend.shared.active_session.lock().unwrap() = Some(session);
+        let window = suspend_test_window(cx, &backend);
+        window
+            .update(cx, |probe, _, cx| {
+                probe.0.update(cx, |view, cx| {
+                    view.sync_tabs(cx);
+                    view.reconcile_panes(cx);
+                    view.stats_config.usage.compute.cpu = false;
+                    view.stats_config.usage.compute.gpu = false;
+                    view.stats_config.usage.memory = false;
+                    view.stats_config.network = false;
+                    let pane = view.pane_for(session).unwrap();
+                    pane.with_terminal(|terminal| terminal.feed_output(b"before\x1b[?25l"));
+                    let signal = Arc::clone(&view.shared.generation);
+                    signal.visible.lock().unwrap().clear();
+                    while signal.wake.notified().now_or_never().is_some() {}
+                    let before = signal.generation.load(Ordering::Acquire);
+                    view.capture_pane_frames(cx);
+                    let frozen = view.pane_frame(session).unwrap();
+                    // Pause root assembly after capture but before surfaces are prepared.
+                    // The producer publishes its final bytes in exactly that gap.
+                    let producer = Arc::clone(&signal);
+                    std::thread::spawn(move || {
+                        pane.with_terminal(|terminal| terminal.feed_output(b" final"));
+                        producer.grid_changed(session);
+                    })
+                    .join()
+                    .unwrap();
+                    let placements =
+                        view.shell.placements(view.pane_viewport(), view.tab_bar_height, cx);
+                    view.prepare_pane_surfaces(&placements, cx);
+                    assert!(
+                        view.redraw_deadline().is_none(),
+                        "no fallback animation or chrome clock"
+                    );
+                    assert_eq!(frozen.content.row_text(0).trim_end(), "before");
+                    assert_eq!(signal.generation.load(Ordering::Acquire), before + 1);
+                    assert!(
+                        signal.wake.notified().now_or_never().is_some(),
+                        "late commit must wake a parked renderer"
+                    );
+                    view.render_frames = None;
+                    view.capture_pane_frames(cx);
+                    assert_eq!(
+                        view.pane_frame(session).unwrap().content.row_text(0).trim_end(),
+                        "before final"
+                    );
+                    view.render_frames = None;
+                });
+            })
+            .unwrap();
     }
 
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
@@ -20884,6 +21185,88 @@ mod tests {
         }
         assert!(runtime.placement.settled(false));
         assert_eq!(runtime.placement, RestorePlacement::Settled);
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Cold Restart Restore#The state assert is verified and re-sent until it lands]]
+    #[gpui::test]
+    fn restored_state_gate_release_notifies_deferred_sizes_without_a_clock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut backend = suspend_test_backend();
+        let session = SessionId::new();
+        backend.shared.tabs.lock().unwrap().insert_active(TabEntry::new(
+            session,
+            WorkspaceId::new(),
+            "bash".into(),
+        ));
+        *backend.shared.active_session.lock().unwrap() = Some(session);
+        let window = suspend_test_window(cx, &backend);
+        let _observer = window
+            .update(cx, |probe, _, cx| {
+                probe.0.update(cx, |view, cx| {
+                    view.sync_tabs(cx);
+                    view.reconcile_panes(cx);
+                    view.grid_area
+                        .set(Some(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)))));
+                    view.stats_config.usage.compute.cpu = false;
+                    view.stats_config.usage.compute.gpu = false;
+                    view.stats_config.usage.memory = false;
+                    view.stats_config.network = false;
+                    // TestWindow cannot supply a native handle for the full root render.
+                    // Observe its real notify and run the render's deferred-size consumer.
+                    cx.observe_self(TerminalView::publish_pane_sizes)
+                })
+            })
+            .unwrap();
+        for (observed, attempts) in
+            [(WindowState::Maximized, 1), (WindowState::Windowed, STATE_ASSERT_ATTEMPTS)]
+        {
+            window
+                .update(cx, |probe, _, cx| {
+                    probe.0.update(cx, |view, cx| {
+                        view.pane_for(session).unwrap().with_terminal(|terminal| {
+                            terminal.feed_output(b"\x1b[?25l");
+                            terminal.resize(1, 1);
+                        });
+                        view.pane_sizes.clear();
+                        view.restore.state_target = Some(StateAssert {
+                            state: WindowState::Maximized,
+                            attempts,
+                            asked_at: Instant::now().checked_sub(RESTORE_DEBOUNCE).unwrap(),
+                        });
+                        assert!(
+                            view.redraw_deadline().is_none(),
+                            "no cursor or chrome fallback frame"
+                        );
+                        while backend.ipc.out_rx.try_recv().is_some() {}
+                        view.publish_pane_sizes(cx);
+                        assert!(
+                            backend.ipc.out_rx.try_recv().is_none(),
+                            "restore gate must defer sizing"
+                        );
+                        assert!(view.complete_restored_state(observed, cx));
+                        assert!(view.restore.state_target.is_none());
+                    });
+                })
+                .unwrap();
+            // No explicit publish/draw/notify after completion: its notification
+            // must release the same size publication used by the root renderer.
+            let mut resized = false;
+            while let Some(message) = backend.ipc.out_rx.try_recv() {
+                if matches!(message, ClientMessage::Resize { session_id, .. } if session_id == session)
+                {
+                    resized = true;
+                }
+            }
+            assert!(resized, "gate release left deferred geometry parked");
+            window
+                .update(cx, |probe, _, cx| {
+                    probe.0.update(cx, |view, _| {
+                        assert!(view.pane_sizes.contains_key(&session));
+                    });
+                })
+                .unwrap();
+        }
     }
 
     // @lat: [[test#Window geometry compat#X11 restore has one state transition]]

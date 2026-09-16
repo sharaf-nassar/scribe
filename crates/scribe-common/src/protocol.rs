@@ -48,7 +48,11 @@ use crate::terminal_images::{
 /// Bumped to `9` for the Beads Flow view: the epic-graph request/reply pair and
 /// the `beads_flow` capability are additive under the same exact-match policy,
 /// so a v8 peer never negotiates a graph it cannot render.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 9;
+///
+/// Bumped to `10` for per-cell underline styles in `CellDecorationFlags`: a
+/// v9 peer replays every underline as SGR `4` (single), so the two sides no
+/// longer agree on what a reattached grid looks like.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 10;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3375,9 +3379,12 @@ mod tests {
         assert!(!live.make_pi_provider_compatible(false));
     }
 
+    /// Bumped for per-cell underline styles: a v9 peer replays every underline
+    /// as a single line, so the two sides no longer agree on what a reattached
+    /// grid looks like.
     #[test]
-    fn remote_protocol_advances_for_beads_flow_capability() {
-        assert_eq!(REMOTE_PROTOCOL_VERSION, 9);
+    fn remote_protocol_advances_for_underline_styles() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 10);
     }
 
     /// The bump must keep the refusal legible: a v8 dialer meeting this server

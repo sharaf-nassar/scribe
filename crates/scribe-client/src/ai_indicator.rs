@@ -87,6 +87,8 @@ pub struct AiStateTracker {
     last_contexts: HashMap<SessionId, u8>,
     /// Monotonically increasing time in seconds, used for pulse animation.
     animation_time: f32,
+    last_wall_tick: Instant,
+    motion_enabled: bool,
     /// Time each session entered its current state, for timeout expiry.
     state_enter_times: HashMap<SessionId, f32>,
     /// Last time (in `animation_time` units) a session showed liveness:
@@ -115,6 +117,8 @@ impl AiStateTracker {
             detected_providers: HashMap::new(),
             last_contexts: HashMap::new(),
             animation_time: 0.0,
+            last_wall_tick: Instant::now(),
+            motion_enabled: true,
             state_enter_times: HashMap::new(),
             last_activity_times: HashMap::new(),
             last_activity_instant: HashMap::new(),
@@ -223,10 +227,8 @@ impl AiStateTracker {
     /// The time is wrapped modulo a large period (100 full sine cycles at TAU)
     /// to prevent f32 precision degradation after long uptime.
     pub fn tick(&mut self, dt: f32) {
-        self.animation_time = (self.animation_time + dt) % ANIMATION_WRAP_PERIOD;
-
-        // Expire states whose configured timeout has elapsed.
-        let now = self.animation_time;
+        // Expire against elapsed time before wrapping the visual phase.
+        let now = self.animation_time + dt;
         let config = &self.config;
         self.states.retain(|sid, ps| {
             let timeout = entry_for_config(config, &ps.state).timeout_secs;
@@ -237,6 +239,11 @@ impl AiStateTracker {
             let elapsed = (now - entered).max(0.0);
             elapsed < timeout
         });
+        self.animation_time = now % ANIMATION_WRAP_PERIOD;
+        let shift = now - self.animation_time;
+        for at in self.state_enter_times.values_mut().chain(self.last_activity_times.values_mut()) {
+            *at -= shift;
+        }
         // Clean up orphaned enter-times and activity-times.
         self.state_enter_times.retain(|sid, _| self.states.contains_key(sid));
         self.last_activity_times.retain(|sid, _| self.states.contains_key(sid));
@@ -246,21 +253,81 @@ impl AiStateTracker {
     /// Returns `true` if any session has an animated (pulsing or decaying)
     /// state that requires continuous redraw.
     pub fn needs_animation(&self, terminal: &TerminalConfig) -> bool {
-        self.states.iter().any(|(sid, s)| {
-            if !terminal.ai_provider_enabled(s.provider) {
-                return false;
-            }
-            if matches!(s.state, AiState::Error) {
-                // Error decays over timeout_secs; animate while decay is active.
-                self.config.error.timeout_secs > 0.0
-            } else {
-                // Only keep the redraw loop alive while the pulse is within
-                // its envelope. Once stale it rests statically (see
-                // `animated_color`) and contributes no animation, letting
-                // the shared redraw loop retire.
-                requires_animation(&s.state) && self.pulse_is_active(*sid, &s.state)
-            }
-        })
+        self.states.keys().any(|sid| self.session_animates(*sid, terminal))
+    }
+
+    fn session_animates(&self, sid: SessionId, terminal: &TerminalConfig) -> bool {
+        let Some(state) = self.states.get(&sid) else { return false };
+        if !self.motion_enabled || !terminal.ai_provider_enabled(state.provider) {
+            return false;
+        }
+        let entry = self.entry_for(&state.state);
+        if !entry.pane_border {
+            return false;
+        }
+        if matches!(state.state, AiState::Error) {
+            entry.timeout_secs > 0.0
+        } else {
+            entry.pulse_ms > 0
+                && requires_animation(&state.state)
+                && self.pulse_is_active(sid, &state.state)
+        }
+    }
+
+    /// Only placed sessions can own an animation deadline. Static states still expire.
+    pub fn redraw_delay(
+        &self,
+        terminal: &TerminalConfig,
+        visible: &[SessionId],
+    ) -> Option<Duration> {
+        // Match workspace_border_color's priority and first-session tie rule.
+        let owner = visible
+            .iter()
+            .rev()
+            .filter_map(|sid| {
+                let state = self.states.get(sid)?;
+                (terminal.ai_provider_enabled(state.provider)
+                    && self.entry_for(&state.state).pane_border)
+                    .then_some((*sid, state_priority(&state.state)))
+            })
+            .max_by_key(|(_, priority)| *priority)
+            .map(|(sid, _)| sid);
+        visible
+            .iter()
+            .filter_map(|sid| {
+                if owner == Some(*sid) && self.session_animates(*sid, terminal) {
+                    return Some(Duration::from_millis(16));
+                }
+                let state = self.states.get(sid)?;
+                if !terminal.ai_provider_enabled(state.provider) {
+                    return None;
+                }
+                let timeout = self.entry_for(&state.state).timeout_secs;
+                if timeout <= 0.0 {
+                    return None;
+                }
+                let entered =
+                    self.state_enter_times.get(sid).copied().unwrap_or(self.animation_time);
+                Some(Duration::from_secs_f32(
+                    (timeout - (self.animation_time - entered).max(0.0)).max(0.0),
+                ))
+            })
+            .min()
+    }
+
+    /// Advance by elapsed time even after the renderer has been parked.
+    pub fn advance_wall_clock(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_wall_tick);
+        self.last_wall_tick = now;
+        let before = self.states.len();
+        self.tick(elapsed.as_secs_f32());
+        self.states.len() != before
+    }
+
+    /// Reduced motion paints a stable indicator, but does not disable expiry.
+    pub fn set_motion_enabled(&mut self, enabled: bool) {
+        self.motion_enabled = enabled;
     }
 
     /// Policy predicate: should this session's state still be *actively
@@ -278,10 +345,6 @@ impl AiStateTracker {
     /// — `Error` never reaches here.
     fn pulse_is_active(&self, session_id: SessionId, state: &AiState) -> bool {
         let now = self.animation_time;
-        // `.max(0.0)` mirrors the wrap handling in `tick` / `animated_color`:
-        // across the ~628 s `animation_time` wrap a stale delta clamps to 0,
-        // erring toward "still pulsing" for one cycle — never toward a
-        // wrongly-frozen indicator.
         match state {
             // Attention states block on the human; the pulse is a bounded
             // attention grab measured from when the state was entered. After
@@ -438,7 +501,10 @@ impl AiStateTracker {
             | AiState::IdlePrompt
             | AiState::WaitingForInput
             | AiState::PermissionPrompt => {
-                if self.pulse_is_active(session_id, &state.state) {
+                if self.motion_enabled
+                    && entry.pulse_ms > 0
+                    && self.pulse_is_active(session_id, &state.state)
+                {
                     let hz = pulse_hz(entry.pulse_ms);
                     pulse_alpha(self.animation_time, hz)
                 } else {
@@ -450,7 +516,7 @@ impl AiStateTracker {
             }
             AiState::Error => {
                 let timeout = self.config.error.timeout_secs;
-                if timeout <= 0.0 {
+                if timeout <= 0.0 || !self.motion_enabled {
                     return [base[0], base[1], base[2], PULSE_ALPHA_MAX];
                 }
                 self.state_enter_times.get(&session_id).map_or(0.0, |&t| {
@@ -674,6 +740,28 @@ mod tests {
         let sid = SessionId::new();
         tracker.update(sid, AiProcessState::new(AiState::Processing));
         assert!(tracker.needs_animation(&terminal), "fresh Processing must pulse");
+        assert!(
+            tracker.redraw_delay(&terminal, &[]).is_none(),
+            "hidden state has no frame deadline"
+        );
+        tracker.set_motion_enabled(false);
+        assert!(!tracker.needs_animation(&terminal));
+        assert!(tracker.redraw_delay(&terminal, &[sid]).is_none());
+        tracker.set_motion_enabled(true);
+        let mut styles = tracker.config.clone();
+        styles.processing.pulse_ms = 0;
+        tracker.reconfigure(styles);
+        assert!(!tracker.needs_animation(&terminal), "zero pulse is static");
+        let color =
+            tracker.animated_color(sid, &AiProcessState::new(AiState::Processing), &ANSI_COLORS);
+        tracker.tick(1.0);
+        assert_eq!(
+            color.map(f32::to_bits),
+            tracker
+                .animated_color(sid, &AiProcessState::new(AiState::Processing), &ANSI_COLORS)
+                .map(f32::to_bits)
+        );
+        tracker.reconfigure(AiStateStylesConfig::default());
         tracker.tick(super::PROCESSING_IDLE_PULSE_SECS + 1.0);
         assert!(
             !tracker.needs_animation(&terminal),
@@ -827,6 +915,28 @@ mod tests {
             border[0..3],
             permission_only[0..3],
             "the highest-priority state must own the workspace border colour"
+        );
+        let mut styles = tracker.config.clone();
+        styles.permission_prompt.pulse_ms = 0;
+        tracker.reconfigure(styles);
+        assert!(
+            tracker.redraw_delay(&terminal, &sessions).is_none(),
+            "an occluded lower-priority pulse requests no frame"
+        );
+        assert!(
+            tracker.redraw_delay(&terminal, &[processing]).is_some(),
+            "a different visible workspace can still pulse"
+        );
+        tracker.update(permission, AiProcessState::new(AiState::Error));
+        tracker.set_motion_enabled(false);
+        assert!(
+            tracker.redraw_delay(&terminal, &[permission]).is_some(),
+            "static errors still expire"
+        );
+        tracker.tick(super::ANIMATION_WRAP_PERIOD + 10.0);
+        assert!(
+            tracker.redraw_delay(&terminal, &[permission]).is_none(),
+            "expiry survives a parked-clock wrap"
         );
     }
 

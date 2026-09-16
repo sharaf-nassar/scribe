@@ -192,6 +192,18 @@ impl X11FocusGuard {
         None
     }
 
+    /// The X11 id of the window this guard watches.
+    ///
+    /// Only diagnostics use this: a client with several windows logs one guard
+    /// line per window, and nothing else ties a pane to the native window that
+    /// shows it, so log order was the only available pairing and it does not
+    /// hold when windows and session attachments interleave.
+    #[must_use]
+    #[cfg(target_os = "linux")]
+    pub const fn window_id(&self) -> u32 {
+        self.our_window
+    }
+
     /// Refresh cached state by querying `_NET_ACTIVE_WINDOW`.
     ///
     /// Call from a periodic callback so the guard has an up-to-date picture of

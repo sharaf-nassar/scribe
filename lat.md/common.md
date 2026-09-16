@@ -89,8 +89,15 @@ A load failure is not cached, so a transiently unreadable config does not pin an
 ### Appearance
 
 Font, cursor, opacity, motion, theme name, scrollbar, focus border, tab and status
-dimensions, and the five optional prompt-bar color overrides live in
-[[crates/scribe-common/src/config.rs#AppearanceConfig]].
+dimensions, retained GPU bases, and the five optional prompt-bar color overrides
+live in [[crates/scribe-common/src/config.rs#AppearanceConfig]].
+
+`retained_gpu_bases` defaults on and selects the Linux/WGPU path that holds a
+pane's settled text as one GPU texture instead of re-issuing every glyph per
+frame; see [[rendering#Retained GPU terminal bases]]. It is a config key rather
+than a build-time choice because the measurements behind it come from a single
+NVIDIA/Vulkan host, so a user on untested hardware can switch it off without a
+rebuild. macOS renders through Metal and ignores it.
 
  provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range.  is a three-variant enum (`Block`, `Beam`, `Underline`).
 

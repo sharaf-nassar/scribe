@@ -90,6 +90,7 @@ struct Snapshot {
     frames: u64,
     dropped_frames: u64,
     pty_bytes: u64,
+    render_work: [u64; 4],
     latency_samples: usize,
     latency_p50_ms: Option<f64>,
     latency_mean_ms: Option<f64>,
@@ -110,6 +111,7 @@ pub struct PerfProbe {
     frames: AtomicU64,
     dropped_frames: AtomicU64,
     pty_bytes: AtomicU64,
+    render_work: [AtomicU64; 4],
     state: Mutex<ProbeState>,
 }
 
@@ -124,6 +126,7 @@ impl PerfProbe {
             frames: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             pty_bytes: AtomicU64::new(0),
+            render_work: std::array::from_fn(|_| AtomicU64::new(0)),
             state: Mutex::new(ProbeState {
                 last_frame: None,
                 last_flush: now,
@@ -290,6 +293,7 @@ impl PerfProbe {
             frames: self.frames.load(Ordering::Relaxed),
             dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
             pty_bytes: self.pty_bytes.load(Ordering::Relaxed),
+            render_work: self.render_work.each_ref().map(|counter| counter.load(Ordering::Relaxed)),
             latency_samples,
             latency_p50_ms,
             latency_mean_ms,
@@ -349,6 +353,10 @@ fn render_report(snapshot: &Snapshot) -> String {
         format!("frames={}", snapshot.frames),
         format!("dropped_frames={}", snapshot.dropped_frames),
         format!("pty_bytes={}", snapshot.pty_bytes),
+        format!("content_preparations={}", snapshot.render_work[0]),
+        format!("row_preparations={}", snapshot.render_work[1]),
+        format!("content_cache_reuses={}", snapshot.render_work[2]),
+        format!("terminal_overlay_paints={}", snapshot.render_work[3]),
         format!("input_samples={}", snapshot.latency_samples),
     ];
     if let Some(first_frame) = snapshot.startup_first_frame_ms {
@@ -427,6 +435,16 @@ pub fn record_sessions(sessions: Vec<SessionId>, focused: Option<SessionId>) {
     }
 }
 
+/// Count terminal base invalidations, prepared rows, and cached base mounts.
+/// Compare with `frames` to distinguish root/overlay work from terminal work.
+pub fn record_render_work(content: u64, rows: u64, reused: u64, overlays: u64) {
+    if let Some(probe) = probe() {
+        for (counter, count) in probe.render_work.iter().zip([content, rows, reused, overlays]) {
+            counter.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +486,7 @@ mod tests {
             frames: 120,
             dropped_frames: 3,
             pty_bytes: 4096,
+            render_work: [2, 5, 8, 9],
             latency_samples: 2,
             latency_p50_ms: Some(7.5),
             latency_mean_ms: Some(8.0),
@@ -481,6 +500,10 @@ mod tests {
             "frames=120",
             "dropped_frames=3",
             "pty_bytes=4096",
+            "content_preparations=2",
+            "row_preparations=5",
+            "content_cache_reuses=8",
+            "terminal_overlay_paints=9",
             "input_samples=2",
             "startup_first_frame_ms=612.500",
             "input_latency_p50_ms=7.500",

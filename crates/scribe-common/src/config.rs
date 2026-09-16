@@ -143,6 +143,17 @@ pub struct AppearanceConfig {
     pub cursor_shape: CursorShape,
     #[serde(default = "default_true")]
     pub cursor_blink: bool,
+    /// Whether a pane's settled text is held on the GPU as one texture and
+    /// recomposited, instead of re-issuing every glyph each frame.
+    ///
+    /// Linux only: the retained path lives in the wgpu renderer, and macOS
+    /// draws through Metal, so this key does nothing there. It was measured
+    /// lowering both CPU and GPU cost per frame, but on a single NVIDIA/Vulkan
+    /// machine, which is why it can be turned off without a rebuild. Changing
+    /// it takes effect on the next repaint; content the prototype does not
+    /// support falls back to ordinary painting on its own.
+    #[serde(default = "default_true")]
+    pub retained_gpu_bases: bool,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     #[serde(default = "default_theme_name")]
@@ -193,6 +204,7 @@ impl Default for AppearanceConfig {
             line_padding: 0,
             cursor_shape: CursorShape::default(),
             cursor_blink: true,
+            retained_gpu_bases: true,
             opacity: default_opacity(),
             theme: default_theme_name(),
             scrollbar_width: default_scrollbar_width(),

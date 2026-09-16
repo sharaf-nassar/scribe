@@ -378,16 +378,31 @@ seed_session() {
   log "seeded detached session ${session} for the client to attach to"
 }
 
+# Close every session this run seeded.
+#
+# Attachment ownership is per connection, and the server drops a `CloseSession`
+# for a session this connection never attached with only a warning in its own
+# log — the helper still reports success, because all it did was write the
+# message. A fresh daemon must therefore attach the detached seed first, or
+# cleanup silently leaves the session running.
 close_seeded_sessions() {
   [[ -f "$WORK_DIR/seeded" ]] || return 0
   command -v "$SCRIBE_TEST_BIN" >/dev/null 2>&1 || return 0
   "$SCRIBE_TEST_BIN" daemon start >/dev/null 2>&1 || return 0
-  local session
+  local session leaked=0
   while read -r session; do
-    [[ -n "$session" ]] && "$SCRIBE_TEST_BIN" session close "$session" >/dev/null 2>&1
+    [[ -n "$session" ]] || continue
+    if ! "$SCRIBE_TEST_BIN" session attach "$session" >/dev/null 2>&1; then
+      log "cleanup: could not attach seeded session ${session}; leaving it rather than issuing a close the server will ignore"
+      leaked=$((leaked + 1))
+      continue
+    fi
+    "$SCRIBE_TEST_BIN" session close "$session" >/dev/null 2>&1 \
+      || { log "cleanup: closing seeded session ${session} failed"; leaked=$((leaked + 1)); }
   done <"$WORK_DIR/seeded"
   "$SCRIBE_TEST_BIN" daemon stop >/dev/null 2>&1 || true
   rm -f "$WORK_DIR/seeded"
+  [[ "$leaked" -eq 0 ]] || log "cleanup: ${leaked} seeded session(s) may still be running"
 }
 
 # Prerequisites for any live workload. Echoes a reason when live mode cannot
@@ -738,7 +753,10 @@ close_owned_ai_tab() {
     waited=$((waited + 1))
   done
   log "AI tab: marker session ${OWNED_SESSION} did not close after Ctrl+C"
+  # Same ownership rule as the seed cleanup: this daemon connection has to
+  # attach before its close counts.
   if "$SCRIBE_TEST_BIN" daemon start >/dev/null 2>&1 \
+    && "$SCRIBE_TEST_BIN" session attach "$OWNED_SESSION" >/dev/null 2>&1 \
     && "$SCRIBE_TEST_BIN" session close "$OWNED_SESSION" >/dev/null 2>&1; then
     "$SCRIBE_TEST_BIN" daemon stop >/dev/null 2>&1 || true
     CLEANUP_SESSIONS=""
@@ -1041,6 +1059,26 @@ wait_for_probe_rewrite() {
   return 1
 }
 
+# Preserve what a failed scroll arm saw, so a NOT-MEASURED result can be
+# diagnosed after the run. `$WORK_DIR` is deleted by cleanup, so anything worth
+# keeping has to be copied next to the report while the arm is still running.
+keep_scroll_artifacts() {
+  local bin="$1" reason="$2" dir
+  dir="${OUT%/*}/perf-ab-artifacts/scroll-$(basename "$bin")-${reason}"
+  mkdir -p "$dir" || return 0
+  local file
+  for file in "$PROBE_FILE" "$WORK_DIR/scroll-before.txt" "$WORK_DIR/scroll-after.txt"; do
+    [[ -f "$file" ]] && cp "$file" "$dir/" 2>/dev/null
+  done
+  {
+    printf 'reason=%s\n' "$reason"
+    printf 'binary=%s\n' "$bin"
+    printf 'owned_session=%s\n' "${OWNED_SESSION:-none}"
+    printf 'scroll_command=%s\n' "$SCROLL_COMMAND"
+  } >"$dir/context.txt" 2>/dev/null || true
+  log "scroll: kept failure artifacts in ${dir}"
+}
+
 # Drive the scroll workload on one client and echo `<fps>#<dropped_pct>`, or an
 # empty string when the workload could not be measured. The compound value is
 # the same shape `measure_memory` uses, so `eval_pair` can carry it.
@@ -1058,7 +1096,30 @@ measure_scroll() {
   # scrolling the grid — independently of which one has wired its own scroll
   # actions, and nothing between the shell and the renderer paces the frames.
   focus_client
+  # Keys land wherever focus actually is. If the owned pane is not focused at
+  # the moment the writer command is typed, the command never reaches its
+  # shell, and everything measured afterwards belongs to some other pane while
+  # still looking like a clean sample.
+  local focused
+  focused="$(probe_value "$PROBE_FILE" focused_session)"
+  if [[ "$focused" != "$OWNED_SESSION" ]]; then
+    log "scroll: owned pane ${OWNED_SESSION} lost focus to '${focused:-none}' before the writer command"
+    keep_scroll_artifacts "$bin" "unfocused-before-command"
+    close_owned_tabs
+    stop_client
+    echo ""
+    return
+  fi
   run_command "$SCROLL_COMMAND" || true
+  focused="$(probe_value "$PROBE_FILE" focused_session)"
+  if [[ "$focused" != "$OWNED_SESSION" ]]; then
+    log "scroll: focus moved to '${focused:-none}' while the writer command was being typed"
+    keep_scroll_artifacts "$bin" "unfocused-during-command"
+    close_owned_tabs
+    stop_client
+    echo ""
+    return
+  fi
   sleep "$SCROLL_SETTLE_SECONDS"
   # The window is derived from the probe's own uptime stamps, so both edges have
   # to name a moment the client was actually busy: the report is rewritten when
@@ -1070,6 +1131,7 @@ measure_scroll() {
   stale_stamp="$(probe_value "$PROBE_FILE" uptime_ms)"
   if ! wait_for_probe_rewrite "$stale_stamp"; then
     log "scroll: the pane produced no output, so there was no scrolling to measure"
+    keep_scroll_artifacts "$bin" "no-output"
     close_owned_tabs
     stop_client
     echo ""
@@ -1101,6 +1163,7 @@ measure_scroll() {
   delta_ms="$(calc "b - a" "a=${uptime_before:-0}" "b=${uptime_after}")"
   if float_cmp "$delta_ms" "<=" 0 || float_cmp "$delta_frames" "<=" 0; then
     log "scroll: the client painted no frames while the grid was scrolling (${delta_frames} frames over ${delta_ms} ms)"
+    keep_scroll_artifacts "$bin" "no-frames"
     echo ""
     return
   fi
@@ -1504,6 +1567,25 @@ EOF
   echo "wrote report: $OUT"
   echo "overall gate verdict: $overall"
   [[ "$overall" == "FAIL" ]] && return 1
+
+  # A subset run is always INCOMPLETE overall, because the metrics it did not
+  # select are never measured. That must not hide the one metric it was asked
+  # for: a selected workload whose command never reached its pane returns an
+  # empty measurement, and reporting NOT-MEASURED while exiting 0 reads exactly
+  # like a clean run.
+  if [[ -n "$ONLY_METRIC" && "$MODE" == "live" && -z "$LIVE_BLOCKER" ]]; then
+    local selected_status
+    case "$ONLY_METRIC" in
+      startup) selected_status="$STARTUP_STATUS" ;;
+      latency) selected_status="$LAT_STATUS" ;;
+      scroll) selected_status="$SCROLL_STATUS" ;;
+      *) selected_status="" ;;
+    esac
+    if [[ "$selected_status" == "NOT-MEASURED" ]]; then
+      echo "selected metric ${ONLY_METRIC} was never measured" >&2
+      return 1
+    fi
+  fi
   return 0
 }
 

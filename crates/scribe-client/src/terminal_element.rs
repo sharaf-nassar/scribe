@@ -1,7 +1,7 @@
 //! GPUI paint path for a display-only terminal [`Content`](crate::terminal::Content) snapshot.
 //!
-//! Every visible property of a terminal cell is resolved here, on the live
-//! paint call, in the order the legacy wgpu renderer used: cell backgrounds
+//! Changed rows are resolved and shaped once; cached pane base layers keep
+//! image/text ordering while overlays repaint independently: cell backgrounds
 //! first, then the procedural box-drawing overlay, then shaped glyph runs.
 //! Colours come from the ported `TerminalColors` SGR semantics, glyph coverage
 //! from an explicit Nerd-Font-first fallback chain, and ligatures from the
@@ -19,7 +19,7 @@ use gpui::{
 };
 use scribe_client::{
     box_drawing,
-    color::{TerminalColors, linear_to_srgb_rgba},
+    color::TerminalColors,
     gpui_image_lifecycle::{
         CroppedImageGeometry, GpuiImageCache, GpuiImageError, GpuiImageKey,
         paint_cropped_image_clipped,
@@ -187,7 +187,7 @@ impl Default for GridFont {
     }
 }
 
-/// The four style variants a row's runs are shaped with, built once per frame.
+/// The four style variants shared by a row-preparation or overlay pass.
 ///
 /// Cloning a [`Font`] clones four `Arc`s, so materialising the variants up
 /// front keeps the per-cell run construction to reference bumps.
@@ -324,6 +324,7 @@ pub struct ScrollbarPaint {
 }
 
 /// Paints the current terminal grid with fixed-width rows.
+#[derive(Clone)]
 pub struct TerminalElement {
     /// Shared with the pane's published render projection, so handing a
     /// snapshot to the paint pass copies no rows.
@@ -363,6 +364,7 @@ pub struct TerminalElement {
     /// Immutable CPU scene plus the window-local cache shared by all panes.
     images: Option<TerminalImagesPaint>,
     bounds_sink: GridBounds,
+    prepared: Rc<RefCell<PreparedRows>>,
 }
 
 /// Optional style override for a hovered-link underline.
@@ -398,6 +400,114 @@ pub struct TerminalImagesPaint {
     pub active_sessions: Rc<HashSet<SessionId>>,
 }
 
+/// Persistent base layer. Overlays are deliberately not cached with terminal text.
+pub struct PaneContentView {
+    element: TerminalElement,
+    initialized: bool,
+    atlas_drops: u64,
+}
+
+#[derive(Default)]
+struct PreparedRows {
+    cells: Vec<Arc<Vec<Cell>>>,
+    resolved: Vec<Arc<Vec<ResolvedCell>>>,
+    shaped: Vec<Option<gpui::ShapedLine>>,
+}
+
+impl PaneContentView {
+    pub fn new(element: TerminalElement) -> Self {
+        Self { element, initialized: false, atlas_drops: 0 }
+    }
+
+    /// The root uses this result directly, not a notify issued during render.
+    pub fn sync(&mut self, element: &mut TerminalElement) -> bool {
+        let old = &self.element;
+        let styles_match = old.font == element.font
+            && Arc::ptr_eq(&old.colors.cells, &element.colors.cells)
+            && old.colors.opacity.to_bits() == element.colors.opacity.to_bits()
+            && old.colors.background == element.colors.background
+            && old.highlights == element.highlights
+            && old.highlight_colors.current_bg == element.highlight_colors.current_bg
+            && old.highlight_colors.current_fg == element.highlight_colors.current_fg
+            && old.highlight_colors.accent == element.highlight_colors.accent;
+        let same_images = match (&old.images, &element.images) {
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(&a.scene, &b.scene)
+                    && a.session_id == b.session_id
+                    && a.active_sessions == b.active_sessions
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        let atlas_drops =
+            element.images.as_ref().map_or(0, |images| images.cache.borrow().stats().atlas_drops);
+        let sources_ready = element.image_sources_ready();
+        let changed = !sources_ready
+            || atlas_drops != self.atlas_drops
+            || !self.initialized
+            || !styles_match
+            || !same_images
+            || old.content.display_offset != element.content.display_offset
+            || old.content.pin_rows != element.content.pin_rows
+            || old.content.rows.len() != element.content.rows.len()
+            || old.content.rows.iter().zip(&element.content.rows).any(|(a, b)| !Arc::ptr_eq(a, b));
+        element.prepared = if styles_match { Rc::clone(&old.prepared) } else { Rc::default() };
+        self.element = element.clone();
+        self.initialized = true;
+        self.atlas_drops = atlas_drops;
+        scribe_common::perf_probe::record_render_work(0, 0, u64::from(!changed), 0);
+        changed
+    }
+}
+
+impl Render for PaneContentView {
+    fn render(&mut self, window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        scribe_common::perf_probe::record_render_work(1, 0, 0, 0);
+        self.element.prepare_rows(window);
+        self.element.clone().paint_layer(false)
+    }
+}
+
+/// Live value of `appearance.retained_gpu_bases`, published by the client
+/// whenever config is loaded or hot-reloaded.
+///
+/// A static rather than a field on the element: the flag is process-wide, every
+/// pane reads it on the same frame, and threading it through each element
+/// constructor would say nothing the config does not already say. Defaults to
+/// off so a renderer that somehow paints before config is applied keeps the
+/// ordinary path.
+#[cfg(target_os = "linux")]
+static RETAINED_GPU_BASES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish `appearance.retained_gpu_bases`. Takes effect on the next repaint.
+///
+/// `SCRIBE_DEV_RETAINED_GPU=0|1` overrides the saved value, mirroring
+/// `SCRIBE_DISABLE_ANIMATIONS`: the A/B rigs have to flip this per process
+/// without rewriting a config file the running client is watching.
+#[cfg(target_os = "linux")]
+pub fn set_retained_gpu_bases(enabled: bool) {
+    // Read once: a reload must not change meaning if the environment did.
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let forced =
+        OVERRIDE.get_or_init(|| match std::env::var("SCRIBE_DEV_RETAINED_GPU").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        });
+    RETAINED_GPU_BASES.store(forced.unwrap_or(enabled), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ignored off Linux, where the retained path is not compiled.
+#[cfg(not(target_os = "linux"))]
+pub fn set_retained_gpu_bases(_enabled: bool) {}
+
+// @lat: [[rendering#Retained GPU terminal bases]]
+#[cfg(target_os = "linux")]
+fn retained_gpu_base_enabled() -> bool {
+    RETAINED_GPU_BASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl TerminalElement {
     /// Captures one stable terminal snapshot for this render pass, painted with
     /// the font metrics and theme colours resolved from the live config.
@@ -426,6 +536,7 @@ impl TerminalElement {
             jump_button_pressed: false,
             images: None,
             bounds_sink,
+            prepared: Rc::default(),
         }
     }
 
@@ -538,8 +649,28 @@ impl TerminalElement {
         let bounds_sink = Rc::clone(&self.bounds_sink);
         div().size_full().overflow_hidden().bg(background).child(
             canvas(
+                move |bounds, _, _| bounds_sink.set(Some(bounds)),
+                move |bounds, (), window, cx| {
+                    self.prepare_rows(window);
+                    self.paint_grid(bounds, false, window, cx);
+                    self.paint_grid(bounds, true, window, cx);
+                },
+            )
+            .size_full(),
+        )
+    }
+
+    pub fn paint_overlay(self) -> impl IntoElement {
+        self.paint_layer(true)
+    }
+
+    fn paint_layer(self, overlay: bool) -> impl IntoElement {
+        let background = self.colors.background;
+        let bounds_sink = Rc::clone(&self.bounds_sink);
+        div().size_full().overflow_hidden().when(!overlay, |div| div.bg(background)).child(
+            canvas(
                 move |bounds, _window, _cx| bounds_sink.set(Some(bounds)),
-                move |bounds, (), window, cx| self.paint_grid(bounds, window, cx),
+                move |bounds, (), window, cx| self.paint_grid(bounds, overlay, window, cx),
             )
             .size_full(),
         )
@@ -551,81 +682,60 @@ impl TerminalElement {
     /// the procedural box-drawing overlay, then shaped text. Box-drawing cells
     /// are blanked out of the shaped text so the overlay is the only thing that
     /// draws them — that is what removes the font's sub-pixel bearing gaps.
-    fn paint_grid(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint_grid(
+        &self,
+        bounds: Bounds<Pixels>,
+        overlay_only: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let cell_width = self.font.cell_width();
         let line_height = px(self.font.line_height);
         if cell_width <= 0.0 || line_height <= px(0.0) {
             return;
         }
-        let default_bg = linear_to_srgb_rgba(self.colors.cells.default_bg());
+        let default_bg = self.colors.cells.default_bg();
         let variants = FontVariants::new(&self.font);
         let thickness = self.font.decoration_thickness();
         let cursor = self.painted_cursor();
-        let resolved_rows = self.resolve_rows(bounds, line_height, default_bg);
-        let image_geometry = ImageGridGeometry { viewport: bounds, cell_width, line_height };
-
+        let prepared = self.prepared.borrow();
+        let resolved_rows = &prepared.resolved;
         self.sync_image_cache(window);
-
-        // Phase 1: Kitty's deepest z band and Sixel's legacy raster layer sit
-        // above the terminal fill but below every non-default cell background.
-        self.paint_images(ImagePaintPhase::BehindCellBackgrounds, image_geometry, window);
-
-        // Phase 2: non-default cell backgrounds occlude deep Kitty and Sixel
-        // pixels. Resolve first, then paint globally so later image phases can
-        // cross row boundaries without row-local ordering inversions.
-        for (row_index, resolved) in resolved_rows.iter().enumerate() {
-            let top = bounds.top() + line_height * grid_f32(row_index);
-            let geometry =
-                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
-            paint_cell_backgrounds(resolved, geometry, window);
-        }
-
-        // Phase 3: remaining negative-z Kitty placements cover cell
-        // backgrounds while staying below box drawing and glyphs.
-        self.paint_images(ImagePaintPhase::Negative, image_geometry, window);
-
-        // Phase 4: box drawing and shaped terminal text.
-        for (row_index, (row, resolved)) in self.content.rows.iter().zip(&resolved_rows).enumerate()
+        #[cfg(target_os = "linux")]
+        if !overlay_only
+            && retained_gpu_base_enabled()
+            && self.images.as_ref().is_none_or(|images| {
+                images.scene.placements().is_empty() && images.scene.definitions.is_empty()
+            })
         {
-            let top = bounds.top() + line_height * grid_f32(row_index);
-            let geometry =
-                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
-            paint_box_drawing(row, resolved, geometry, window);
-            paint_row_text(
-                &RowPaint {
-                    cells: row,
-                    resolved,
-                    font: &self.font,
-                    variants: &variants,
-                    thickness,
-                    geometry,
-                },
-                window,
-                cx,
-            );
+            window.paint_retained_layer(bounds, |window| {
+                self.paint_content(bounds, &prepared, window, cx);
+            });
+            return;
+        }
+        if !overlay_only {
+            self.paint_content(bounds, &prepared, window, cx);
+            return;
         }
 
-        // Phase 5: nonnegative Kitty placements cover terminal glyphs.
-        self.paint_images(ImagePaintPhase::Nonnegative, image_geometry, window);
-
+        scribe_common::perf_probe::record_render_work(0, 0, 0, 1);
         // Phase 6: selection, cursor, split-scroll,
         // scrollbar, and IME/chrome overlays remain above every image.
         let overlay = OverlayGeometry {
             bounds,
             cell_width,
             line_height,
-            accent: opaque_slot(linear_to_srgb_rgba(
+            accent: opaque_slot(
                 self.colors
                     .cells
                     .resolve_color(vte::ansi::Color::Named(vte::ansi::NamedColor::Cursor)),
-            )),
-            cursor: opaque_slot(linear_to_srgb_rgba(self.colors.cells.cursor_color())),
+            ),
+            cursor: opaque_slot(self.colors.cells.cursor_color()),
         };
         // The two overlays that repaint resolved cells share their inputs, so
         // they share one bundle: neither can be handed a different view of the
         // cells the phases above already painted.
-        let cells =
-            SelectionOverlayPaint { resolved_rows: &resolved_rows, variants: &variants, thickness };
+        let cells = SelectionOverlayPaint { resolved_rows, variants: &variants, thickness };
         self.paint_selection_overlay(overlay, &cells, window, cx);
         self.paint_link_underline(overlay, &cells, window);
         paint_block_cursor(
@@ -634,7 +744,7 @@ impl TerminalElement {
             &BlockCursorPaint {
                 default_bg,
                 content: &self.content,
-                resolved_rows: &resolved_rows,
+                resolved_rows,
                 font: &self.font,
                 variants: &variants,
                 thickness,
@@ -658,31 +768,133 @@ impl TerminalElement {
         self.serve_ime(overlay, window, cx);
     }
 
-    fn resolve_rows(
+    fn paint_content(
         &self,
         bounds: Bounds<Pixels>,
-        line_height: Pixels,
-        default_bg: [f32; 4],
-    ) -> Vec<Vec<ResolvedCell>> {
-        let mut rows = Vec::new();
-        for (row_index, row) in self.content.rows.iter().enumerate() {
-            if bounds.top() + line_height * grid_f32(row_index) >= bounds.bottom() {
-                break;
-            }
-            let mut resolved = row
-                .iter()
-                .map(|cell| {
-                    let (fg, bg) =
-                        self.colors.cells.resolve_cell_colors_srgb(cell.fg, cell.bg, cell.flags);
-                    let painted_bg = (!slots_equal(bg, default_bg))
-                        .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
-                    ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
-                })
-                .collect::<Vec<_>>();
-            self.apply_highlights(row_index, default_bg, &mut resolved);
-            rows.push(resolved);
+        prepared: &PreparedRows,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let cell_width = self.font.cell_width();
+        let line_height = px(self.font.line_height);
+        let resolved_rows = &prepared.resolved;
+        let image_geometry = ImageGridGeometry { viewport: bounds, cell_width, line_height };
+        // Phase 1: Kitty's deepest z band and Sixel's legacy raster layer sit
+        // above the terminal fill but below every non-default cell background.
+        self.paint_images(ImagePaintPhase::BehindCellBackgrounds, image_geometry, window);
+
+        // Phase 2: non-default cell backgrounds occlude deep Kitty and Sixel
+        // pixels. Resolve first, then paint globally so later image phases can
+        // cross row boundaries without row-local ordering inversions.
+        for (row_index, resolved) in resolved_rows.iter().enumerate() {
+            let top = bounds.top() + line_height * grid_f32(row_index);
+            let geometry =
+                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
+            paint_cell_backgrounds(resolved, geometry, window);
         }
-        rows
+
+        // Phase 3: remaining negative-z Kitty placements cover cell
+        // backgrounds while staying below box drawing and glyphs.
+        self.paint_images(ImagePaintPhase::Negative, image_geometry, window);
+
+        // Phase 4: box drawing and shaped terminal text.
+        for (row_index, (row, resolved)) in self.content.rows.iter().zip(resolved_rows).enumerate()
+        {
+            let top = bounds.top() + line_height * grid_f32(row_index);
+            let geometry =
+                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
+            paint_box_drawing(row, resolved, geometry, window);
+            if let Some(line) = prepared.shaped.get(row_index).and_then(Option::as_ref) {
+                line.paint(
+                    point(geometry.left, geometry.top),
+                    geometry.height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .ok();
+            }
+        }
+
+        // Phase 5: nonnegative Kitty placements cover terminal glyphs.
+        self.paint_images(ImagePaintPhase::Nonnegative, image_geometry, window);
+    }
+
+    fn prepare_rows(&self, window: &Window) {
+        let mut prepared = self.prepared.borrow_mut();
+        let variants = FontVariants::new(&self.font);
+        let default_bg = self.colors.cells.default_bg();
+        let mut resolved_rows = Vec::with_capacity(self.content.rows.len());
+        let mut shaped = Vec::with_capacity(self.content.rows.len());
+        for (index, row) in self.content.rows.iter().enumerate() {
+            if let Some((resolved, line)) = prepared
+                .resolved
+                .get(index)
+                .zip(prepared.shaped.get(index))
+                .filter(|_| prepared.cells.get(index).is_some_and(|old| Arc::ptr_eq(old, row)))
+            {
+                resolved_rows.push(Arc::clone(resolved));
+                shaped.push(line.clone());
+                continue;
+            }
+            let resolved = self.resolve_row(index, row, default_bg);
+            let geometry = CellGeometry {
+                left: px(0.),
+                top: px(0.),
+                width: self.font.cell_width(),
+                height: px(self.font.line_height),
+            };
+            shaped.push(shape_row_text(
+                &RowPaint {
+                    cells: row,
+                    resolved: &resolved,
+                    font: &self.font,
+                    variants: &variants,
+                    thickness: self.font.decoration_thickness(),
+                    geometry,
+                },
+                window,
+            ));
+            resolved_rows.push(Arc::new(resolved));
+            scribe_common::perf_probe::record_render_work(0, 1, 0, 0);
+        }
+        prepared.cells.clone_from(&self.content.rows);
+        prepared.resolved = resolved_rows;
+        prepared.shaped = shaped;
+    }
+
+    fn resolve_row(&self, index: usize, row: &[Cell], default_bg: [f32; 4]) -> Vec<ResolvedCell> {
+        let mut resolved = row
+            .iter()
+            .map(|cell| {
+                let (fg, bg) = self.colors.cells.resolve_cell_colors(cell.fg, cell.bg, cell.flags);
+                let painted_bg = (!slots_equal(bg, default_bg))
+                    .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
+                ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
+            })
+            .collect::<Vec<_>>();
+        self.apply_highlights(index, default_bg, &mut resolved);
+        resolved
+    }
+
+    fn image_sources_ready(&self) -> bool {
+        let Some(images) = &self.images else { return true };
+        let Some(session) = images.session_id else { return true };
+        let cache = images.cache.borrow();
+        images.scene.placements().iter().all(|placement| {
+            images
+                .scene
+                .definitions
+                .iter()
+                .find(|definition| {
+                    definition.metadata.id == placement.image_id
+                        && definition.metadata.generation == placement.generation
+                })
+                .is_none_or(|definition| {
+                    cache.get(GpuiImageKey::for_session(session, &definition.metadata)).is_some()
+                })
+        })
     }
 
     fn sync_image_cache(&self, window: &mut Window) {
@@ -859,11 +1071,8 @@ impl TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let bg = scale_alpha(
-            opaque_slot(linear_to_srgb_rgba(self.colors.cells.selection_bg())),
-            self.colors.opacity,
-        );
-        let fg = opaque_slot(linear_to_srgb_rgba(self.colors.cells.selection_fg()));
+        let bg = scale_alpha(opaque_slot(self.colors.cells.selection_bg()), self.colors.opacity);
+        let fg = opaque_slot(self.colors.cells.selection_fg());
         for span in &self.selection {
             let Some(row) = self.content.rows.get(span.row) else { continue };
             let Some(resolved) = paint.resolved_rows.get(span.row) else { continue };
@@ -1017,7 +1226,7 @@ impl TerminalElement {
         // Opaque on purpose even under a translucent window: the backdrop's job
         // is to hide the cells the composition sits on, and a scaled alpha
         // would let them read through the glyphs.
-        let background = opaque_slot(linear_to_srgb_rgba(self.colors.cells.default_bg()));
+        let background = opaque_slot(self.colors.cells.default_bg());
 
         window.paint_quad(fill(Bounds::new(origin, span), background));
         let run = TextRun {
@@ -1825,7 +2034,7 @@ struct ResolvedCell {
 }
 
 struct SelectionOverlayPaint<'a> {
-    resolved_rows: &'a [Vec<ResolvedCell>],
+    resolved_rows: &'a [Arc<Vec<ResolvedCell>>],
     variants: &'a FontVariants,
     thickness: Pixels,
 }
@@ -1834,7 +2043,7 @@ struct SelectionOverlayPaint<'a> {
 struct SegmentRulePaint<'a> {
     /// One visible-row segment per part of the run being ruled.
     spans: &'a [SelectionSpan],
-    resolved_rows: &'a [Vec<ResolvedCell>],
+    resolved_rows: &'a [Arc<Vec<ResolvedCell>>],
     overlay: OverlayGeometry,
     thickness: Pixels,
     /// `None` rules each cell in its own resolved foreground.
@@ -1884,7 +2093,7 @@ struct AnnotationPainter<'a> {
     overlay: OverlayGeometry,
     font: &'a GridFont,
     variants: &'a FontVariants,
-    resolved_rows: &'a [Vec<ResolvedCell>],
+    resolved_rows: &'a [Arc<Vec<ResolvedCell>>],
 }
 
 impl AnnotationPainter<'_> {
@@ -2000,7 +2209,7 @@ impl AnnotationPainter<'_> {
 struct BlockCursorPaint<'a> {
     default_bg: [f32; 4],
     content: &'a Content,
-    resolved_rows: &'a [Vec<ResolvedCell>],
+    resolved_rows: &'a [Arc<Vec<ResolvedCell>>],
     font: &'a GridFont,
     variants: &'a FontVariants,
     thickness: Pixels,
@@ -2184,9 +2393,21 @@ struct RowPaint<'a> {
 /// grid column — that combination keeps a multi-cell ligature's outline intact
 /// without letting the row drift off the grid.
 fn paint_row_text(row: &RowPaint<'_>, window: &mut Window, cx: &mut App) {
-    let Some(last) = row.cells.iter().rposition(is_painted_cell) else {
-        return;
-    };
+    if let Some(line) = shape_row_text(row, window) {
+        line.paint(
+            point(row.geometry.left, row.geometry.top),
+            row.geometry.height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
+    }
+}
+
+fn shape_row_text(row: &RowPaint<'_>, window: &Window) -> Option<gpui::ShapedLine> {
+    let last = row.cells.iter().rposition(is_painted_cell)?;
 
     let mut text = String::with_capacity(last + 1);
     let mut runs: Vec<TextRun> = Vec::new();
@@ -2221,19 +2442,12 @@ fn paint_row_text(row: &RowPaint<'_>, window: &mut Window, cx: &mut App) {
         }
     }
 
-    let geometry = row.geometry;
-    window
-        .text_system()
-        .shape_line(text.into(), px(row.font.size), &runs, Some(px(geometry.width)))
-        .paint(
-            point(geometry.left, geometry.top),
-            geometry.height,
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .ok();
+    Some(window.text_system().shape_line(
+        text.into(),
+        px(row.font.size),
+        &runs,
+        Some(px(row.geometry.width)),
+    ))
 }
 
 /// Whether two adjacent runs are stylistically identical and can be merged.
@@ -2318,7 +2532,7 @@ mod tests {
 
     fn jump_content(rows: usize, pin_rows: usize, display_offset: usize) -> Content {
         Content {
-            rows: vec![vec![Cell::default()]; rows],
+            rows: (0..rows).map(|_| Arc::new(vec![Cell::default()])).collect(),
             pin_rows,
             display_offset,
             ..Content::default()
@@ -2534,7 +2748,8 @@ mod tests {
             cells: Arc::new(cells),
             opacity: 1.0,
         };
-        let content = Content { rows: vec![vec![Cell::default(); 8]], ..Content::default() };
+        let content =
+            Content { rows: vec![Arc::new(vec![Cell::default(); 8])], ..Content::default() };
         TerminalElement::new(
             Arc::new(content),
             GridFont::default(),
@@ -2545,11 +2760,91 @@ mod tests {
         .with_highlights(highlights)
     }
 
-    // @lat: [[client#Client#URL Detection#Failed link opens]]
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Cell-accurate paint path#Native sRGB preserves background elision and opacity]]
     #[test]
-    fn absent_annotations_leave_the_paint_element_idle() {
+    fn native_srgb_preserves_background_elision_and_opacity() {
+        use vte::ansi::{Color, Rgb};
+
+        let mut theme = minimal_dark();
+        theme.background = [3.0 / 255.0, 7.0 / 255.0, 11.0 / 255.0, 1.0];
+        theme.foreground = [0.5, 0.6, 0.7, 0.4];
+        let mut colors = TerminalColors::new();
+        colors.set_theme(&theme);
+        let mut element = element_with_highlights(Vec::new());
+        element.colors.cells = Arc::new(colors);
+        element.colors.opacity = 0.5;
+        element.content = Arc::new(Content {
+            rows: vec![Arc::new(vec![
+                Cell::default(),
+                Cell { bg: Color::Spec(Rgb { r: 3, g: 7, b: 11 }), ..Cell::default() },
+                Cell { bg: Color::Spec(Rgb { r: 255, g: 0, b: 0 }), ..Cell::default() },
+            ])],
+            ..Content::default()
+        });
+        let row = element.resolve_row(0, &element.content.rows[0], theme.background);
+        assert!(row[0].bg.is_none(), "default background uses the window fill");
+        assert!(row[1].bg.is_none(), "equivalent truecolor also uses the window fill");
+        assert_eq!(row[2].bg, Some(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 0.5 }));
+        assert_eq!(row[2].fg, Rgba { r: 0.5, g: 0.6, b: 0.7, a: 0.4 });
+    }
+
+    // @lat: [[client#Client#URL Detection#Failed link opens]]
+    #[gpui::test]
+    fn pane_content_view_reuses_rows_without_caching_overlays(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
         let idle = element_with_highlights(Vec::new()).with_annotation(None);
         assert!(idle.annotation.is_none());
+        let mut content_view = super::PaneContentView::new(idle.clone());
+        let mut overlay = idle.clone();
+        assert!(content_view.sync(&mut overlay));
+        overlay.cursor = Some(super::CursorPaint {
+            visible: true,
+            shape: scribe_common::config::CursorShape::Block,
+        });
+        overlay.selection = vec![SelectionSpan { row: 0, start_col: 1, end_col: 2 }];
+        overlay.link_underline = overlay.selection.clone();
+        assert!(
+            !content_view.sync(&mut overlay),
+            "cursor, selection and hover leave the base cached"
+        );
+        assert!(std::rc::Rc::ptr_eq(&content_view.element.prepared, &overlay.prepared));
+        overlay.font.size += 1.0;
+        assert!(content_view.sync(&mut overlay), "font changes invalidate row preparation");
+
+        content_view.element.content = Arc::new(Content {
+            rows: ['x', 'y']
+                .into_iter()
+                .map(|c| Arc::new(vec![Cell { c, ..Cell::default() }]))
+                .collect(),
+            ..Content::default()
+        });
+        let window = cx.update(|app| {
+            app.open_window(gpui::WindowOptions::default(), |_, app| app.new(|_| content_view))
+                .unwrap()
+        });
+        let prepared = window
+            .update(cx, |view, _, _| view.element.prepared.borrow().resolved.clone())
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                let mut next = view.element.clone();
+                let content = Arc::make_mut(&mut next.content);
+                content.rows[0] = Arc::new(vec![Cell { c: 'z', ..Cell::default() }]);
+                assert!(view.sync(&mut next));
+                cx.notify();
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                let next = view.element.prepared.borrow();
+                assert!(!Arc::ptr_eq(&prepared[0], &next.resolved[0]));
+                assert!(
+                    Arc::ptr_eq(&prepared[1], &next.resolved[1]),
+                    "unchanged row preparation survives a sibling edit"
+                );
+                assert_eq!(next.shaped[0].as_ref().unwrap().text.as_ref(), "z");
+            })
+            .unwrap();
 
         let active = element_with_highlights(Vec::new()).with_annotation(Some(AnnotationPaint {
             layout: AnnotationLayout {

@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/*"]
 exclude = [
+  "third_party/gpui-retained",
   "third_party/icy-sixel-decoder",
   "third_party/image-png-decoder",
   "third_party/unix-ancillary",
@@ -243,3 +244,9 @@ opt-level = 3
 # `std::io`. Drop this patch once a fixed release ships on crates.io.
 [patch.crates-io]
 unix-ancillary = { path = "third_party/unix-ancillary" }
+
+# Pinned GPUI sources carrying the Linux retained terminal-base path, which
+# `appearance.retained_gpu_bases` (default on) controls at runtime.
+[patch."https://github.com/zed-industries/zed.git"]
+gpui = { path = "third_party/gpui-retained/gpui" }
+gpui_wgpu = { path = "third_party/gpui-retained/gpui_wgpu" }

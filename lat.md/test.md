@@ -1209,6 +1209,15 @@ paints through both Kitty and Sixel; an over-limit transmit paints nothing and
 leaves the pane usable; and after `terminal.images.enabled = false` a client
 attaching next paints nothing while the pane keeps running commands.
 
+The over-limit phase asserts the refusal itself, not just absent pixels, and the
+server records that refusal with `debug!`: an over-limit transmit is an ordinary
+typed failure boundary rather than a PTY-chunk error, and refusals stay at debug
+in production because they are attacker-triggerable and must not be sprayable
+into the log. The suite therefore runs under `just e2e-visual-terminal-images`,
+which raises the server's level, and fails fast naming that recipe when the
+configured level cannot carry the evidence — a filtered-out line is otherwise
+indistinguishable from a server that never rejected anything.
+
 Two mechanics keep the relaunching phases honest. The container leaves more
 than one window with nobody viewing it, and one client process reopens all of
 them. The corpus maps each restored session to the X11 window logged by its
@@ -3165,6 +3174,10 @@ The copy phase drags a real mouse selection across the pane and first requires r
 
 `tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for scrollback paging, jump control, vi / copy mode, split-scroll, and the smart-selection context menu.
 
+The jump-control pixel search includes the full lower-right control band above
+the footer, while still requiring one 30px component before clicking its measured
+center. Cropping the button itself must not turn a correct rendering into a failure.
+
 Font scaling has its own stronger `tests/e2e/visual/terminal-zoom.sh` oracle, which also verifies published cell geometry on the wire.
 
 It starts on the  with `terminal.scroll_pin = false`, so the plain terminal path cannot borrow the AI pin gate. The split-scroll phase hot-reloads the opt-in before posting its provider event. Every phase asserts a log line the wired path alone writes *and* a pixel effect, because either alone is weak: a log line does not prove the frame changed, and a screenshot diff does not prove which code produced it.
@@ -3522,6 +3535,10 @@ Performance validation uses the dedicated A/B script because runtime probes and 
 
 Use `tools/perf-ab-rig/run-perf-ab.sh`. Its `--live` mode attaches to the isolated `scribe-dev` server and never restarts it; assess mode does not launch a GUI.
 
+A live subset run exits non-zero when the metric it was asked for comes back `NOT-MEASURED`. A subset is always `INCOMPLETE` overall, because the metrics it did not select are never measured, so that verdict cannot be allowed to swallow the one that was requested. The scroll workload also refuses to measure unless the pane it owns holds focus both before and after its writer command is typed: keystrokes land wherever focus actually is, and a command that never reached its shell otherwise yields a sample taken from another pane. Failed arms copy the runtime probe and their before/after snapshots beside the report, since the work directory is deleted on exit.
+
+Seeded sessions are attached before they are closed. Attachment ownership is per connection, and the server drops a `CloseSession` from a connection that never attached, logging a warning and returning nothing, while `scribe-test` still reports success because writing the message is all it did. A cleanup that only closes therefore leaks the seed while appearing to work.
+
 ### Packaging
 
 Packaging uses an offline regression rig instead of install tests against the active workstation.
@@ -3709,6 +3726,10 @@ Driving a four-way-split synchronized frame through the queue into a real  rende
 [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#advance_output]] moves the grid while every reader keeps the snapshot it already holds, so a frame the pacer skips builds no viewport of its own.
 
 [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#publish_content]] then catches the snapshot up to everything advanced since the last one, and a second publish rebuilds nothing — the deferral is a coalesced rebuild, never a dropped one.
+
+The existing deferred-publication test also asserts unchanged row identities survive coalesced advances, both modified rows are captured, and cursor-only movement publishes a new cursor without replacing text rows. A later multi-row advance proves damage was not lost between publications.
+
+The image-scroll regression sends accepted Begin/Update/Commit records in both directions over full and partial regions. Staging exposes neither new text nor image scene; commit updates noncursor rows as well, preserves unaffected row identities, and resumes ordinary row reuse afterward.
 
 ## GPUI URL Detection
 
@@ -4566,6 +4587,8 @@ The report carries the median and mean of the echo round-trip samples, including
 
 The rig parses the report by key, so serialisation must emit every key it reads — counters, uptime, latency statistics, session list and focused session — in the exact `key=value` shape.
 
+The report assertion includes content preparations, row preparations, cache-eligible mounts and terminal overlay paints, alongside the existing root frame count. These counters are absent from normal execution unless the existing probe is enabled.
+
 #### Probe stays inert without the env var
 
 With `SCRIBE_PERF_PROBE` unset every entry point must be a no-op that neither writes a file nor panics, since both clients call them on every frame and every keystroke in normal use.
@@ -4945,6 +4968,10 @@ states. The design they pin is
 One probe pair holds the rule that placement cannot: a child view the root
 syncs during its own render has to repaint in *that* frame, because on the
 path this was found on no second frame is coming.
+
+The same mount rule now serves persistent terminal bases. The existing probe also verifies `RedrawSignal` ignores hidden-grid changes, wakes for visible/chrome changes, and coalesces multiple changes into one pending wake. The terminal-element check keeps cursor, selection and hover out of the base key while font changes invalidate preparation. Its headless GPUI window also edits one row, verifies the changed shaped text, and checks that the sibling row retains its prepared identity.
+
+The visibility-regain regression pauses root assembly after frame capture but before surface preparation, then publishes final bytes from a producer thread. With cursor and chrome deadlines absent, it asserts a generation change and coalesced wake, stable old paint inputs for that frame, and the latest text on the next capture.
 
 A two-entity probe embeds a child view exactly as
 [[crates/scribe-client/src/main.rs#TerminalView#render_beads_boards]] and
@@ -5391,6 +5418,16 @@ The overlay can only ask; the sink is what turns the ask into a frame, so the lo
 Locks the pieces of  that can be asserted without a display server: the snapshot's per-cell state, the box-drawing quad reduction, and the font configuration each shaped run carries.
 
 None of these prove the running client paints anything — a headless case passes identically whether or not the app constructs `TerminalElement`. They exist to pin the pure inputs the paint call consumes, so a regression shows up as a failing assertion rather than as a wrong screenshot. The painted result is a visual-E2E property: bead `scribe-38e.63` confirmed per-cell SGR colours, seamless box joins, a live `appearance.ligatures` flip, and `U+F09B`/`U+F121` resolving through the embedded fallback face against a real X11 window, per .
+
+#### Combined color flags preserve order and alpha
+
+The native sRGB resolver preserves BOLD promotion before INVERSE, HIDDEN and DIM, including combinations where DIM affects a swapped or hidden foreground. Theme alpha remains unchanged.
+
+The existing palette tests also cover every truecolor byte, ANSI overrides, cube/greyscale entries and named dim aliases. Theme tests check a second reload updates semantic colors and ANSI alpha without a color-space conversion.
+
+#### Native sRGB preserves background elision and opacity
+
+The paint-input test checks that default and equivalent truecolor backgrounds are omitted, explicit backgrounds receive appearance opacity once, and foreground theme alpha is preserved without applying appearance opacity.
 
 #### Snapshot carries per-cell colour and attributes
 
@@ -6042,6 +6079,12 @@ Phases 7 and 8 run in source order right after phase 1, ahead of phase 2's own O
 
 STALE-FALSE (phase 7): with `$SESSION`'s own scrollback still zero, the pointer parks inside the hit zone and `scribe-test send` grows real history over the wire, so no client-side input event of any kind — mouse or keyboard — ever reaches the client. The right-edge strip has to change by at least `THUMB_DIFF_MIN` with no intervening `MouseMoveEvent` at all, which only the idle tick's re-run of the hover pass can produce.
 
+Every park coordinate is derived from the card insets rather than measured from the window edge, because the hit zone is anchored to the *grid's* right edge: an edge pane card keeps `PANE_CARD_MARGIN` to the region edge, draws `PANE_BORDER_WIDTH`, and insets `PANE_CONTENT_PADDING`, so the grid ends 17px short of the viewport and a pointer parked 6px in sits outside it, where [[crates/scribe-client/src/main.rs#TerminalView#pane_at]] rejects it before the scrollbar is hit-tested at all. A split's inner edge keeps `PANE_GAP_HALF` instead of the outer margin, so it has its own offset. The rect [[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes]] logs is what confirms those offsets against a running client.
+
+Every phase that expects a thumb has to overflow its pane, not merely fill it, because [[crates/scribe-client/src/scrollbar.rs#hit_test_scrollbar]] refuses outright while `history_size` is zero. A split keeps the window's full height, so the split phase needs the same filler the parked-pointer phase uses; a pane holding ten lines of a thirty-four row grid has nothing to scroll and reveals nothing however the pointer is parked.
+
+The suite runs under `just e2e-visual-scrollbar`, which sets `SCRIBE_SHARED_PANE=1` so `scribe-test` writes into the very pane the client paints. Run through the plain visual recipe instead, the injected output lands in a session the client never displays: hover resolves and the geometry checks out, but `history_size` stays zero and every thumb assertion fails as though hover were stale.
+
 STALE-TRUE (phase 8): with hover still live from phase 7, the pointer moves straight out of the platform window through the same hit zone that set it. Past the 1.5s idle delay plus the 0.3s fade ramp the strip must be back at the phase-1 rested baseline, proving the grid band's `on_mouse_exit` listener cleared `PointerState::last_position` and the next idle tick's hover re-run cleared `hover` in turn — `tick_fade_at` no longer short-circuits to full opacity forever. A further pair of captures across another idle window has to stay pixel-stable, which is the black-box proxy for "a rested window does not repaint on the idle tick."
 
 Two controls guard the fix against regressing the paths that already worked, run after phase 6 once `$SESSION` no longer has zero scrollback to offer: phase 9 opens its own tab — its session id is client-minted and unreachable by `scribe-test send`, so typed keystrokes fill it instead — and proves ordinary motion into the hit zone still reveals the bar with no prior scroll; phase 10 splits that same tab's pane and proves both the left pane's inner edge (against the shared divider) and the right pane's outer edge reveal on hover, since a split moves each pane's hit zone exactly the way a resize or a pane close does.
@@ -6081,6 +6124,8 @@ A mark whose `abs_pos` is stale (larger than the post-resize history) clamps to 
 ### Fade idles then fades over the configured windows
 
  holds full opacity through the 1.5s idle delay after a scroll, ramps opacity down across the 0.3s fade window, and settles to invisible past it.
+
+The same check verifies the scheduler rests after the final clearing frame, stationary hover has no deadline, and reduced motion waits for expiry then hides immediately instead of interpolating.
 
 ### Hover holds opacity and widens the thumb
 

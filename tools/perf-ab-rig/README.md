@@ -71,6 +71,17 @@ it waits for a rewrite before it snapshots; see
 the others report `NOT-MEASURED`. They are the fast iteration loops for the
 startup and scroll perf beads.
 
+A subset run is always `INCOMPLETE` overall, because the metrics it did not
+select are never measured. That verdict must not swallow the one metric it was
+asked for, so a live subset run whose *selected* metric comes back
+`NOT-MEASURED` exits non-zero. The scroll workload additionally refuses to
+measure unless the pane it owns holds focus both before and after its writer
+command is typed: keys land wherever focus actually is, and a command that
+never reached its shell otherwise yields a sample taken from someone else's
+pane. Failed scroll arms copy the runtime probe and their before/after
+snapshots to `perf-ab-artifacts/` beside the report, since the work directory
+is deleted on exit.
+
 `--ai-tab-only` is a separate Q6 measurement rather than a sixth A/B metric.
 With `--live`, it times the `ctrl+alt+c` key send to the first increase in the
 client's PTY-byte counter and prints machine-readable milliseconds, the 1000 ms
@@ -167,6 +178,13 @@ Every typing workload runs in a tab the rig opened itself: it sends the
 workload aborts instead of typing into a pane that was already open. The rig
 closes the tabs it opened afterwards, and only ever sends `exit` to a session it
 watched itself create.
+
+Seeded sessions are attached before they are closed. Attachment ownership is
+per connection, and the server drops a `CloseSession` for a session that
+connection never attached, logging a warning in its own log and returning
+nothing; the `scribe-test` helper still reports success, because writing the
+message is all it did. A cleanup that only closes therefore leaves the seed
+running while looking like it worked.
 
 ## Driving input
 

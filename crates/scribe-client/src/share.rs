@@ -458,6 +458,11 @@ impl ShareChrome {
 
     /// Drop an expired hint on the idle-wake boundary. Returns `true` when the
     /// chrome changed, so the caller can repaint exactly once.
+    /// The one pending hint expiry, if any.
+    pub fn hint_deadline(&self) -> Option<Instant> {
+        self.hint.as_ref().map(ControlHint::expires_at)
+    }
+
     pub fn expire_hint(&mut self) -> bool {
         if self.hint.as_ref().is_some_and(ControlHint::is_expired) {
             self.hint = None;

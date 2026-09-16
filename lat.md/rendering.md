@@ -8,20 +8,16 @@ The GPUI client paints terminal cells and bespoke chrome from immutable terminal
 instructions; GPUI owns text shaping, scene composition, GPU submission, and
 presentation.
 
-[[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint]] creates
-one GPUI canvas for the grid. Its paint callback resolves cell colours,
-emits background and box-drawing quads, and supplies styled row text to GPUI in
-that order. The client owns these terminal semantics but no renderer backend.
+[[crates/scribe-client/src/terminal_element.rs#PaneContentView]] retains each pane's base canvas. Changed rows resolve colors and shape text once; unchanged base views reuse GPUI paint primitives. A separate overlay canvas paints selection, cursor and transient chrome without preparing terminal rows.
 
 ## Glyph Atlas
 
 GPUI owns glyph shaping caches, rasterization, atlas allocation, and texture
 uploads; `scribe-client` neither allocates nor addresses a glyph texture.
 
-[[crates/scribe-client/src/terminal_element.rs#paint_row_text]] supplies a
+[[crates/scribe-client/src/terminal_element.rs#shape_row_text]] supplies a
 logical text line, `TextRun` styles, font size, and forced cell width to
-GPUI's `WindowTextSystem::shape_line`, then asks the returned `ShapedLine` to
-paint. The pinned GPUI revision caches raster bounds in `TextSystem` and owns
+GPUI's `WindowTextSystem::shape_line`, then retains the returned `ShapedLine` for changed-base paint calls. Overlay glyphs use the same shaping helper. The pinned GPUI revision caches raster bounds in `TextSystem` and owns
 the platform atlas behind that call.
 
 ### DPI Scaling
@@ -87,6 +83,8 @@ find cells so the search accent keeps its existing precedence.
 Placements sort by z-index, image id, placement id, then committed chronology;
 Sixel retains completion order in its background raster band.
 
+Accepted image `Scroll` effects mutate Alacritty's grid directly and bypass `Term` damage. Live commits and replay commits that drain these effects therefore force a viewport reread through [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#make_content_with_damage]]. Equal rows still retain identity; text and image publication remain atomic. This also covers accepted effects not currently emitted by the stock server.
+
 Classic placements derive destination bounds from current logical cell metrics,
 then [[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image_clipped]]
 keeps full placement scaling while intersecting its content mask with the pane
@@ -125,26 +123,231 @@ The direct `wgpu` call in [[crates/scribe-client/src/main.rs#probe_vulkan]] is
 an installer preflight that opens no window and draws no frame. It is separate
 from the GPUI-owned render path.
 
+## Retained GPU terminal bases
+
+A Linux/WGPU path that retains terminal bases past GPUI scene replay and
+upload, so a pane whose text has settled is recomposited from one texture
+instead of re-issuing every glyph each frame.
+
+[[crates/scribe-client/src/terminal_element.rs#retained_gpu_base_enabled]] reads
+a process-wide flag the client publishes from `appearance.retained_gpu_bases`
+at startup and on every config reload, so the setting reaches an installed
+binary and can be turned off without a rebuild. `SCRIBE_DEV_RETAINED_GPU=0|1`
+overrides the saved value for the A/B rigs, mirroring `SCRIBE_DISABLE_ANIMATIONS`;
+it is read once per process, so a config reload cannot change meaning mid-run.
+The flag defaults off in the renderer itself, so a frame painted before config
+is applied keeps the ordinary path. Server lifecycle and animation policy are
+untouched, and non-Linux clients do not compile the retained path at all.
+
+The measured evidence is one NVIDIA/Vulkan machine: per frame it lowered both
+CPU and GPU cost on every workload, but nothing has been run on AMD, Intel,
+Wayland or macOS, and energy was never measured. That is why the key exists
+rather than the behaviour being unconditional.
+
+The disposable native-display border workload still used 84.12% of one CPU
+core after preparation caching, with zero base/row preparations. Scene replay,
+stable sorting and bounds insertion accounted for 15.45%, 13.93% and 12.42% of
+the fresh profile. That is what motivated retention beyond the CPU preparation
+cache, and the per-frame measurements above are what settled whether it paid.
+
+Pinned `gpui` and `gpui_wgpu` are patched under `third_party/gpui-retained/`,
+vendored complete except for upstream's `examples/`, `docs/`, `tests/` and
+`benches/`, which nothing here compiles and which were most of the copied
+bytes. Their `[[example]]`/`[[bench]]` manifest targets were removed with them.
+Upstream's own `gpui` unit tests cannot run in this tree regardless, because
+they `include_bytes!` fonts from Zed's repository-root `assets/`, so these two
+packages are linted with `--lib` rather than `--all-targets`.
+[[third_party/gpui-retained/gpui/src/scene.rs#RetainedLayer]] holds an immutable
+captured scene behind one outer ordering reference. WGPU caches its texture by
+view owner and capture revision. Hits composite without base scene uploads;
+misses submit captures before main-frame buffer writes, but only after an owner
+repeats its revision. First-seen/changing revisions paint directly without
+waiting or suppressing frames. Revision history follows cache visibility and
+invalidation; stale textures never composite. A capture that cannot fit the
+instance buffer at its ceiling keeps its allocation with no revision, so the
+next admitted capture reuses the texture instead of reallocating. A view paints
+at most one retained layer per frame; debug builds assert it, since a second
+layer would evict the first from the owner-keyed cache every frame.
+
+Sprite draw order is keyed on the atlas *texture*, never the individual tile.
+A tile id records where a glyph landed, which follows the order glyphs were
+first rasterized, and that order varies between launches: identical sessions
+allocated 86 shared glyphs at different origins, diverging by the ninth miss.
+Sorting on it reordered equal-order sprites run to run, and blending overlapping
+sprites in a different sequence left one-level rounding differences, so two
+launches of one binary disagreed in 56-78 pixels and no exact-pixel oracle could
+hold. Batching only needs sprites sharing a texture to be contiguous and the
+sort is stable, so the texture index preserves batches while ties keep paint
+order. Glyph rasterization was never the variable: every glyph sampled across
+those launches had an identical bitmap checksum.
+
+Repeating once is not proof that content rests: a pane producing output pauses
+for a single frame often enough to earn a texture its next frame throws away,
+which is why concurrent output recorded captures against zero hits. An owner
+whose texture is replaced having never been composited therefore has to show
+twice the stability before the next capture, doubling to a bounded ceiling,
+and any reuse resets it. Repurposing an allocation for new content clears the
+reuse flag, so the requirement cannot be escaped by holding the same texture. Cursor, selection, IME,
+scrollbar, annotations, animated borders and outer background remain separate.
+
+Capture bounds round outward in device pixels while shader calculations retain
+window coordinates. RGBA8/BGRA8 captures store premultiplied pixels regardless
+of window presentation alpha mode: either the existing shader or its SrcAlpha
+blend factor supplies the multiplication. The composite uses factor One.
+Images, ordinary paint-layer scopes and unsupported capture content retain
+normal painting. Backend budget or format refusal draws the supported inner
+scene directly. Each renderer admits at most 64 MiB of logical layer textures,
+reuses equal sizes and prunes absent owners. Driver-held in-flight references
+can temporarily exceed that logical budget. Private oversized-window checks
+exercise single-layer and aggregate refusal, absent-owner pruning through
+image exclusion, and subsequent readmission with pixel comparisons. They do
+not establish physical-memory limits or an LRU eviction policy. Recovery must
+invalidate retained textures and force fresh paint after atlas reset. A private
+logical-device destruction check exercises the platform recovery path and
+verifies fresh capture, resumed hits, preserved session identity and exact
+before/after glyph pixels. It is not physical GPU reset, driver-crash or
+multi-window recovery coverage. Private 1.25x steady-cursor and real IBus
+preedit checks match direct rendering without recapturing the base; committing
+text causes one new capture. These are overlay-parity checks, not blink-phase
+or independent baseline cursor-geometry coverage.
+
+Native owned-window RGBA parity passes on the measured NVIDIA/Vulkan X11
+surface, but configured 0.95 opacity still produces background alpha 255 in
+both disabled controls and the retained case. The surface advertises only
+`Opaque` presentation, so this does not qualify alpha-preserving composition.
+A later same-host comparison ran the pre-vendor client against the current one
+under the same compositor: both produced alpha 255, so this is a surface
+capability on this host rather than anything retention introduced, and
+`scribe-5f2i` closed on that evidence. Forcing an unsupported presentation mode
+remains invalid, and whole-window opacity is not a substitute because it would
+fade glyphs too.
+
+`GPUI_RETAINED_LAYER_PROBE` enables separate capture, actual hit, composite,
+fallback, upload-span and logical texture-byte counters. Image exclusions and
+rejected CPU captures are not backend fallback counts. These counters do not
+prove completed presentation cadence or lower GPU utilization. Evidence covers
+matched image/default paths, fractional-DPI lifecycle and overlays, logical
+budget and device-loss recovery, native RGBA parity, cross-launch pixel
+determinism, and the Linux regression, visual and build gates, which run
+through this path now that it is on by default. What remains unproven is
+hardware and duration: every number comes from short samples on one
+NVIDIA/Vulkan host, with nothing measured on AMD, Intel, Wayland or macOS, no
+energy measurement, and no physical GPU reset, driver crash or suspend/resume
+coverage. That is the risk `appearance.retained_gpu_bases` exists to let a user
+retire without a rebuild.
+Provenance, scenario limits and the counter contract live in
+`third_party/gpui-retained/README.md`.
+
+Independent dev-only `SCRIBE_DEV_GPU_TIMESTAMPS=1` requests supported timestamp
+queries. Bounded, separate main/capture readback pools collect asynchronously
+without waiting for the GPU. Main intervals include continuation and path
+passes; retained capture intervals are separate. Overflow aborts release their
+slots. The probe reports elapsed nanoseconds, sample counts, skips and errors,
+and splits main samples per renderer because process-global totals mix windows
+of different sizes and frame shares. Renderer index follows window creation
+order, so each renderer logs its index with its surface size.
+These times exclude queue uploads and compositor work and are not utilization
+percentages. Comparisons require coverage and an instrumentation-overhead
+control. The private idle NVML probe returned no utilization values; active
+native workloads returned intermittent numeric values, not complete coverage.
+
+Reuse-gated native measurements show lower CPU cost for stable animated bases
+and one updating pane. Per-second totals also showed higher concurrent-output
+CPU and higher border GPU pass time, but those totals compare unequal delivered
+work: retention sustains about 177-182 border frames/s against 126-137, because
+the control is CPU-bound and drops frames. Three repeated runs with per-renderer
+attribution compared cost per frame for the same window, and every retained
+sample was below every control sample: medians 17.7% lower GPU per frame for
+border animation, 29.7% for one updating pane and 13.9% for concurrent output,
+with CPU per frame 58.1% and 46.4% lower for the first two. Concurrent-output
+CPU per frame is 3.9% higher, the one measured per-frame regression, where
+captures are attempted and never reused. Per-frame times drift between runs and
+controls spread over 20% within a run, so only within-run sequential same-binary
+comparisons are used. A temporary in-pass probe attributed 9.2-9.3% of main pass
+time to retained batches and 98.8-98.9% to draw commands, excluding render-pass
+clear and store boundaries as the cost; it has been removed. This is not
+production acceptance, energy measurement, or cross-platform evidence. Fixture population and per-window geometry
+must be checked independently: process-wide root and pane counters flush at
+different rendering stages and their ratio cannot prove visible-pane count.
+
 ## GPUI Ported Rendering Logic
 
 `scribe-client` owns display-independent terminal colour and box-drawing logic,
 while GPUI owns every GPU resource used to put that logic on screen.
 
-These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output.  is the consumer that puts them on the live paint call.
+These modules are display-independent and own no GPU resources. Unit tests pin SGR semantics and exact sRGB values; [[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint_grid]] puts them on the live paint path.
 
 ### GPUI Colour Palette
 
- is a verbatim port of the xterm-256 palette, resolving the shared `vte::ansi::Color` values the Zed alacritty fork produces.
+[[crates/scribe-client/src/palette.rs#ColorPalette]] stores the xterm-256 palette in sRGB, the color space accepted by GPUI, and resolves the raw `vte::ansi::Color` values from the terminal snapshot.
 
-It reproduces the standard/bright ANSI entries, the 6×6×6 colour cube, and the greyscale ramp, all linearised at construction, with theme override of entries 0-15 and the opaque-magenta sentinel for out-of-table named colours.
+Standard/bright ANSI, the 6×6×6 cube and greyscale entries are table lookups. Truecolor is byte-to-float normalization only. Theme overrides copy sRGB entries 0-15 including alpha; out-of-table named colors retain the opaque-magenta sentinel.
 
 ### GPUI Colour Semantics
 
- holds the theme-derived default colours plus the palette and resolves a cell's raw fg/bg fields to linear RGBA, mirroring the legacy `resolve_cell_colors_raw`.
+[[crates/scribe-client/src/color.rs#TerminalColors]] resolves terminal colors entirely in sRGB. GPUI owns the rendering conversion, so no CPU transfer function runs per cell.
 
-It applies bold→bright promotion via , the DIM 0.67 sRGB round-trip via , the `BrightForeground` boost via , and INVERSE/HIDDEN handling. Theme colours are linearised through .
+[[crates/scribe-client/src/color.rs#TerminalColors#resolve_cell_colors]] keeps one ordered rule set: BOLD promotion, color resolution, INVERSE swap, HIDDEN foreground replacement, then DIM. DIM multiplies the resulting foreground's RGB by 0.67 without changing alpha. Semantic bright and dim foregrounds are precomputed when the theme changes.
 
-GPUI's `Rgba` is already sRGB, so the paint path calls , which runs the identical rules and converts the result back with . Keeping one resolver and converting at the boundary is deliberate: duplicating the bold-bright / INVERSE / HIDDEN / DIM ordering in a second colour space is exactly how the two clients would drift.
+The old renderer required linear inputs; GPUI does not. Keeping that old storage domain after the port caused six inverse-transfer calls for a common foreground/background cell, plus forward conversions for truecolor and extra round trips for DIM. The native sRGB design deletes that work rather than caching it or duplicating SGR rules. Palette, cursor, selection and IME backgrounds all use the same domain. Existing `opaque_slot` and `scale_alpha` paint policies are unchanged.
+
+The pinned [GPUI shader implementation](https://github.com/zed-industries/zed/blob/f96212f2c50f54d93712fa130d6226b1ce7d76b5/crates/gpui_wgpu/src/shaders.wgsl) owns backend color handling. This matches Scribe's existing sRGB chrome rather than adding a second renderer contract.
+
+#### Repaint Optimization Boundaries
+
+Pane base caching and row preparation reuse avoid repeated terminal work on unrelated root frames; GPU retention is not part of this refactor.
+
+[[client#Client#GPUI Client Spike#Per-Pane Grids And Sizing#Pane-grid cached-view decision]] defines publication, cache keys, overlay separation, scheduling and hidden-session behavior. The pinned GPUI cache replays recorded primitives into scene ordering and sorting. WGPU clears the full target, so this is CPU-side preparation reuse, not partial GPU presentation.
+
+With `SCRIBE_PERF_PROBE=/absolute/report-path`, the existing probe now reports `content_preparations` (actual base-view render calls), `row_preparations` (resolved/shaped base rows), `content_cache_reuses` (unchanged inputs eligible for a cached mount), and `terminal_overlay_paints`, alongside root `frames`. Bounds/refresh can still force a base render after a cached mount, so read both counters. Overlay glyph shaping is not counted as base-row preparation. Counters are process-wide and disabled without the existing opt-in.
+
+Manual acceptance, requiring separate authority to launch or replace a client: preserve the original three large windows (2160x3765, 1577x918, 1655x2303), with nine panes in the main window. Record report deltas, `pidstat -t -p CLIENT_PID 1 20`, and the same 15-second `perf record -e cpu-clock:u -F 99 --call-graph dwarf,8192` profile for baseline and candidate under matched activity. Capture GPU telemetry separately; CPU counters do not prove GPU savings.
+
+Run settled idle, AI-border-only, cursor-only, one-row edits in one pane, one actively scrolling pane, hidden-tab output, visibility regain, and multiple active agents. After cache warmup, border/cursor-only frames must increase root/overlay counts without base-row preparation; one-row edits should prepare that row rather than unchanged siblings. Scrolling/full damage may legitimately prepare the viewport. Hidden output alone must not add grid frames; prompt/CI/status deadlines and visible badges remain legitimate chrome work. To test fully parked rendering, disable cursor blinking, live status stats and eligible chrome clocks as well as animation. Repeat static `pulse_ms=0` and reduced motion.
+
+Exercise split-scroll, old/new cursor positions, selection/vi, IME composition, find and hover, font/theme/opacity reload, resize/DPI moves, Kitty/Sixel ordering, image deletion/budget pressure, and session close/regain. Use existing `terminal::`, `terminal_element::`, `ai_indicator::`, `scrollbar::`, and root-synced-child headless checks, plus the registered terminal-image renderer probe and visual suites. No live run or numeric CPU/GPU improvement is asserted by this implementation.
+
+GPUI already wraps each shaped line in a native paint layer. Its [paint-layer contract](https://github.com/zed-industries/zed/blob/f96212f2c50f54d93712fa130d6226b1ce7d76b5/crates/gpui/src/window.rs#L3715-L3738) batches non-overlapping geometry at one draw order. A whole terminal is not such a batch: equal-order primitives are sorted by type and sprites by atlas texture, which could break the Kitty/Sixel/text/overlay phases. The row cache retains these phases rather than wrapping the entire terminal in one unordered layer.
+
+The ignored `benchmark_cell_color_resolution` test in [[crates/scribe-client/src/color.rs]] measures the actual resolver with default, indexed and truecolor inputs, mixed SGR flags, one warmup and seven timed samples. Run with the client package optimized:
+
+```bash
+cargo test -p scribe-client --lib \
+  --config 'profile.dev.package.scribe-client.opt-level=3' \
+  benchmark_cell_color_resolution -- --ignored --nocapture
+```
+
+On the 64-logical-CPU workstation, three interleaved baseline/fixed runs produced the following medians of run medians. Each timed sample resolved 4096 cells over 64 passes; inputs and outputs use `black_box`. Both client test builds used the package optimization override above. Nanoseconds per cell are integer-truncated.
+
+| Workload | Before ns/cell | After ns/cell | Speedup |
+|---|---:|---:|---:|
+| Default colors | 71 | 7 | 10.1x |
+| Indexed colors | 85 | 10 | 8.5x |
+| Truecolor | 171 | 12 | 14.2x |
+
+All 904 client-library tests and 188 client-binary tests passed, including the alpha/opacity regression, and client all-target/all-feature Clippy passed with warnings denied. These are CPU color-resolution measurements, not full-frame or input-latency results. Live deployment still needs explicit approval; a microbenchmark cannot establish that the running application's reported lag is resolved.
+
+#### Dev Runtime Validation
+
+Dev-only validation compares the updated client with the old release on the same server and matched 1600×1000 windows, using owned disposable sessions. Stable Scribe remains untouched.
+
+The installed dev client matches the tested release build, SHA-256 `5271caf953d778ddaf7fdda848a6ca7593e88082b1ff2e66c7f91b47e8b709a5`. Both old and new executables run under the `scribe-dev` identity. This is a release-to-current comparison, not an isolated color-only binary A/B.
+
+After external ffmpeg memory pressure cleared, the controlled run recorded:
+
+| Metric | Updated dev | Old release |
+|---|---:|---:|
+| Render cadence | 60.025 fps | 59.628 fps |
+| Inferred dropped frames | 0 / 483 (0%) | 2 / 483 (0.414%) |
+| UI-thread CPU | 14.25% | 16.25% |
+| Total client CPU | 98.25% | 102.62% |
+| Median key-to-PTY echo, 60 samples | 0.272 ms | 0.290 ms |
+
+Scrolling used a FIFO-gated `seq 1 1000000000` writer, a two-second settle and an eight-second measurement. The gate proves the owned shell reached the workload without relying on desktop keyboard focus. Byte counters advanced across both measurement windows. CPU percentages use one core as 100%; most sustained-output CPU was on the IPC/parser thread, not the UI thread.
+
+The keyboard-echo run used the existing perf rig with window-targeted input, verified dev-window ownership and 60 captured samples per arm. The first keyboard-started scroll attempt was invalid because its shell never ran the command; it was not counted as a pass. The rig also failed to close a detached seed without attaching first, so owned sessions were explicitly attached and closed afterward. Test-created restore snapshots were archived outside the active dev store.
+
+Host load was 11-12 on 64 logical CPUs with roughly 94 GiB available and zero averaged memory/I/O pressure at both measurement boundaries. Both clients met the scroll budget under these conditions; earlier stressed-host failures therefore do not establish a client regression. The probe measures application render cadence and key-to-PTY echo, not compositor presentation latency. This single-pane check does not reproduce the original nine-pane AI workload, and unmeasured startup/memory metrics leave the full launch gate incomplete.
 
 ### GPUI Box-Drawing Rasterizer
 
@@ -166,11 +369,11 @@ The alpha-aware surfaces are the terminal grid, titlebar and tab bar, prompt bar
 
 ## GPUI Cell-Accurate Paint Path
 
-The GPUI terminal grid resolves every visible property of a cell — colour, attributes, glyph coverage, and shaping — on the live paint call, so the ported rendering logic above reaches real pixels instead of only unit tests.
+The GPUI terminal grid prepares changed rows and retains their resolved colors and shaping; overlays reuse those rows while maintaining independent cursor, selection and IME paint.
 
-`Content` carries a `Cell` per grid position (character, raw `vte::ansi::Color` foreground and background, and the alacritty `Flags` bitset) rather than a `String` per row. The colours stay unresolved in the snapshot on purpose: a theme edit then repaints existing scrollback without re-running the parser, because `TerminalElement` resolves against the current theme every frame.
+`Content` carries a `Cell` per grid position (character, raw `vte::ansi::Color` foreground and background, and the alacritty `Flags` bitset) rather than a `String` per row. The colours stay unresolved in the snapshot on purpose: a theme edit then repaints existing scrollback without re-running the parser, because a theme change invalidates prepared rows without rerunning the parser.
 
-`TerminalElement::paint` lowers that snapshot onto one `gpui::canvas` rather than a div per row, because the three passes below must land in one paint call in order. A styled-div tree can express none of them.
+The retained base canvas keeps image/background/text phases together rather than making independently layered row elements. The uncached overlay canvas follows it. The image probe can still use `TerminalElement::paint` to exercise both passes together.
 
 ### Paint Order
 
@@ -230,6 +433,20 @@ Carrying the chain is necessary but not sufficient on this GPUI revision: a stoc
  therefore registers  — the upstream binary with a `U+006D` cmap alias added by `tools/patch-nerd-symbols-font.py` — with GPUI's text system before the first frame is shaped. The face passes the `'m'` check, keeps its upstream family name so the chain resolves it, and covers the icon ranges even on hosts with no Nerd Fonts installed. The alias never leaks into visible text: the chain is only consulted for codepoints the primary font lacks, and every terminal font covers `m`.
 
 Live capture on the real client confirms the chain is live: `U+F09B` and `U+F121` — absent from the primary JetBrains Mono — render as the octocat and code icons from the embedded face instead of `Unifont Sample` hex boxes, alongside the `U+E0B0`/`U+E0B2`/`U+E0A0` powerline glyphs.
+
+#### Color Emoji Face Admission
+
+The vendored WGPU text system admits recognized color-emoji faces without requiring a Latin `m` glyph, so loading the explicit fallback chain does not delete Noto Color Emoji from the font database.
+
+Recognition is by PostScript name: `NotoColorEmoji`, `TwemojiMozilla`, `AppleColorEmoji` and `SegoeUIEmoji`; upstream knew only the first.
+
+[[third_party/gpui-retained/gpui_wgpu/src/cosmic_text_system.rs#CosmicTextSystemState#load_family]]
+uses its existing emoji-face recognition when applying the upstream no-`m`
+filter. Other face filtering and fallback ordering stay unchanged. This is a
+font-loading correction independent of retained rendering: both direct and
+retained paths can use the installed color font. No font is installed or fetched
+at runtime. Visual comparisons must pair equivalent font-loading behavior,
+rather than treating newly available emoji as a retained-layer regression.
 
 ### Ligature Toggle
 

@@ -1393,8 +1393,9 @@ pub fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
             italic: flags.contains(CellFlags::ITALIC),
         },
         decoration: scribe_common::screen::CellDecorationFlags {
-            underline: flags.contains(CellFlags::UNDERLINE),
+            underline: flags.intersects(CellFlags::ALL_UNDERLINES),
             strikethrough: flags.contains(CellFlags::STRIKEOUT),
+            underline_style: convert_underline_style(flags),
         },
         presentation: scribe_common::screen::CellPresentationFlags {
             inverse: flags.contains(CellFlags::INVERSE),
@@ -1404,6 +1405,25 @@ pub fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
             wide: flags.contains(CellFlags::WIDE_CHAR),
             wrap: flags.contains(CellFlags::WRAPLINE),
         },
+    }
+}
+
+/// Which of alacritty's five underline flags a cell carries.
+///
+/// The flags are mutually exclusive in practice, but the order here decides
+/// what a hand-built cell with several of them replays as.
+fn convert_underline_style(flags: CellFlags) -> scribe_common::screen::UnderlineStyle {
+    use scribe_common::screen::UnderlineStyle;
+    if flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if flags.contains(CellFlags::UNDERCURL) {
+        UnderlineStyle::Curly
+    } else if flags.contains(CellFlags::DOTTED_UNDERLINE) {
+        UnderlineStyle::Dotted
+    } else if flags.contains(CellFlags::DASHED_UNDERLINE) {
+        UnderlineStyle::Dashed
+    } else {
+        UnderlineStyle::Single
     }
 }
 
@@ -1564,6 +1584,66 @@ mod tests_session_cap {
 
         assert_eq!(manager.pending_session_ids().await.len(), 2);
         assert!(manager.reserve_session_slot().is_err(), "truncated restore must fill the cap");
+    }
+}
+
+#[cfg(test)]
+mod tests_underline_replay {
+    use alacritty_terminal::Term;
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::term::cell::Flags as CellFlags;
+    use alacritty_terminal::term::test::TermSize;
+    use scribe_common::ids::SessionId;
+    use scribe_pty::event_listener::ScribeEventListener;
+    use vte::ansi::Processor as AnsiProcessor;
+
+    fn listener() -> ScribeEventListener {
+        // The receiver is dropped: painting cells emits no event this test reads.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ScribeEventListener::new(SessionId::new(), tx)
+    }
+
+    /// Feed `bytes` to a fresh grid and return the flags of its first five cells.
+    fn replay_flags(bytes: &[u8]) -> Vec<CellFlags> {
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(20, 3), listener());
+        let mut processor: AnsiProcessor = AnsiProcessor::new();
+        processor.advance(&mut term, bytes);
+        let grid = term.grid();
+        (0..5)
+            .map(|col| {
+                grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(col)]
+                    .flags
+                    & CellFlags::ALL_UNDERLINES
+            })
+            .collect()
+    }
+
+    /// A reattaching client rebuilds its grid from the replay, so every
+    /// underline the terminal drew has to survive grid -> snapshot -> ANSI.
+    #[test]
+    fn every_underline_style_survives_a_replay_round_trip() {
+        // One cell per style: single, double, curly, dotted, dashed.
+        let painted = b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc\x1b[4:4md\x1b[4:5me\x1b[0m";
+        let before = replay_flags(painted);
+        assert_eq!(
+            before,
+            vec![
+                CellFlags::UNDERLINE,
+                CellFlags::DOUBLE_UNDERLINE,
+                CellFlags::UNDERCURL,
+                CellFlags::DOTTED_UNDERLINE,
+                CellFlags::DASHED_UNDERLINE,
+            ],
+            "the terminal must distinguish the five underlines before any replay"
+        );
+
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(20, 3), listener());
+        let mut processor: AnsiProcessor = AnsiProcessor::new();
+        processor.advance(&mut term, painted);
+        let snapshot = super::snapshot_term(&term);
+
+        let after = replay_flags(&scribe_common::screen_replay::snapshot_to_ansi(&snapshot));
+        assert_eq!(after, before, "replay flattened underline styles");
     }
 }
 

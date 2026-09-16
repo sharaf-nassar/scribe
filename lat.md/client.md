@@ -86,7 +86,7 @@ is `specs/016-gpui-client-rebuild/gpui-component-evaluation.md`.
 
 The spike adopts Zed's display-only terminal model:  owns an alacritty `Term` plus a VTE `Processor` and holds no PTY. Server bytes enter through , which advances the processor, reports whether the frame changed visible state, and rebuilds an immutable `Content` grid snapshot.  paints that snapshot as fixed-width GPUI rows.
 
-A background thread runs : it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`.  attaches the first live session and hands every message to , which normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (via the  helpers, off the drain) and forwards them as . Each coalesced batch bumps a shared generation counter;  polls it on the GPUI foreground and calls `notify()` so the window repaints.
+A background thread runs : it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`.  attaches the first live session and hands every message to , which normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (via the  helpers, off the drain) and forwards them as . Each committed visible batch signals [[crates/scribe-client/src/main.rs#RedrawSignal]]. Its coalesced wake reaches the GPUI foreground without a fixed redraw poll; hidden output still advances its session but requests no visible grid frame.
 
 The dispatcher implements twenty-nine of the protocol's inbound variants, six of which it names and hands to , four more to , and three more to , so the table stays a list of routing decisions. The rest reach , which names them from the exhaustive table in , counts the drop, and logs it at `warn`. Session-scoped arms gate on the attached session inside the arm rather than in a match guard, so a frame for a background pane stays a deliberate no-op instead of being reported as unhandled. See  for the ratchet that keeps the unhandled set shrinking.
 
@@ -142,7 +142,7 @@ Outbound:  replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInpu
 
 Pacing is what makes a burst a burst: the drain hands the grid one committed frame per redraw instead of emptying the pane's queue every batch.
 
-Emptying it was the de-facto behaviour, and it collapsed a whole run of committed frames into one repaint — every frame was parsed, the redraw generation was bumped once, and a `CSI ? 2026` animation was shown as its last frame only. [[crates/scribe-client/src/main.rs#run_frame_pacer]] presents what pacing holds back, one burst per pane per [[crates/scribe-client/src/main.rs#REDRAW_INTERVAL]] — the same clock [[crates/scribe-client/src/main.rs#drive_redraws]] repaints on, so "one burst per redraw" is one number rather than two that can drift apart. It parks while every pane is caught up and the drain wakes it whenever a batch leaves a burst behind, so a pane that queued more than one frame never waits on the next batch to show the rest.
+Emptying it was the de-facto behaviour, and it collapsed a whole run of committed frames into one repaint: every frame was parsed, the redraw generation was bumped once, and a `CSI ? 2026` animation was shown as its last frame only. [[crates/scribe-client/src/main.rs#run_frame_pacer]] presents what pacing holds back, one burst per pane per [[crates/scribe-client/src/main.rs#REDRAW_INTERVAL]], the same minimum background-frame interval [[crates/scribe-client/src/main.rs#drive_redraws]] uses, so "one burst per redraw" is one number rather than two that can drift apart. It parks while every pane is caught up and the drain wakes it whenever a batch leaves a burst behind, so a pane that queued more than one frame never waits on the next batch to show the rest.
 
 The pacer needs no bound of its own because the catch-up threshold already is one: a pane past it is drained through in a single pass, so a firehose is presented at the batch's own rate and only a caught-up pane is actually paced. That is also why the pacing fix is safe to make: the bursts it skips are never load-bearing for correctness, because a client that falls behind is repaired by the bounded inbound queue's `RequestSnapshot` resync rather than by replaying every intermediate frame.
 
@@ -338,7 +338,7 @@ Geometry is resolved during paint, because only the grid canvas knows the pane's
 
 The palette comes from the theme, never from config.  takes the derived `chrome.scrollbar` slot (whose 40 % alpha doubles as the resting fade ceiling) and the ANSI green/red for the ticks; `appearance.scrollbar_width` and `appearance.scrollbar_color` stay deliberately unread, because both are declared removed keys for the GPUI client and the width is fixed at .
 
-The fade is wall-clock, so it is driven from the idle tick rather than from output:  runs on the same 16 ms wake  already uses for the share hint, and repaints while any scrollbar is animating *or* while this tick changed an opacity — the tick that finally reaches zero reports "not visible" while still owing the frame that clears it.  reveals the overlay from every path that moves a viewport, including a paging chord that hit the end of the scrollback, because that is exactly when the user wants to see where they are.
+The fade is wall-clock. [[crates/scribe-client/src/scrollbar.rs#ScrollbarState#redraw_delay]] schedules the idle-delay boundary, then frame-paced opacity/width changes, including the final clearing frame. Stationary hover and drag schedule no fade frames. Only placed panes participate. Reduced motion snaps width and hides the thumb at expiry without an interpolated ramp; paging and pointer paths still reveal it.
 
 The pointer surfaces reuse the module's own hit-testing.  offers a left press to the scrollbar before the mouse reporter, mirroring the winit client's chrome-first ordering: a click on the thumb was never meant for the application below it. A press on the thumb starts a drag, a press elsewhere in the 3x hit zone jumps the viewport to that point on the track, and both land on  so they share the split-scroll bookkeeping the keyboard path does. Hover is tracked even while an application owns the pointer, because the hover widen is what makes the 6 px thumb grabbable at all.
 
@@ -352,7 +352,7 @@ The feature-015 sharing surface is live in the GPUI shell: the reader mirrors th
 
 Input follows the winit dispatch order. A pending request is a full-window modal claimed at the top of , so it is answered before any binding, overlay, or PTY byte; everything else reaches  from , after the configured bindings, so a viewer keeps its shortcuts while its terminal keystrokes are suppressed. The decision table returns a : a viewer's first key raises the take-control hint and is dropped, Enter while that hint is up claims control, and the prompt's Enter/Esc grants or denies. Each emitted  leaves through , the single place the frozen v3 `ControlClaim` / `ControlGrant` frames are built.
 
-Rendering has two halves.  draws the roster panel, the hint strip, and the dimmed modal on the window's overlay layer, and  feeds the status bar's existing share badge (). Because a hint expires on wall-clock time rather than on traffic,  clears it on the same 16 ms idle-wake tick it already runs, so a notice cannot outlive its window on a quiet pane.
+Rendering has two halves.  draws the roster panel, the hint strip, and the dimmed modal on the window's overlay layer, and  feeds the status bar's existing share badge (). A hint contributes its exact expiry deadline to [[crates/scribe-client/src/main.rs#TerminalView#redraw_deadline]], so a notice also clears when terminal traffic has stopped.
 
 The surface is verified against the running app, not headlessly: see .
 
@@ -554,7 +554,9 @@ The second is the one with nothing to fall back on — it was never opened with 
 
 The add is not fire-and-forget: the first one goes out around the first paint, which can be before the window manager has managed the window at all, and EWMH's `_NET_WM_STATE` message addresses mapped windows — one sent early is dropped, not queued.
 
-Mutter answers GPUI's map through a placement pass and a map animation, so a maximized window relaunched by a package update raced that map and came back windowed. The assert now arms a target the frame loop verifies on the restore debounce, re-sending the idempotent add a bounded number of times before logging a give-up; unlike the position, where the window manager's different answer is respected, the only party that asked for windowed here is the race. A record whose only work is the state also keeps the placement open, so a capture taken while the assert is in flight is adopted as baseline rather than persisted — one lost race no longer demotes a maximized record to windowed permanently.
+Mutter answers GPUI's map through a placement pass and a map animation, so a maximized window relaunched by a package update raced that map and came back windowed. The assert now arms a target the lifecycle task verifies on the restore debounce, re-sending the idempotent add a bounded number of times before logging a give-up; unlike the position, where the window manager's different answer is respected, the only party that asked for windowed here is the race. A record whose only work is the state also keeps the placement open, so a capture taken while the assert is in flight is adopted as baseline rather than persisted; one lost race no longer demotes a maximized record to windowed permanently.
+
+[[crates/scribe-client/src/main.rs#TerminalView#complete_restored_state]] clears the sizing gate and notifies on both observed success and exhausted attempts. This releases deferred PTY sizing even for a cursor-hidden pane with no chrome deadline. The headless regression observes the real notification and runs the render's size-publication consumer, asserting `Resize` for both outcomes. GPUI TestWindow has no native handle, so this covers completion/notification/sizing, not actual window-manager observation; platform validation remains separate.
 
 #### Replayed prompts reach the live AI chrome
 
@@ -716,9 +718,23 @@ Two orderings hold the design together. Nothing on the paint path takes a pane's
 
 #### Pane-grid cached-view decision
 
-Pane grids remain uncached. Bead `scribe-goa4.1` closed the investigation as **do not implement now** because a faithful caching-on measurement variant is indistinguishable from building the feature.
+Pane content is now retained per placement, with independently repainted overlays and damage-backed row preparation. The root remains the layout, focus and input controller.
 
-Unlike the retained board and panel views, each pane is currently assembled directly inside [[crates/scribe-client/src/main.rs#TerminalView#render_panes]]. A real variant needs a retained per-session `Entity`, complete input diffing for the content snapshot, font and palette, find/selection/link overlays, cursor blink, scrollbar, IME, image scene/cache, bounds sink, and pane lifecycle, plus the live-versus-cached mount rule required when a root render changes child inputs. Omitting any of those is not the proposed cache and can silently paint stale state. No caching-on binary was fabricated, no production code changed, and no probe counter was added.
+[[crates/scribe-client/src/main.rs#TerminalView#capture_pane_frames]] freezes one immutable `PaneFrame` per visible session after sizing and split-scroll synchronization. It publishes visibility first, using the same placements it then captures. A concurrent commit is therefore either included in the frozen publication or requests the next frame; revealing a hidden tab cannot discard its final wake. Text, image scene, selection, viewport metrics and IME cursor all read that publication, including a stable absence when a pane has not published yet. Parser locks are not held while preparing or painting it.
+
+[[crates/scribe-client/src/terminal_element.rs#PaneContentView]] owns the base layer for a pane identity. Its key covers row identities, font, palette/opacity, find spans and colors, viewport mapping, image scene/session/active-source ownership, admission readiness and atlas drops. Bounds, clipping, inherited text style and window refresh are also checked by pinned GPUI. GPUI's bounds-change path refreshes on DPI changes. A changed child mounts live in the current root frame; unchanged children mount cached through [[crates/scribe-client/src/main.rs#mount_synced_view]]. No in-render child notify is relied on to invalidate a stale cache.
+
+Selection, hover/annotation, cursor, split-scroll seam, jump control, scrollbar and IME remain an uncached overlay canvas. IME registration therefore runs every frame. AI borders and other chrome do not enter the content key. The base keeps all image/background/text phases in their original order; overlays stay above them. Row colors and `ShapedLine`s are retained across base rebuilds when row identity and preparation style are unchanged. Image sources remain window-owned, not row-owned; missing admissions retry on a later frame and atlas drops invalidate cached bases.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#make_content]] captures Alacritty damage only at publication and resets it after the new snapshot is built. Skipped/coalesced parser advances never reset damage. An unchanged ordinary viewport reads damaged rows only; resize, full damage, viewport remapping and split-scroll conservatively reread rows and compare cells. Equal rows retain their `Arc` identity, so even cursor-only damage does not reshape text. Selection and vi cursor are explicit snapshot state, not inferred from Alacritty damage.
+
+[[crates/scribe-client/src/main.rs#drive_redraws]] waits on one per-window coalesced signal or the nearest eligible deadline, pacing background requests at 16 ms while direct input remains prompt. Every generation producer uses the signal. Output activity updates AI continuity without an unconditional root notification; hidden bursts, pacer commits and sync expiry still parse and publish but only placed sessions request grid frames. Showing a hidden session reads its latest complete publication.
+
+AI pulses use elapsed wall time and each workspace's winning placed border state only, respecting `pulse_ms=0` and reduced motion. Cursor edges use 530 ms only when a shell cursor is paintable. Hints and scrollbar fades use deadlines. Live visible prompt/CI elapsed labels request one-second chrome updates, configured status samples two-second updates. Lifecycle/config polling stays separate, including restore verification, stale AI cleanup, board hover expiry and persistence. GPUI-owned animations and existing toast tasks keep their own scheduling.
+
+Cached paint replays GPUI primitives and scene sorting; it is not retained GPU pixels. WGPU still clears the full render target. Backend retention and partial presentation are outside this change. The opt-in probe and workload procedure are documented in [[rendering#GPUI Ported Rendering Logic#GPUI Colour Semantics#Repaint Optimization Boundaries]]. No CPU/GPU savings are claimed before matched workload measurement.
+
+The earlier `scribe-goa4.1` investigation deferred implementation because a faithful caching-on variant required this refactor. Its following caching-off measurements remain historical controls, not evidence for the new cache.
 
 The measurable control used commit `18db2d5ac5532962feec34ebc7b5b4cde23129a7` and the same caching-off `target/release/scribe-client` for both sequential rig arms. This preserves the current board/panel caching from `e42757e` and measures only same-commit run-to-run variation:
 
@@ -735,7 +751,7 @@ The unpaced `seq 1 100000000` scroll produced 470 `frames` and 0 `dropped_frames
 
 Host load was recorded around the run on a 64-logical-CPU host: load average `23.43, 19.67, 17.05` at `2026-08-22T20:26:51Z` and `18.11, 18.73, 16.82` at `2026-08-22T20:27:22Z`. Top consumers included `containerd` at 97.8%, `dockerd` at 88.4%, and the stable `/usr/bin/scribe-client` at 83.0%; no `rustc` build was active. The rig staged only the isolated `scribe-dev` identity, the pointer was parked at `(0,0)` after the run, and `/proc/13871/exe` plus `/proc/687754/exe` remained `/usr/bin/scribe-server` and `/usr/bin/scribe-client`.
 
-Pulse-only frames remain unmeasurable with the current probe. [[crates/scribe-common/src/perf_probe.rs#missed_frames]] deliberately scores gaps longer than its 250 ms idle threshold as zero dropped frames, so idle pulse gaps do not form the drop-accounting signal this hypothesis needs; the report also has no cause label that could separate a pulse repaint from other frames. Since measuring the cache requires building it and the output-heavy control already sustains the frame target with zero drops, no pulse counter is warranted.
+The old control's idle-gap accounting alone cannot measure pulse-only work: [[crates/scribe-common/src/perf_probe.rs#missed_frames]] scores gaps longer than 250 ms as idle. New content/row/overlay counters distinguish preparation from root frames, but they do not change that legacy FPS estimator into compositor timing.
 
  runs after any layout change: each pane's rect yields a cell count, which is reshaped locally through  and announced to the server as `Resize` followed by `RequestSnapshot` — the client owns no PTY and never reflows locally, so the authoritative grid has to come back from the server. Unchanged panes are skipped, so a redraw storm never becomes a `RequestSnapshot` storm.
 
@@ -1345,7 +1361,7 @@ Each visible board and each open issue panel is its own GPUI view embedded with 
 
 The cost this removes was measured, not guessed: while any agent pane is
 live, [[crates/scribe-client/src/main.rs#drive_redraws]] notifies the root
-view every 16 ms (PTY bursts bump the generation; between bursts
+view on coalesced state changes and eligible deadlines (visible PTY bursts wake it; between bursts
 [[crates/scribe-client/src/main.rs#TerminalView#tick_ai_animation]] keeps the
 pulse alive), and the root render used to rebuild every open board's full
 element tree on each of those frames. With several agents streaming and
@@ -2434,15 +2450,15 @@ Verifies titlebar tabs keep unique session-backed accessibility IDs when drag re
 
 The GPUI rebuild ports the winit client's per-session AI state machine so pulsing pane borders, tab indicators, and the context store behave identically across the cutover. The state machine is pure and covered by `#[gpui::test]`.
 
- is a byte-for-byte port of the winit  tracker. It keeps the Layer-1 pulse envelope (attention states pulse for a bounded window from entry; `Processing` pulses only while alive, re-armed by state edges and PTY output via ) so a hung AI stops pinning the redraw loop (), the Layer-2 wall-clock  that removes a dead `Processing` state entirely, the keystroke-driven , and the workspace-level priority aggregation (, `PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing`).
+The tracker retains the legacy AI state semantics with visible-only, elapsed-time scheduling. It keeps the Layer-1 pulse envelope (attention states pulse for a bounded window from entry; `Processing` pulses only while alive, re-armed by state edges and PTY output via ) so a hung AI stops pinning the redraw loop (), the Layer-2 wall-clock  that removes a dead `Processing` state entirely, the keystroke-driven , and the workspace-level priority aggregation (, `PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing`).
 A live agent legitimately re-arms the pulse for as long as it works, so the
 redraw loop staying hot is by design; what keeps those frames affordable is
-that the expensive chrome they would otherwise rebuild is cached — see
+that terminal bases and expensive chrome can reuse their prepared subtrees. See
 [[client#Beads Board CLI Data Source#Cached strip painting]].
 
 The context-window percent is stored independently of the visible state () so it survives every state-pruning path; the pulse-suppression predicate () is the `pulsing` argument for the tab suffix banding that now lives in . The pulsing border geometry is , which excludes the tab bar and reuses the shared  strip math; the GPUI paint path fills those rects with the aggregated colour, shrinking the pane-local rect by the card's 1px border on both axes first — the card's absolute children resolve against (and clip at) its padding box, so full-size strips lost their bottom and right edges entirely ([[crates/scribe-client/src/main.rs#ai_pane_border]]). `AiStateChanged`/`AiStateCleared` are verified by the visual-E2E harness.
 
- supplies each tab's indicator and context suffix, while  aggregates and paints each workspace border. Config reloads reconfigure the shared tracker, so active tab dots and pane borders immediately use the latest per-state signal colors. The redraw and lifecycle ticks advance pulses and clear stale processing; PTY output re-arms liveness and encoded keystrokes clear attention states.
+ supplies each tab's indicator and context suffix, while  aggregates and paints each workspace border. Config reloads reconfigure the shared tracker, so active tab dots and pane borders immediately use the latest per-state signal colors. The redraw deadlines and lifecycle checks advance elapsed time and clear stale processing; PTY output re-arms liveness and encoded keystrokes clear attention states.
 
 ### Provider toggle gates the indicator
 
@@ -2458,7 +2474,7 @@ Verifies a Codex session is remembered as a Codex provider (not Claude) so provi
 
 ### Processing pulse rests after idle window
 
-Verifies a fresh `Processing` state pulses, then after `PROCESSING_IDLE_PULSE_SECS` of silence  reports idle so the shared redraw loop retires — the GPU-drain fix.
+Verifies Processing rests after its idle window, hidden states schedule no frames, and zero-period or reduced-motion indicators stay static.
 
 ### Activity re-arms the processing pulse
 
@@ -2491,6 +2507,8 @@ Verifies  resets the wall-clock staleness timer so a sign of life before the pru
 ### Workspace border takes the highest-priority state
 
 Verifies  aggregates several sessions to the highest-priority state's colour (`PermissionPrompt` over `WaitingForInput` and `Processing`).
+
+The same check covers animation eligibility: a static winning border suppresses lower-priority pulses in its workspace, another visible workspace can animate, and static error expiry survives a long parked-clock wrap.
 
 ### Border colour drops decayed sessions
 
@@ -3183,6 +3201,8 @@ scroll makes the control visible, without requiring another motion event.
 Every pane records where it painted its grid into its own `GridBounds` sink, keyed by session in `TerminalView::pane_bounds`, so a hit test can never disagree with what paint drew.
 
 [[crates/scribe-client/src/main.rs#TerminalView#prepare_pane_surfaces]] keeps sinks only for sessions in the current pane placements. Hidden tabs therefore lose their last rect before pointer hit-testing can focus or scroll them, while visible split panes keep separate sinks. Scrollbar animation state has a longer lifetime and is retired only when [[crates/scribe-client/src/main.rs#TerminalView#retire_scrollbars]] sees that the session closed. [[crates/scribe-client/src/main.rs#TerminalView#pane_at]] resolves the pointer to a session against the remaining sinks; [[crates/scribe-client/src/main.rs#TerminalView#focused_grid_bounds]] is the focused pane's entry.
+
+That rect is the only thing that places a pane on screen, so [[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes]] logs it alongside the native window id from [[crates/scribe-client/src/x11_focus.rs#X11FocusGuard#window_id]]. Neither is recoverable from outside: a client that reopens several windows logs each window's focus guard and each session attach on its own schedule, so log order cannot say which window shows a pane, and the grid rect cannot be derived from the window size and the card insets. The line fires on both the fresh and the restored path, which the pane-adoption line does not, and the rect is the last painted one, so it reads zero until the first frame.
 
 That split is what divides the pointer surface in two. Selection, Ctrl+click links,
 and smart selection stay focus-relative because

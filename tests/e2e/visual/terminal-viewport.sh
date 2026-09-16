@@ -130,15 +130,15 @@ set_scroll_pin() {
 }
 
 # Locate the only 30px foreground component in the pane's lower-right control
-# band, then click its measured centre. This follows the painted grid instead
-# of guessing how X11 window decorations affect client-space coordinates.
+# band, then click its measured centre. Include the full control above the
+# footer; a tight crop can truncate its top and reject a correctly painted button.
 jump_to_bottom() {
     local x y w h
     local -a controls
     capture /output/vp-jump-target.png
     mapfile -t controls < <(convert /output/vp-jump-target.png \
-    -crop "60x60+$(( WIN_W - 80 ))+$(( WIN_H - 110 ))" +repage \
-    -fuzz 3% -transparent '#0e0e10' -alpha extract -threshold 0 \
+    -crop "80x110+$(( WIN_W - 100 ))+$(( WIN_H - 150 ))" +repage \
+    -fuzz 3% -transparent '#0e0e10' -alpha extract -threshold 0 -colorspace Gray \
     -define connected-components:verbose=true -connected-components 8 null: 2>&1 \
         | awk '$NF != "gray(0)" {
             geometry = $2
@@ -151,8 +151,8 @@ jump_to_bottom() {
         || fail "FAIL: expected one 30px jump control, found ${#controls[@]} (${controls[*]:-none})"
     read -r x y w h <<<"${controls[0]}"
     xdotool mousemove --sync \
-        $(( WIN_X + WIN_W - 80 + x + w / 2 )) \
-        $(( WIN_Y + WIN_H - 110 + y + h / 2 ))
+        $(( WIN_X + WIN_W - 100 + x + w / 2 )) \
+        $(( WIN_Y + WIN_H - 150 + y + h / 2 ))
     xdotool click 1
     sleep 0.5
 }
@@ -261,7 +261,9 @@ case "$LINE" in
 esac
 capture /output/vp-02b-jump-bottom.png
 BASE_JUMP=$(count_log "terminal jump-to-bottom clicked")
-jump_to_bottom
+# The pointer is still at the measured center. Click that former location,
+# rather than requiring the now-hidden control to be found again.
+xdotool click 1
 if wait_for_log_growth "terminal jump-to-bottom clicked" "$BASE_JUMP" 3; then
     fail "PHASE 2b FAIL: the at-bottom control stayed clickable"
 fi

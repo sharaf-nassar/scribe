@@ -331,6 +331,16 @@ e2e-visual script image="scribe-test-visual" runtime_profile="default":
 e2e-visual-hardened script image="scribe-test-visual":
     just e2e-visual "{{ script }}" "{{ image }}" runtime_profile=hardened
 
+# Run the terminal-image visual test with the server's image evidence visible.
+#
+# An over-limit transmit is refused as an ordinary typed failure boundary, not a
+# PTY-chunk error, so the only record of it is a debug line. Refusals stay at
+# debug in production on purpose: they are attacker-triggerable, and a program
+# spraying malformed graphics commands must not be able to spray the log. The
+# test asserts the refusal really happened, so it needs that level.
+e2e-visual-terminal-images script="visual/terminal-images-visual.sh":
+    RUST_LOG="scribe_server=debug,scribe_client=info" just e2e-visual "{{ script }}"
+
 # Prove the shared loopback Actions fixture is staged in both E2E images.
 e2e-github-actions-api-fixture func_image="scribe-test-func" visual_image="scribe-test-visual":
     SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 just e2e-func github-actions-api.sh "{{ func_image }}"
@@ -784,7 +794,7 @@ e2e-all-visual: build-release docker-visual
         'visual/terminal-image-apps.sh|e2e-visual'
         'visual/terminal-image-renderer.sh|e2e-visual'
         'visual/terminal-images-frame-stability.sh|e2e-visual'
-        'visual/terminal-images-visual.sh|e2e-visual'
+        'visual/terminal-images-visual.sh|e2e-visual-terminal-images'
         'visual/terminal-links.sh|e2e-visual-terminal-links'
         'visual/terminal-viewport.sh|e2e-visual-terminal-viewport'
         'visual/terminal-zoom.sh|e2e-visual-terminal-zoom'

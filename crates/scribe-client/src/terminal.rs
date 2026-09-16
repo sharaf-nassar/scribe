@@ -73,7 +73,7 @@ use crate::sync_frames::{
 /// The colour fields stay in alacritty's own `Color` space rather than being
 /// resolved here, so a live theme edit repaints existing content without
 /// re-running the parser: [`crate::terminal_element::TerminalElement`] resolves
-/// them against the current theme on every frame.
+/// them when preparing a changed row or theme.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     /// The character in this cell (a blank cell holds a space).
@@ -190,8 +190,9 @@ pub struct CursorPlacement {
 /// Immutable grid snapshot consumed by [`crate::terminal_element::TerminalElement`].
 #[derive(Clone, Default)]
 pub struct Content {
-    /// Visible rows, including blank cells so every row keeps terminal width.
-    pub rows: Vec<Vec<Cell>>,
+    /// Immutable visible rows. Identity survives unchanged cells across publications.
+    /// Blank cells keep every row at terminal width.
+    pub rows: Vec<Arc<Vec<Cell>>>,
     /// Rows the pane is scrolled above its live bottom.
     pub display_offset: usize,
     /// How many trailing rows of [`Self::rows`] show the *live* screen while
@@ -482,7 +483,12 @@ impl DisplayOnlyTerminal {
         for effect in &scene.last_grid_effects {
             self.apply_image_grid_effect(effect);
         }
-        self.make_content();
+        self.make_content_with_damage(
+            scene
+                .last_grid_effects
+                .iter()
+                .any(|effect| matches!(effect, TerminalGridEffect::Scroll { .. })),
+        );
         Ok(true)
     }
 
@@ -501,7 +507,12 @@ impl DisplayOnlyTerminal {
         for effect in &scene.last_grid_effects {
             self.apply_image_grid_effect(effect);
         }
-        self.make_content();
+        self.make_content_with_damage(
+            scene
+                .last_grid_effects
+                .iter()
+                .any(|effect| matches!(effect, TerminalGridEffect::Scroll { .. })),
+        );
         Ok(true)
     }
 
@@ -1043,6 +1054,11 @@ impl DisplayOnlyTerminal {
     /// active the trailing [`Content::pin_rows`] rows are read from the live
     /// screen instead, anchored on the shell cursor.
     fn make_content(&mut self) {
+        self.make_content_with_damage(false);
+    }
+
+    /// Image-grid scrolls bypass Term damage; reread their rows before publishing.
+    fn make_content_with_damage(&mut self, force_full_damage: bool) {
         // Every path that can move a visible cell — a parse, a scroll, a
         // resize, a history trim, a vi motion — rebuilds the snapshot here, so
         // this is the one place the link scan has to be invalidated from.
@@ -1053,14 +1069,38 @@ impl DisplayOnlyTerminal {
         let pin_rows = self.active_pin_rows();
         let top_rows = lines.saturating_sub(pin_rows);
 
-        let mut rows = Vec::with_capacity(lines);
-        for row in 0..top_rows {
-            rows.push(Self::read_row(&self.term, grid_i32(row) - display_offset, columns));
-        }
+        // Damage accumulates across skipped publications.
+        // ponytail: split-scroll rereads all rows; map both ranges if profiling warrants it.
+        let same_viewport = !force_full_damage
+            && self.content.rows.len() == lines
+            && self.content.rows.first().is_some_and(|row| row.len() == columns)
+            && self.content.display_offset == self.display_offset()
+            && self.content.pin_rows == 0
+            && pin_rows == 0;
+        let damaged = match self.term.damage() {
+            alacritty_terminal_gpui::term::TermDamage::Partial(damage) if same_viewport => {
+                Some(damage.map(|line| line.line).collect::<std::collections::HashSet<_>>())
+            }
+            _ => None,
+        };
         let first_pin_line = grid_i32(self.cursor_line()) - grid_i32(pin_rows.saturating_sub(1));
-        for row in 0..pin_rows {
-            rows.push(Self::read_row(&self.term, first_pin_line + grid_i32(row), columns));
-        }
+        let rows = (0..lines)
+            .map(|row| {
+                let old = self.content.rows.get(row);
+                if let Some(old) =
+                    old.filter(|_| damaged.as_ref().is_some_and(|damage| !damage.contains(&row)))
+                {
+                    return Arc::clone(old);
+                }
+                let line = if row < top_rows {
+                    grid_i32(row) - display_offset
+                } else {
+                    first_pin_line + grid_i32(row - top_rows)
+                };
+                let cells = Self::read_row(&self.term, line, columns);
+                old.filter(|old| old.as_ref() == &cells).map_or_else(|| Arc::new(cells), Arc::clone)
+            })
+            .collect();
 
         let vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
         let shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
@@ -1072,6 +1112,7 @@ impl DisplayOnlyTerminal {
             shell_cursor,
         });
         self.content_stale = false;
+        self.term.reset_damage();
     }
 
     /// Project the live shell cursor onto the viewport the snapshot just built.
@@ -1415,6 +1456,10 @@ impl PaneGrids {
     /// Every live pane, so a caller can walk them all with the registry lock
     /// already released.
     #[must_use]
+    pub fn entries(&self) -> Vec<(SessionId, Arc<PaneGrid>)> {
+        self.grids.iter().map(|(id, pane)| (*id, Arc::clone(pane))).collect()
+    }
+
     pub fn panes(&self) -> Vec<Arc<PaneGrid>> {
         self.grids.values().map(Arc::clone).collect()
     }
@@ -1908,7 +1953,83 @@ mod tests {
         // the last one, and a second publish has nothing left to rebuild.
         assert!(terminal.publish_content());
         assert_eq!(terminal.content().row_text(2).trim_end(), "third");
+        let committed = terminal.content();
+        assert!(Arc::ptr_eq(&published.rows[0], &committed.rows[0]));
+        assert!(Arc::ptr_eq(&published.rows[3], &committed.rows[3]));
+        assert!(!Arc::ptr_eq(&published.rows[1], &committed.rows[1]));
+        assert!(!Arc::ptr_eq(&published.rows[2], &committed.rows[2]));
         assert!(!terminal.publish_content(), "a current snapshot is not rebuilt again");
+        terminal.feed_output(b"\x1b[1;1H");
+        let cursor_only = terminal.content();
+        assert_ne!(committed.shell_cursor, cursor_only.shell_cursor);
+        assert!(committed.rows.iter().zip(&cursor_only.rows).all(|(a, b)| Arc::ptr_eq(a, b)));
+        terminal.advance_output(b"A");
+        terminal.advance_output(b"\x1b[4;1HZ");
+        terminal.publish_content();
+        assert!(terminal.content().row_text(0).starts_with('A'));
+        assert!(terminal.content().row_text(3).starts_with('Z'));
+        assert!(Arc::ptr_eq(&committed.rows[1], &terminal.content().rows[1]));
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Advancing a frame defers the snapshot]]
+    #[test]
+    fn committed_image_scrolls_refresh_rows_outside_alacritty_damage() {
+        use scribe_common::terminal_images::{
+            TerminalImageGeneration, TerminalImageUpdate, TerminalOutputSequence,
+        };
+        for (top, bottom, rows, expected) in [
+            (0, 3, 1, ["b", "c", "d", ""]),
+            (0, 3, -1, ["", "a", "b", "c"]),
+            (1, 2, 1, ["a", "c", "", "d"]),
+            (1, 2, -1, ["a", "", "b", "d"]),
+        ] {
+            let mut terminal = DisplayOnlyTerminal::new(8, 4);
+            terminal.feed_output(b"a\r\nb\r\nc\r\nd");
+            let before = terminal.content();
+            let scene = terminal.image_scene();
+            let generation = TerminalImageGeneration(1);
+            let sequence = TerminalOutputSequence(1);
+            assert!(
+                !terminal
+                    .apply_image_live(TerminalImageLiveMessage::Begin { generation, sequence })
+                    .unwrap()
+            );
+            assert!(
+                !terminal
+                    .apply_image_live(TerminalImageLiveMessage::Update {
+                        generation,
+                        sequence,
+                        update: TerminalImageUpdate::GridEffect {
+                            effect: TerminalGridEffect::Scroll { top, bottom, rows }
+                        },
+                    })
+                    .unwrap()
+            );
+            assert!(Arc::ptr_eq(&before, &terminal.content()), "staged scroll must not leak text");
+            assert!(Arc::ptr_eq(&scene, &terminal.image_scene()));
+            assert!(
+                terminal
+                    .apply_image_live(TerminalImageLiveMessage::Commit { generation, sequence })
+                    .unwrap()
+            );
+            let after = terminal.content();
+            for (row, text) in expected.iter().enumerate() {
+                assert_eq!(after.row_text(row).trim_end(), *text);
+            }
+            assert!(
+                !Arc::ptr_eq(&before.rows[1], &after.rows[1]),
+                "noncursor row must be replaced"
+            );
+            assert!(!Arc::ptr_eq(&scene, &terminal.image_scene()));
+            if top == 1 {
+                assert!(Arc::ptr_eq(&before.rows[0], &after.rows[0]));
+                assert!(Arc::ptr_eq(&before.rows[3], &after.rows[3]));
+            }
+            terminal.feed_output(b"\x1b[1;1H");
+            assert!(
+                after.rows.iter().zip(&terminal.content().rows).all(|(a, b)| Arc::ptr_eq(a, b))
+            );
+        }
     }
 
     // @lat: [[test#GPUI Terminal Viewport#A parse in flight blocks neither the registry nor a paint]]

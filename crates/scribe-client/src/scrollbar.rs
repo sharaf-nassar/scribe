@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use scribe_common::theme::Theme;
 
@@ -236,6 +236,7 @@ pub struct ScrollbarState {
     target_width: f32,
     /// Last tick timestamp for width animation delta-time.
     last_tick: Option<Instant>,
+    motion_enabled: bool,
 }
 
 impl Default for ScrollbarState {
@@ -265,6 +266,7 @@ impl ScrollbarState {
             display_width: 0.0,
             target_width: 0.0,
             last_tick: None,
+            motion_enabled: true,
         }
     }
 
@@ -309,6 +311,9 @@ impl ScrollbarState {
     /// is still visible and needs further redraws.
     pub fn tick_fade_at(&mut self, display_offset: usize, now: Instant) -> bool {
         // --- Width lerp animation ---
+        if self.target_width > 0.0 && !self.motion_enabled {
+            self.display_width = self.target_width;
+        }
         if self.target_width > 0.0 {
             let dt = self.last_tick.map_or(0.0, |prev| now.duration_since(prev).as_secs_f32());
             let factor = (WIDTH_LERP_SPEED * dt).min(1.0);
@@ -348,7 +353,7 @@ impl ScrollbarState {
         }
 
         let fade_progress = (elapsed - FADE_DELAY_SECS) / FADE_DURATION_SECS;
-        if fade_progress >= 1.0 {
+        if fade_progress >= 1.0 || !self.motion_enabled {
             self.opacity = 0.0;
             self.fade_start = None;
             return width_animating;
@@ -356,6 +361,27 @@ impl ScrollbarState {
 
         self.opacity = 1.0 - fade_progress;
         true
+    }
+
+    /// Reduced motion keeps expiry but omits width and opacity interpolation.
+    pub fn set_motion_enabled(&mut self, enabled: bool) {
+        self.motion_enabled = enabled;
+    }
+
+    /// Deadline for changing pixels, not for a stationary visible thumb.
+    pub fn redraw_delay(&self, now: Instant) -> Option<Duration> {
+        if self.motion_enabled
+            && self.target_width > 0.0
+            && (self.display_width - self.target_width).abs() > 0.1
+        {
+            return Some(Duration::from_millis(16));
+        }
+        if self.hover || self.drag.is_some() {
+            return None;
+        }
+        let start = self.fade_start?;
+        let delay = Duration::from_secs_f32(FADE_DELAY_SECS);
+        Some((start + delay).saturating_duration_since(now).max(Duration::from_millis(16)))
     }
 
     /// Advance the fade and width animations against the real clock.
@@ -484,8 +510,8 @@ pub fn build_scrollbar_render(
     // Update width animation targets based on hover state.
     let hover_width = style.width + HOVER_EXTRA_WIDTH;
     state.target_width = if state.hover { hover_width } else { style.width };
-    if state.display_width <= 0.0 {
-        state.display_width = style.width;
+    if state.display_width <= 0.0 || !state.motion_enabled {
+        state.display_width = state.target_width;
     }
 
     if state.opacity <= 0.0 {
@@ -860,6 +886,17 @@ mod tests {
 
         // Past the full fade window the scrollbar is invisible and settles.
         state.tick_fade_at(10, t0 + Duration::from_secs(2));
+        assert!(state.redraw_delay(t0 + Duration::from_secs(2)).is_none());
+        state.on_scroll_action();
+        state.fade_start = Some(t0);
+        state.set_motion_enabled(false);
+        assert_eq!(state.redraw_delay(t0), Some(Duration::from_millis(1500)));
+        state.tick_fade_at(10, t0 + Duration::from_millis(1500));
+        assert!(state.redraw_delay(t0 + Duration::from_millis(1500)).is_none());
+        state.on_hover_enter();
+        assert!(state.redraw_delay(t0).is_none(), "a stationary hover is not an animation");
+        state.on_hover_leave();
+        state.tick_fade_at(10, Instant::now() + Duration::from_secs(2));
         assert!(state.opacity <= 0.0);
     }
 

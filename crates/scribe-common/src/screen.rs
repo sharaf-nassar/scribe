@@ -36,11 +36,35 @@ pub struct CellEmphasisFlags {
     pub italic: bool,
 }
 
+/// Which underline a cell draws. Only meaningful while `underline` is set.
+///
+/// A terminal distinguishes five underlines, so a single boolean cannot round
+/// trip a grid: everything collapses to a straight line on the way back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnderlineStyle {
+    /// SGR 4, and the decoded value for snapshots written before styles were
+    /// carried, which recorded only that a cell was underlined.
+    #[default]
+    Single,
+    /// SGR 4:2.
+    Double,
+    /// SGR 4:3, alacritty's `UNDERCURL`.
+    Curly,
+    /// SGR 4:4.
+    Dotted,
+    /// SGR 4:5.
+    Dashed,
+}
+
 /// Decoration-related cell attributes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellDecorationFlags {
     pub underline: bool,
     pub strikethrough: bool,
+    /// Ignored unless `underline` is set.
+    #[serde(default)]
+    pub underline_style: UnderlineStyle,
 }
 
 /// Visibility and colour-presentation attributes.
@@ -99,6 +123,18 @@ impl CellFlags {
 
     pub fn set_underline(&mut self, value: bool) {
         self.decoration.underline = value;
+    }
+
+    /// The cell's underline, or `None` when it is not underlined. Comparing
+    /// this instead of the raw field keeps a stale style on a non-underlined
+    /// cell from reading as a difference.
+    #[must_use]
+    pub const fn underline_style(self) -> Option<UnderlineStyle> {
+        if self.decoration.underline { Some(self.decoration.underline_style) } else { None }
+    }
+
+    pub fn set_underline_style(&mut self, value: UnderlineStyle) {
+        self.decoration.underline_style = value;
     }
 
     #[must_use]

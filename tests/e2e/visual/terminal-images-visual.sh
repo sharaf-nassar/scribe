@@ -100,17 +100,22 @@ focus() {
     printf '%s' "$wid"
 }
 
-# Match a restored session to the GPUI window created for it. Each backend logs
-# its attach before the X11 id for that same window.
+# Match a restored session to the GPUI window showing it.
+#
+# The pane-adoption line carries its own window id, so this holds however a
+# client interleaves window creation with session attachment. Pairing on log
+# order instead — an attach followed by the next focus-guard line — breaks as
+# soon as one client reopens two windows: the second window's guard is logged
+# before the session it ends up showing ever attaches.
 window_for_session() {
     sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" | awk -v wanted="$1" '
-        /attaching to session session_id=/ {
-            for (i = 1; i <= NF; i++)
+        /published a pane.s grid size session_id=/ {
+            session = ""; window = ""
+            for (i = 1; i <= NF; i++) {
                 if ($i ~ /^session_id=/) session = substr($i, 12)
-        }
-        /X11 active-window guard enabled window=/ && session == wanted {
-            for (i = 1; i <= NF; i++)
-                if ($i ~ /^window=/) { print substr($i, 8); exit }
+                if ($i ~ /^window=/) window = substr($i, 8)
+            }
+            if (session == wanted && window ~ /^[1-9][0-9]*$/) { print window; exit }
         }
     '
 }
@@ -516,12 +521,21 @@ echo "PHASE 14 PASS: pinned chafa 1.18.2 painted $APP_KITTY_PX px (Kitty) and $A
 # ---------------------------------------------------------------------------
 # Phase 15: a rejected transmit paints nothing and costs the session nothing.
 # ---------------------------------------------------------------------------
+# The refusal is an ordinary typed failure boundary, not a PTY-chunk error, so
+# the server records it with `debug!`. That is deliberate: refusals are
+# attacker-triggerable and must not be sprayable into the log at info. Check the
+# level here, or a filtered-out line reads exactly like a server that never
+# rejected anything at all.
+case "${RUST_LOG:-}" in
+    *scribe_server=debug* | *scribe_server=trace* | debug | trace) ;;
+    *) fail "rejected: RUST_LOG=${RUST_LOG:-unset} hides the refusal evidence; run 'just e2e-visual-terminal-images'" ;;
+esac
 REJECT_MARK=$(( $(wc -l <"$SERVER_LOG") + 1 ))
 run_step rejected
 assert_absent "$OUT/rejected.png" "$RED" rejected_unpainted >/dev/null
 tail -n "+$REJECT_MARK" "$SERVER_LOG" | sed 's/\x1b\[[0-9;]*m//g' \
-    | grep -qF 'terminal image' \
-    || fail "rejected: the server logged nothing about the over-limit transmit"
+    | grep -qF 'terminal image application output failed' \
+    || fail "rejected: the server never logged the over-limit transmit as a failed image application"
 run_step ready rejected-recovered
 echo "PHASE 15 PASS: an over-limit transmit painted nothing and left the pane usable"
 

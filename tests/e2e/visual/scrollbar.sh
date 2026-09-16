@@ -50,6 +50,22 @@ GRID_BOTTOM_INSET_PX="${GRID_BOTTOM_INSET_PX:-80}"
 # 40 % alpha over a near-black background; an unpainted scrollbar changes zero.
 THUMB_DIFF_MIN="${THUMB_DIFF_MIN:-60}"
 
+# How far in from a window edge the pointer must sit to land on a resting thumb.
+#
+# The hit zone is anchored to the terminal GRID's right edge, not the window's:
+# an edge pane card keeps PANE_CARD_MARGIN (6) to the region edge, draws a
+# PANE_BORDER_WIDTH (1) border, and insets PANE_CONTENT_PADDING (10) before the
+# grid, so the grid ends 17 px short of the viewport. The thumb then sits
+# RIGHT_INSET (2) further in and is SCROLLBAR_WIDTH (6) wide, putting its centre
+# 17 + 2 + 3 = 22 px in. Parking 6 px in — as this script used to — lands 11 px
+# outside the grid, where `pane_at` rejects the pointer before the scrollbar is
+# ever hit-tested, so the bar stayed hidden on baseline and candidate alike.
+PANE_EDGE_PARK_PX="${PANE_EDGE_PARK_PX:-22}"
+
+# Same arithmetic for a split's inner edge, where the card keeps PANE_GAP_HALF
+# (3) instead of the 6 px outer margin: 3 + 1 + 10 + 2 + 3 = 19 px.
+PANE_INNER_PARK_PX="${PANE_INNER_PARK_PX:-19}"
+
 # Pixels one command tick must contribute. A tick is 2 px tall across the thumb
 # width, so a single mark is ~12-18 px; the floor is deliberately below one
 # tick so the assertion fails on "no ticks" rather than on antialiasing.
@@ -182,7 +198,7 @@ send_keys() {
 # Park the pointer inside the scrollbar's hit zone (the 3x-width band anchored
 # to the pane's right edge), which pins the overlay open and widens the thumb.
 hover_scrollbar() {
-    xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+    xdotool mousemove $(( WIN_X + WIN_W - PANE_EDGE_PARK_PX )) $(( WIN_Y + WIN_H / 2 ))
     sleep 0.5
 }
 
@@ -339,7 +355,7 @@ send_keys ctrl+Prior
 # Ctrl+Shift+T carries a session id this harness never sees in a form
 # `scribe-test send` accepts, so it cannot stand in here.
 focus
-xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+xdotool mousemove $(( WIN_X + WIN_W - PANE_EDGE_PARK_PX )) $(( WIN_Y + WIN_H / 2 ))
 sleep 0.5
 capture /output/sb-07-parked-empty.png
 strip /output/sb-07-parked-empty.png /output/sb-07-parked-empty-strip.png
@@ -521,7 +537,7 @@ xdotool type --clearmodifiers --delay 20 \
 xdotool key --clearmodifiers Return
 sleep 1.5
 
-xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+xdotool mousemove $(( WIN_X + WIN_W - PANE_EDGE_PARK_PX )) $(( WIN_Y + WIN_H / 2 ))
 sleep 0.5
 capture /output/sb-09-move-in.png
 strip /output/sb-09-move-in.png /output/sb-09-move-in-strip.png
@@ -545,19 +561,23 @@ if ! wait_for_log_growth "split the focused pane" "$BASE_SPLIT" 15; then
     fail "PHASE 10 FAIL: ctrl+shift+backslash never split the pane"
 fi
 sleep 1
+# The filler has to overflow the pane, not merely fill it: a split pane keeps
+# the window's full height (34 rows here), and a scrollbar is refused outright
+# while `history_size` is zero, so ten lines leave nothing to scroll and the
+# right pane's edge can never reveal a thumb. Phase 7 uses the same 60.
 # shellcheck disable=SC2016 # single-quoted: this is typed into the remote
 # shell verbatim and must expand there, not in this script.
 xdotool type --clearmodifiers --delay 20 \
-    'i=1; while [ $i -le 10 ]; do echo "sp-$i"; i=$((i+1)); done'
+    'i=1; while [ $i -le 60 ]; do echo "sp-$i"; i=$((i+1)); done'
 xdotool key --clearmodifiers Return
-sleep 1.5
+sleep 2.5
 
 xdotool mousemove $(( WIN_X + WIN_W / 4 )) $(( WIN_Y + WIN_H / 2 ))
 sleep 2.5
 capture /output/sb-10-rested.png
 strip_left /output/sb-10-rested.png /output/sb-10-rested-left-strip.png
 
-xdotool mousemove $(( WIN_X + WIN_W / 2 - 6 )) $(( WIN_Y + WIN_H / 2 ))
+xdotool mousemove $(( WIN_X + WIN_W / 2 - PANE_INNER_PARK_PX )) $(( WIN_Y + WIN_H / 2 ))
 sleep 0.5
 capture /output/sb-10-left.png
 strip_left /output/sb-10-left.png /output/sb-10-left-strip.png
@@ -571,7 +591,7 @@ sleep 2.5
 capture /output/sb-10-rested2.png
 strip /output/sb-10-rested2.png /output/sb-10-rested2-strip.png
 
-xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+xdotool mousemove $(( WIN_X + WIN_W - PANE_EDGE_PARK_PX )) $(( WIN_Y + WIN_H / 2 ))
 sleep 0.5
 capture /output/sb-10-right.png
 strip /output/sb-10-right.png /output/sb-10-right-strip.png

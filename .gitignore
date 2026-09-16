@@ -51,4 +51,5 @@ design/
 .beads/proxieddb/
 .beads.gate.lock
 .impeccable/
+.pi/tasks/
 

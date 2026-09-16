@@ -684,7 +684,7 @@ fn fixture_content() -> Content {
         }
     }
     Content {
-        rows,
+        rows: rows.into_iter().map(Arc::new).collect(),
         shell_cursor: Some(ShellCursor {
             point: ViewportPoint { row: 8, col: 29 },
             shape: ShellCursorShape::Block,

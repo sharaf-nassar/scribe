@@ -652,7 +652,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, `7` for suppressed AI ED 3 terminal-frame semantics, and `8` for structured Pi provider remote state — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, `7` for suppressed AI ED 3 terminal-frame semantics, `8` for structured Pi provider remote state, `9` for the Beads flow capability, and `10` for per-cell underline styles ([[protocol#Screen Snapshots#ScreenCell]]), without which a peer replays every underline as a single line — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 
@@ -685,6 +685,8 @@ Also includes alternate screen mode flag and scrollback history as a separate ce
 ### ScreenCell
 
 Each cell holds a character, foreground and background [[protocol#Screen Snapshots#ScreenColor]], and a flags struct with booleans for bold, italic, underline, strikethrough, dim, inverse, hidden, and wide.
+
+Underlined cells also carry an `underline_style` of single, double, curly, dotted or dashed, because a terminal draws five underlines and a boolean alone cannot round trip them. The field is only meaningful while `underline` is set, and defaults to single so snapshots written before it existed still decode. [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] replays them as SGR `4`, `4:2`, `4:3`, `4:4` and `4:5`; the parser reads SGR `21` as cancel-bold, so double underline must use the subparameter form.
 
 ### ScreenColor
 
