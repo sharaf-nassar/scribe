@@ -2516,14 +2516,7 @@ impl TerminalView {
     ///
     /// `None` off X11, where the guard never starts.
     fn x11_window_id(&self) -> Option<u32> {
-        #[cfg(target_os = "linux")]
-        {
-            self.x11_focus.as_ref().map(X11FocusGuard::window_id)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
+        self.x11_focus.as_ref().map(X11FocusGuard::window_id)
     }
 
     /// Veto every platform close so the in-app dialog decides what happens.

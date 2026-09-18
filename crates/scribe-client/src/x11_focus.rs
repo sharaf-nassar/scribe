@@ -199,9 +199,13 @@ impl X11FocusGuard {
     /// shows it, so log order was the only available pairing and it does not
     /// hold when windows and session attachments interleave.
     #[must_use]
-    #[cfg(target_os = "linux")]
     pub const fn window_id(&self) -> u32 {
-        self.our_window
+        #[cfg(target_os = "linux")]
+        {
+            self.our_window
+        }
+        #[cfg(not(target_os = "linux"))]
+        match self.never {}
     }
 
     /// Refresh cached state by querying `_NET_ACTIVE_WINDOW`.
