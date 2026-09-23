@@ -6015,7 +6015,9 @@ impl TerminalView {
     fn poll_beads_writes(&mut self, cx: &mut Context<Self>) {
         let mut board_refreshes = Vec::new();
         let expired = self.shared.beads_panels.lock().is_ok_and(|mut panels| {
-            let expired = panels.expire_writes();
+            // A toast leaves on this tick, not on whatever repaints next: an
+            // idle window has no other frame coming to take it down.
+            let expired = panels.expire_writes() | panels.expire_notices();
             while let Some(workspace_id) = panels.take_board_refresh() {
                 board_refreshes.push(workspace_id);
             }
@@ -13109,12 +13111,13 @@ impl TerminalView {
         let result =
             self.sink.write_beads_issue(workspace_id, issue_id.clone(), write.verb, write.guards);
         let Err(error) = result else { return };
-        tracing::debug!(%error, %workspace_id, %issue_id, "Beads issue write dropped");
+        // The toast says the connection dropped; the error itself stays here.
+        tracing::warn!(%error, %workspace_id, %issue_id, "Beads issue write dropped");
         if let Ok(mut boards) = self.shared.beads_boards.lock() {
             boards.cancel_card_drop(workspace_id, &issue_id);
         }
         if let Ok(mut panels) = self.shared.beads_panels.lock() {
-            panels.write_send_failed(workspace_id, &issue_id, &error.to_string());
+            panels.write_send_failed(workspace_id, &issue_id);
         }
         self.shared.generation.bump();
     }
@@ -13610,8 +13613,7 @@ impl TerminalView {
                         (
                             workspace_id,
                             panels.visible(workspace_id).cloned(),
-                            panels.notice(workspace_id).map(str::to_owned),
-                            panels.notice_lane(workspace_id),
+                            panels.active_notice(workspace_id).cloned(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -13623,7 +13625,7 @@ impl TerminalView {
         let viewport = self.pane_viewport();
         let animations = AnimationSettings::from_config(&self.config.config().config);
         let mut out = Vec::with_capacity(layers.len());
-        for (workspace_id, panel, notice, notice_lane) in layers {
+        for (workspace_id, panel, notice) in layers {
             let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
                 continue;
             };
@@ -13643,7 +13645,7 @@ impl TerminalView {
                 colors: self.beads_colors,
                 animations,
                 panel,
-                notice: notice.zip(notice_lane),
+                notice,
             };
             let (layer, changed) = self.sync_panel_view(inputs, cx);
             // Same full-band wrapper as the board strips: definite bounds
@@ -17492,10 +17494,10 @@ async fn dispatch_server_message(
                     classifier_won
                 },
             );
-            if let Some((issue_id, lane)) = classifier_won.into_iter().last()
+            if let Some((card, lane)) = classifier_won.into_iter().last()
                 && let Ok(mut panels) = ctx.beads_panels.lock()
             {
-                panels.classifier_won(workspace_id, &issue_id, lane);
+                panels.classifier_won(workspace_id, &card, lane);
             }
             if loading {
                 let sink = ctx.sink.clone();

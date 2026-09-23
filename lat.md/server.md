@@ -784,6 +784,14 @@ success envelope and uses bounded stdout, stderr, process-group cleanup, and a
 and invalid success JSON map to `Failed`. Those paths do not advance the
 generation or last-good board, and dropping the file releases the lock.
 
+A `Failed` reason carries bd's message, never its JSON.
+[[crates/scribe-server/src/beads_board.rs#bd_error_message]] reads the
+schema-1 envelope's per-issue `data.failed[].error` first, then
+`data.error`, then a bare `{"error": …}`, from either stream, pretty-printed
+or on one line beside plain text; only then does it fall back to a plain
+stderr line, preferring one that names an error over a usage banner. The
+board read path uses the same reader for its unavailable message.
+
 ### Generation fence and fan-out
 
 Only a committed generation may replace the board cache or reach another authorized workspace on its project root.

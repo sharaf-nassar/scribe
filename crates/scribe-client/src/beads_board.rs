@@ -18,7 +18,7 @@ use crate::beads_board_a2::{
 use crate::beads_flow::{
     FlowBandControl, FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow,
 };
-use crate::beads_panel::BeadsPanels;
+use crate::beads_panel::{BeadsPanels, snapshot_card};
 use crate::button::stop_activation_key;
 use crate::layout::Rect;
 use crate::opacity::surface;
@@ -634,12 +634,12 @@ impl BeadsBoards {
     }
 
     /// Replace one server snapshot and report cards whose authoritative lane
-    /// differed from both ends of an applied drop.
+    /// differed from both ends of an applied drop, as the snapshot now has them.
     pub fn update(
         &mut self,
         workspace_id: WorkspaceId,
         state: BeadsBoardState,
-    ) -> Vec<(String, u8)> {
+    ) -> Vec<(BeadsBoardItem, u8)> {
         if !matches!(state, BeadsBoardState::Unavailable { .. }) {
             self.retry_after.remove(&workspace_id);
         }
@@ -683,13 +683,13 @@ impl BeadsBoards {
         let mut classifier_won = Vec::new();
         for key in settled {
             let Some(drop) = self.optimistic_drops.remove(&key) else { continue };
-            let actual_lane = snapshot.and_then(|snapshot| snapshot_card_lane(snapshot, &key.1));
-            if let Some(actual_lane) = actual_lane
+            let placed = snapshot.and_then(|snapshot| snapshot_card(snapshot, &key.1));
+            if let Some((actual_lane, card)) = placed
                 && drop.generation.is_some()
                 && actual_lane != drop.source_lane
                 && actual_lane != drop.target_lane
             {
-                classifier_won.push((key.1, actual_lane));
+                classifier_won.push((card.clone(), actual_lane));
             }
         }
         self.states.insert(workspace_id, state);
@@ -1563,13 +1563,6 @@ fn same_queue_membership(
         (None, None) => true,
         _ => false,
     }
-}
-
-fn snapshot_card_lane(snapshot: &BeadsBoardSnapshot, issue_id: &str) -> Option<u8> {
-    [&snapshot.backlog, &snapshot.ready, &snapshot.in_progress, &snapshot.blocked, &snapshot.done]
-        .into_iter()
-        .position(|cards| cards.iter().any(|card| card.id == issue_id))
-        .and_then(|lane| u8::try_from(lane).ok())
 }
 
 fn lane_cards_mut(snapshot: &mut BeadsBoardSnapshot, lane: u8) -> Option<&mut Vec<BeadsBoardItem>> {
@@ -4266,7 +4259,7 @@ mod tests {
             BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
             BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
         }?;
-        snapshot_card_lane(snapshot, "scribe-drag.1")
+        snapshot_card(snapshot, "scribe-drag.1").map(|(lane, _)| lane)
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Beads card drag tracking]]
@@ -4370,7 +4363,7 @@ mod tests {
             &BeadsIssueWriteResult::Applied { generation: 23 },
         );
 
-        assert_eq!(boards.update(workspace, drag_snapshot(3)), [(drag.source.id.clone(), 3)]);
+        assert_eq!(boards.update(workspace, drag_snapshot(3)), [(drag.source.clone(), 3)]);
 
         assert_eq!(board_card_lane(&boards, workspace), Some(3));
         assert!(!boards.optimistic_drops.contains_key(&(workspace, drag.source.id)));

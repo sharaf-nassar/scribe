@@ -2292,8 +2292,12 @@ The network-none real-bd GPUI run proves the production drag contract and termin
 [The script](../tests/e2e/func/beads-board.sh) checks native claim status,
 actor, and start time,
 close and board-side Undo after its Applied result and a later board snapshot,
-defer clearing, classifier-won repaint, and zero writes for rejected,
-same-lane, and collapsed-Blocked-tab drops. It keeps the `SingleController`
+clicking the Undo button the close toast paints in the section's top-right
+corner, defer clearing, classifier-won repaint, and zero writes for rejected,
+same-lane, and collapsed-Blocked-tab drops. Every toast is captured, and the
+close toast's Undo clicked, straight after the typed result that raised it
+and before any `bd show`: under load that read waits on the post-write board
+refresh for longer than a toast lives. It keeps the `SingleController`
 owner,
 proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
 during each gesture. The readiness probe waits for an actual SGR motion frame
@@ -2334,8 +2338,10 @@ pinning the second replaces the first. The click leaves that lane's control
 focused, and tab, drawer, and pinned `×` share one handle, so Enter unpins into
 a focus-opened drawer and Enter again pins it back: pointer and keyboard reach
 the same two states. A card dropped on the pinned Done lane closes through the
-same guarded `close_issue` verb the collapsed tab takes, and the pinned head's
-`×` returns the rail to two tabs.
+same guarded `close_issue` verb the collapsed tab takes, and `bd show` must
+report it closed with a native `closed_at`. That read lives here rather than
+beside the collapsed-tab close, whose five-second Undo it could outlast. The
+pinned head's `×` returns the rail to two tabs.
 
 #### Keyboard card move
 
@@ -2497,8 +2503,9 @@ The real-bd GPUI run proves editor isolation, failure notices, and timeout conve
 uses the transparent wire tap as the pane-byte oracle. Text typed while the
 inline editor owns focus must emit zero `KeyInput` frames and no write. Forced
 nonzero and timeout writes must return typed failures, keep the persisted
-title, and change at least 500 panel pixels for each coral notice. Timeout must
-request both board and detail again.
+title, and change at least 500 panel pixels for the failure toast and the
+timeout warning toast.
+Timeout must request both board and detail again.
 
 Evidence is `beads-real-detail-evidence.json`,
 `beads-write-gpui-final-show.json`, `beads-write-last-good.png`,
@@ -2829,10 +2836,33 @@ visible until that matching authoritative reply arrives.
 
 #### Write failure notice lifecycle
 
-A failed issue write paints one coral line until five seconds pass or a later write succeeds.
+A failed issue write paints one coral-toned toast until five seconds pass or a later write succeeds.
 
 The exact expiry removes the notice. The next applied result clears it early
 before requesting fresh detail.
+
+#### Hovered toasts hold
+
+A toast under the pointer outlives its five seconds and lingers two more once the pointer leaves, while its Undo still lapses at the exact deadline.
+
+The held close toast refuses Undo at the deadline, keeps its words up
+without the button, and leaves only after the linger. A hold that never hears
+the pointer leave still ends at its 30-second cap. The headless close-mark
+probe beside it moves a real pointer onto a painted toast and requires the
+hold, so the wiring is proved as well as the state.
+
+#### Write failure notice copy
+
+A failure toast names the action that failed and gives bd's reason as one sentence; nothing shaped like JSON reaches it.
+
+The server framing and a leading `Error` label are stripped, the first line
+is sentence-cased and ended, and an overlong reason ends in an ellipsis.
+JSON, bare status text, and blank reasons yield no sentence, so a raw
+envelope forwarded by an older server leaves the toast saying "Beads
+reported an error, so nothing was saved." with no brace anywhere in its
+accessible name. The server half is
+[[crates/scribe-server/src/beads_board.rs#bd_error_message]], whose unit
+test replays real bd failure output.
 
 #### Write timeout convergence
 
@@ -4962,6 +4992,25 @@ states, and both measure instead of asserting existence for the reason
 [gpui-layout-chains-fail-silently-and-only-measurement-catches-them](../docs/solutions/conventions/gpui-layout-chains-fail-silently-and-only-measurement-catches-them.md)
 states. The design they pin is
 [[client#Client#Beads Board CLI Data Source#Cached strip painting]].
+
+### Beads notice toast placement
+
+A real-window probe measures an applied close's toast in its section's top-right corner and clicks both controls it paints there.
+
+The probe sites the toast on the second of two regions, for the reason
+[viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md)
+states: its right edge must sit 12px inside that region's right edge, its top
+8px under the board, and its width exactly the fixed 340px. The Undo button
+must end one border, the right padding, the close mark, and one gap inside
+the toast, and the close mark must centre one border and the right padding
+inside it, both on the headline's line box: those are the offsets the
+functional E2E clicks from, so the probe is what keeps those coordinates
+honest. Clicking Undo must queue guarded `UndoClose` carrying the issue's
+title, and clicking the close mark must take a live toast down. A plain unit
+test beside it pins
+[[crates/scribe-client/src/beads_panel.rs#notice_slot]]'s text-scale growth,
+region clamp, and the no-room cases. The design is
+[[client#Client#Beads Board CLI Data Source#Guarded issue writes#Notice toasts]].
 
 ### Root-synced child invalidation
 

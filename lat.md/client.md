@@ -1317,8 +1317,9 @@ composer through the same editor. Blank drafts emit nothing. `AddComment`
 never inserts a local row; only a matching uncached detail reply repaints the
 thread. [[crates/scribe-client/src/beads_panel.rs#status_rail]] lowers open,
 in-progress, and closed targets plus native claim and close. An applied close
-replaces the panel with `closed <id> · undo`; undo before the five-second
-deadline sends guarded `UndoClose`, while the exact deadline sends nothing.
+replaces the panel with an `Issue closed` toast naming the issue, with an
+Undo button; Undo before the five-second deadline sends guarded `UndoClose`,
+while the exact deadline sends nothing.
 The [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Priority type and label editing|picker]],
 [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Comment composer authoritative refresh|comment]],
 and [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents|rail]]
@@ -1330,9 +1331,10 @@ Write results resolve an in-flight fence, preserve last-good detail, and request
 
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#finish_write]] removes the
 matching in-flight intent. `Applied` clears an earlier error and requests fresh
-detail, except close, which opens undo. `PreconditionFailed` reports that
-someone else won and rereads detail. `Failed` retains loaded content and paints
-one coral notice without rereading detail. The notice expires after five
+detail, except close, which opens undo. `PreconditionFailed` warns that the
+issue changed elsewhere and rereads detail. `Failed` retains loaded content and
+paints one error toast without rereading detail; a timeout `Failed` is a
+warning instead, because its outcome is unknown. The notice expires after five
 seconds or clears early on the next applied result.
 
 Each sent write gets a 15-second client deadline.
@@ -1354,6 +1356,78 @@ panel state matrix lives under
 [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures]], and
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes]]
 proves the complete protocol, server, GPUI, and real-`bd` path.
+
+#### Notice toasts
+
+Every write outcome and automatic panel close surfaces as one five-second toast in its own section's top-right corner.
+
+[[crates/scribe-client/src/beads_panel.rs#render_notice]] hangs it from
+[[crates/scribe-client/src/beads_panel.rs#notice_slot]]: 8px under the board
+and 12px in from the region's right edge. Below the board rather than on it,
+because the board's right edge holds the Blocked and Done rail tabs a drop
+is aimed at; and the board stays visible while its workspace has a live
+notice, so the slot never floats over a vanished strip. The toast is a fixed
+340px at text scale 1.0, so its lines wrap at one measure and its controls
+never move. A slot narrower than 220px, or with less than 44 scaled pixels
+under the board, paints no toast.
+
+[[crates/scribe-client/src/beads_panel.rs#PanelNotice]] holds three rungs
+that each take their own line and weight. The message group is set tight: a
+13px semibold headline in title ink that says what happened, then 2px under
+it one 12px sentence in the queue-name tone that says why or what it means.
+The issue it names sits 7px lower as a quieter footnote,
+[[crates/scribe-client/src/beads_panel.rs#notice_subject]]: the id in
+JetBrains Mono, the terminal's own data face, named explicitly because GPUI
+does not resolve a generic `monospace` family, then the panel's `·`
+separator and the title truncating in the muted role. Only the sentence
+wraps, up to three lines.
+
+The tone is an outline codicon as well as a hue, never colour alone: `pass`
+for an applied close, `info` for a classifier placement or a vanished issue
+or project, `warning` for a conflict or an unknown timeout outcome, and
+`error` for a failed or unsent write. The codicons are VS Code's own family,
+already in the embedded Nerd Font, and their line weight sits with the
+board's hairlines where a filled disc outweighed the headline and hid its
+check. Warning and error toasts take the alert role; the accessible name
+reads all three rungs in order. The surface is the detail panel's raised
+card with an offset shadow scaled from the approved panel mock, so it lifts
+on a dark ground. A close adds a fixed-size outlined Undo button, and every
+toast has its own close mark, the panel's `×` one step quieter in the mark
+tone. It fades and slides 6px into place through the shared animation
+policy; like the window's copy toasts, it leaves without motion.
+
+Resting the pointer on a toast holds it, and letting go leaves it for at
+least two more seconds, so an error being read never vanishes from under
+the reader. A hold is capped at 30 seconds: a toast whose slot disappears
+mid-hover never hears the pointer leave, and without the cap it would stay
+alive, and keep its board visible, indefinitely. The hold never stretches
+Undo: a close's reopen keeps its own exact five-second deadline, and
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#expire_notices]]
+drops the button from a held toast when that deadline passes. A replacement
+toast with different words replays the entrance, while an identical one,
+such as the server's timeout arriving after the client's deadline already
+said the same thing, stays still.
+
+The copy never carries tool output. A failed write's headline names the
+user's action from its verb ("Couldn’t save the title"), and
+[[crates/scribe-client/src/beads_panel.rs#reason_sentence]] turns bd's reason
+into the sentence under it: the server's `bd failed:` framing and a leading
+`Error` label go, the first line is sentence-cased and ended, and anything
+still shaped like JSON is withheld in favour of "Beads reported an error, so
+nothing was saved." That keeps an older server's raw envelope off the screen
+too. The verbatim reason goes to the client log instead. A timeout, from
+either the client deadline or the server, says the change may still have
+saved while convergence reloads it.
+
+[[crates/scribe-client/src/main.rs#TerminalView#poll_beads_writes]] expires
+toasts on the 200ms window-lifecycle tick and repaints when one goes, so an
+idle window takes a toast down on time rather than at its next unrelated
+frame. The toast occludes what it covers and swallows its press and the
+matching release (scribe-uu2y), except while a card is lifted: that release
+belongs to [[crates/scribe-client/src/main.rs#TerminalView#release_board]].
+It may overlap an open panel's corner in a narrow region; its close mark or
+Esc clears it. [[test#Test Harness#GPUI Client Headless Suites#Beads notice toast placement]]
+measures the corner, the controls, and both clicks.
 
 ### Cached strip painting
 
@@ -1833,8 +1907,8 @@ still lands on the identical final frame.
 through [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#update]] by both
 workspace and issue id. Its backdrop, close mark, and Esc all dismiss it. A
 missing detail or a later `NotDetected` board closes it and leaves a
-five-second notice at its former anchor. State stays keyed by workspace, so
-neighbouring regions remain independent.
+five-second [[client#Client#Beads Board CLI Data Source#Guarded issue writes#Notice toasts|notice toast]].
+State stays keyed by workspace, so neighbouring regions remain independent.
 
 [[crates/scribe-client/src/main.rs#on_welcome]] latches `beads_detail` before a
 card may open. An absent bit leaves the board read-only, and a later disabled

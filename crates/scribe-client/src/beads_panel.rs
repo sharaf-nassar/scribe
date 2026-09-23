@@ -8,11 +8,11 @@ use std::{
 };
 
 use gpui::{
-    AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, Pixels, Point, Rgba, Role, SharedString, StyledText, Subscription,
-    TextLayout, UTF16Selection, UnderlineStyle, Window, canvas, combine_highlights, div, fill,
-    linear_color_stop, linear_gradient, prelude::*, px, size,
+    AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, Context,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight,
+    HighlightStyle, KeyDownEvent, MouseButton, Pixels, Point, Rgba, Role, SharedString, StyledText,
+    Subscription, TextLayout, UTF16Selection, UnderlineStyle, Window, canvas, combine_highlights,
+    div, fill, hsla, linear_color_stop, linear_gradient, prelude::*, px, size,
 };
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
@@ -34,6 +34,35 @@ const PANEL_MARGIN: f32 = 12.0;
 const PANEL_BOARD_GAP: f32 = 4.0;
 const PANEL_OPEN_DURATION: Duration = Duration::from_millis(120);
 const NOTICE_DURATION: Duration = Duration::from_secs(5);
+/// A notice toast is this wide at text scale 1.0 and hangs this far under
+/// the board. A narrower region or less room under the board gets no toast.
+const NOTICE_WIDTH: f32 = 340.0;
+const NOTICE_BOARD_GAP: f32 = 8.0;
+const NOTICE_MIN_WIDTH: f32 = 220.0;
+const NOTICE_MIN_ROOM: f32 = 44.0;
+const NOTICE_PAD_Y: f32 = 12.0;
+const NOTICE_PAD_LEFT: f32 = 12.0;
+/// Tighter than the left: the close mark's ink sits inside its 20px box, so
+/// this leaves it as far from the right edge as the tone glyph is from the left.
+const NOTICE_PAD_RIGHT: f32 = 6.0;
+/// The headline's line box, which the tone glyph and both controls centre on.
+const NOTICE_TITLE_LINE: f32 = 18.0;
+const NOTICE_UNDO_WIDTH: f32 = 56.0;
+const NOTICE_UNDO_HEIGHT: f32 = 24.0;
+const NOTICE_DISMISS_SIZE: f32 = 20.0;
+const NOTICE_ACTION_GAP: f32 = 6.0;
+/// How long a toast stays once the pointer that held it leaves.
+const NOTICE_LINGER: Duration = Duration::from_secs(2);
+/// A hold is a courtesy to a reader, not a pin. Past this the toast leaves
+/// even under the pointer, so one whose slot vanished mid-hover, and so never
+/// hears the pointer leave, cannot stay up (and keep its board open) forever.
+const NOTICE_HOLD_MAX: Duration = Duration::from_secs(30);
+/// The explanation may wrap this far before it ellipsizes; the accessible
+/// name keeps all of it.
+const NOTICE_MESSAGE_LINES: usize = 3;
+const NOTICE_ENTRANCE: Duration = Duration::from_millis(150);
+/// The embedded icon face the settings window already draws its glyphs from.
+const NERD_SYMBOLS: &str = "Symbols Nerd Font Mono";
 const BD_ISSUE_TYPES: [&str; 12] = [
     "bug",
     "feature",
@@ -267,44 +296,207 @@ impl BeadsPanel {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PanelNotice {
-    text: String,
-    lane: u8,
+/// One workspace's five-second outcome toast.
+///
+/// It reads top to bottom: a headline that says what happened, one plain
+/// sentence that says why or what it means, then the issue it happened to.
+/// Tool output never reaches any of the three; see [`reason_sentence`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelNotice {
+    tone: NoticeTone,
+    title: String,
+    message: Option<String>,
+    subject: Option<NoticeSubject>,
     expires_at: Instant,
+    /// When the pointer came to rest on the toast, while it still does: one
+    /// being read never leaves from under it, up to [`NOTICE_HOLD_MAX`].
+    held_since: Option<Instant>,
     undo: Option<UndoClose>,
 }
 
-#[derive(Debug, Clone)]
+/// The issue a notice names: its id and, when the gesture knew it, its title.
+#[derive(Debug, Clone, PartialEq)]
+struct NoticeSubject {
+    id: String,
+    title: String,
+}
+
+/// What a notice reports. Each tone pairs its hue with its own glyph, so the
+/// state never rests on colour alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NoticeTone {
+    /// A write landed.
+    Success,
+    /// The tracker placed or removed something on its own.
+    Info,
+    /// The outcome is unknown, or someone else's change won.
+    Warning,
+    /// A write failed or never left the client.
+    Error,
+}
+
+/// A close's guarded reopen. Its deadline is its own: holding the toast
+/// keeps the words up, never the five-second Undo window.
+#[derive(Debug, Clone, PartialEq)]
 struct UndoClose {
     issue_id: String,
     assignee: String,
+    deadline: Instant,
 }
 
+const TIMEOUT_TITLE: &str = "Beads didn’t respond in time";
+const TIMEOUT_MESSAGE: &str = "The change may still have saved. Reloading to check.";
+
 impl PanelNotice {
-    fn new(text: String, lane: u8) -> Self {
-        Self::new_at(text, lane, None, Instant::now())
+    fn at(tone: NoticeTone, title: impl Into<String>, now: Instant) -> Self {
+        Self {
+            tone,
+            title: title.into(),
+            message: None,
+            subject: None,
+            expires_at: now + NOTICE_DURATION,
+            held_since: None,
+            undo: None,
+        }
     }
 
-    fn closed_at(issue_id: String, assignee: String, lane: u8, now: Instant) -> Self {
-        Self::new_at(
-            format!("closed {issue_id} · undo"),
-            lane,
-            Some(UndoClose { issue_id, assignee }),
-            now,
-        )
+    fn saying(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
     }
 
-    fn new_at(text: String, lane: u8, undo: Option<UndoClose>, now: Instant) -> Self {
-        Self { text, lane, expires_at: now + NOTICE_DURATION, undo }
+    fn about(mut self, id: &str, title: &str) -> Self {
+        self.subject = Some(NoticeSubject { id: id.to_owned(), title: title.trim().to_owned() });
+        self
+    }
+
+    fn closed_at(issue_id: &str, title: &str, assignee: String, now: Instant) -> Self {
+        Self {
+            undo: Some(UndoClose {
+                issue_id: issue_id.to_owned(),
+                assignee,
+                deadline: now + NOTICE_DURATION,
+            }),
+            ..Self::at(NoticeTone::Success, "Issue closed", now).about(issue_id, title)
+        }
+    }
+
+    /// The Undo this toast still offers at `now`, if any.
+    fn live_undo(&self, now: Instant) -> Option<&UndoClose> {
+        self.undo.as_ref().filter(|undo| now < undo.deadline)
+    }
+
+    /// Identifies what the toast says, so new words replay the entrance while
+    /// an identical replacement, such as the server's timeout landing after
+    /// the client's own deadline already said the same, stays still.
+    fn words_key(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.tone.hash(&mut hasher);
+        self.title.hash(&mut hasher);
+        self.message.hash(&mut hasher);
+        self.subject.as_ref().map(|subject| (&subject.id, &subject.title)).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Everything the toast shows, in reading order, for its accessible name.
+    /// Every message already ends its own sentence.
+    fn spoken(&self) -> String {
+        let mut spoken = format!("{}.", self.title);
+        if let Some(message) = &self.message {
+            spoken.push(' ');
+            spoken.push_str(message);
+        }
+        if let Some(subject) = &self.subject {
+            spoken.push(' ');
+            spoken.push_str(&subject.id);
+            if !subject.title.is_empty() {
+                spoken.push_str(": ");
+                spoken.push_str(&subject.title);
+            }
+        }
+        spoken
     }
 
     fn active_at(&self, now: Instant) -> bool {
-        now < self.expires_at
+        now < self.expires_at || self.held_since.is_some_and(|since| now < since + NOTICE_HOLD_MAX)
     }
 
     fn active(&self) -> bool {
         self.active_at(Instant::now())
+    }
+}
+
+/// A failed write's headline, named for what the user was doing.
+fn failure_title(verb: &BeadsIssueWrite) -> &'static str {
+    match verb {
+        BeadsIssueWrite::SetTitle { .. } => "Couldn’t save the title",
+        BeadsIssueWrite::SetDescription { .. } => "Couldn’t save the description",
+        BeadsIssueWrite::SetAcceptance { .. } => "Couldn’t save the acceptance criteria",
+        BeadsIssueWrite::SetNotes { .. } => "Couldn’t save the notes",
+        BeadsIssueWrite::SetDesign { .. } => "Couldn’t save the design",
+        BeadsIssueWrite::SetSpecId { .. } => "Couldn’t save the spec",
+        BeadsIssueWrite::SetPriority { .. } => "Couldn’t change the priority",
+        BeadsIssueWrite::SetType { .. } => "Couldn’t change the type",
+        BeadsIssueWrite::SetLabels { .. } => "Couldn’t save the labels",
+        BeadsIssueWrite::SetStatus { .. } => "Couldn’t change the status",
+        BeadsIssueWrite::Claim => "Couldn’t claim the issue",
+        BeadsIssueWrite::CloseIssue => "Couldn’t close the issue",
+        BeadsIssueWrite::UndoClose => "Couldn’t reopen the issue",
+        BeadsIssueWrite::AddComment { .. } => "Couldn’t add the comment",
+    }
+}
+
+/// The longest reason a toast will lay out; three clamped lines show less.
+const REASON_MAX_CHARS: usize = 240;
+
+/// bd's own reason as one readable sentence, or `None` when nothing in it is
+/// fit to show. The server's `bd failed:` framing and a leading `Error`
+/// label go, only the first line stays, and anything still shaped like JSON
+/// is withheld rather than printed: a server older than this client may
+/// still forward bd's raw envelope.
+fn reason_sentence(reason: &str) -> Option<String> {
+    let reason = reason.trim();
+    let reason = reason.strip_prefix("bd failed:").unwrap_or(reason);
+    let line = reason.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = match (line.get(..5), line.get(5..)) {
+        (Some(word), Some(rest))
+            if word.eq_ignore_ascii_case("error") && rest.starts_with([':', ' ']) =>
+        {
+            rest.trim_start_matches([':', ' '])
+        }
+        _ => line,
+    };
+    if line.is_empty() || line.starts_with(['{', '[']) || line.starts_with("exited with") {
+        return None;
+    }
+    let clipped = line.chars().count() > REASON_MAX_CHARS;
+    let mut sentence: String = line.chars().take(REASON_MAX_CHARS).collect();
+    // Sentence case, except where the sentence opens on bd's own lowercase name.
+    if !sentence.starts_with("bd ") {
+        let mut chars = sentence.chars();
+        if let Some(first) = chars.next() {
+            sentence = first.to_uppercase().chain(chars).collect();
+        }
+    }
+    if clipped {
+        sentence.push('…');
+    } else if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    Some(sentence)
+}
+
+const LANE_NAMES: [&str; 5] = ["Backlog", "Ready", "In progress", "Blocked", "Done"];
+
+/// Why the tracker filed a dropped card somewhere other than its target.
+fn placement_reason(lane: u8) -> &'static str {
+    match lane {
+        0 => "Beads doesn’t list it as ready yet.",
+        1 => "Nothing blocks it, so Beads lists it as ready.",
+        2 => "Its status is in progress.",
+        3 => "Another issue is blocking it.",
+        _ => "Its status is closed.",
     }
 }
 
@@ -989,6 +1181,9 @@ pub struct PanelWriteIntent {
     pub issue_id: String,
     pub verb: BeadsIssueWrite,
     pub guards: BeadsIssueWriteGuards,
+    /// The issue's title as the gesture saw it. It names the issue in the
+    /// outcome toast and never leaves the client.
+    pub title: String,
 }
 
 /// Per-workspace panel state plus intents parked for the owning GPUI view.
@@ -1102,7 +1297,9 @@ impl BeadsPanels {
         self.pick_rows.remove(&workspace_id);
         self.notices.insert(
             workspace_id,
-            PanelNotice::new(format!("Issue {issue_id} no longer exists"), panel.lane),
+            PanelNotice::at(NoticeTone::Info, "Issue not found", Instant::now())
+                .saying("Beads can’t find it anymore, so its panel closed.")
+                .about(issue_id, panel.title()),
         );
         self.last_opened = Some(workspace_id);
     }
@@ -1216,6 +1413,7 @@ impl BeadsPanels {
                 if_status: Some(detail.status.clone()),
                 if_assignee: Some(detail.assignee.clone().unwrap_or_default()),
             },
+            title: panel.title().to_owned(),
         };
         self.park_write(intent)
     }
@@ -1253,6 +1451,7 @@ impl BeadsPanels {
             issue_id: drag.source.id.clone(),
             verb,
             guards,
+            title: drag.source.title.clone(),
         })
     }
 
@@ -1282,23 +1481,32 @@ impl BeadsPanels {
         Some(intent)
     }
 
-    pub fn write_send_failed(&mut self, workspace_id: WorkspaceId, issue_id: &str, reason: &str) {
+    pub fn write_send_failed(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
         let key = (workspace_id, issue_id.to_owned());
-        self.in_flight_writes.remove(&key);
+        let intent = self.in_flight_writes.remove(&key);
         self.write_deadlines.remove(&key);
-        let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
-        self.notices
-            .insert(workspace_id, PanelNotice::new(format!("Issue write dropped: {reason}"), lane));
-    }
-
-    pub fn classifier_won(&mut self, workspace_id: WorkspaceId, issue_id: &str, lane: u8) {
-        let lane_name = ["Backlog", "Ready", "In progress", "Blocked", "Done"]
-            .get(usize::from(lane))
-            .copied()
-            .unwrap_or("board");
+        let headline = intent
+            .as_ref()
+            .map_or("Couldn’t send the change", |intent| failure_title(&intent.verb));
         self.notices.insert(
             workspace_id,
-            PanelNotice::new(format!("{issue_id} stayed {lane_name}; classifier won"), lane),
+            PanelNotice::at(NoticeTone::Error, headline, Instant::now())
+                .saying("Scribe couldn’t reach its server, so nothing was saved.")
+                .about(issue_id, intent.as_ref().map_or("", |intent| intent.title.as_str())),
+        );
+    }
+
+    pub fn classifier_won(&mut self, workspace_id: WorkspaceId, card: &BeadsBoardItem, lane: u8) {
+        let lane_name = LANE_NAMES.get(usize::from(lane)).copied().unwrap_or("another lane");
+        self.notices.insert(
+            workspace_id,
+            PanelNotice::at(
+                NoticeTone::Info,
+                format!("Moved to {lane_name} instead"),
+                Instant::now(),
+            )
+            .saying(placement_reason(lane))
+            .about(&card.id, &card.title),
         );
         self.last_opened = Some(workspace_id);
     }
@@ -1324,21 +1532,15 @@ impl BeadsPanels {
             return;
         };
         self.write_deadlines.remove(&key);
-        let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
+        let title = intent.title.as_str();
         match result {
             BeadsIssueWriteResult::Applied { .. }
                 if matches!(intent.verb, BeadsIssueWrite::CloseIssue) =>
             {
                 self.open.remove(&workspace_id);
-                self.notices.insert(
-                    workspace_id,
-                    PanelNotice::closed_at(
-                        issue_id.to_owned(),
-                        intent.guards.if_assignee.unwrap_or_default(),
-                        lane,
-                        now,
-                    ),
-                );
+                let assignee = intent.guards.if_assignee.clone().unwrap_or_default();
+                self.notices
+                    .insert(workspace_id, PanelNotice::closed_at(issue_id, title, assignee, now));
                 self.last_opened = Some(workspace_id);
             }
             BeadsIssueWriteResult::Applied { .. } => {
@@ -1348,24 +1550,35 @@ impl BeadsPanels {
             BeadsIssueWriteResult::PreconditionFailed => {
                 self.notices.insert(
                     workspace_id,
-                    PanelNotice::new_at(
-                        "Someone else won; refreshing issue detail".into(),
-                        lane,
-                        None,
-                        now,
-                    ),
+                    PanelNotice::at(NoticeTone::Warning, "Issue changed elsewhere", now)
+                        .saying(
+                            "It changed since Scribe last loaded it, so your change wasn’t saved.",
+                        )
+                        .about(issue_id, title),
                 );
                 self.refresh_open_issue(workspace_id, issue_id);
             }
-            BeadsIssueWriteResult::Failed { reason } => {
-                let timed_out = reason.contains("timed out");
+            BeadsIssueWriteResult::Failed { reason } if reason.contains("timed out") => {
                 self.notices.insert(
                     workspace_id,
-                    PanelNotice::new_at(format!("Issue write failed: {reason}"), lane, None, now),
+                    PanelNotice::at(NoticeTone::Warning, TIMEOUT_TITLE, now)
+                        .saying(TIMEOUT_MESSAGE)
+                        .about(issue_id, title),
                 );
-                if timed_out {
-                    self.force_convergence(workspace_id, issue_id);
-                }
+                self.force_convergence(workspace_id, issue_id);
+            }
+            BeadsIssueWriteResult::Failed { reason } => {
+                // The toast shows bd's reason cleaned into a sentence; the
+                // log keeps it verbatim for whoever has to chase it.
+                tracing::warn!(%workspace_id, issue_id, reason, "Beads issue write failed");
+                let message = reason_sentence(&reason)
+                    .unwrap_or_else(|| "Beads reported an error, so nothing was saved.".to_owned());
+                self.notices.insert(
+                    workspace_id,
+                    PanelNotice::at(NoticeTone::Error, failure_title(&intent.verb), now)
+                        .saying(message)
+                        .about(issue_id, title),
+                );
             }
         }
     }
@@ -1384,10 +1597,16 @@ impl BeadsPanels {
         for (workspace_id, issue_id) in &expired {
             let key = (*workspace_id, issue_id.clone());
             self.write_deadlines.remove(&key);
-            let lane = self.open.get(workspace_id).map_or(4, |panel| panel.lane);
+            let title = self
+                .in_flight_writes
+                .get(&key)
+                .map(|intent| intent.title.clone())
+                .unwrap_or_default();
             self.notices.insert(
                 *workspace_id,
-                PanelNotice::new_at("Issue write timed out; refreshing".into(), lane, None, now),
+                PanelNotice::at(NoticeTone::Warning, TIMEOUT_TITLE, now)
+                    .saying(TIMEOUT_MESSAGE)
+                    .about(issue_id, &title),
             );
             self.force_convergence(*workspace_id, issue_id);
         }
@@ -1453,11 +1672,10 @@ impl BeadsPanels {
             return false;
         }
         let Some(notice) = self.notices.remove(&workspace_id) else { return false };
-        if !notice.active_at(now) {
-            return false;
-        }
-        let Some(undo) = notice.undo.clone() else {
-            self.notices.insert(workspace_id, notice);
+        let Some(undo) = notice.live_undo(now).cloned() else {
+            if notice.active_at(now) {
+                self.notices.insert(workspace_id, notice);
+            }
             return false;
         };
         let key = (workspace_id, undo.issue_id.clone());
@@ -1478,14 +1696,37 @@ impl BeadsPanels {
                 if_status: Some("closed".into()),
                 if_assignee: Some(undo.assignee),
             },
+            title: notice.subject.map(|subject| subject.title).unwrap_or_default(),
         });
         true
     }
 
+    /// Take a workspace's toast down early, leaving any open panel alone.
+    pub fn dismiss_notice(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.notices.remove(&workspace_id).is_some()
+    }
+
+    /// Hold a workspace's toast while the pointer rests on it. Letting go
+    /// leaves it up for at least [`NOTICE_LINGER`] more, so it never vanishes
+    /// the instant the pointer moves off.
+    pub fn hold_notice(&mut self, workspace_id: WorkspaceId, held: bool) {
+        self.hold_notice_at(workspace_id, held, Instant::now());
+    }
+
+    fn hold_notice_at(&mut self, workspace_id: WorkspaceId, held: bool, now: Instant) {
+        let Some(notice) = self.notices.get_mut(&workspace_id) else { return };
+        if held {
+            if notice.held_since.is_none() {
+                notice.held_since = Some(now);
+            }
+        } else if notice.held_since.take().is_some() {
+            notice.expires_at = notice.expires_at.max(now + NOTICE_LINGER);
+        }
+    }
+
     pub fn undo_available(&self, workspace_id: WorkspaceId) -> bool {
-        self.notices
-            .get(&workspace_id)
-            .is_some_and(|notice| notice.active() && notice.undo.is_some())
+        let now = Instant::now();
+        self.notices.get(&workspace_id).is_some_and(|notice| notice.live_undo(now).is_some())
     }
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
@@ -1548,23 +1789,34 @@ impl BeadsPanels {
         self.pending_copy.take()
     }
 
-    pub fn notice(&self, workspace_id: WorkspaceId) -> Option<&str> {
+    fn notice_at(&self, workspace_id: WorkspaceId, now: Instant) -> Option<&PanelNotice> {
+        self.notices.get(&workspace_id).filter(|notice| notice.active_at(now))
+    }
+
+    /// The live notice a workspace's toast paints, if any.
+    pub fn active_notice(&self, workspace_id: WorkspaceId) -> Option<&PanelNotice> {
         self.notice_at(workspace_id, Instant::now())
     }
 
-    fn notice_at(&self, workspace_id: WorkspaceId, now: Instant) -> Option<&str> {
-        self.notices
-            .get(&workspace_id)
-            .filter(|notice| notice.active_at(now))
-            .map(|notice| notice.text.as_str())
+    /// Drop every toast whose five seconds are up, reporting whether one went.
+    pub fn expire_notices(&mut self) -> bool {
+        self.expire_notices_at(Instant::now())
     }
 
-    pub fn notice_lane(&self, workspace_id: WorkspaceId) -> Option<u8> {
-        self.notices.get(&workspace_id).filter(|notice| notice.active()).map(|notice| notice.lane)
-    }
-
-    pub fn expire_notices(&mut self) {
-        self.notices.retain(|_, notice| notice.active());
+    fn expire_notices_at(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        self.notices.retain(|_, notice| {
+            // A held close toast outlives its Undo: the button goes at the
+            // exact deadline even while the words stay up.
+            if notice.undo.is_some() && notice.live_undo(now).is_none() {
+                notice.undo = None;
+                changed = true;
+            }
+            let live = notice.active_at(now);
+            changed |= !live;
+            live
+        });
+        changed
     }
 
     pub fn sync_board(&mut self, workspace_id: WorkspaceId, state: &BeadsBoardState) -> bool {
@@ -1572,10 +1824,13 @@ impl BeadsPanels {
             self.reconcile_snapshot(workspace_id, false);
             self.pending_navigation.remove(&workspace_id);
             self.pick_rows.remove(&workspace_id);
-            let Some(panel) = self.open.remove(&workspace_id) else { return false };
+            if self.open.remove(&workspace_id).is_none() {
+                return false;
+            }
             self.notices.insert(
                 workspace_id,
-                PanelNotice::new("Beads project is no longer detected".into(), panel.lane),
+                PanelNotice::at(NoticeTone::Info, "Beads project not found", Instant::now())
+                    .saying("This workspace is no longer inside a Beads project, so the issue panel closed."),
             );
             self.last_opened = Some(workspace_id);
             return true;
@@ -1640,7 +1895,7 @@ fn board_snapshot(state: &BeadsBoardState) -> Option<&BeadsBoardSnapshot> {
     }
 }
 
-fn snapshot_card<'a>(
+pub(crate) fn snapshot_card<'a>(
     snapshot: &'a BeadsBoardSnapshot,
     issue_id: &str,
 ) -> Option<(u8, &'a BeadsBoardItem)> {
@@ -1719,7 +1974,7 @@ pub struct PanelLayerInputs {
     pub colors: BeadsBoardColors,
     pub animations: AnimationSettings,
     pub panel: Option<BeadsPanel>,
-    pub notice: Option<(String, u8)>,
+    pub notice: Option<PanelNotice>,
 }
 
 impl PanelLayer {
@@ -1763,11 +2018,7 @@ impl gpui::Render for PanelLayer {
         };
         let mut layers =
             inputs.panel.as_ref().map_or_else(Vec::new, |panel| render(panel, &wiring));
-        if let Some((text, lane)) = &inputs.notice
-            && let Some(notice) = render_notice(text, *lane, &wiring)
-        {
-            layers.push(notice);
-        }
+        layers.extend(inputs.notice.as_ref().and_then(|notice| render_notice(notice, &wiring)));
         // The overlay children position themselves absolutely in band
         // coordinates; the wrapper spans the band so those coordinates keep
         // meaning what they meant when the root painted them inline.
@@ -1829,44 +2080,256 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender<'_>) -> Vec<AnyEleme
     vec![backdrop, body]
 }
 
-pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender<'_>) -> Option<AnyElement> {
-    let layout = panel_layout(wiring.region, wiring.board, lane, wiring.scale)?;
+/// Where a region's toast hangs, as `(x, top, width)`: one gap under the
+/// board, inset from the section's right edge by [`PANEL_MARGIN`]. Below the
+/// board rather than on it, because the board's right edge holds the Blocked
+/// and Done tabs a drop is aimed at.
+fn notice_slot(region: Rect, board: Rect, scale: f32) -> Option<(f32, f32, f32)> {
+    let width = (NOTICE_WIDTH * scale).min(region.width - PANEL_MARGIN * 2.0);
+    let top = board.y + board.height + NOTICE_BOARD_GAP;
+    let room = region.y + region.height - top;
+    (width >= NOTICE_MIN_WIDTH && room >= NOTICE_MIN_ROOM * scale).then_some((
+        region.x + region.width - PANEL_MARGIN - width,
+        top,
+        width,
+    ))
+}
+
+/// Paint one workspace's notice as a toast in its section's top-right
+/// corner. The headline, the plain sentence under it, and the issue it
+/// names each take their own line and their own weight, and the tone reads
+/// from a glyph as well as a hue.
+pub fn render_notice(notice: &PanelNotice, wiring: &BeadsPanelRender<'_>) -> Option<AnyElement> {
+    let scale = wiring.scale;
+    let (x, top, width) = notice_slot(wiring.region, wiring.board, scale)?;
+    let colors = &wiring.colors;
     let workspace_id = wiring.workspace_id;
-    let undo = wiring.state.lock().is_ok_and(|panels| panels.undo_available(workspace_id));
-    let notice = div()
-        .id(SharedString::from(format!("beads-detail-notice-{workspace_id}")))
+    let urgent = matches!(notice.tone, NoticeTone::Warning | NoticeTone::Error);
+    let toast = div()
+        .id(SharedString::from(format!("beads-notice-{workspace_id}")))
+        .debug_selector(|| "beads-notice".to_owned())
+        .role(if urgent { Role::Alert } else { Role::Status })
+        .aria_label(notice.spoken())
+        .occlude()
         .absolute()
-        .left(px(layout.geometry.x))
-        .top(px(layout.geometry.y))
-        .w(px(layout.geometry.width))
-        .px(px(14.0))
-        .py(px(9.0))
+        .left(px(x))
+        .top(px(top))
+        .w(px(width))
+        .flex()
+        .items_start()
+        .gap(at(scale, 10.0))
+        .py(at(scale, NOTICE_PAD_Y))
+        .pl(at(scale, NOTICE_PAD_LEFT))
+        .pr(at(scale, NOTICE_PAD_RIGHT))
         .rounded(px(4.0))
         .border_1()
-        .border_color(with_alpha(wiring.colors.blocked_state, 0.65))
-        .bg(wiring.colors.card)
-        .font_family("monospace")
-        .text_size(at(layout.scale, 10.0))
-        .line_height(at(layout.scale, 14.0))
-        .text_color(wiring.colors.panel_state_ink(wiring.colors.blocked_state))
-        .child(text.to_owned());
-    let notice = if undo {
-        let state = std::sync::Arc::clone(&wiring.state);
-        notice
-            .role(Role::Button)
-            .aria_label("Undo issue close")
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-            .on_click(move |_event, window, _app| {
+        .border_color(colors.card_border_hover)
+        .bg(linear_gradient(
+            180.0,
+            linear_color_stop(colors.card_top, 0.0),
+            linear_color_stop(colors.card, 1.0),
+        ))
+        // The approved panel mock's lift, scaled down to a toast: an offset
+        // shadow reads on a dark ground where a flat 10% one vanishes.
+        .shadow(vec![
+            BoxShadow::new(px(0.0), px(8.0), hsla(0.0, 0.0, 0.0, 0.45)).blur_radius(px(24.0)),
+            BoxShadow::new(px(0.0), px(2.0), hsla(0.0, 0.0, 0.0, 0.3)).blur_radius(px(6.0)),
+        ])
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        // The press stops here, so its release does too (scribe-uu2y),
+        // except under a lifted card, whose release `release_board` owns.
+        .on_mouse_up(MouseButton::Left, |_, _window, app| {
+            if !app.has_active_drag() {
+                app.stop_propagation();
+            }
+        })
+        .on_hover({
+            let state = Arc::clone(&wiring.state);
+            move |hovered, _window, _app| {
                 if let Ok(mut panels) = state.lock() {
-                    panels.undo(workspace_id);
+                    panels.hold_notice(workspace_id, *hovered);
                 }
-                window.refresh();
-            })
-    } else {
-        notice
+            }
+        })
+        .child(notice_glyph(notice.tone, colors, scale))
+        .child(notice_text(notice, colors, scale))
+        .child(
+            div()
+                .flex_none()
+                .h(at(scale, NOTICE_TITLE_LINE))
+                .flex()
+                .items_center()
+                .gap(at(scale, NOTICE_ACTION_GAP))
+                .children(
+                    (notice.undo.is_some() && wiring.write_enabled).then(|| notice_undo(wiring)),
+                )
+                .child(notice_dismiss(wiring)),
+        )
+        .with_animation(
+            ElementId::NamedInteger(
+                format!("beads-notice-in-{workspace_id}").into(),
+                notice.words_key(),
+            ),
+            wiring.animations.transition(NOTICE_ENTRANCE),
+            move |toast, progress| {
+                toast.opacity(progress).top(px((1.0 - progress).mul_add(-6.0, top)))
+            },
+        );
+    Some(toast.into_any_element())
+}
+
+/// The tone's outline codicon, the VS Code family a developer already reads
+/// at a glance, centred on the headline's line box. The line weight matches
+/// the board's hairlines where a filled disc would outweigh the headline.
+fn notice_glyph(tone: NoticeTone, colors: &BeadsBoardColors, scale: f32) -> gpui::Div {
+    let (glyph, hue) = match tone {
+        NoticeTone::Success => ("\u{eba4}", colors.done_state),
+        NoticeTone::Info => ("\u{ea74}", colors.progress_state),
+        NoticeTone::Warning => ("\u{ea6c}", priority_color(colors, 1)),
+        NoticeTone::Error => ("\u{ea87}", colors.blocked_state),
     };
-    Some(notice.into_any_element())
+    div()
+        .flex_none()
+        .size(at(scale, 16.0))
+        .mt(at(scale, 1.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(NERD_SYMBOLS)
+        .text_size(at(scale, 16.0))
+        .line_height(at(scale, 16.0))
+        .text_color(colors.panel_state_ink(hue))
+        .child(glyph)
+}
+
+/// The headline with the sentence under it, then the issue it names as a
+/// quieter footnote set a step further down.
+fn notice_text(notice: &PanelNotice, colors: &BeadsBoardColors, scale: f32) -> gpui::Div {
+    let headline = div()
+        .text_size(at(scale, 13.0))
+        .line_height(at(scale, NOTICE_TITLE_LINE))
+        .font_weight(FontWeight(600.0))
+        .text_color(colors.title)
+        .line_clamp(2)
+        .text_ellipsis()
+        .child(notice.title.clone());
+    let sentence = notice.message.as_ref().map(|message| {
+        div()
+            .mt(at(scale, 2.0))
+            .text_size(at(scale, 12.0))
+            .line_height(at(scale, 17.0))
+            .text_color(colors.queue_name)
+            .line_clamp(NOTICE_MESSAGE_LINES)
+            .text_ellipsis()
+            .child(message.clone())
+    });
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .child(headline)
+        .children(sentence)
+        .children(notice.subject.as_ref().map(|subject| notice_subject(subject, colors, scale)))
+}
+
+/// `id · title`, the id in the terminal's data face as it is everywhere a
+/// value is shown, the title truncating into whatever width is left.
+fn notice_subject(subject: &NoticeSubject, colors: &BeadsBoardColors, scale: f32) -> gpui::Div {
+    let row = div()
+        .mt(at(scale, 7.0))
+        .flex()
+        .items_baseline()
+        .gap(at(scale, 5.0))
+        .min_w(px(0.0))
+        .text_size(at(scale, 11.5))
+        .line_height(at(scale, 16.0))
+        .text_color(colors.muted)
+        .child(
+            div()
+                .flex_none()
+                .font_family(crate::fonts::TERMINAL_FONT_FAMILY)
+                .text_size(at(scale, 11.0))
+                .text_color(colors.queue_name)
+                .child(subject.id.clone()),
+        );
+    if subject.title.is_empty() {
+        return row;
+    }
+    // The title grows into the rest of the line: without `flex_1` its
+    // truncating basis collapses to the ellipsis alone.
+    row.child(separator(colors).flex_none())
+        .child(div().flex_1().min_w(px(0.0)).truncate().child(subject.title.clone()))
+}
+
+/// A close toast's Undo, a fixed-size button so its target never moves with
+/// the font.
+fn notice_undo(wiring: &BeadsPanelRender<'_>) -> gpui::Stateful<gpui::Div> {
+    let colors = &wiring.colors;
+    let scale = wiring.scale;
+    let workspace_id = wiring.workspace_id;
+    let state = Arc::clone(&wiring.state);
+    div()
+        .id(SharedString::from(format!("beads-notice-undo-{workspace_id}")))
+        .debug_selector(|| "beads-notice-undo".to_owned())
+        .role(Role::Button)
+        .aria_label("Undo close")
+        .flex_none()
+        .w(at(scale, NOTICE_UNDO_WIDTH))
+        .h(at(scale, NOTICE_UNDO_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(colors.card_border_hover)
+        .text_size(at(scale, 12.0))
+        .font_weight(FontWeight(600.0))
+        .text_color(colors.title)
+        .cursor_pointer()
+        .hover(|button| button.bg(colors.button_hover).border_color(colors.chevron))
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            if let Ok(mut panels) = state.lock() {
+                panels.undo(workspace_id);
+            }
+            window.refresh();
+        })
+        .child("Undo")
+}
+
+/// The toast's own close mark, so it never has to be waited out.
+fn notice_dismiss(wiring: &BeadsPanelRender<'_>) -> gpui::Stateful<gpui::Div> {
+    let colors = &wiring.colors;
+    let scale = wiring.scale;
+    let workspace_id = wiring.workspace_id;
+    let state = Arc::clone(&wiring.state);
+    div()
+        .id(SharedString::from(format!("beads-notice-dismiss-{workspace_id}")))
+        .debug_selector(|| "beads-notice-dismiss".to_owned())
+        .role(Role::Button)
+        .aria_label("Dismiss notification")
+        .flex_none()
+        .size(at(scale, NOTICE_DISMISS_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        // The detail panel's own close mark, so the two read as one control,
+        // one step quieter than the words it sits beside.
+        .text_size(at(scale, 15.0))
+        .line_height(at(scale, 15.0))
+        .text_color(colors.chevron)
+        .cursor_pointer()
+        .hover(|button| button.bg(colors.button_hover).text_color(colors.title))
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            if let Ok(mut panels) = state.lock() {
+                panels.dismiss_notice(workspace_id);
+            }
+            window.refresh();
+        })
+        .child("×")
 }
 
 fn panel_body(
@@ -3383,6 +3846,15 @@ mod tests {
         (workspace, panels)
     }
 
+    /// A toast's headline and sentence, the two strings a reader acts on.
+    fn copy(notice: Option<&PanelNotice>) -> Option<(&str, Option<&str>)> {
+        notice.map(|notice| (notice.title.as_str(), notice.message.as_deref()))
+    }
+
+    fn subject_id(notice: Option<&PanelNotice>) -> Option<&str> {
+        notice.and_then(|notice| notice.subject.as_ref()).map(|subject| subject.id.as_str())
+    }
+
     fn loaded_detail(panels: &BeadsPanels, workspace_id: WorkspaceId) -> &BeadsIssueDetail {
         panels
             .visible(workspace_id)
@@ -3611,11 +4083,23 @@ mod tests {
 
         panels.update(vanished, "scribe-5wh1.4", None);
         assert!(panels.visible(vanished).is_none());
-        assert_eq!(panels.notice(vanished), Some("Issue scribe-5wh1.4 no longer exists"));
+        assert_eq!(
+            copy(panels.active_notice(vanished)),
+            Some(("Issue not found", Some("Beads can’t find it anymore, so its panel closed.")))
+        );
+        assert_eq!(subject_id(panels.active_notice(vanished)), Some("scribe-5wh1.4"));
 
         assert!(panels.sync_board(missing_project, &BeadsBoardState::NotDetected));
         assert!(panels.visible(missing_project).is_none());
-        assert_eq!(panels.notice(missing_project), Some("Beads project is no longer detected"));
+        assert_eq!(
+            copy(panels.active_notice(missing_project)),
+            Some((
+                "Beads project not found",
+                Some(
+                    "This workspace is no longer inside a Beads project, so the issue panel closed."
+                )
+            ))
+        );
     }
 
     #[test]
@@ -3758,7 +4242,11 @@ mod tests {
         panels.update(workspace, "next-1", None);
 
         assert!(panels.visible(workspace).is_none());
-        assert_eq!(panels.notice(workspace), Some("Issue next-1 no longer exists"));
+        assert_eq!(
+            copy(panels.active_notice(workspace)).map(|(title, _)| title),
+            Some("Issue not found")
+        );
+        assert_eq!(subject_id(panels.active_notice(workspace)), Some("next-1"));
     }
 
     #[test]
@@ -3880,6 +4368,7 @@ mod tests {
                     if_status: Some("open".into()),
                     if_assignee: Some("maintainer".into()),
                 },
+                title: "Render the read-only detail panel".into(),
             })
         );
         assert_eq!(panels.take_write(), None);
@@ -3963,7 +4452,14 @@ mod tests {
         );
 
         assert_eq!(loaded_detail(&panels, workspace).description, "Description");
-        assert_eq!(panels.notice_at(workspace, now), Some("Issue write failed: bd rejected edit"));
+        assert_eq!(
+            copy(panels.notice_at(workspace, now)),
+            Some(("Couldn’t save the description", Some("bd rejected edit.")))
+        );
+        assert_eq!(
+            panels.notice_at(workspace, now).map(|notice| notice.tone),
+            Some(NoticeTone::Error)
+        );
         assert_eq!(panels.take_request(), None);
     }
 
@@ -4022,6 +4518,7 @@ mod tests {
                     if_status: Some("open".into()),
                     if_assignee: Some("maintainer".into()),
                 },
+                title: "Render the read-only detail panel".into(),
             })
         );
         assert_eq!(panels.take_write(), None);
@@ -4040,6 +4537,7 @@ mod tests {
                     if_status: Some("open".into()),
                     if_assignee: Some("maintainer".into()),
                 },
+                title: "Render the read-only detail panel".into(),
             })
         );
         assert_eq!(type_panels.take_write(), None);
@@ -4127,6 +4625,7 @@ mod tests {
                     if_status: Some("open".into()),
                     if_assignee: Some("maintainer".into()),
                 },
+                title: "Render the read-only detail panel".into(),
             })
         );
         assert_eq!(
@@ -4168,7 +4667,15 @@ mod tests {
             BeadsIssueWriteResult::Failed { reason: "permission denied".into() },
             now,
         );
-        assert_eq!(panels.notice_at(workspace, now), Some("Issue write failed: permission denied"));
+        assert_eq!(
+            copy(panels.notice_at(workspace, now)),
+            Some(("Couldn’t claim the issue", Some("Permission denied.")))
+        );
+        let just_before = (now + NOTICE_DURATION)
+            .checked_sub(Duration::from_millis(1))
+            .expect("notice duration exceeds one millisecond");
+        assert!(!panels.expire_notices_at(just_before), "a live toast stays up");
+        assert!(panels.notice_at(workspace, just_before).is_some());
 
         assert!(panels.claim(workspace));
         assert!(panels.take_write().is_some());
@@ -4179,6 +4686,15 @@ mod tests {
             now,
         );
         assert_eq!(panels.notice_at(workspace, now), None);
+
+        // Left alone, a toast is removed at its exact deadline, and the
+        // lifecycle tick learns that it has a frame to paint.
+        panels
+            .notices
+            .insert(workspace, PanelNotice::at(NoticeTone::Error, "Couldn’t claim the issue", now));
+        assert!(panels.expire_notices_at(now + NOTICE_DURATION));
+        assert!(panels.notices.is_empty());
+        assert!(!panels.expire_notices_at(now + NOTICE_DURATION), "nothing left to expire");
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write timeout convergence]]
@@ -4197,8 +4713,13 @@ mod tests {
         assert_eq!(panels.take_board_refresh(), Some(workspace));
         assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
         assert_eq!(
-            panels.notice_at(workspace, now + WRITE_DEADLINE),
-            Some("Issue write timed out; refreshing")
+            copy(panels.notice_at(workspace, now + WRITE_DEADLINE)),
+            Some((TIMEOUT_TITLE, Some(TIMEOUT_MESSAGE)))
+        );
+        assert_eq!(
+            panels.notice_at(workspace, now + WRITE_DEADLINE).map(|notice| notice.tone),
+            Some(NoticeTone::Warning),
+            "an unknown outcome is a warning, not a failure"
         );
         assert!(!panels.claim(workspace), "unknown timeout result blocks another write");
         panels.sync_board(workspace, &board_with(item(), 1));
@@ -4322,10 +4843,72 @@ mod tests {
         let workspace = WorkspaceId::new();
         let mut panels = BeadsPanels::default();
 
-        panels.classifier_won(workspace, "scribe-5wh1.4", 3);
+        panels.classifier_won(workspace, &item(), 3);
 
-        assert_eq!(panels.notice(workspace), Some("scribe-5wh1.4 stayed Blocked; classifier won"));
-        assert_eq!(panels.notice_lane(workspace), Some(3));
+        let notice = panels.active_notice(workspace);
+        assert_eq!(
+            copy(notice),
+            Some(("Moved to Blocked instead", Some("Another issue is blocking it.")))
+        );
+        assert_eq!(notice.map(|notice| notice.tone), Some(NoticeTone::Info));
+        assert_eq!(
+            notice.and_then(|notice| notice.subject.clone()),
+            Some(NoticeSubject {
+                id: "scribe-5wh1.4".into(),
+                title: "Render the read-only detail panel".into(),
+            })
+        );
+    }
+
+    /// Every failure a toast can report, reduced to what a person should
+    /// read. Nothing shaped like JSON ever survives, whatever sent it.
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write failure notice copy]]
+    #[test]
+    fn failure_reasons_become_sentences_and_json_never_shows() {
+        for (reason, expected) in [
+            ("bd failed: forced nonzero write", Some("Forced nonzero write.")),
+            (
+                r#"bd failed: resolving issue: no issue found matching "nope-123""#,
+                Some(r#"Resolving issue: no issue found matching "nope-123"."#),
+            ),
+            ("bd failed: Error: database is locked", Some("Database is locked.")),
+            ("bd issue write timed out", Some("bd issue write timed out.")),
+            ("Permission denied!", Some("Permission denied!")),
+            (r#"bd failed: {"error":"forced nonzero write"}"#, None),
+            ("bd failed: [1, 2]", None),
+            ("bd failed: exited with exit status: 9", None),
+            ("  ", None),
+        ] {
+            assert_eq!(reason_sentence(reason).as_deref(), expected, "{reason}");
+        }
+        let long = format!("bd failed: {}", "x".repeat(REASON_MAX_CHARS + 20));
+        let clipped = reason_sentence(&long).expect("a long reason is clipped, not dropped");
+        assert_eq!(clipped.chars().count(), REASON_MAX_CHARS + 1);
+        assert!(clipped.ends_with('…'));
+
+        // An older server can still forward bd's raw envelope: the toast
+        // then says what failed and withholds the JSON entirely.
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write().is_some());
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Failed {
+                reason: r#"bd failed: {"data":{"error":"boom"},"schema_version":1}"#.into(),
+            },
+            now,
+        );
+        let notice = panels.notice_at(workspace, now).expect("a failure raises its toast");
+        assert_eq!(
+            copy(Some(notice)),
+            Some((
+                "Couldn’t claim the issue",
+                Some("Beads reported an error, so nothing was saved.")
+            ))
+        );
+        assert!(!notice.spoken().contains('{'), "{}", notice.spoken());
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]
@@ -4351,6 +4934,7 @@ mod tests {
                         if_status: Some("open".into()),
                         if_assignee: Some("maintainer".into()),
                     },
+                    title: "Render the read-only detail panel".into(),
                 })
             );
         }
@@ -4393,10 +4977,9 @@ mod tests {
             now,
         );
         assert!(panels.visible(workspace).is_none());
-        assert_eq!(
-            panels.notice_at(workspace, now + Duration::from_millis(4_999)),
-            Some("closed scribe-5wh1.4 · undo")
-        );
+        let closed = panels.notice_at(workspace, now + Duration::from_millis(4_999));
+        assert_eq!(copy(closed), Some(("Issue closed", None)));
+        assert_eq!(subject_id(closed), Some("scribe-5wh1.4"));
         assert!(panels.undo_at(workspace, now + Duration::from_millis(4_999)));
         assert_eq!(
             panels.take_write().map(|intent| (intent.verb, intent.guards)),
@@ -4426,6 +5009,54 @@ mod tests {
         assert!(!panels.undo_at(workspace, now + Duration::from_secs(5)));
         assert_eq!(panels.take_write(), None);
         assert_eq!(panels.notice_at(workspace, now + Duration::from_secs(5)), None);
+    }
+
+    /// Resting the pointer on a toast keeps it up past its five seconds and
+    /// letting go leaves it for [`NOTICE_LINGER`] more, but the Undo it
+    /// carries keeps its exact deadline: holding the words never holds the
+    /// window a reopen may still land in.
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Hovered toasts hold]]
+    #[test]
+    fn a_hovered_toast_holds_but_its_undo_keeps_the_exact_deadline() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.close_issue(workspace));
+        assert!(panels.take_write().is_some());
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 3 },
+            now,
+        );
+        panels.hold_notice_at(workspace, true, now + Duration::from_secs(1));
+
+        let deadline = now + NOTICE_DURATION;
+        assert!(!panels.undo_at(workspace, deadline), "held or not, the deadline is exact");
+        assert!(panels.notice_at(workspace, deadline).is_some(), "a refused Undo keeps the toast");
+        assert!(panels.expire_notices_at(deadline), "the lapsed Undo leaves the held toast");
+        let late = deadline + Duration::from_secs(10);
+        assert!(
+            panels.notice_at(workspace, late).is_some_and(|notice| notice.undo.is_none()),
+            "the words stay up while held, without the Undo"
+        );
+        assert!(!panels.expire_notices_at(late), "nothing leaves while held");
+
+        panels.hold_notice_at(workspace, false, late);
+        let lingered = late + NOTICE_LINGER;
+        let just_before =
+            lingered.checked_sub(Duration::from_millis(1)).expect("linger exceeds one millisecond");
+        assert!(!panels.expire_notices_at(just_before), "letting go lingers");
+        assert!(panels.expire_notices_at(lingered));
+        assert!(panels.notices.is_empty());
+
+        // A hold that never hears the pointer leave still ends at its cap.
+        panels.notices.insert(workspace, PanelNotice::at(NoticeTone::Error, "Held", now));
+        panels.hold_notice_at(workspace, true, now);
+        let capped = now + NOTICE_HOLD_MAX;
+        let before_cap =
+            capped.checked_sub(Duration::from_millis(1)).expect("hold cap exceeds one millisecond");
+        assert!(!panels.expire_notices_at(before_cap), "a hold outlives the five seconds");
+        assert!(panels.expire_notices_at(capped), "but not its own cap");
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write capability and closed issue gates]]
@@ -4468,8 +5099,11 @@ mod tests {
         );
 
         assert_eq!(
-            panels.notice_at(workspace, now),
-            Some("Someone else won; refreshing issue detail")
+            copy(panels.notice_at(workspace, now)),
+            Some((
+                "Issue changed elsewhere",
+                Some("It changed since Scribe last loaded it, so your change wasn’t saved.")
+            ))
         );
         assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
         assert!(panels.visible(workspace).is_some());
@@ -5245,7 +5879,8 @@ mod panel_cache_tests {
         assert!(!layer.same_inputs(&closed), "panel closed");
 
         let mut noticed = clone_inputs(&layer);
-        noticed.notice = Some(("Issue closed".into(), 1));
+        noticed.notice =
+            Some(PanelNotice::at(NoticeTone::Info, "Issue closed", std::time::Instant::now()));
         assert!(!layer.same_inputs(&noticed), "notice");
 
         let mut zoomed = clone_inputs(&layer);
@@ -5333,6 +5968,174 @@ mod panel_cache_tests {
             "the second region's cached overlay never took the click its own backdrop painted"
         );
         assert!(store.visible(left).is_some(), "dismissing one region dismissed the other");
+    }
+
+    /// Paint `notice` as the only thing in the second of two regions, the way
+    /// the root mounts it, with `panels` holding the same toast as live state.
+    fn notice_probe(
+        cx: &mut gpui::TestAppContext,
+        panels: &Arc<Mutex<BeadsPanels>>,
+        workspace: WorkspaceId,
+        notice: PanelNotice,
+    ) -> gpui::VisualTestContext {
+        {
+            let mut store = panels.lock().expect("probe store");
+            store.set_enabled(true);
+            store.set_write_enabled(true);
+            store.notices.insert(workspace, notice.clone());
+        }
+        let options = gpui::WindowOptions {
+            window_bounds: Some(gpui::WindowBounds::Windowed(Bounds {
+                origin: gpui::point(px(0.0), px(0.0)),
+                size: gpui::size(px(2.0 * REGION_WIDTH), px(REGION_HEIGHT)),
+            })),
+            ..Default::default()
+        };
+        let window = cx
+            .update(|app| {
+                AnimationSettings::resolve_with_env(false, None).apply_to_app(app);
+                app.open_window(options, |window, app| {
+                    notice_probe_root(window, app, panels, workspace, notice)
+                })
+            })
+            .expect("open the notice probe");
+        // Opening already drew once, and a cached replay records no debug
+        // bounds, so force the uncached frame an interaction would.
+        cx.update_window(window.into(), |_, window, app| {
+            window.refresh();
+            window.draw(app).clear();
+        })
+        .expect("draw the notice toast");
+        gpui::VisualTestContext::from_window(window.into(), cx)
+    }
+
+    /// The probe window's root: one region's layer carrying only `notice`.
+    fn notice_probe_root(
+        window: &mut Window,
+        app: &mut App,
+        panels: &Arc<Mutex<BeadsPanels>>,
+        workspace: WorkspaceId,
+        notice: PanelNotice,
+    ) -> Entity<CachedLayersProbe> {
+        let editor = app.new(|editor_cx| BeadsEditor::new(Arc::clone(panels), window, editor_cx));
+        let layer = region_layer(app, panels, &editor, workspace, REGION_WIDTH);
+        layer.update(app, |layer, _| {
+            layer.inputs.panel = None;
+            layer.inputs.notice = Some(notice);
+        });
+        app.new(|_| CachedLayersProbe { layers: vec![layer] })
+    }
+
+    /// A close's toast hangs in its own section's top-right corner, one gap
+    /// under the board, and its Undo is a real target there. Sited on the
+    /// second of two regions so region-anchored and window-anchored differ.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Beads notice toast placement]]
+    #[gpui::test]
+    fn close_toast_hangs_in_its_sections_top_right_and_undoes(cx: &mut gpui::TestAppContext) {
+        let workspace = WorkspaceId::new();
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        let closed = PanelNotice::closed_at(
+            "scribe-panel.1",
+            "Panel issue",
+            "maintainer".into(),
+            std::time::Instant::now(),
+        );
+        let mut test_window = notice_probe(cx, &panels, workspace, closed);
+
+        let toast = test_window.debug_bounds("beads-notice").expect("the toast painted");
+        let region_right = 2.0 * REGION_WIDTH;
+        assert!(
+            (f32::from(toast.right()) - (region_right - PANEL_MARGIN)).abs() < 0.5,
+            "toast right edge {:?} is not the section's inset top-right corner",
+            toast.right()
+        );
+        assert!(
+            (f32::from(toast.top()) - (197.0 + NOTICE_BOARD_GAP)).abs() < 0.5,
+            "toast top {:?} is not one gap under the board",
+            toast.top()
+        );
+        assert!(f32::from(toast.left()) > REGION_WIDTH, "toast escaped its own region");
+        assert!(
+            (f32::from(toast.size.width) - NOTICE_WIDTH).abs() < 0.5,
+            "toast is not its fixed width"
+        );
+
+        // The functional E2E clicks Undo from these same offsets: the button
+        // ends one border, the right padding, the close mark, and one gap in
+        // from the toast's right edge, centred on the headline's line box.
+        let undo = test_window.debug_bounds("beads-notice-undo").expect("close offers Undo");
+        let undo_right = f32::from(toast.right())
+            - 1.0
+            - NOTICE_PAD_RIGHT
+            - NOTICE_DISMISS_SIZE
+            - NOTICE_ACTION_GAP;
+        assert!((f32::from(undo.right()) - undo_right).abs() < 0.5, "Undo moved: {undo:?}");
+        let headline_centre = f32::from(toast.top()) + 1.0 + NOTICE_PAD_Y + NOTICE_TITLE_LINE / 2.0;
+        assert!(
+            (f32::from(undo.center().y) - headline_centre).abs() < 0.5,
+            "Undo left the headline's line: {undo:?}"
+        );
+        test_window.simulate_click(undo.center(), gpui::Modifiers::default());
+        assert_eq!(
+            panels
+                .lock()
+                .expect("probe store")
+                .take_write()
+                .map(|intent| (intent.verb, intent.title)),
+            Some((scribe_common::protocol::BeadsIssueWrite::UndoClose, "Panel issue".into())),
+            "the toast's Undo queued the guarded reopen"
+        );
+    }
+
+    /// Every toast carries its own close mark, so none has to be waited out.
+    #[gpui::test]
+    fn a_toast_close_mark_takes_it_down(cx: &mut gpui::TestAppContext) {
+        let workspace = WorkspaceId::new();
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        let failed = PanelNotice::at(
+            NoticeTone::Error,
+            "Couldn’t claim the issue",
+            std::time::Instant::now(),
+        )
+        .saying("Permission denied.");
+        let mut test_window = notice_probe(cx, &panels, workspace, failed);
+
+        assert!(
+            test_window.debug_bounds("beads-notice-undo").is_none(),
+            "only a close offers Undo"
+        );
+        let toast = test_window.debug_bounds("beads-notice").expect("the toast painted");
+        test_window.simulate_mouse_move(toast.center(), None, gpui::Modifiers::default());
+        assert!(
+            panels
+                .lock()
+                .expect("probe store")
+                .notices
+                .get(&workspace)
+                .is_some_and(|notice| notice.held_since.is_some()),
+            "resting the pointer on the toast holds it"
+        );
+        let dismiss =
+            test_window.debug_bounds("beads-notice-dismiss").expect("every toast can be closed");
+        test_window.simulate_click(dismiss.center(), gpui::Modifiers::default());
+        assert!(
+            panels.lock().expect("probe store").active_notice(workspace).is_none(),
+            "the close mark took the toast down"
+        );
+    }
+
+    #[test]
+    fn notice_slot_needs_room_under_the_board() {
+        let region = Rect { x: 40.0, y: 0.0, width: 800.0, height: 600.0 };
+        let board = Rect { x: 40.0, y: 0.0, width: 800.0, height: 197.0 };
+        assert_eq!(notice_slot(region, board, 1.0), Some((488.0, 205.0, NOTICE_WIDTH)));
+        let large = NOTICE_WIDTH * 1.6;
+        assert_eq!(notice_slot(region, board, 1.6), Some((840.0 - 12.0 - large, 205.0, large)));
+        let narrow = Rect { width: 260.0, ..region };
+        assert_eq!(notice_slot(narrow, board, 1.0), Some((52.0, 205.0, 236.0)));
+        assert_eq!(notice_slot(Rect { width: 240.0, ..region }, board, 1.0), None);
+        let full_board = Rect { height: 590.0, ..board };
+        assert_eq!(notice_slot(region, full_board, 1.0), None, "no room under a full board");
     }
 
     const REGION_WIDTH: f32 = 504.0;

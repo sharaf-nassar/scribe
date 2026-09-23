@@ -829,7 +829,7 @@ PANEL_W=560
 PANEL_LEFT=${PANEL_X#+}
 PANEL_TOP=${PANEL_Y#+}
 PANEL_ID_X=32
-PANEL_ID_Y=60
+PANEL_ID_Y=46
 PANEL_OUTSIDE_X=$(( PANEL_LEFT + PANEL_W + 16 ))
 [ "$PANEL_OUTSIDE_X" -lt "$WIN_W" ] || PANEL_OUTSIDE_X=$(( PANEL_LEFT - 16 ))
 PANEL_OUTSIDE_Y=$(( PANEL_TOP + PANEL_H + 16 ))
@@ -841,6 +841,19 @@ panel_move() {
 panel_move_outside() {
     xdotool mousemove --sync --window "$WID" "$PANEL_OUTSIDE_X" "$PANEL_OUTSIDE_Y"
 }
+
+# A notice toast hangs in the section's top-right corner, 8px under the board
+# with its right edge 12px in from the region's, which is the window's here.
+# Its controls centre on the headline, 22px below the toast's top. From the
+# right edge: one border, 6px of padding, the 20px close mark, a 6px gap, then
+# the 56px Undo. The headless placement probe pins these offsets against the
+# painted layout, so a coordinate here cannot drift from the renderer.
+notice_control() {
+    xdotool mousemove --sync --window "$WID" \
+        "$(( WIN_W - 12 - $1 ))" "$(( STRIP_TOP + A2_STRIP_H + 8 + 22 ))"
+}
+NOTICE_DISMISS_INSET=17
+NOTICE_UNDO_INSET=61
 
 # The painted panel's identity target is the final semantic check: it copies
 # the same full id read from bd show and carried on the matched wire response.
@@ -921,9 +934,9 @@ xdotool key --clearmodifiers Return
 wait_for_write_failure 'forced nonzero write' 50 \
     || fail "GPUI nonzero write produced no typed Failed result"
 rm -f /tmp/scribe-beads-write-fault-mode
-NONZERO_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
-printf '%s\n' "$NONZERO_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
-    || fail "GPUI nonzero write replaced last-good detail: $NONZERO_SHOW"
+# Capture the toast before `bd show`: that read can wait on the tracker for
+# longer than a toast lives, so every capture below comes straight after the
+# typed result that raised it.
 panel_move_outside
 sleep 0.2
 import -window "$WID" /output/beads-write-nonzero-notice.png
@@ -932,11 +945,20 @@ NONZERO_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
 NONZERO_NOTICE_DIFF=${NONZERO_NOTICE_DIFF%%.*}
 [ "${NONZERO_NOTICE_DIFF:-0}" -ge 500 ] \
     || fail "nonzero write painted no failure notice (${NONZERO_NOTICE_DIFF:-0}px)"
+# Close the toast by its own mark while it is certainly still up, so the
+# timeout proof starts from the same visible last-good detail. Waiting it out
+# instead would race the read below, and a click that outlived the toast would
+# land on the panel's dismissal backdrop.
+notice_control "$NOTICE_DISMISS_INSET"
+xdotool click 1
+panel_move_outside
+sleep 0.3
+NONZERO_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
+printf '%s\n' "$NONZERO_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
+    || fail "GPUI nonzero write replaced last-good detail: $NONZERO_SHOW"
 
-# Let the first one-line notice expire so the timeout proof starts from the
-# same visible last-good detail. Timeout convergence must request both board
-# and detail again while the persisted issue remains untouched.
-sleep 5.2
+# Timeout convergence must request both board and detail again while the
+# persisted issue remains untouched.
 TIMEOUT_DETAIL_BEFORE=$(flow_detail_requests e2e-detail)
 TIMEOUT_BOARD_BEFORE=$(board_request_count)
 printf '%s\n' timeout:e2e-detail >/tmp/scribe-beads-write-fault-mode
@@ -947,6 +969,14 @@ xdotool key --clearmodifiers Return
 wait_for_write_failure 'bd issue write timed out' 100 \
     || fail "GPUI timeout write produced no typed Failed result"
 rm -f /tmp/scribe-beads-write-fault-mode
+panel_move_outside
+sleep 0.2
+import -window "$WID" /output/beads-write-timeout-notice.png
+TIMEOUT_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
+    /output/beads-write-timeout-notice.png null: 2>&1 || true)
+TIMEOUT_NOTICE_DIFF=${TIMEOUT_NOTICE_DIFF%%.*}
+[ "${TIMEOUT_NOTICE_DIFF:-0}" -ge 500 ] \
+    || fail "timeout write painted no warning notice (${TIMEOUT_NOTICE_DIFF:-0}px)"
 for _ in $(seq 1 50); do
     [ "$(flow_detail_requests e2e-detail)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
         && [ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
@@ -961,14 +991,6 @@ TIMEOUT_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
 printf '%s\n' "$TIMEOUT_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
     || fail "GPUI timeout write replaced last-good detail: $TIMEOUT_SHOW"
 printf '%s\n' "$TIMEOUT_SHOW" >/output/beads-write-gpui-final-show.json
-panel_move_outside
-sleep 0.2
-import -window "$WID" /output/beads-write-timeout-notice.png
-TIMEOUT_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
-    /output/beads-write-timeout-notice.png null: 2>&1 || true)
-TIMEOUT_NOTICE_DIFF=${TIMEOUT_NOTICE_DIFF%%.*}
-[ "${TIMEOUT_NOTICE_DIFF:-0}" -ge 500 ] \
-    || fail "timeout write painted no failure notice (${TIMEOUT_NOTICE_DIFF:-0}px)"
 
 echo 'PASS: real bd detail persisted, editor input stayed local, and write failures retained last-good state with notices'
 
@@ -1016,19 +1038,17 @@ drag_issue e2e-close 4
 wait_for_write e2e-close close_issue "$CLOSE_BEFORE"
 wait_for_applied e2e-close "$CLOSE_APPLIED_BEFORE"
 sleep 0.3
-CLOSED_DROP=$(cd "$PROJECT" && bd show e2e-close --json)
-printf '%s\n' "$CLOSED_DROP" | grep -Fq '"status": "closed"' \
-    || fail "Done drop did not close through native bd: $CLOSED_DROP"
-printf '%s\n' "$CLOSED_DROP" | grep -Eq '"closed_at": "[0-9]{4}-' \
-    || fail "Done drop omitted native closed_at: $CLOSED_DROP"
+# Undo lives exactly five seconds from the Applied result, so the capture and
+# the click come first and the tracker is read afterwards: `bd show` can wait
+# on the post-write board refresh for longer than the whole Undo window.
 import -window "$WID" /output/beads-drag-close-notice.png
 UNDO_BEFORE=$(issue_write_count e2e-close undo_close)
 UNDO_RECORD_BEFORE=$(wc -l <"$RECORD")
-# The close notice shares the detail panel's centered geometry, so its Undo
-# target follows the detected panel origin rather than the lane the card was
-# dropped into.
-panel_move 280 16
+notice_control "$NOTICE_UNDO_INSET"
 xdotool click 1
+# The Applied result above is bd's own success envelope for the close; the
+# pinned-lane close below reads the tracker for its native closed_at, where
+# no Undo deadline is running against the read.
 wait_for_write e2e-close undo_close "$UNDO_BEFORE"
 UNDO_RESULT_LINE=$(wait_for_applied_line e2e-close "$UNDO_RECORD_BEFORE")
 wait_for_lane_after_result e2e-close 1 "$UNDO_RESULT_LINE"
@@ -1059,15 +1079,16 @@ drag_issue e2e-classifier 1
 wait_for_write e2e-classifier set_status "$CLASSIFIER_BEFORE"
 wait_for_lane e2e-classifier 3
 sleep 0.3
-CLASSIFIED=$(cd "$PROJECT" && bd show e2e-classifier --json)
-printf '%s\n' "$CLASSIFIED" | grep -Fq '"status": "open"' \
-    || fail "classifier fixture did not stay open: $CLASSIFIED"
+# The toast is captured before `bd show`, which can outlast it.
 import -window "$WID" /output/beads-drag-classifier-notice.png
 NOTICE_CHANGED=$(crop_diff /output/beads-drag-classifier-before.png \
     /output/beads-drag-classifier-notice.png \
     "${WIN_W}x40+0+$(( STRIP_TOP + A2_STRIP_H + 14 ))")
 [ "${NOTICE_CHANGED:-0}" -ge 1000 ] \
     || fail "classifier-won notice changed only ${NOTICE_CHANGED:-0}px"
+CLASSIFIED=$(cd "$PROJECT" && bd show e2e-classifier --json)
+printf '%s\n' "$CLASSIFIED" | grep -Fq '"status": "open"' \
+    || fail "classifier fixture did not stay open: $CLASSIFIED"
 
 # Same-lane, derived-lane, and collapsed-Blocked drops never enter the write
 # queue or touch bd. The Blocked arm is a drop on the painted 36px rail tab,
@@ -1233,6 +1254,8 @@ wait_for_applied e2e-deferred "$PINNED_APPLIED_BEFORE"
 PINNED_CLOSED=$(cd "$PROJECT" && bd show e2e-deferred --json)
 printf '%s\n' "$PINNED_CLOSED" | grep -Fq '"status": "closed"' \
     || fail "a drop on the pinned Done lane did not close through bd: $PINNED_CLOSED"
+printf '%s\n' "$PINNED_CLOSED" | grep -Eq '"closed_at": "[0-9]{4}-' \
+    || fail "a Done drop omitted native closed_at: $PINNED_CLOSED"
 
 # The pinned head's own `×` unpins by pointer. Dropping keyboard focus
 # afterwards is what closes the drawer that focus would otherwise hold open.

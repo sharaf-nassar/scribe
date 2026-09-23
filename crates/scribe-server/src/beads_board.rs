@@ -959,12 +959,70 @@ async fn invoke_bd(
 }
 
 fn failure_detail(output: &BdOutput) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    let json = json_error(&output.stdout);
-    if json.is_empty() { format!("exited with {}", output.status) } else { json }
+    bd_error_message(&output.stdout, &output.stderr)
+        .unwrap_or_else(|| format!("exited with {}", output.status))
+}
+
+/// The sentence a failed `bd` call means, never the JSON that carried it.
+///
+/// bd's schema-1 envelope puts its message at `data.error` and per-issue
+/// causes under `data.failed[].error`; errors raised outside the envelope
+/// are a bare `{"error": …}`. Either shape may arrive on stdout or stderr,
+/// pretty-printed or on one line beside a plain `Error …` line. The most
+/// specific JSON message wins, then a plain line that names an error, then
+/// any plain line, so a usage banner never outranks the reason.
+fn bd_error_message(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    json_message(&stdout).or_else(|| json_message(&stderr)).or_else(|| {
+        let plain: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('{'))
+            .collect();
+        plain
+            .iter()
+            .find(|line| line.get(..5).is_some_and(|word| word.eq_ignore_ascii_case("error")))
+            .or_else(|| plain.first())
+            .map(|line| (*line).to_owned())
+    })
+}
+
+/// How many lines opening a JSON object [`json_message`] will try. A failed
+/// bd prints one envelope; the bound keeps a pathological stdout from being
+/// reparsed once per line.
+const MAX_JSON_CANDIDATES: usize = 8;
+
+/// The first envelope message in `text`, reading each line that opens a JSON
+/// object as the start of a document that may run on past that line.
+fn json_message(text: &str) -> Option<String> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .filter_map(|line| {
+            let start = offset + (line.len() - line.trim_start().len());
+            offset += line.len();
+            text.get(start..).filter(|document| document.starts_with('{'))
+        })
+        .take(MAX_JSON_CANDIDATES)
+        .find_map(envelope_message)
+}
+
+/// The message one JSON document carries: a per-issue cause before the
+/// envelope's summary, and either before a bare top-level `error`.
+fn envelope_message(document: &str) -> Option<String> {
+    let value = serde_json::Deserializer::from_str(document)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    let body = value.get("data").unwrap_or(&value);
+    let cause = body.get("failed").and_then(serde_json::Value::as_array).and_then(|failed| {
+        failed.iter().find_map(|entry| entry.get("error").and_then(serde_json::Value::as_str))
+    });
+    cause
+        .or_else(|| body.get("error").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
 }
 
 async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<Vec<u8>, RunError> {
@@ -1033,11 +1091,10 @@ async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<V
     } else if lowercase.contains("issue") && lowercase.contains("not found") {
         Err(RunError::IssueNotFound)
     } else {
-        Err(RunError::Failed(if detail.is_empty() {
-            format!("bd exited with {status}")
-        } else {
-            format!("bd failed: {detail}")
-        }))
+        Err(RunError::Failed(bd_error_message(&stdout_bytes, &stderr_bytes).map_or_else(
+            || format!("bd exited with {status}"),
+            |message| format!("bd failed: {message}"),
+        )))
     }
 }
 
@@ -1611,6 +1668,46 @@ mod tests {
         assert!(search_dirs.contains(&shims), "child PATH dropped the dir bd came from");
         assert!(search_dirs.contains(&PathBuf::from("/usr/bin")), "child PATH lost system dirs");
         fs::remove_dir_all(scratch).expect("remove scratch dir");
+    }
+
+    /// Real bd failure output, captured verbatim: the reason people read is
+    /// the message inside the envelope, never the envelope.
+    #[test]
+    fn bd_error_message_reads_the_envelope_instead_of_showing_it() {
+        let unknown_issue = concat!(
+            "Error resolving nope-123: no issue found matching \"nope-123\"\n",
+            r#"{"data":{"error":"1 of 1 issues failed to update","failed":"#,
+            r#"[{"id":"nope-123","error":"resolving issue: no issue found matching \"nope-123\""}]},"#,
+            r#""schema_version":1}"#,
+            "\n",
+        );
+        assert_eq!(
+            bd_error_message(b"", unknown_issue.as_bytes()).as_deref(),
+            Some(r#"resolving issue: no issue found matching "nope-123""#),
+            "the specific per-issue cause outranks the summary and the plain line"
+        );
+
+        let bad_priority = concat!(
+            "{\n  \"data\": {\n    \"error\": \"invalid priority \\\"9\\\" (expected 0-4)\"\n",
+            "  },\n  \"schema_version\": 1\n}\n",
+        );
+        assert_eq!(
+            bd_error_message(bad_priority.as_bytes(), b"").as_deref(),
+            Some(r#"invalid priority "9" (expected 0-4)"#),
+            "a pretty-printed envelope on stdout"
+        );
+
+        assert_eq!(
+            bd_error_message(b"", br#"{"error":"forced nonzero write"}"#).as_deref(),
+            Some("forced nonzero write"),
+            "a bare error object"
+        );
+        assert_eq!(
+            bd_error_message(b"", b"Thanks for using bd!\nError: database is locked\n").as_deref(),
+            Some("Error: database is locked"),
+            "a plain error line outranks a banner"
+        );
+        assert_eq!(bd_error_message(b"", b"  \n"), None);
     }
 
     #[tokio::test]

@@ -129,9 +129,16 @@ Acceptance criteria:
   removes repeats while preserving first appearance.
 - The rail's bare words write `open`, `in_progress`, or `closed` with
   `clear_defer: false`. Claim and close use their native verbs.
-- Applied `CloseIssue` removes the panel and shows
-  `closed <id> · undo`. A click before five seconds sends guarded
-  `UndoClose`; the exact deadline sends nothing.
+- Applied `CloseIssue` removes the panel and shows an `Issue closed` toast
+  naming the issue, with an Undo button. A click before five seconds sends
+  guarded `UndoClose`; the exact deadline sends nothing.
+- Every notice is a toast in its own section's top-right corner, under the
+  board: a headline, one plain sentence, and the issue it names, each on its
+  own line, with a tone glyph and a close mark. No toast ever shows raw
+  `bd` output or JSON; a failure names the action that failed and bd's
+  reason as a sentence. A toast under the pointer stays up, for at most 30
+  seconds, and lingers two seconds after the pointer leaves; the Undo it
+  carries still lapses at its exact five-second deadline.
 - A nonblank comment queues `AddComment` and leaves the current thread intact.
   Only the matching uncached detail reply adds the persisted row.
 - Every panel write copies current detail status and assignee into optional
@@ -140,9 +147,10 @@ Acceptance criteria:
 - One pending or in-flight write is allowed per workspace and issue. A panel
   that navigated elsewhere rejects its stale intent.
 - An applied non-close write clears an earlier error and rereads open detail.
-  A precondition failure reports "Someone else won" and rereads. Other
-  failures keep detail unchanged and show one coral line for five seconds or
-  until the next applied result.
+  A precondition failure warns that the issue changed elsewhere and
+  rereads. Other failures keep detail unchanged and show one coral-toned
+  toast for five seconds, longer while hovered, or until the next applied
+  result.
 - A 15-second client expiry or server timeout marks the outcome unknown,
   requests a board refresh plus detail reread, and blocks another write until
   the first authoritative Ready snapshot reconciles it.
