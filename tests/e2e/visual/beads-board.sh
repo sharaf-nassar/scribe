@@ -432,10 +432,9 @@ trap stop_board_keeper EXIT
 inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":null}"
 inject "$(board_message "$WORKSPACE" sparse)"
 park_pointer 0.2
-shot a2-closed.png
 open_badge
 shot a2-open-probe.png
-BOARD_TOP=$(python3 "$ORACLE" board-top "$CONTRACT" /output/a2-closed.png /output/a2-open-probe.png) || fail "could not measure A2 board top"
+BOARD_TOP=$(python3 "$ORACLE" board-top "$CONTRACT" /output/a2-open-probe.png) || fail "could not measure A2 board top"
 [ "$BOARD_TOP" -ge 0 ] || fail "invalid board top $BOARD_TOP"
 
 # Pin the board reservation; lane pinning below is a separate A2 state.

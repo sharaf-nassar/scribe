@@ -2277,9 +2277,11 @@ width. Card and target coordinates come from that measurement plus the
 contract's row pitch, so a lane that collapsed to its legible header width, a
 pinned 0.85 share, and a 36px tab are all addressable by the same two helpers.
 Every gesture re-measures, because a card that changed lanes reflows the rail
-behind it. The same `widest-run` probe locates the drawer's top border, A3's
-position-bar thumb, and the selected `FLOW` chip; `contract-env` exports the
-same generated contract fields to both suites.
+behind it. The visual suite's `board-top` reuses the same seam search through
+`find_strip`, so both suites locate the strip one way. The same `widest-run`
+probe locates the drawer's top border, A3's position-bar thumb, and the
+selected `FLOW` chip; `contract-env` exports the same generated contract
+fields to both suites.
 
 The measurement is also an assertion: the run requires exactly five tracks, the
 first at the contract's gutter, and both collapsible queues at 36px before it
@@ -4791,6 +4793,16 @@ scans A2 tracks; [beads-board-oracle.py](../tests/e2e/visual/beads-board-oracle.
 layers the visual assertions over those measurements. No Flow or rail geometry
 is copied into the harness.
 
+The board top every later capture addresses comes from one open-board capture,
+not a closed/open diff. The layered chrome paints the board's ground in the
+window's base colour, so a diff down the window edge never sees the strip's
+own edges, only the pane ring it covers and the shadow it casts past its
+floor: it read 202 rows for the 197px strip and aborted the whole suite
+(scribe-krzj). `board-top` instead calls the same `find_strip` seam-row search
+the functional run's `rail-search` uses, then proves the full `strip_h`
+height by finding the header hairline, the 3px floor band, and the centred
+grip at their contract offsets from that top.
+
 A2's named captures cover sparse and busy collapsed rails, both hover drawers,
 both exclusive pinned lanes, and the native drag state. Extended captures pin
 empty copy, overflow without a partial fourth row, 51px hover and focus boxes,
@@ -4839,13 +4851,27 @@ remainder, is exactly the offset -- which is what makes the paint layer's
 negative top offset and the model's slice one measurement rather than two.
 That bound is the guard on `scribe-jfob`, which filed unvirtualised 200-row
 lanes as a perf bug before A2 had a scroll axis to reintroduce them. A lane at
-either end reports only the edge it is actually clipped on, so the `⌄` cue and
-the bottom fade go away together once the last row rests on the floor, and an
-offset out of range for a queue that shrank clamps rather than painting past
-its own rows.
+either end, like one at rest, lands its edges on row boundaries and cuts no
+row, while a mid-row offset cuts both; the `⌄` cue goes away once the last row
+rests on the floor, and an offset out of range for a queue that shrank clamps
+rather than painting past its own rows.
 
 The as-built rules live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
+
+#### Whole rows own Tab order and fades
+
+Only window rows wholly inside the lane body take Tab stops, and only an edge that actually cuts a row fades (scribe-y3x1).
+
+At rest a five-row lane builds three whole rows plus two bleed rows below the
+body, and only the three take Tab stops; a mid-row offset drops both cut rows
+from the Tab order. Accumulated wheel error within a hundredth of a pixel of a
+row boundary still paints flush, so it neither fades nor loses a whole row. At
+text scale 1.6 a default board's single whole row stays unfaded at rest while
+the `⌄` cue still points at the rest. The bug this pins let Shift+Tab from the
+Blocked tab focus an invisible bleed row, and dimmed the last whole row of
+every overflowing lane at rest; the running-client check is the board visual
+suite's row-focus and 1.6-scale hover captures.
 
 ### Beads keyboard card move
 

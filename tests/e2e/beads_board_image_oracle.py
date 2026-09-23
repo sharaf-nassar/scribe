@@ -99,35 +99,49 @@ def close(actual: float, expected: float, tolerance: float = 1.1) -> bool:
     return abs(actual - expected) <= tolerance
 
 
-def rail_search(args: argparse.Namespace) -> int:
-    data = contract(args.contract)
+def find_strip(
+    image: Image, data: dict, width: int, search_top: int = 0, search_height: int = 120
+) -> tuple[int, list[tuple[int, int]]] | None:
+    """The strip top and track bounds, read from the first row where every
+    track paints its state seam, or None when no row in the band does."""
     geometry = data["geometry"]["a2"]
     pad_left = int(geometry["lanes_padding_left"])
     pad_right = int(geometry["lanes_padding_right"])
     gap = int(geometry["track_gap"])
     seam_offset = int(geometry["lanes_padding_top"]) + int(geometry["head_h"])
-    image = Image(args.shot)
-
-    for y in range(args.search_top, args.search_top + args.search_height):
+    for y in range(search_top, search_top + search_height):
         ground = image.pixel(0, y)
         found = runs(
-            (differs(image.pixel(x, y), ground) for x in range(args.width)),
+            (differs(image.pixel(x, y), ground) for x in range(width)),
             3,
             gap - 4,
         )
         if len(found) < 3 or found[0][0] != pad_left:
             continue
-        print(y - seam_offset)
+        tracks = []
         for index, (left, run_width) in enumerate(found):
-            width = (
+            track_width = (
                 found[index + 1][0] - gap - left
                 if index + 1 < len(found)
-                else min(run_width, args.width - pad_right - left)
+                else min(run_width, width - pad_right - left)
             )
-            print(left, width)
-        return 0
-    print("no painted A2 seam row in the searched band", file=sys.stderr)
-    return 1
+            tracks.append((left, track_width))
+        return y - seam_offset, tracks
+    return None
+
+
+def rail_search(args: argparse.Namespace) -> int:
+    strip = find_strip(
+        Image(args.shot), contract(args.contract), args.width, args.search_top, args.search_height
+    )
+    if strip is None:
+        print("no painted A2 seam row in the searched band", file=sys.stderr)
+        return 1
+    top, tracks = strip
+    print(top)
+    for left, width in tracks:
+        print(left, width)
+    return 0
 
 
 def widest_run(args: argparse.Namespace) -> int:

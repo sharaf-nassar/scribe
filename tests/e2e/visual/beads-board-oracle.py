@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from beads_board_image_oracle import Image, close, contract, delta, runs, seam_tracks
+from beads_board_image_oracle import Image, close, contract, delta, find_strip, runs, seam_tracks
 
 
 class Failure(Exception):
@@ -78,16 +78,20 @@ def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dic
 
 
 def command_board_top(args: argparse.Namespace) -> None:
-    before, after = Image(args.before), Image(args.after)
-    require((before.width, before.height) == (after.width, after.height), "board-top images differ in size")
-    strip = contract(args.contract)["geometry"]["a2"]["strip_h"]
-    candidates: list[tuple[int, int]] = []
-    for x in (2, 4, 6):
-        flags = [delta(before.pixel(x, y), after.pixel(x, y)) > 8 for y in range(before.height)]
-        candidates.extend(runs(flags, max(8, round(strip * 0.8))))
-    require(candidates, "could not find the A2 strip in the before/after capture")
-    top, height = min(candidates, key=lambda run: abs(run[1] - strip))
-    require(close(height, strip, 1.5), f"board strip is {height}px high, expected {strip}px")
+    """Read the open board's top from its own painted structure.
+
+    The layered chrome paints the board's ground in the window's base colour,
+    so a closed/open diff sees neither of the strip's edges, only the pane
+    ring it covers and the shadow it casts past its floor. The lanes' seam
+    row fixes the top, and the header hairline, floor band, and centred grip
+    at their contract offsets from it prove the whole strip_h height.
+    """
+    image = Image(args.image)
+    data = contract(args.contract)
+    strip = find_strip(image, data, image.width)
+    require(strip is not None, "no painted A2 seam row near the top of the capture")
+    top, _ = strip
+    assert_board_chrome(image, top, 0, image.width, data)
     print(top)
 
 
@@ -695,8 +699,7 @@ def parser() -> argparse.ArgumentParser:
 
     board_top = sub.add_parser("board-top")
     board_top.add_argument("contract")
-    board_top.add_argument("before")
-    board_top.add_argument("after")
+    board_top.add_argument("image")
     board_top.set_defaults(func=command_board_top)
 
     tracks = sub.add_parser("tracks")

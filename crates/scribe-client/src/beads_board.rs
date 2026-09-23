@@ -3051,6 +3051,15 @@ fn lane_body(
                 };
                 let key_move =
                     ctx.stores.key_move.filter(|mv| mv.source_id == row.item.id).cloned();
+                // Every built row keeps tracking its handle, so focus already
+                // held survives a scroll, but only a row wholly inside the
+                // body is a Tab stop: a bleed row is there for pixel-smooth
+                // scroll, and focus landing on one is invisible (A2-I6).
+                let focus = ctx
+                    .stores
+                    .row_focus
+                    .get(&row.item.id)
+                    .map(|handle| handle.clone().tab_stop(lane.whole_rows.contains(&index)));
                 ledger_row(
                     row,
                     RowMeta {
@@ -3063,7 +3072,7 @@ fn lane_body(
                         key_move,
                     },
                     card,
-                    ctx.stores.row_focus.get(&row.item.id),
+                    focus.as_ref(),
                 )
             }),
         );
@@ -3074,15 +3083,17 @@ fn lane_body(
 /// the partial row at a clipped edge fades into the ground it sits on, so it
 /// reads as a row continuing past the edge rather than as a short whole row.
 /// The vertical twin of the Flow strip's own `edge_fades` (A3-G8), and like
-/// it, present only on the side that is actually clipped -- a lane resting at
-/// the top wears no top fade, and one scrolled to its end wears no bottom
-/// fade, which is the same predicate the `⌄` cue reads.
+/// it, present only on an edge that actually cuts a row -- a lane at rest or
+/// scrolled exactly onto a row boundary wears no fade at all, though its `⌄`
+/// cue still shows while rows remain below.
 fn lane_edge_fades(lane: &QueueLane<'_>, ground: Rgba, metrics: Metrics) -> Vec<AnyElement> {
     let mut fades = Vec::with_capacity(2);
-    if lane.clipped_above {
+    if lane.cut.above {
         fades.push(lane_fade(LaneEdge::Top, ground, metrics));
     }
-    if lane.overflow {
+    // Not `overflow`: a lane at rest has rows below but cuts none, and a fade
+    // there would dim its last whole row.
+    if lane.cut.below {
         fades.push(lane_fade(LaneEdge::Bottom, ground, metrics));
     }
     fades
@@ -3694,8 +3705,10 @@ fn row_key_move(
 ) -> gpui::Stateful<gpui::Div> {
     let Some(handle) = focus else { return el };
     let key_handler = row_key_handler(card, source, handle.clone());
+    // The handle carries its own Tab-stop flag, set by `lane_body` from
+    // whether the row sits wholly inside the lane body; GPUI ignores an
+    // element's `tab_stop` for an explicitly tracked handle.
     el.track_focus(handle)
-        .tab_stop(true)
         .focus_visible(move |style| style.border_1().border_color(title))
         .on_key_down(key_handler)
 }

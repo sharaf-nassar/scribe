@@ -23,6 +23,8 @@
 //! committed JSON with `include_str!` and asserts every constant still
 //! matches it, so the two cannot silently drift apart.
 
+use std::ops::Range;
+
 use scribe_common::protocol::{BeadsBoardItem, BeadsBoardSnapshot, BeadsIssueQueue};
 
 use crate::beads_board::{CollapsedLaneState, short_epic};
@@ -272,12 +274,17 @@ pub struct QueueLane<'a> {
     /// `[0, row_height)`: the sub-row remainder of the clamped offset, since
     /// `rows` starts at the row that offset lands in (A2-I7).
     pub row_offset: f32,
-    /// Whether this lane is scrolled off its own first row, so the body's top
-    /// edge cuts a row (A2-I7). The fade that masks it is the paint layer's.
-    pub clipped_above: bool,
+    /// The indices into `rows` that sit wholly inside the body. Only these
+    /// take Tab stops (A2-I6): the window's bleed rows exist for pixel-smooth
+    /// scroll, and a keyboard focus that lands on one is invisible.
+    pub whole_rows: Range<usize>,
+    /// Which of the body's edges cut a row, and so wear a fade. At rest both
+    /// edges land on row boundaries, so an overflowing lane's last whole row
+    /// stays unfaded while `overflow` still raises the `⌄` cue.
+    pub cut: LaneCut,
     /// Whether this queue holds rows below the body's bottom edge, the board's
-    /// `⌄` overflow cue (A2-S6, A2-G9) and the bottom edge fade. False once a
-    /// lane is scrolled to its end, since nothing remains to point at.
+    /// `⌄` overflow cue (A2-S6, A2-G9). False once a lane is scrolled to its
+    /// end, since nothing remains to point at.
     pub overflow: bool,
     /// Queue-specific empty-state copy, present only when `total == 0`
     /// (A2-S5).
@@ -410,6 +417,10 @@ fn queue_lane(args: QueueLaneArgs<'_>) -> QueueLane<'_> {
     let first = rows_above(offset, row_height, items.len());
     let last = items.len().min(first.saturating_add(visible_rows).saturating_add(WINDOW_BLEED));
     let visible = items.get(first..last).unwrap_or_default();
+    let edges =
+        RowEdges { first, offset, row_height, body: count_to_f32(visible_rows) * row_height };
+    let whole_rows = edges.whole(visible.len());
+    let cut = edges.cut(&whole_rows, visible.len());
     let rows = visible
         .iter()
         .map(|item| RowView {
@@ -428,7 +439,8 @@ fn queue_lane(args: QueueLaneArgs<'_>) -> QueueLane<'_> {
         epic: hoisted.map(short_epic),
         rows,
         row_offset: offset - count_to_f32(first) * row_height,
-        clipped_above: offset > f32::EPSILON,
+        cut,
+        whole_rows,
         overflow: span - offset > f32::EPSILON,
         void: (total == 0).then(|| void_copy(queue, blocked_total)),
         width,
@@ -450,6 +462,57 @@ pub fn lane_scroll_span(input: A2Input<'_>, queue: BeadsIssueQueue) -> f32 {
 
 fn scroll_span(items: usize, visible_rows: usize, row_height: f32) -> f32 {
     ((count_to_f32(items) - count_to_f32(visible_rows)) * row_height).max(0.0)
+}
+
+/// Wheel deltas accumulate float error, so a row edge within this many pixels
+/// of the body's edge paints flush and counts as on the boundary: neither cut
+/// nor fading, and whole for Tab order.
+const ROW_EDGE_SLACK: f32 = 0.01;
+
+/// Which of a lane body's edges cut a row, which is what their fades mask
+/// (A2-I7, A2-S6). An edge landing on a row boundary cuts nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaneCut {
+    pub above: bool,
+    pub below: bool,
+}
+
+/// Where one lane's window rows sit against its body, in body pixels.
+struct RowEdges {
+    /// The queue index of the window's first row.
+    first: usize,
+    offset: f32,
+    row_height: f32,
+    /// The body's own height: its whole visible rows.
+    body: f32,
+}
+
+impl RowEdges {
+    /// The top of window row `index`, relative to the body's top edge.
+    fn top(&self, index: usize) -> f32 {
+        count_to_f32(self.first + index) * self.row_height - self.offset
+    }
+
+    /// The window rows that sit wholly inside the body. Rows are contiguous,
+    /// so the whole ones are too.
+    fn whole(&self, rows: usize) -> Range<usize> {
+        let start = (0..rows).find(|&index| self.top(index) >= -ROW_EDGE_SLACK).unwrap_or(rows);
+        let end = (start..rows)
+            .take_while(|&index| self.top(index) + self.row_height <= self.body + ROW_EDGE_SLACK)
+            .last()
+            .map_or(start, |index| index + 1);
+        start..end
+    }
+
+    /// Which edges cut a row, given the window's whole range: the row before
+    /// it is cut when more than the slack of it still shows, and the row after
+    /// it when it starts that far inside the body.
+    fn cut(&self, whole: &Range<usize>, rows: usize) -> LaneCut {
+        LaneCut {
+            above: whole.start > 0 && self.top(whole.start - 1) + self.row_height > ROW_EDGE_SLACK,
+            below: whole.end < rows && self.top(whole.end) < self.body - ROW_EDGE_SLACK,
+        }
+    }
 }
 
 /// How many whole rows sit entirely above `offset` -- the index of the row
@@ -1079,7 +1142,7 @@ mod tests {
 
         assert_eq!(out.visible_rows, 3);
         assert_eq!(out.backlog.rows.len(), 5, "three whole rows plus the window's own bleed");
-        assert!(!out.backlog.clipped_above, "an unscrolled lane rests on its own first row");
+        assert!(!out.backlog.cut.above, "an unscrolled lane rests on its own first row");
         assert!(close(out.backlog.row_offset, 0.0));
         assert!(out.backlog.overflow, "5 items over 3 visible rows must raise the overflow cue");
         assert!(out.backlog.void.is_none(), "a nonempty lane never carries void copy");
@@ -1144,13 +1207,18 @@ mod tests {
         let span = lane_scroll_span(backlog_input(&snapshot), BeadsIssueQueue::Backlog);
 
         let home = backlog_at(&snapshot, 0.0);
-        assert!(!home.clipped_above, "nothing is cut above an unscrolled lane");
+        assert!(!home.cut.above, "nothing is cut above an unscrolled lane");
         assert!(home.overflow, "two rows still sit below the body");
+        assert!(!home.cut.below, "at rest the bottom edge lands on a row boundary");
 
         let end = backlog_at(&snapshot, span);
-        assert!(end.clipped_above);
         assert!(!end.overflow, "a lane at its end points the `⌄` cue at nothing");
+        assert!(!end.cut.above, "the end lands on a row boundary, so nothing is cut above");
+        assert!(!end.cut.below);
         assert_eq!(end.rows.last().unwrap().item.id, "sc-4", "the last row rests on the floor");
+
+        let between = backlog_at(&snapshot, ROW_H * 0.5);
+        assert!(between.cut.above && between.cut.below, "mid-row scroll cuts both edges");
 
         // A short lane has no axis at all, and an out-of-range offset from a
         // queue that shrank under the pointer clamps rather than paints past
@@ -1158,10 +1226,53 @@ mod tests {
         let short = backlog_of(2);
         assert!(close(lane_scroll_span(backlog_input(&short), BeadsIssueQueue::Backlog), 0.0));
         let clamped = backlog_at(&short, 4000.0);
-        assert!(!clamped.clipped_above);
+        assert!(!clamped.cut.above);
         assert!(!clamped.overflow);
         assert_eq!(clamped.rows.len(), 2);
         assert!(close(backlog_at(&snapshot, f32::NAN).row_offset, 0.0));
+    }
+
+    /// Only rows wholly inside the body take Tab stops, and only an edge that
+    /// actually cuts a row fades: the bleed rows a window carries for
+    /// pixel-smooth scroll are neither focusable nor unfaded partial rows.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Beads lane scroll#Whole rows own Tab order and fades]]
+    #[test]
+    fn only_whole_rows_are_tab_stops_and_only_cut_edges_fade() {
+        let snapshot = backlog_of(5);
+        let span = lane_scroll_span(backlog_input(&snapshot), BeadsIssueQueue::Backlog);
+
+        let home = backlog_at(&snapshot, 0.0);
+        assert_eq!(home.rows.len(), 5, "three visible rows plus two bleed rows");
+        assert_eq!(home.whole_rows, 0..3, "the bleed rows below the body take no Tab stop");
+
+        let between = backlog_at(&snapshot, ROW_H * 0.4);
+        assert_eq!(between.whole_rows, 1..3, "both cut rows leave the Tab order");
+
+        let end = backlog_at(&snapshot, span);
+        assert_eq!(end.whole_rows, 0..3);
+        assert_eq!(end.rows[0].item.id, "sc-2", "the whole range starts at the window's own top");
+
+        // Accumulated wheel error either side of a row boundary still paints
+        // flush: nothing is cut and every visible row stays whole.
+        for drift in [ROW_H - 0.003, ROW_H + 0.003] {
+            let lane = backlog_at(&snapshot, drift);
+            assert!(!lane.cut.above && !lane.cut.below, "drift {drift} cut a row");
+            assert_eq!(lane.whole_rows.len(), 3, "drift {drift} lost a whole row");
+        }
+
+        // At text scale 1.6 a default board shows one whole row; resting on
+        // it must not fade it, though the cue still points at the rest.
+        let scaled =
+            layout(A2Input { text_scale: 1.6, ..backlog_input(&snapshot) }, LaneScroll::default());
+        assert_eq!(scaled.visible_rows, 1);
+        assert_eq!(scaled.backlog.whole_rows, 0..1);
+        assert!(scaled.backlog.overflow && !scaled.backlog.cut.below);
+
+        // A lane shorter than its body has every row whole and nothing cut.
+        let short = backlog_of(2);
+        let short_lane = backlog_at(&short, 0.0);
+        assert_eq!(short_lane.whole_rows, 0..2);
+        assert!(!short_lane.cut.above && !short_lane.cut.below);
     }
 
     // ---- row count: whole rows only, never a partial final row -----------

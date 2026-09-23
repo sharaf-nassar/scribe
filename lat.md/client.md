@@ -1702,8 +1702,14 @@ the body by the offset's sub-row remainder and
 [[crates/scribe-client/src/beads_board.rs#lane_edge_fades]] fades whichever
 edge is actually cutting a row into the ground beneath it -- the vertical twin
 of Flow's own `edge_fades` (A3-G8), on the same present-only-when-clipped
-predicate. The `⌄` cue reads that same predicate from the bottom half of it, so
-a lane scrolled to its end stops advertising rows it no longer hides.
+predicate. The layout decides it per edge as
+[[crates/scribe-client/src/beads_board_a2.rs#LaneCut]], with a hundredth of a
+pixel of slack for accumulated wheel error, so a lane at rest or scrolled
+exactly onto a row boundary wears no fade over its whole rows. The `⌄` cue reads a different predicate, `overflow`:
+rows remaining below, cut or not, so a resting lane with more rows still shows
+it and a lane scrolled to its end stops advertising rows it no longer hides.
+The first version drew the bottom fade on `overflow` too, which dimmed the
+last whole row of every overflowing lane at rest (scribe-y3x1).
 [[crates/scribe-client/src/beads_board_a2.rs#layout]] also hoists a lane's
 shared epic to its head via
 [[crates/scribe-client/src/beads_board_a2.rs#common_epic]] when every item the
@@ -1836,7 +1842,11 @@ stable `FocusHandle` per card id those three lanes currently hold --
 them straight off the snapshot rather than the windowed visible slice, since
 an element that gets no Tab stop this frame is simply outside the Tab order
 either way -- so Tab order and an armed move's own focus both survive a
-repaint. [[crates/scribe-client/src/beads_board.rs#row_key_move]] attaches
+repaint. [[crates/scribe-client/src/beads_board.rs#lane_body]] makes a handle a
+Tab stop only while its row sits wholly inside the lane body, the layout's
+`whole_rows`; the two bleed rows a window builds for pixel-smooth scroll keep
+tracking their handles, so focus already held survives a scroll, but Tab never
+lands on a row nobody can see (scribe-y3x1). [[crates/scribe-client/src/beads_board.rs#row_key_move]] attaches
 that handle's `track_focus`/`tab_stop`/`focus_visible` ring to a draggable row
 only, then [[crates/scribe-client/src/beads_board.rs#row_key_handler]] arms
 the move on Space through
