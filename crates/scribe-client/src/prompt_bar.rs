@@ -18,7 +18,7 @@
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use gpui::{App, ElementId, Rgba, Role, Window, div, prelude::*, px};
+use gpui::{App, ElementId, Rgba, Role, SharedString, Window, div, prelude::*, px};
 use scribe_common::protocol::{SessionPromptState, from_epoch_secs};
 
 use crate::opacity::scale_slot;
@@ -172,7 +172,7 @@ pub struct PromptBarModel {
 /// (the height actually painted). Passing one value to both is what keeps the
 /// reserved strip and the painted strip identical at every font size — a drift
 /// there sizes the PTY grid against a band that is not there.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PromptBarMetrics {
     /// Prompt text glyph size in pixels.
     pub text_size: f32,
@@ -181,6 +181,10 @@ pub struct PromptBarMetrics {
     /// Per-glyph advance width the strip's monospace text lays out at, which
     /// is what [`is_prompt_truncated`] measures a row against.
     pub cell_width: f32,
+    /// The grid's own font family, which `cell_width` was measured in. GPUI
+    /// has no generic `monospace` face, so the strip names this one: painting
+    /// in any other would clip at a width the measure never saw.
+    pub font_family: SharedString,
 }
 
 impl PromptBarMetrics {
@@ -198,6 +202,7 @@ impl PromptBarMetrics {
         grid_size: f32,
         grid_line_height: f32,
         grid_cell_width: f32,
+        grid_family: impl Into<SharedString>,
     ) -> Self {
         let text_size = override_size.unwrap_or(grid_size);
         let scale = if grid_size > 0.0 { text_size / grid_size } else { 1.0 };
@@ -205,6 +210,7 @@ impl PromptBarMetrics {
             text_size,
             cell_height: grid_line_height * scale,
             cell_width: grid_cell_width * scale,
+            font_family: grid_family.into(),
         }
     }
 }
@@ -220,7 +226,7 @@ pub fn prompt_bar_row_height(cell_height: f32) -> f32 {
 /// Zero prompts (or a non-positive cell height) yields a zero-height bar; two
 /// or more prompts add the second row plus its seam.
 #[must_use]
-pub fn prompt_bar_height(prompt_count: u32, metrics: PromptBarMetrics) -> f32 {
+pub fn prompt_bar_height(prompt_count: u32, metrics: &PromptBarMetrics) -> f32 {
     if prompt_count == 0 || metrics.cell_height <= 0.0 {
         return 0.0;
     }
@@ -409,6 +415,7 @@ struct RowWiring {
     /// `true` when the row's text does not fit, so hovering should reveal it.
     truncated: bool,
     text_size: f32,
+    font_family: SharedString,
     on_hover: PromptHoverHandler,
 }
 
@@ -421,6 +428,7 @@ struct PromptTooltip {
     text: String,
     style: RowStyle,
     text_size: f32,
+    font_family: SharedString,
 }
 
 impl gpui::Render for PromptTooltip {
@@ -432,7 +440,7 @@ impl gpui::Render for PromptTooltip {
             .bg(rgba(with_alpha(self.style.bg, 1.0)))
             .border_1()
             .border_color(rgba(with_alpha(self.style.text_color, 0.28)))
-            .font_family("monospace")
+            .font_family(self.font_family.clone())
             .text_size(px(self.text_size))
             .text_color(rgba(self.style.text_color))
             .child(self.text.clone())
@@ -488,8 +496,15 @@ fn prompt_row(
     }
     let text = row.full_text.clone();
     let text_size = wiring.text_size;
+    let font_family = wiring.font_family.clone();
     body.tooltip(move |_window, cx| {
-        cx.new(|_| PromptTooltip { text: text.clone(), style, text_size }).into()
+        cx.new(|_| PromptTooltip {
+            text: text.clone(),
+            style,
+            text_size,
+            font_family: font_family.clone(),
+        })
+        .into()
     })
     .tooltip_show_delay(Duration::ZERO)
 }
@@ -564,7 +579,7 @@ fn count_cluster(
 pub fn render(
     model: &PromptBarModel,
     colors: &PromptBarColors,
-    metrics: PromptBarMetrics,
+    metrics: &PromptBarMetrics,
     actions: PromptBarActions,
 ) -> impl IntoElement {
     let PromptBarActions { id: strip_id, hover, width, on_hover, on_dismiss } = actions;
@@ -574,6 +589,7 @@ pub fn render(
         target,
         truncated: is_prompt_truncated(text, width, metrics.cell_width),
         text_size: metrics.text_size,
+        font_family: metrics.font_family.clone(),
         on_hover: Rc::clone(&on_hover),
     };
     // `flex_none` for the same reason the status bar carries it: the strip is a
@@ -592,7 +608,7 @@ pub fn render(
         .flex_col()
         .flex_none()
         .w_full()
-        .font_family("monospace")
+        .font_family(metrics.font_family.clone())
         .text_size(px(metrics.text_size))
         .relative();
 
@@ -747,11 +763,16 @@ mod tests {
         // Compare by bit pattern: these are exact f32 arithmetic results, so the
         // strict `clippy::float_cmp` lint stays satisfied without approximation.
         let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
-        let m = |cell_height| PromptBarMetrics { text_size: 14.0, cell_height, cell_width: 8.0 };
-        assert!(eq(prompt_bar_height(0, m(16.0)), 0.0));
-        assert!(eq(prompt_bar_height(1, m(16.0)), prompt_bar_row_height(16.0)));
-        assert!(eq(prompt_bar_height(2, m(16.0)), prompt_bar_row_height(16.0) * 2.0 + ROW_SEAM_H));
-        assert!(eq(prompt_bar_height(1, m(0.0)), 0.0), "non-positive cell height yields no bar");
+        let m = |cell_height| PromptBarMetrics {
+            text_size: 14.0,
+            cell_height,
+            cell_width: 8.0,
+            font_family: "JetBrains Mono".into(),
+        };
+        assert!(eq(prompt_bar_height(0, &m(16.0)), 0.0));
+        assert!(eq(prompt_bar_height(1, &m(16.0)), prompt_bar_row_height(16.0)));
+        assert!(eq(prompt_bar_height(2, &m(16.0)), prompt_bar_row_height(16.0) * 2.0 + ROW_SEAM_H));
+        assert!(eq(prompt_bar_height(1, &m(0.0)), 0.0), "non-positive cell height yields no bar");
     }
 
     // @lat: [[client#GPUI Prompt Bar#Strip metrics follow the grid font]]
@@ -760,12 +781,18 @@ mod tests {
         let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
         let (size, line_height, cell_width) = (20.0, 26.0, 12.0);
 
-        let followed = PromptBarMetrics::resolve(None, size, line_height, cell_width);
+        let followed = PromptBarMetrics::resolve(None, size, line_height, cell_width, "Grid Mono");
         assert!(eq(followed.text_size, size), "unset override paints at the grid size");
+        assert_eq!(
+            followed.font_family.as_ref(),
+            "Grid Mono",
+            "and paints in the grid's own family, the face its advance was measured in"
+        );
         assert!(eq(followed.cell_height, line_height), "and reserves the grid's row");
         assert!(eq(followed.cell_width, cell_width), "and measures with the grid's advance");
 
-        let overridden = PromptBarMetrics::resolve(Some(10.0), size, line_height, cell_width);
+        let overridden =
+            PromptBarMetrics::resolve(Some(10.0), size, line_height, cell_width, "Grid Mono");
         assert!(eq(overridden.text_size, 10.0), "an explicit size wins over the grid");
         assert!(
             eq(overridden.cell_height, line_height * 0.5),

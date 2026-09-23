@@ -116,6 +116,42 @@ mod tests {
         }
     }
 
+    /// GPUI's cosmic-text backend matches family names literally and knows no
+    /// CSS generic, so a surface asking for `monospace` or `sans-serif` never
+    /// errors: it silently paints whatever GPUI's fallback stack finds first.
+    /// Every surface in the crate must name a real family instead.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Named font families]]
+    #[test]
+    fn no_client_surface_requests_a_generic_css_family() {
+        let generics =
+            ["monospace", "sans-serif", "serif", "system-ui", "ui-monospace", "ui-sans-serif"];
+        let needles: Vec<String> =
+            generics.iter().map(|family| format!("font_family(\"{family}\")")).collect();
+        let mut sources = Vec::new();
+        rust_sources(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut sources,
+        );
+        assert!(sources.len() > 50, "walked only {} files: the wrong tree", sources.len());
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("source file reads");
+            let found = needles.iter().find(|needle| source.contains(needle.as_str()));
+            assert!(found.is_none(), "{} requests {found:?}", path.display());
+        }
+    }
+
+    /// Collect every `.rs` file under `dir` into `files`.
+    fn rust_sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("source directory reads") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
     // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Bundled primary terminal font]]
     #[test]
     fn missing_primary_uses_bundled_font_not_a_proportional_ui_fallback() {

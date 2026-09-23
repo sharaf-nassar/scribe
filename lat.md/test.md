@@ -4743,16 +4743,20 @@ The strip keeps its region's x and width, and clamps rather than going negative 
 
 Pinning it here is what keeps the board a region citizen. The band it replaced spanned the window, so pinning a board in one region pushed every other region's panes down and shrank PTYs that had nothing to do with it.
 
-### Beads data face
+### Named font families
 
-A source guard fails if any Beads surface asks GPUI for the generic `monospace` family, which its cosmic-text backend cannot resolve.
+A source guard fails if any client surface asks GPUI for a CSS generic family such as `monospace` or `sans-serif`, which its cosmic-text backend cannot resolve.
 
-The request never errors: GPUI walks its fallback stack and paints the UI
-sans, so ids, counts, priorities, and ages silently lost their monospace face
-(scribe-xdhm) the same way the status bar and CI bar once did. The guard scans
-the board, panel, and Flow sources for the literal call, since no rendered
-assertion can tell a fallback face from a requested one. The rule it pins is
-[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
+The request never errors: GPUI walks its fallback stack and paints whatever
+face it finds first. That silently cost the Beads board, panel, and Flow their
+data face (scribe-xdhm), then the settings window's key caps, paths, and
+release-note code, the prompt bar, and the board's zoom glyphs (scribe-o9r8),
+the same way the status bar and CI bar once had. The guard walks every source
+file in the client crate for the literal calls, since no rendered assertion
+can tell a fallback face from a requested one, and asserts it walked the real
+tree. The rules it pins are
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]]
+and [[client#GPUI Prompt Bar]].
 
 ### Beads card drag tracking
 

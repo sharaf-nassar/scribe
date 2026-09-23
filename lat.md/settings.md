@@ -366,6 +366,13 @@ an opacity that would push its explanation below 4.5:1. Keybinding and
 read-only values render as plain right-aligned quiet monospace — the missing
 outline is the read-only mark, and AccessKit still says `Read-only value`.
 
+Monospace is data only, and it is always the named `DATA_FONT`, JetBrains
+Mono, which the client embeds: GPUI has no generic `monospace` family, and
+asking for one silently painted the fallback sans. Key caps, the workspace
+root path and its field, and release-note code blocks are data. The colour
+menu's `EXACT VALUE` caption is not: it sits beside `PRESETS` and `CUSTOM` as
+the same semibold quiet caption (scribe-o9r8).
+
 The Colors page leads with the palette rather than the controls that adjust
 it. [[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_ansi_palette]]
 renders the sixteen ANSI entries as one 8×2 swatch grid instead of sixteen

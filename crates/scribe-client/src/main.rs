@@ -8502,7 +8502,7 @@ impl TerminalView {
             .and_then(|s| self.prompt_model_for(s).map(|model| (s, model)))
             .map(|(session_id, model)| {
                 let actions = self.prompt_bar_actions(session_id, placement.rect.width, cx);
-                prompt_bar::render(&model, &colors, metrics, actions).into_any_element()
+                prompt_bar::render(&model, &colors, &metrics, actions).into_any_element()
             });
         let jump_button = placement.session_id.and_then(|session_id| {
             self.pane_content(session_id).and_then(|content| {
@@ -12638,6 +12638,7 @@ impl TerminalView {
             self.font.size,
             self.font.line_height,
             self.font.cell_width(),
+            self.font.family.clone(),
         )
     }
 
@@ -12735,7 +12736,7 @@ impl TerminalView {
         let metrics = self.prompt_bar_metrics();
         let Ok(ai) = self.shared.ai.lock() else { return 0.0 };
         ai.visible_prompts(session_id)
-            .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompts.prompt_count, metrics))
+            .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompts.prompt_count, &metrics))
     }
 
     /// The invisible canvas that measures the grid band and republishes the

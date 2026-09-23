@@ -2569,7 +2569,8 @@ fn scale_button(
         .flex()
         .items_center()
         .justify_center()
-        .font_family("sans-serif")
+        // The mock's `+`/`−` are the board's own sans; GPUI has no generic
+        // `sans-serif` family, so the glyphs simply inherit the UI face.
         .text_size(px(11.0))
         .line_height(px(ZOOM_GLYPH_H))
         // Quiet at rest, lifting to title ink on hover/focus (A2-C8).
@@ -5147,22 +5148,6 @@ mod tests {
         let hottest = vividness(colors.priorities[0]);
         let below = vividness(colors.priorities[1]);
         assert!(hottest > below, "P0 reads at {hottest:.2} saturation against P1 at {below:.2}");
-    }
-
-    /// GPUI's cosmic-text backend matches family names literally and has no
-    /// generic `monospace`, so asking for one silently paints the UI sans.
-    /// Every Beads surface names the embedded data face instead.
-    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Beads data face]]
-    #[test]
-    fn beads_surfaces_never_request_the_nonexistent_generic_monospace() {
-        let generic = format!("font_family(\"{}\")", "monospace");
-        for (file, source) in [
-            ("beads_board.rs", include_str!("beads_board.rs")),
-            ("beads_panel.rs", include_str!("beads_panel.rs")),
-            ("beads_flow.rs", include_str!("beads_flow.rs")),
-        ] {
-            assert!(!source.contains(&generic), "{file} asks GPUI for a generic monospace family");
-        }
     }
 
     /// A theme whose muted slot and ANSI red sit close to its background must
