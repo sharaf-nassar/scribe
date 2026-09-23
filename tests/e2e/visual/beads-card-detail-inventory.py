@@ -105,7 +105,13 @@ def main():
 
     rail_y = 320
     rail_row = [panel[x, rail_y] for x in range(panel_width)]
-    rail_ground = collections.Counter(rail_row).most_common(1)[0][0]
+    # The ground comes from the empty band under the rail, not the rail row's
+    # own majority: the status words' flat boxes and the panel gradient paint
+    # the row's ground in two tones a level apart, and together they can lose
+    # the vote to the hairline they interrupt.
+    rail_ground = collections.Counter(
+        panel[x, rail_y + 8] for x in range(panel_width)
+    ).most_common(1)[0][0]
     rail = longest_run(rail_row, rail_ground)
     if rail is None or rail[1] - rail[0] < 180 or rail[1] > 400:
         raise AssertionError(f"status rail run is {rail}, expected a break before x=400")

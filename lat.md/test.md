@@ -2739,18 +2739,27 @@ replies. The run mounts and directly reads
 and refresh time, then sends records through `scribe-test share-inject` under
 `--network none`.
 
-The loading message paints its five-card board. The script clicks the Backlog
+The loading message paints its five-card board, revealed by hovering the
+titlebar's Beads mark. The shared image oracle's `badge-center` finds that
+mark by shape rather than colour: it wears the workspace's name-hashed palette
+accent, which the active tab's edge and the pane ring share, so the hard-coded
+blue it once searched for stopped matching when chrome adopted the accent
+(scribe-mo9v). The script clicks the Backlog
 card, requires `RequestBeadsIssueDetail` on the wire tap, and captures the
 card-derived loading head and placeholder before injecting the matching reply.
 It rejects any dropped detail message. At text scale 1.0, its screenshots derive
 the mock's 560px loading and settled panel bounds, require both midpoint values
 to match the active terminal region, and require no horizontal arrival jump; the
 panel remains 4px below the board. Sampled pixels assert the spine node and
-halo, run-in heads, status-rail break and stop-short gap, empty-field row
+halo, run-in heads, status-rail break and stop-short gap (measured against the
+empty band under the rail, since the rail row's own majority can be the
+hairline), empty-field row
 omission, epic hue, priority ink, and two-line/newest plus one-line/older comment
 clamp. Clicking the newest comment must expand and restore that folded shape.
-Hovering the identity ID must reveal only its copy glyph; one click writes the
-full ID, and a clipboard sentinel installed afterward survives later frames. The
+Hovering the identity ID must reveal only its copy glyph, measured inside the
+panel crop because the status bar's live graphs tick between any two window
+captures; one click writes the full ID, and a clipboard sentinel installed
+afterward survives later frames. The
 same run captures the loading, closed, blocked, comment-clamped, and hidden-count
 variants, reopens after Esc, close-mark, and backdrop dismissal, then requires a
 visible close notice for both a missing detail and a workspace whose board changes
@@ -4731,6 +4740,17 @@ Unit coverage for the second reservation the region content rect carries: a pinn
 The strip keeps its region's x and width, and clamps rather than going negative in a region shorter than the board. Its reserved-height helper subtracts three terminal lines before clamping a stored height, so a tall restored board in a short stacked region cannot starve the PTY; widening the region restores the untouched height preference.
 
 Pinning it here is what keeps the board a region citizen. The band it replaced spanned the window, so pinning a board in one region pushed every other region's panes down and shrank PTYs that had nothing to do with it.
+
+### Beads data face
+
+A source guard fails if any Beads surface asks GPUI for the generic `monospace` family, which its cosmic-text backend cannot resolve.
+
+The request never errors: GPUI walks its fallback stack and paints the UI
+sans, so ids, counts, priorities, and ages silently lost their monospace face
+(scribe-xdhm) the same way the status bar and CI bar once did. The guard scans
+the board, panel, and Flow sources for the literal call, since no rendered
+assertion can tell a fallback face from a requested one. The rule it pins is
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
 ### Beads card drag tracking
 

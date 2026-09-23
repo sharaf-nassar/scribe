@@ -24,6 +24,7 @@ use scribe_common::protocol::{
 use crate::animation::AnimationSettings;
 use crate::beads_board::{BeadsBoardColors, CardDragState, card_drop_verb};
 use crate::beads_board_a2::queue_name;
+use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::layout::Rect;
 use crate::settings::window::{utf8_range_to_utf16, utf16_range_to_utf8};
 use unicode_segmentation::UnicodeSegmentation;
@@ -2248,7 +2249,7 @@ fn notice_subject(subject: &NoticeSubject, colors: &BeadsBoardColors, scale: f32
         .child(
             div()
                 .flex_none()
-                .font_family(crate::fonts::TERMINAL_FONT_FAMILY)
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(at(scale, 11.0))
                 .text_color(colors.queue_name)
                 .child(subject.id.clone()),
@@ -2493,7 +2494,7 @@ fn priority_pick_row(
     let mark = div()
         .flex_none()
         .mr(px(6.0))
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .text_size(at(wiring.scale, 11.0))
         .line_height(at(wiring.scale, 20.0))
         .font_weight(FontWeight(700.0))
@@ -2636,7 +2637,7 @@ fn identity_left(
                 .aria_label(format!("Copy issue {issue_id}"))
                 .flex()
                 .items_center()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .cursor_pointer()
                 .text_color(colors.queue_name)
                 .hover(|id| id.text_color(colors.title))
@@ -2648,11 +2649,16 @@ fn identity_left(
                     window.refresh();
                 })
                 .child(issue_id.to_owned())
+                // The codicon copy mark, from the embedded icon face: `⧉` is
+                // in neither embedded face, so it only ever painted through
+                // whatever system font happened to cover it, or as a box.
                 .child(
                     div()
+                        .ml(at(wiring.scale, 4.0))
+                        .font_family(NERD_SYMBOLS)
                         .opacity(0.0)
                         .group_hover(copy_group, |glyph| glyph.opacity(1.0))
-                        .child("⧉"),
+                        .child("\u{ebcc}"),
                 ),
         )
         .children(detail.is_some().then(|| separator(colors).into_any_element()))
@@ -2696,7 +2702,7 @@ fn identity_labels(
                 &issue.id,
                 EditField::Labels,
                 &labels,
-                div().font_family("monospace"),
+                div().font_family(TERMINAL_FONT_FAMILY),
             ))
             .into_any_element(),
     )
@@ -2726,7 +2732,6 @@ fn type_pick_row(issue: &BeadsIssueDetail, wiring: &BeadsPanelRender<'_>) -> Any
                     .role(Role::Button)
                     .aria_label(format!("Set issue type to {issue_type}"))
                     .cursor_pointer()
-                    .font_family("monospace")
                     .font_weight(if issue_type == issue.issue_type {
                         FontWeight(600.0)
                     } else {
@@ -2746,7 +2751,9 @@ fn type_pick_row(issue: &BeadsIssueDetail, wiring: &BeadsPanelRender<'_>) -> Any
             }))
             .into_any_element();
     }
-    let shown = div().font_family("monospace").child(issue.issue_type.clone());
+    // The type is a word in the identity row, set in its UI face as the
+    // approved mock does; the id and labels beside it are the data.
+    let shown = div().child(issue.issue_type.clone());
     if !writable {
         return shown.into_any_element();
     }
@@ -3292,7 +3299,7 @@ fn blocker_row(
         .line_height(at(scale, 14.0))
         .text_color(colors.muted)
         .child(div().size(px(6.0)).rounded_full().bg(colors.blocked_state))
-        .child(div().font_family("monospace").child(blocker.id.clone()))
+        .child(div().font_family(TERMINAL_FONT_FAMILY).child(blocker.id.clone()))
         .child(div().truncate().text_color(colors.queue_name).child(blocker.title.clone()))
         .into_any_element()
 }
@@ -3354,7 +3361,7 @@ fn optional_facts(detail: &BeadsIssueDetail, colors: &BeadsBoardColors, scale: f
     div()
         .mt(px(8.0))
         .truncate()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .text_size(at(scale, 9.5))
         .line_height(at(scale, 14.0))
         .text_color(colors.muted)
@@ -3385,7 +3392,7 @@ fn comments(
         .children(presentation.hidden_comment_count().map(|hidden| {
             div()
                 .mt(px(4.0))
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(at(scale, 9.5))
                 .text_color(colors.muted)
                 .child(format!("{hidden} older comments hidden"))
@@ -3497,7 +3504,7 @@ fn unblocks(detail: &BeadsIssueDetail, wiring: PanelContentWiring<'_>) -> AnyEle
                 })
                 .child(
                     div()
-                        .font_family("monospace")
+                        .font_family(TERMINAL_FONT_FAMILY)
                         .text_color(colors.queue_name)
                         .child(dependent.id.clone()),
                 )
@@ -3591,7 +3598,7 @@ fn panel_verb_word(verb: PanelVerb, writable: bool, wiring: PanelContentWiring<'
         PanelVerb::CloseIssue => ("close issue", colors.done_state, "close"),
     };
     let word = div()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .text_size(at(scale, 10.0))
         .line_height(at(scale, 16.0))
         .font_weight(FontWeight(600.0))

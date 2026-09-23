@@ -8,6 +8,7 @@ CONTROL="${SHARE_TAP_CONTROL:-$XDG_RUNTIME_DIR/scribe/share-tap.sock}"
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 MOCK="${BEADS_DETAIL_MOCK:-/mocks/beads-card-detail.html}"
+IMAGE_ORACLE=/tests/beads_board_image_oracle.py
 
 fail() {
     echo "FAIL: $1"
@@ -19,26 +20,15 @@ window_id() {
     xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1
 }
 
-beads_badge_center() {
-    local marker=/tmp/beads-detail-badge-marker.png
-    local width height scan_height bounds marker_width marker_height marker_x marker_y
-    import -window "$WID" "$marker"
-    read -r width height <<<"$(identify -format '%w %h' "$marker")"
-    scan_height=$(( height < 80 ? height : 80 ))
-    bounds=$(convert "$marker" -crop "${width}x${scan_height}+0+0" \
-        -fill black +opaque '#3B82F6' -fill white -opaque '#3B82F6' -trim \
-        -format '%w %h %X %Y' info:) || fail "could not measure the Beads badge marker"
-    read -r marker_width marker_height marker_x marker_y <<<"$bounds"
-    [[ "$marker_width" =~ ^[0-9]+$ && "$marker_height" =~ ^[0-9]+$ \
-        && "$marker_x" =~ ^\+[0-9]+$ && "$marker_y" =~ ^\+[0-9]+$ ]] \
-        || fail "could not find the Beads badge marker in titlebar geometry: $bounds"
-    printf '%s %s\n' "$(( ${marker_x#+} + marker_width / 2 ))" \
-        "$(( ${marker_y#+} + marker_height / 2 ))"
-}
-
+# The Beads mark wears the workspace's name-hashed palette accent, which the
+# active tab's edge and the pane ring share, so the shared oracle finds it by
+# shape rather than by any one colour.
 hover_beads_badge() {
-    local x y
-    read -r x y <<<"$(beads_badge_center)"
+    local marker=/tmp/beads-detail-badge-marker.png center x y
+    import -window "$WID" "$marker"
+    center=$(python3 "$IMAGE_ORACLE" badge-center --shot "$marker") \
+        || fail "no Beads badge mark in the titlebar band"
+    read -r x y <<<"$center"
     xdotool mousemove --sync --window "$WID" "$x" "$y"
 }
 
@@ -334,9 +324,15 @@ RECOLLAPSE_DIFF=${RECOLLAPSE_DIFF%%.*}
 panel_move 78 49
 sleep 0.2
 import -window "$WID" /output/beads-detail-id-hover.png
+# Diff the panel alone, like the expand and recollapse checks above: the status
+# bar's live CPU and memory graphs tick between any two window captures, and
+# counted against this budget they failed a hover that touched only the id.
 ID_HOVER_DIFF=$(compare -metric AE \
-    /output/beads-detail-comment-clamped.png \
-    /output/beads-detail-id-hover.png null: 2>&1 || true)
+    \( /output/beads-detail-comment-clamped.png \
+        -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage \) \
+    \( /output/beads-detail-id-hover.png \
+        -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage \) \
+    null: 2>&1 || true)
 ID_HOVER_DIFF=${ID_HOVER_DIFF%%.*}
 [ "${ID_HOVER_DIFF:-0}" -ge 10 ] \
     || fail "id hover changed only ${ID_HOVER_DIFF:-0}px"

@@ -20,6 +20,7 @@ use crate::beads_flow::{
 };
 use crate::beads_panel::{BeadsPanels, snapshot_card};
 use crate::button::stop_activation_key;
+use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::layout::Rect;
 use crate::opacity::surface;
 use crate::restore_replay::round_positive_f32_to_u16;
@@ -2181,7 +2182,7 @@ impl Render for BeadsCardTooltip {
                     .bg(alpha(self.colors.ground, 1.0))
                     .border_1()
                     .border_color(alpha(self.colors.title, 0.28))
-                    .font_family("monospace")
+                    // A title is prose, so it keeps the card title's UI face.
                     .text_size(self.text_size)
                     .text_color(self.colors.title)
                     .child(self.title.clone()),
@@ -2917,7 +2918,7 @@ fn lane_head(lane: &QueueLane<'_>, state_color: Rgba, ctx: LaneCtx<'_>) -> AnyEl
         .child(
             div()
                 .flex_none()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(px(11.0))
                 .line_height(px(beads_board_a2::HEAD_H))
                 .font_weight(FontWeight(600.0))
@@ -3131,7 +3132,7 @@ fn void_copy(void: &VoidCopy, colors: &BeadsBoardColors, metrics: Metrics) -> An
         )
         .children(void.subordinate.as_deref().map(|subordinate| {
             div()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(metrics.at(9.5))
                 .line_height(metrics.at(15.0))
                 .font_weight(FontWeight(500.0))
@@ -3215,7 +3216,7 @@ fn collapsed_tab(
             .h(px(beads_board_a2::HEAD_H))
             .flex()
             .items_center()
-            .font_family("monospace")
+            .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(11.0))
             .text_color(count_color)
             .child(lane.total.to_string()),
@@ -3514,7 +3515,7 @@ fn drawer_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColor
         .child(
             div()
                 .flex_none()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(px(11.0))
                 .line_height(px(beads_board_a2::HEAD_H))
                 .font_weight(FontWeight(600.0))
@@ -3535,7 +3536,7 @@ fn drawer_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColor
             div()
                 .ml_auto()
                 .flex_none()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(px(9.5))
                 .line_height(px(beads_board_a2::HEAD_H))
                 .font_weight(FontWeight(500.0))
@@ -3820,7 +3821,7 @@ fn row_title_line(
             div()
                 .flex_none()
                 .w(metrics.at(beads_board_a2::ROW_PRIORITY_W))
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(metrics.at(9.5))
                 .line_height(metrics.at(beads_board_a2::ROW_TITLE_H))
                 .font_weight(FontWeight(700.0))
@@ -3865,7 +3866,7 @@ fn row_sub_line(row: &RowView<'_>, now_epoch_s: i64, card: CardContext<'_>) -> A
                 },
                 div()
                     .flex_none()
-                    .font_family("monospace")
+                    .font_family(TERMINAL_FONT_FAMILY)
                     .text_size(metrics.at(9.5))
                     .line_height(metrics.at(beads_board_a2::ROW_SUB_H))
                     .font_weight(FontWeight(500.0))
@@ -3876,7 +3877,7 @@ fn row_sub_line(row: &RowView<'_>, now_epoch_s: i64, card: CardContext<'_>) -> A
         .child(
             div()
                 .flex_none()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(metrics.at(9.5))
                 .line_height(metrics.at(beads_board_a2::ROW_SUB_H))
                 .font_weight(FontWeight(500.0))
@@ -3947,7 +3948,7 @@ fn drag_ghost_meta(
         .child(
             div()
                 .flex_none()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .text_size(metrics.at(9.0))
                 .line_height(metrics.at(12.0))
                 .font_weight(FontWeight(500.0))
@@ -5133,6 +5134,22 @@ mod tests {
         let hottest = vividness(colors.priorities[0]);
         let below = vividness(colors.priorities[1]);
         assert!(hottest > below, "P0 reads at {hottest:.2} saturation against P1 at {below:.2}");
+    }
+
+    /// GPUI's cosmic-text backend matches family names literally and has no
+    /// generic `monospace`, so asking for one silently paints the UI sans.
+    /// Every Beads surface names the embedded data face instead.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Beads data face]]
+    #[test]
+    fn beads_surfaces_never_request_the_nonexistent_generic_monospace() {
+        let generic = format!("font_family(\"{}\")", "monospace");
+        for (file, source) in [
+            ("beads_board.rs", include_str!("beads_board.rs")),
+            ("beads_panel.rs", include_str!("beads_panel.rs")),
+            ("beads_flow.rs", include_str!("beads_flow.rs")),
+        ] {
+            assert!(!source.contains(&generic), "{file} asks GPUI for a generic monospace family");
+        }
     }
 
     /// A theme whose muted slot and ANSI red sit close to its background must

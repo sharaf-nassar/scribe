@@ -152,6 +152,59 @@ def widest_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def saturated(pixel: tuple[int, int, int]) -> bool:
+    high, low = max(pixel), min(pixel)
+    return high > 90 and high - low > 0.35 * high
+
+
+def badge_center(args: argparse.Namespace) -> int:
+    """Print the centre of the titlebar's Beads mark.
+
+    The mark wears its workspace's name-hashed palette accent, and so do the
+    active tab's top edge and the pane ring, so no colour names it. Its shape
+    does: drop every titlebar row a long saturated run crosses, then take the
+    largest remaining cluster that fits a badge-sized box. The minimum size
+    rejects the ring's one-pixel vertical edges however far they run.
+    """
+    image = Image(args.shot)
+    points: set[tuple[int, int]] = set()
+    for y in range(min(image.height, args.height)):
+        row = [x for x in range(image.width) if saturated(image.pixel(x, y))]
+        if len(row) <= args.max_row_run:
+            points.update((x, y) for x in row)
+    clusters: list[list[tuple[int, int]]] = []
+    unseen = set(points)
+    while unseen:
+        frontier = [unseen.pop()]
+        cluster = []
+        while frontier:
+            x, y = frontier.pop()
+            cluster.append((x, y))
+            near = {
+                (x + dx, y + dy)
+                for dx in range(-3, 4)
+                for dy in range(-3, 4)
+                if (x + dx, y + dy) in unseen
+            }
+            unseen -= near
+            frontier.extend(near)
+        clusters.append(cluster)
+    def fits(cluster: list[tuple[int, int]]) -> bool:
+        width = max(x for x, _ in cluster) - min(x for x, _ in cluster) + 1
+        height = max(y for _, y in cluster) - min(y for _, y in cluster) + 1
+        return all(args.min_size <= side <= args.max_size for side in (width, height))
+
+    badges = [cluster for cluster in clusters if fits(cluster)]
+    if not badges:
+        print("no badge-sized saturated mark in the titlebar band", file=sys.stderr)
+        return 1
+    badge = max(badges, key=len)
+    xs = [x for x, _ in badge]
+    ys = [y for _, y in badge]
+    print((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2)
+    return 0
+
+
 def contract_env(args: argparse.Namespace) -> int:
     data = contract(args.contract)
     for section in ("a2", "a3"):
@@ -183,6 +236,14 @@ def parser() -> argparse.ArgumentParser:
     widest.add_argument("--height", type=int, default=1)
     widest.add_argument("--min-width", type=int, default=1)
     widest.set_defaults(func=widest_run)
+
+    badge = sub.add_parser("badge-center", help="centre of the titlebar's Beads mark")
+    badge.add_argument("--shot", required=True)
+    badge.add_argument("--height", type=int, default=80)
+    badge.add_argument("--max-row-run", type=int, default=40)
+    badge.add_argument("--min-size", type=int, default=6)
+    badge.add_argument("--max-size", type=int, default=32)
+    badge.set_defaults(func=badge_center)
 
     env = sub.add_parser("contract-env", help="emit contract fields as shell assignments")
     env.add_argument("contract")

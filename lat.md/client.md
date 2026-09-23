@@ -1933,8 +1933,10 @@ palette's body-text contrast solver before they paint on the card surface.
 The identity ID calls
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#copy_issue_id]] and parks
 its full, unshortened value for the window's take-once clipboard drain. Hover
-reveals the copy glyph without moving the row. Each dependent on the UNBLOCKS
-line calls
+reveals the copy glyph without moving the row: the codicon `copy` mark from the
+embedded icon face, since the `⧉` it replaced is in neither embedded face and
+only painted where some system font happened to cover it. Each dependent on
+the UNBLOCKS line calls
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#navigate_to_dependent]].
 The source panel remains while the fresh request is in flight; only its
 matching reply swaps the card head, body, and queue lane.
@@ -1970,6 +1972,15 @@ The palette is rebuilt from both a theme edit and an opacity edit, since those
 arrive as separate reload plans. Opacity reaches the strip's own alpha and
 stops there, so a translucent board never bleeds its words into the desktop
 behind the window.
+
+The mocks' `--mono` roles (ids, priorities, counts, ages, the drawer's pin
+hint, the panel's verbs and labels, and Flow's tally, ruler, chips, and agent
+line) name JetBrains Mono through `fonts::TERMINAL_FONT_FAMILY`, the face the
+client embeds. GPUI's cosmic-text backend matches family names literally and
+has no generic `monospace`, so requesting one silently painted the UI sans
+(scribe-xdhm). Prose keeps the UI face: the hover tooltip that reveals a card's
+full title and the panel's issue type, which the card-detail mock sets as a
+plain word beside the monospace id and labels.
 
 The same palette carries the Flow view's slots — wires and their traced and
 dimmed states, the band, the progress track, the opened node's fill and

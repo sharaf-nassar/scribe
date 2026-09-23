@@ -25,6 +25,7 @@ use crate::beads_board_a2::{
 use crate::{
     beads_board::{BeadsBoardColors, alpha, short_id},
     button::stop_activation_key,
+    fonts::TERMINAL_FONT_FAMILY,
 };
 
 fn scalar(value: usize) -> f32 {
@@ -1296,7 +1297,7 @@ fn tally(graph: &BeadsEpicGraph, colors: &BeadsBoardColors, text_scale: f32) -> 
         .flex_none()
         .flex()
         .items_baseline()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .text_color(colors.title)
         .child(
             div()
@@ -1334,7 +1335,7 @@ fn progress_bar(done_width: f32, colors: &BeadsBoardColors) -> AnyElement {
 fn opened_tag(cursor_issue_id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
     div()
         .flex_none()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.muted)
@@ -1400,7 +1401,7 @@ fn rank_ruler(
                 .absolute()
                 .left(px(label.x - scroll_x))
                 .top_0()
-                .font_family("monospace")
+                .font_family(TERMINAL_FONT_FAMILY)
                 .font_weight(gpui::FontWeight(500.0))
                 .text_size(px(9.5 * text_scale))
                 .text_color(colors.rank_label)
@@ -1478,7 +1479,7 @@ fn trace_chip(chip: &FlowChip, colors: &BeadsBoardColors, text_scale: f32) -> An
         .bg(colors.chip)
         .border_1()
         .border_color(colors.chip_border)
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.queue_name)
@@ -1606,7 +1607,7 @@ fn agent_line(agent: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyEle
         .flex()
         .items_center()
         .gap(px(5.0 * text_scale))
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.agent)
@@ -1622,7 +1623,7 @@ fn priority_text(priority: u8, colors: &BeadsBoardColors, text_scale: f32) -> An
         colors.priorities.get(usize::from(priority.min(4))).copied().unwrap_or(colors.muted);
     div()
         .flex_none()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .font_weight(gpui::FontWeight(700.0))
         .text_size(px(9.5 * text_scale))
         .text_color(color)
@@ -1669,7 +1670,7 @@ fn node_title(
 fn node_id(id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
     div()
         .flex_none()
-        .font_family("monospace")
+        .font_family(TERMINAL_FONT_FAMILY)
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.muted)
