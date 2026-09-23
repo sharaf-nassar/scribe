@@ -2981,7 +2981,9 @@ The settings regression opens the selector, applies a keyboard preset and a poin
 
 #### Preset preview and filter
 
-Typing Dracula narrows the open preset menu to a row whose ten painted chips match the built-in background, foreground, and ANSI 0-7 colors.
+Typing Dracula narrows the open preset menu to a row whose preview tile is Dracula's own: a 112x22 line of terminal in its ground, ending in a 5x11 block cursor in its foreground.
+
+The locator searches the whole capture, and each call is checked where it runs, because `read` succeeds on an empty here-string and once let a missing row pass as found.
 
 #### Held preset press stays inside the menu
 
@@ -2989,7 +2991,9 @@ A Dracula pointer press held across a frame keeps the deferred menu open, leaves
 
 #### Keyboard apply persists once
 
-Enter opens Preset, Down highlights the filtered Dracula row, and Enter applies it without pointer selection, writes `appearance.theme`, paints selected chrome, and emits one client hot-reload line.
+Enter opens Preset, Down highlights the filtered Dracula row, and Enter applies it without pointer selection, writes `appearance.theme`, and emits one client hot-reload line.
+
+Reopening the menu must paint that row's label and check mark in the live accent `#6e8bff`, counted across the row's band against the unselected row beneath it. A closed-menu baseline would also count the Preset button's focus ring, which the open menu covers.
 
 #### Derived swatch keeps its trigger visible
 

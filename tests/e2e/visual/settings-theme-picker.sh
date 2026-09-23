@@ -9,6 +9,11 @@ SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
 RELOAD_PATTERN="config hot-reloaded"
 FILTER_CHANGE_MIN="${FILTER_CHANGE_MIN:-500}"
+# The settings window's one accent, spent only on live state: focus, capture,
+# and the selected menu option (DESIGN.md, The One-Accent Rule).
+LIVE_ACCENT='#6e8bff'
+# `CHOICE_OPTION_HEIGHT`: the next menu row's centre sits this far below.
+CHOICE_ROW_PITCH=30
 
 WIN=""
 WIN_X=0
@@ -169,41 +174,84 @@ raise SystemExit(1)
 PY
 }
 
-find_dracula_strip() {
+# Find the Dracula preset row by its preview tile (`theme_preview_strip`): a
+# 112x22 line of terminal in the preset's own ground, ending in a 5x11 block
+# cursor in its own foreground. No other preset pairs that ground with that
+# foreground (dotgov comes closest, 13 levels off). The page's own preview
+# shares both colours while it shows Dracula, so a match must also be an
+# island of ground the size of a tile. Searches the whole capture, since the
+# menu's anchor follows the settings layout, and prints the tile's centre in
+# window coordinates.
+find_dracula_row() {
     python3 - "$1" <<'PY'
-import re
 import subprocess
 import sys
 
-expected = [
-    (0x28, 0x2A, 0x36), (0xF8, 0xF8, 0xF2),
-    (0x21, 0x22, 0x2C), (0xFF, 0x55, 0x55),
-    (0x50, 0xFA, 0x7B), (0xF1, 0xFA, 0x8C),
-    (0xBD, 0x93, 0xF9), (0xFF, 0x79, 0xC6),
-    (0x8B, 0xE9, 0xFD), (0xF8, 0xF8, 0xF2),
-]
-text = subprocess.check_output(
-    ["convert", sys.argv[1], "-crop", "300x460+720+100", "+repage", "txt:-"],
-    text=True,
-)
-pixels = {}
-for line in text.splitlines():
-    match = re.match(r"(\d+),(\d+): \((\d+),(\d+),(\d+)", line)
-    if match:
-        px, py, red, green, blue = map(int, match.groups())
-        pixels[px, py] = red, green, blue
+png = sys.argv[1]
+width, height = map(int, subprocess.check_output(
+    ["identify", "-format", "%w %h", png], text=True).split())
+data = subprocess.check_output(["convert", png, "rgb:-"])
 
-for py in range(460):
-    for px in range(300 - 79):
-        actual = [pixels.get((px + index * 8, py)) for index in range(10)]
-        if all(
-            color is not None
-            and max(abs(channel - wanted) for channel, wanted in zip(color, target)) <= 5
-            for color, target in zip(actual, expected)
-        ):
-            print(px + 720, py + 100)
+GROUND, FOREGROUND = (0x28, 0x2A, 0x36), (0xF8, 0xF8, 0xF2)
+TILE_W, TILE_H, CURSOR_W, CURSOR_H = 112, 22, 5, 11
+
+def near(x, y, target):
+    if not (0 <= x < width and 0 <= y < height):
+        return False
+    offset = 3 * (y * width + x)
+    return max(abs(a - b) for a, b in zip(data[offset:offset + 3], target)) <= 3
+
+def ground(x, y):
+    return near(x, y, GROUND)
+
+def column_span(x, row):
+    """The run of ground through `row` in column `x`, as (top, bottom)."""
+    top = row
+    while ground(x, top - 1):
+        top -= 1
+    bottom = row
+    while ground(x, bottom + 1):
+        bottom += 1
+    return top, bottom
+
+def islanded(left, top, bottom):
+    """No ground two rows above or below: a menu row's own ground frames it."""
+    return not any(
+        ground(x, top - 2) or ground(x, bottom + 2)
+        for x in range(left + 4, left + TILE_W - 4)
+    )
+
+def has_cursor(left, top, bottom):
+    return any(
+        all(near(x + dx, y + dy, FOREGROUND) for dx in range(CURSOR_W) for dy in range(CURSOR_H))
+        for y in range(top, bottom + 1)
+        for x in range(left, left + TILE_W)
+    )
+
+# Remember tried tiles by (left, top). The left edge alone is no key: stacked
+# menu rows' tiles share it, so one rejected tile would hide the rows below.
+tried = set()
+for y in range(height):
+    x = 0
+    while x < width:
+        if not ground(x, y):
+            x += 1
+            continue
+        left = x
+        while x < width and ground(x, y):
+            x += 1
+        if abs((x - left) - TILE_W) > 2:
+            continue
+        # Column left+3 clears the 3px corner and stays in the 6px padding no
+        # glyph reaches, so its run of ground is the tile's full height.
+        top, bottom = column_span(left + 3, y)
+        if (left, top) in tried or abs((bottom - top + 1) - TILE_H) > 2:
+            continue
+        tried.add((left, top))
+        if islanded(left, top, bottom) and has_cursor(left, top, bottom):
+            print(left + TILE_W // 2, top + TILE_H // 2)
             raise SystemExit(0)
-raise SystemExit("Dracula preview strip pixels were not found")
+raise SystemExit("no Dracula preview tile in the capture")
 PY
 }
 
@@ -310,9 +358,11 @@ FILTER_CHANGED=$(changed_pixels \
     /output/theme-picker-01-menu.png /output/theme-picker-02-filtered.png)
 [ "$FILTER_CHANGED" -ge "$FILTER_CHANGE_MIN" ] \
     || fail "PHASE 1 FAIL: filtering repainted $FILTER_CHANGED px (min $FILTER_CHANGE_MIN)"
-read -r DRACULA_X DRACULA_Y <<<"$(find_dracula_strip \
-    /output/theme-picker-02-filtered.png)" \
-    || fail "PHASE 1 FAIL: filtered Dracula row has no known preview strip"
+# `read` succeeds on an empty here-string, so every finder below is checked
+# where it runs rather than through the read that splits its output.
+DRACULA_ROW=$(find_dracula_row /output/theme-picker-02-filtered.png) \
+    || fail "PHASE 1 FAIL: filtered Dracula row has no preview tile in its own colours"
+read -r DRACULA_X DRACULA_Y <<<"$DRACULA_ROW"
 echo "PHASE 1 PASS: preset menu narrowed to the pixel-verified Dracula row"
 
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Held preset press stays inside the menu]]
@@ -323,7 +373,7 @@ mouse_down_settings_at "$DRACULA_X" "$DRACULA_Y"
 sleep 0.2
 shot /output/theme-picker-03-held-dracula.png
 mouse_up_settings
-find_dracula_strip /output/theme-picker-03-held-dracula.png >/dev/null \
+find_dracula_row /output/theme-picker-03-held-dracula.png >/dev/null \
     || fail "PHASE 2 FAIL: Dracula mousedown dismissed the deferred menu"
 UNDERLAY_CHANGED=$(changed_region_pixels \
     /output/theme-picker-02-filtered.png /output/theme-picker-03-held-dracula.png \
@@ -369,12 +419,22 @@ RELOADS_AFTER=$(count_reloads)
     || fail "PHASE 3 FAIL: preset apply produced $(( RELOADS_AFTER - RELOADS_BEFORE )) hot reloads, expected 1"
 assert_preset dracula || fail "PHASE 3 FAIL: Dracula was not saved to appearance.theme"
 shot /output/theme-picker-05-applied.png
-AMBER_CLOSED=$(color_count /output/theme-picker-05-applied.png '#f5b83a' 720 100 300 460)
 send_keys Return
 shot /output/theme-picker-06-selected.png
-AMBER_OPEN=$(color_count /output/theme-picker-06-selected.png '#f5b83a' 720 100 300 460)
-[ "$AMBER_OPEN" -gt "$(( AMBER_CLOSED + 10 ))" ] \
-    || fail "PHASE 3 FAIL: selected menu chrome added only $(( AMBER_OPEN - AMBER_CLOSED )) amber px"
+# The selected option's label and check mark wear the live accent, which the
+# settings window spends on nothing else in a menu row. Measure that row's
+# band against the unselected row beneath it in the same capture. A baseline
+# taken with the menu closed would count the Preset button's focus ring, which
+# the open menu covers.
+SELECTED_ROW=$(find_dracula_row /output/theme-picker-06-selected.png) \
+    || fail "PHASE 3 FAIL: the reopened preset menu shows no Dracula row"
+read -r _ SELECTED_Y <<<"$SELECTED_ROW"
+ACCENT_SELECTED=$(color_count /output/theme-picker-06-selected.png "$LIVE_ACCENT" \
+    0 "$(( SELECTED_Y - 11 ))" "$WIN_W" 22)
+ACCENT_NEIGHBOUR=$(color_count /output/theme-picker-06-selected.png "$LIVE_ACCENT" \
+    0 "$(( SELECTED_Y + CHOICE_ROW_PITCH - 11 ))" "$WIN_W" 22)
+[ "$ACCENT_SELECTED" -gt "$(( ACCENT_NEIGHBOUR + 10 ))" ] \
+    || fail "PHASE 3 FAIL: the selected Dracula row carries only $(( ACCENT_SELECTED - ACCENT_NEIGHBOUR )) more accent px than the row beneath it"
 send_keys Escape
 echo "PHASE 3 PASS: keyboard applied Dracula, saved TOML, painted selected chrome, and hot-reloaded once"
 
@@ -384,9 +444,10 @@ echo "PHASE 3 PASS: keyboard applied Dracula, saved TOML, painted selected chrom
 send_keys ctrl+k
 type_text "First Row"
 shot /output/theme-picker-07-derived-swatch.png
-read -r SWATCH_X SWATCH_Y <<<"$(find_solid_color \
-    /output/theme-picker-07-derived-swatch.png '#232531' 650 100 350 500)" \
+SWATCH=$(find_solid_color \
+    /output/theme-picker-07-derived-swatch.png '#232531' 650 100 350 500) \
     || fail "PHASE 4 FAIL: unset First Row swatch is not Dracula-derived #232531"
+read -r SWATCH_X SWATCH_Y <<<"$SWATCH"
 click_settings_at "$SWATCH_X" "$SWATCH_Y"
 shot /output/theme-picker-08-color-menu.png
 VISIBLE_SWATCH=$(color_count /output/theme-picker-08-color-menu.png '#232531' \
@@ -398,9 +459,10 @@ echo "PHASE 4 PASS: unset derived swatch is #232531 and its trigger remains visi
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Held color preset persists once]]
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Reset omits the override key]]
 # Phase 5: hold one color preset through a frame, then close and reset it.
-read -r RED_X RED_Y <<<"$(find_solid_color \
-    /output/theme-picker-08-color-menu.png '#ef4444' 650 100 350 500)" \
+RED=$(find_solid_color \
+    /output/theme-picker-08-color-menu.png '#ef4444' 650 100 350 500) \
     || fail "PHASE 5 FAIL: red color preset was not visible"
+read -r RED_X RED_Y <<<"$RED"
 RELOADS_BEFORE=$(count_reloads)
 mouse_down_settings_at "$RED_X" "$RED_Y"
 sleep 0.2
