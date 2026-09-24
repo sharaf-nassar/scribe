@@ -138,7 +138,9 @@ Acceptance criteria:
   `bd` output or JSON; a failure names the action that failed and bd's
   reason as a sentence. A toast under the pointer stays up, for at most 30
   seconds, and lingers two seconds after the pointer leaves; the Undo it
-  carries still lapses at its exact five-second deadline.
+  carries still lapses at its exact five-second deadline. A toast stacks
+  above an open detail panel: where a narrow section puts it over the
+  panel's corner, it keeps its slot and takes every press there.
 - A nonblank comment queues `AddComment` and leaves the current thread intact.
   Only the matching uncached detail reply adds the persisted row.
 - Every panel write copies current detail status and assignee into optional

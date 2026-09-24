@@ -2019,6 +2019,8 @@ impl gpui::Render for PanelLayer {
         };
         let mut layers =
             inputs.panel.as_ref().map_or_else(Vec::new, |panel| render(panel, &wiring));
+        // The toast paints after the panel, so where a narrow section puts it
+        // over the panel's corner it stacks on top and takes the press.
         layers.extend(inputs.notice.as_ref().and_then(|notice| render_notice(notice, &wiring)));
         // The overlay children position themselves absolutely in band
         // coordinates; the wrapper spans the band so those coordinates keep
@@ -2453,6 +2455,7 @@ fn panel_header(
                 .child(
                     div()
                         .id(SharedString::from(format!("beads-detail-close-{workspace_id}")))
+                        .debug_selector(|| "beads-detail-close".to_owned())
                         .role(Role::Button)
                         .aria_label("Close issue detail")
                         .flex_none()
@@ -5977,8 +5980,9 @@ mod panel_cache_tests {
         assert!(store.visible(left).is_some(), "dismissing one region dismissed the other");
     }
 
-    /// Paint `notice` as the only thing in the second of two regions, the way
-    /// the root mounts it, with `panels` holding the same toast as live state.
+    /// Paint `notice` in the second of two regions, over any panel `panels`
+    /// holds open there, the way the root mounts them, with `panels` holding
+    /// the same toast as live state.
     fn notice_probe(
         cx: &mut gpui::TestAppContext,
         panels: &Arc<Mutex<BeadsPanels>>,
@@ -6016,7 +6020,8 @@ mod panel_cache_tests {
         gpui::VisualTestContext::from_window(window.into(), cx)
     }
 
-    /// The probe window's root: one region's layer carrying only `notice`.
+    /// The probe window's root: one region's layer carrying `notice` and the
+    /// panel `panels` holds open there, if any.
     fn notice_probe_root(
         window: &mut Window,
         app: &mut App,
@@ -6026,8 +6031,9 @@ mod panel_cache_tests {
     ) -> Entity<CachedLayersProbe> {
         let editor = app.new(|editor_cx| BeadsEditor::new(Arc::clone(panels), window, editor_cx));
         let layer = region_layer(app, panels, &editor, workspace, REGION_WIDTH);
+        let panel = panels.lock().expect("probe store").visible(workspace).cloned();
         layer.update(app, |layer, _| {
-            layer.inputs.panel = None;
+            layer.inputs.panel = panel;
             layer.inputs.notice = Some(notice);
         });
         app.new(|_| CachedLayersProbe { layers: vec![layer] })
@@ -6128,6 +6134,50 @@ mod panel_cache_tests {
         assert!(
             panels.lock().expect("probe store").active_notice(workspace).is_none(),
             "the close mark took the toast down"
+        );
+    }
+
+    /// A toast that lands on an open panel's corner stays on top of it. This
+    /// section is narrow enough that the toast's close mark sits over the
+    /// panel's own, so one press there shows which layer takes the pointer.
+    /// It must be the toast: otherwise dismissing a notice would close the
+    /// issue the reader was looking at.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Beads notice toast placement]]
+    #[gpui::test]
+    fn a_toast_over_an_open_panel_takes_the_press(cx: &mut gpui::TestAppContext) {
+        let workspace = WorkspaceId::new();
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        {
+            let mut store = panels.lock().expect("probe store");
+            store.set_enabled(true);
+            store.open(workspace, panel().card, panel().lane);
+        }
+        let failed = PanelNotice::at(
+            NoticeTone::Error,
+            "Couldn’t save the title",
+            std::time::Instant::now(),
+        )
+        .saying("Forced nonzero write.");
+        let mut test_window = notice_probe(cx, &panels, workspace, failed);
+
+        let dismiss =
+            test_window.debug_bounds("beads-notice-dismiss").expect("every toast can be closed");
+        let covered = test_window
+            .debug_bounds("beads-detail-close")
+            .expect("the open panel painted its close mark");
+        assert!(
+            dismiss.contains(&covered.center()),
+            "the toast's close mark {dismiss:?} no longer sits over the panel's {covered:?}"
+        );
+        test_window.simulate_click(covered.center(), gpui::Modifiers::default());
+        let store = panels.lock().expect("probe store");
+        assert!(
+            store.visible(workspace).is_some(),
+            "the press went through the toast and closed the panel beneath it"
+        );
+        assert!(
+            store.active_notice(workspace).is_none(),
+            "the toast on top of the panel never took the press"
         );
     }
 

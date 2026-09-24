@@ -5060,7 +5060,12 @@ the toast, and the close mark must centre one border and the right padding
 inside it, both on the headline's line box: those are the offsets the
 functional E2E clicks from, so the probe is what keeps those coordinates
 honest. Clicking Undo must queue guarded `UndoClose` carrying the issue's
-title, and clicking the close mark must take a live toast down. A plain unit
+title, and clicking the close mark must take a live toast down. A third probe
+opens a panel under the toast in the same 504px section, where both sit 12px
+inside its right edge and the toast's close mark lands on the panel's. One
+press there must take the toast down and leave the panel open: the toast
+stacks above the panel, so dismissing a notice never closes the issue under
+it. A plain unit
 test beside it pins
 [[crates/scribe-client/src/beads_panel.rs#notice_slot]]'s text-scale growth,
 region clamp, and the no-room cases. The design is

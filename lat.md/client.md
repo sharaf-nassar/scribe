@@ -1425,9 +1425,17 @@ idle window takes a toast down on time rather than at its next unrelated
 frame. The toast occludes what it covers and swallows its press and the
 matching release (scribe-uu2y), except while a card is lifted: that release
 belongs to [[crates/scribe-client/src/main.rs#TerminalView#release_board]].
-It may overlap an open panel's corner in a narrow region; its close mark or
-Esc clears it. [[test#Test Harness#GPUI Client Headless Suites#Beads notice toast placement]]
-measures the corner, the controls, and both clicks.
+A toast that lands while a panel is open keeps its slot rather than dodging
+the panel. In a region narrower than 1264px at text scale 1.0 the centred
+panel reaches under it, so the toast covers the panel's top-right corner,
+and in narrower regions the panel's close mark too. It stacks above the
+panel there:
+[[crates/scribe-client/src/beads_panel.rs#PanelLayer]] paints it after the
+panel in the same layer, so its occlusion keeps every press on the toast.
+Its own close mark clears it, and Esc clears it along with the panel.
+[[test#Test Harness#GPUI Client Headless Suites#Beads notice toast placement]]
+measures the corner, the controls, both clicks, and a press on the covered
+close mark.
 
 ### Cached strip painting
 
