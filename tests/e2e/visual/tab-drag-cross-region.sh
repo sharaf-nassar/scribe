@@ -127,7 +127,10 @@ xdotool mousedown 1
 xdotool mousemove_relative --sync -- 3 0
 xdotool mousemove --sync "$((WIN_X + $(tab_center 0 "$LOWER_WIDTH" "$LOWER_COUNT")))" "$((WIN_Y + LOWER_Y))"
 sleep 0.2
-send_keys Escape
+# Not send_keys: its --clearmodifiers releases the held button before the key,
+# which drops the tab on the lower bar instead of cancelling the drag.
+xdotool key Escape
+sleep 0.3
 xdotool mouseup 1
 sleep 0.5
 [ "$(oracle count MoveWorkspace)" -eq 0 ] || fail "Escape committed a tab-subtree move"

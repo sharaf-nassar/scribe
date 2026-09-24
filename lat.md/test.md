@@ -3462,7 +3462,7 @@ Phase 0 opens three tabs. Phase 1 drags the first onto the third slot and requir
 
 Layout chords dispatch from the pane's focus handle, so the script clicks back into the grid before the split: the drag it just performed leaves GPUI focus on a titlebar tab, where a chord never reaches the layout path.
 
-Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. `tests/e2e/visual/tab-drag-cross-region.sh` now owns the atomic lower-bar→titlebar pointer route: it cancels a live gesture with Escape, then moves one retained tab subtree and requires the correlated `MoveTab`, one same-window full refresh, and no replacement `SessionCreated`.
+Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. `tests/e2e/visual/tab-drag-cross-region.sh` now owns the atomic lower-bar→titlebar pointer route: it cancels a live gesture with Escape, then moves one retained tab subtree and requires the correlated `MoveTab`, one same-window full refresh, and no replacement `SessionCreated`. The cancel holds a titlebar tab over the lower bar, where a release commits a `MoveTab`, and sends Escape with the button still down. `--clearmodifiers` would release the button first and commit that drop before the key arrived.
 
 ### Warm multi-window restore drives the real client
 

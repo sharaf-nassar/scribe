@@ -131,7 +131,9 @@ for pass in 1 2; do
 done
 
 # Escape cancels: zero protocol frames, zero tree change, ghost snaps back.
-xdotool key --clearmodifiers Escape
+# Not --clearmodifiers: it releases the held button before the key, which
+# drops the pill instead of cancelling the drag.
+xdotool key Escape
 sleep 0.5
 xdotool mouseup 1
 sleep 1.0
