@@ -5928,8 +5928,15 @@ The moved session is focused by UUID before each palette action, avoiding
 wrapped directional focus selecting the wrong region. Each return must produce
 a matching client `ReportWorkspaceTree`, not merely a successful server result
 or `SessionList`, proving the receiving UI adopted it.
-The script also holds sibling previews through Escape and blur, requiring no
-`MoveWorkspace` on either cancellation.
+The script also holds a sibling preview over the centre of the target's left
+region through Escape and blur, requiring neither a `MoveWorkspace` nor a
+`TransferWorkspace` on either cancellation. The window's own centre is the
+divider between the target's two regions, where no sibling resolves and the
+drag arms a tear-out instead. Escape goes out without `--clearmodifiers`,
+which releases a held button before the key and so drops the workspace rather
+than cancelling the drag. Each split wait and wire lookup is checked where it
+runs, before `read` splits its output: `read` succeeds on an empty
+here-string, so a guard placed after it could never fire.
 
 Wayland proof is palette-only: launch two windows under nested Mutter, use the
 same palette edge and swap rows, confirm both `WorkspaceMoveResult::Moved`

@@ -91,13 +91,25 @@ PY
 }
 
 assert_move() {
-    local want_source=$1 operation=$2 source target
-    read -r source target <<<"$(last_move)" || fail "no workspace move reached the wire"
+    local want_source=$1 operation=$2 move source target
+    # Check the capture, not the read: `read` succeeds on an empty here-string,
+    # so a `|| fail` after it can never fire.
+    move=$(last_move) || fail "no workspace move reached the wire"
+    read -r source target <<<"$move"
     [ "$want_source" = "-" ] || [ "$source" = "$want_source" ] \
         || fail "move source $source did not match focused workspace $want_source"
     oracle assert-workspace-move "$source" "$target" "$operation" \
         >"/output/workspace-cross-$operation.json" \
         || fail "$operation move lacked atomic refresh/result/no-create evidence"
+}
+
+# A cancelled drag must leave its workspace where it was: no move into the
+# sibling, and no tear-out into a new window either.
+assert_no_departure() {
+    [ "$(oracle count MoveWorkspace)" -eq 0 ] \
+        || fail "$1 committed a cross-window move"
+    [ "$(oracle count TransferWorkspace)" -eq 0 ] \
+        || fail "$1 tore the held workspace out into a new window"
 }
 
 drag_hold_to_target() {
@@ -133,7 +145,8 @@ done
 focus_window "$SOURCE_WID"
 oracle wait-leaves 1 1 >/dev/null || fail "initial workspace never became live"
 send_keys ctrl+alt+backslash
-read -r SOURCE_A SOURCE_B <<<"$(oracle wait-leaves 2 1)" || fail "source split never became live"
+LEAVES=$(oracle wait-leaves 2 1) || fail "source split never became live"
+read -r _ SOURCE_B <<<"$LEAVES"
 ORIGINAL_TREE=/output/workspace-round-trip-original.json
 oracle wait-report >"$ORIGINAL_TREE" || fail "original source layout was never reported"
 SOURCE_B_SESSION=$(oracle leaf "$SOURCE_B" | python3 -c 'import json, sys; print(json.load(sys.stdin)["session_ids"][0])')
@@ -204,38 +217,44 @@ done
 # before exercising the palette's swap row.
 focus_window "$SOURCE_WID"
 send_keys ctrl+alt+backslash
-read -r SOURCE_A SOURCE_SWAP <<<"$(oracle wait-leaves 2 1)" || fail "source split for palette swap never became live"
+LEAVES=$(oracle wait-leaves 2 1) || fail "source split for palette swap never became live"
+read -r _ SOURCE_SWAP <<<"$LEAVES"
 reset_record
 palette "Swap workspace with workspace"
 assert_move "$SOURCE_SWAP" swap
 echo "PHASE 2 PASS: palette centre swap reached the sibling window"
 
-# Rebuild a two-region source after the palette operations so pointer cancel,
+# Give the source a third region after the palette operations so pointer cancel,
 # blur, edge insertion, and centre swap all start with a non-sole source.
 focus_window "$SOURCE_WID"
 send_keys ctrl+alt+backslash
-read -r POINTER_A POINTER_B POINTER_C <<<"$(oracle wait-leaves 3 1)" || fail "source split for pointer path never became live"
+oracle wait-leaves 3 1 >/dev/null || fail "source split for pointer path never became live"
 remember_source_geometry
 remember_target_geometry
-TARGET_CENTER_X=$((T_X + T_W / 2))
 TARGET_CENTER_Y=$((T_Y + T_TOP + T_GRID_H / 2))
 
 # Escape and blur both clear cross-window previews before release. A committed
 # move here would be visible on the wire, so no frame is a stronger oracle than
-# a screenshot of a fading overlay.
+# a screenshot of a fading overlay. Hold over the centre of the target's left
+# region: the window's centre is the divider between its two regions, where no
+# sibling preview resolves and the drag arms a tear-out instead.
+PREVIEW_X=$((T_X + T_W / 4))
 reset_record
-drag_hold_to_target "$TARGET_CENTER_X" "$TARGET_CENTER_Y"
-send_keys Escape
+drag_hold_to_target "$PREVIEW_X" "$TARGET_CENTER_Y"
+# Not send_keys: its --clearmodifiers releases a held mouse button before the
+# key, which drops the workspace instead of cancelling the drag.
+xdotool key Escape
+sleep 0.3
 xdotool mouseup 1
 sleep 0.5
-[ "$(oracle count MoveWorkspace)" -eq 0 ] || fail "Escape committed a cross-window move"
+assert_no_departure "Escape"
 
 reset_record
-drag_hold_to_target "$TARGET_CENTER_X" "$TARGET_CENTER_Y"
+drag_hold_to_target "$PREVIEW_X" "$TARGET_CENTER_Y"
 xdotool windowactivate --sync "$TARGET_WID" 2>/dev/null || true
 xdotool mouseup 1
 sleep 0.5
-[ "$(oracle count MoveWorkspace)" -eq 0 ] || fail "blur committed a cross-window move"
+assert_no_departure "blur"
 echo "PHASE 3 PASS: Escape and blur clear sibling previews without a move"
 
 # X11 pointer edge insert. The destination geometry is measured from its own
@@ -246,12 +265,12 @@ drag_to_target "$((T_X + 18))" "$TARGET_CENTER_Y"
 assert_move - left
 echo "PHASE 4 PASS: measured X11 pointer edge insert reached the sibling"
 
-# The edge leaves one source region. Split it again, then centre-drop the new
-# region so the pointer path covers the same swap operation and shared wording
-# as the palette route.
+# The edge insert leaves two source regions. Split again, then centre-drop so
+# the pointer path covers the same swap operation and shared wording as the
+# palette route.
 focus_window "$SOURCE_WID"
 send_keys ctrl+alt+backslash
-read -r POINTER_AFTER_EDGE POINTER_NEXT POINTER_NEW <<<"$(oracle wait-leaves 3 1)" || fail "source split for pointer swap never became live"
+oracle wait-leaves 3 1 >/dev/null || fail "source split for pointer swap never became live"
 remember_source_geometry
 remember_target_geometry
 TARGET_CENTER_X=$((T_X + T_W / 2))
