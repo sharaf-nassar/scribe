@@ -169,9 +169,10 @@ use scribe_client::{
     },
     tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        StandaloneBadge, TAB_CARD_TOP_GAP, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TabDrag,
-        TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph,
-        badge_width_px, beads_graph_icon, workspace_pill_dot,
+        StandaloneBadge, TAB_CARD_TOP_GAP, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH,
+        TabActivationSource, TabDrag, TabDragGhost, TitlebarEvent, TitlebarView,
+        TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px, beads_graph_icon,
+        drag_placeholder, drop_marker, focus_mark, open_tab_edge, tab_card, workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -214,8 +215,8 @@ use crate::{
         write_or_tear,
     },
     pane_shell::{
-        BoardReservation, ClosedPane, PanePlacement, PaneShell, RegionGeometry, SnapshotSources,
-        WorkspaceInfo, WorkspaceInfoOutcome,
+        BoardReservation, ClosedPane, PANE_CARD_MARGIN, PanePlacement, PaneShell, RegionGeometry,
+        SnapshotSources, WorkspaceInfo, WorkspaceInfoOutcome,
     },
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::present_next_burst,
@@ -2386,17 +2387,8 @@ impl Focusable for TerminalView {
 /// Distinct from the titlebar's own marker so a region drag never wakes
 /// [`TitlebarView`]'s `on_drag_move`, and so its presence keeps mouse moves
 /// flowing to the region bar after the cursor leaves the band.
-struct RegionTabDrag;
-
-/// Invisible cursor-following overlay for a region tab drag. The tab itself
-/// slides inside the bar, so the overlay paints nothing.
-struct RegionTabDragGhost;
-
-impl Render for RegionTabDragGhost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
-    }
-}
+/// It carries the same cursor-following [`TabDragGhost`] the titlebar paints.
+struct RegionTabDrag(TabDragGhost);
 
 /// Which bar a region tab belongs to and where it sits in it.
 #[derive(Clone, Copy)]
@@ -6940,6 +6932,11 @@ impl TerminalView {
         // The report is deduplicated against the last one, so an idle switch
         // back and forth costs one frame's tree build and no traffic.
         self.report_workspace_tree(cx);
+        // The titlebar repaints its card on its own notify, but the bridge
+        // joining that card to the pane is painted by this view's grid; without
+        // a notify here the bridge stayed under the old tab until the next
+        // unrelated repaint, a frame or two of a card with no pane under it.
+        cx.notify();
     }
 
     /// The region and pane an unshown tab should be shown in.
@@ -8594,6 +8591,66 @@ impl TerminalView {
     /// region stacked below gets the legacy client's in-region bar here, at
     /// the top of its rect, above the panes [`PaneShell::placements`] already
     /// shrank to make room.
+    /// One [`tab_bridge`] per open tab whose pane card sits directly under its
+    /// bar: the titlebar's measured runs for top-row regions, the equal-share
+    /// slot for a lower region's own bar.
+    ///
+    /// A region with a CI band or a pinned board between bar and panes gets no
+    /// bridge, since its open tab opens onto that band instead. The bridge is
+    /// clipped to the card's straight top edge so it can never square off a
+    /// corner.
+    fn render_tab_bridges(&self, cx: &App) -> Vec<gpui::AnyElement> {
+        let viewport = self.pane_viewport();
+        if viewport.width <= 0.0 || viewport.height <= 0.0 {
+            return Vec::new();
+        }
+        let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
+        let fill = surface(self.terminal_colors.background, self.opacity);
+        let origin = self.workspace_drag_grid_origin();
+        // (workspace, bar bottom, left, width, edge), in grid pixels.
+        let mut runs: Vec<(WorkspaceId, f32, f32, f32, gpui::Rgba)> = Vec::new();
+        for (left, width, edge) in self.titlebar.read(cx).open_tab_runs() {
+            let left = left - origin.x;
+            let Some((workspace_id, _)) =
+                self.shell.workspace_rects(viewport, cx).into_iter().find(|(_, rect)| {
+                    rect.y <= f32::EPSILON && rect.x <= left && left < rect.x + rect.width
+                })
+            else {
+                continue;
+            };
+            runs.push((workspace_id, 0.0, left, width, edge));
+        }
+        let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        for (workspace_id, rect) in self.shell.region_bar_rects(viewport, self.tab_bar_height, cx) {
+            let Some(bar) =
+                self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id)
+            else {
+                continue;
+            };
+            let Some((index, (_, tab))) =
+                bar.tabs.iter().enumerate().find(|(_, (_, tab))| tab.is_active())
+            else {
+                continue;
+            };
+            let Some(edge) = open_tab_edge(tab, &colors) else { continue };
+            let badge = bar.badge.as_ref().map_or(0.0, badge_width_px);
+            let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, bar.tabs.len());
+            runs.push((
+                workspace_id,
+                rect.y + rect.height,
+                run_left + px_units(index) * slot,
+                slot,
+                edge,
+            ));
+        }
+        runs.into_iter()
+            .filter_map(|(workspace_id, bar_bottom, left, width, edge)| {
+                let bridge = tab_bridge_rect(&placements, workspace_id, bar_bottom, left, width)?;
+                Some(tab_bridge(&bridge, fill, edge))
+            })
+            .collect()
+    }
+
     fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let bar_rects = self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx);
         if bar_rects.is_empty() {
@@ -9457,9 +9514,7 @@ impl TerminalView {
         if tab_count == 0 {
             return 0;
         }
-        let tabs_left = bar_left + badge_width.min(bar_width.max(0.0));
-        let tab_span = (bar_width - badge_width).max(0.0);
-        let slot_width = tab_span / px_units(tab_count);
+        let (tabs_left, slot_width) = tab_run_slots(bar_left, bar_width, badge_width, tab_count);
         if slot_width <= 0.0 {
             return tab_count;
         }
@@ -9577,6 +9632,75 @@ impl TerminalView {
         None
     }
 
+    /// The insertion mark on the bar a tab from another section is aimed at.
+    ///
+    /// Window coordinates: the mark is a root child, drawn with the drag
+    /// layers so it sits over both bars without either bar knowing about the
+    /// other's drag. Its x is the slot boundary `tab_bar_insertion_index`
+    /// resolved, in the same equal-share geometry.
+    fn tab_subtree_drop_marker(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let target = self.tab_subtree_drag.as_ref()?.target?;
+        let origin = self.workspace_drag_grid_origin();
+        let viewport = self.pane_viewport();
+        let lower_bar = self
+            .shell
+            .region_bar_rects(viewport, self.tab_bar_height, cx)
+            .into_iter()
+            .find(|(id, _)| *id == target.workspace_id);
+        let (rect, badge, count) = if let Some((_, rect)) = lower_bar {
+            let bar =
+                self.region_chrome.bars.iter().find(|bar| bar.workspace_id == target.workspace_id);
+            (
+                Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect },
+                bar.and_then(|bar| bar.badge.as_ref()).map_or(0.0, badge_width_px),
+                bar.map_or(0, |bar| bar.tabs.len()),
+            )
+        } else {
+            let rect = self.shell.workspace_rect(target.workspace_id, viewport, cx)?;
+            (
+                Rect {
+                    x: origin.x + rect.x,
+                    y: 0.0,
+                    width: rect.width,
+                    height: self.tab_bar_height,
+                },
+                self.titlebar_badge_width(target.workspace_id, cx),
+                self.rendered_tabs.region(target.workspace_id).map_or(0, WorkspaceTabs::len),
+            )
+        };
+        let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, count);
+        let x = run_left + px_units(target.index.min(count)) * slot;
+        // The theme accent, as the placeholder uses: an unnamed region's muted
+        // identity tone is too faint for a mark that has to read through the
+        // ghost.
+        let accent = TabBarColors::from_chrome(&self.chrome, self.opacity).accent;
+        // The whole receiving workspace lights up too: a drop anywhere over it
+        // lands, and the 3px slot mark alone is easy to miss with the ghost
+        // over a pane.
+        let region = self.shell.workspace_rect(target.workspace_id, viewport, cx)?;
+        let outline = div()
+            .absolute()
+            .left(px(origin.x + region.x))
+            .top(px(if region.y <= f32::EPSILON { 0.0 } else { origin.y + region.y }))
+            .w(px(region.width))
+            .h(px(region.height + if region.y <= f32::EPSILON { origin.y } else { 0.0 }))
+            .rounded(px(PANE_CARD_RADIUS))
+            .border_2()
+            .border_color(accent)
+            .bg(gpui::Rgba { a: 0.08, ..accent });
+        // Pinned to the window: the root is a flex column, and an unpositioned
+        // wrapper would lay out below the status bar, taking its absolutely
+        // placed children off-screen with it.
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(outline)
+                .child(drop_marker(x, rect.y, rect.height, accent))
+                .into_any_element(),
+        )
+    }
+
     fn tab_subtree_target_at(
         &self,
         point: Point<Pixels>,
@@ -9586,6 +9710,35 @@ impl TerminalView {
         let pointer = DragPoint { x: f32::from(point.x), y: f32::from(point.y) };
         self.top_tab_subtree_target(pointer, source_workspace, cx)
             .or_else(|| self.lower_tab_subtree_target(pointer, source_workspace, cx))
+            .or_else(|| self.region_body_tab_subtree_target(pointer, source_workspace, cx))
+    }
+
+    /// A tab released anywhere over another workspace's region (its panes,
+    /// boards, or bands) joins that workspace as its last tab.
+    ///
+    /// The bars are 36px tall, and a drag aimed at a workspace routinely ends a
+    /// few pixels into its panes, or straight onto them: that used to resolve
+    /// no target and the release silently did nothing.
+    fn region_body_tab_subtree_target(
+        &self,
+        pointer: DragPoint,
+        source_workspace: WorkspaceId,
+        cx: &App,
+    ) -> Option<TabSubtreeDropTarget> {
+        let local = self.workspace_drag_layout_point(pointer);
+        let (workspace_id, _) =
+            self.shell.workspace_rects(self.pane_viewport(), cx).into_iter().find(
+                |(_, rect)| {
+                    local.x >= rect.x
+                        && local.x <= rect.x + rect.width
+                        && local.y >= rect.y
+                        && local.y <= rect.y + rect.height
+                },
+            )?;
+        (workspace_id != source_workspace).then(|| TabSubtreeDropTarget {
+            workspace_id,
+            index: self.rendered_tabs.region(workspace_id).map_or(0, WorkspaceTabs::len),
+        })
     }
 
     fn update_tab_subtree_drag(
@@ -9602,6 +9755,10 @@ impl TerminalView {
         let target = self.tab_subtree_target_at(point, source.workspace_id, cx);
         let left_source_bar = !self.point_in_workspace_tab_bar(point, source.workspace_id, cx);
         if let Some(drag) = self.tab_subtree_drag.as_mut() {
+            if drag.target != target {
+                // The drop marker is a root child, so it repaints with the view.
+                cx.notify();
+            }
             drag.target = target;
             drag.left_source_bar |= left_source_bar;
         }
@@ -9739,13 +9896,24 @@ impl TerminalView {
             .flex()
             .flex_row()
             .items_center()
+            .px(px(TAB_RUN_INSET))
             .overflow_hidden()
             .bg(colors.bg)
             // Every move while a region tab drag is active, so the drag keeps
             // tracking the cursor after it leaves this bar's band.
             .on_drag_move(cx.listener(
                 |view, event: &DragMoveEvent<RegionTabDrag>, _win, ctx| {
-                    view.update_region_drag(f32::from(event.event.position.x), ctx);
+                    // Same rule as the titlebar: the slot freezes once the
+                    // pointer leaves this bar, so a ghost aimed at another
+                    // section does not keep shuffling the bar it left.
+                    let Some(drag) = view.region_chrome.drag else { return };
+                    if view.point_in_workspace_tab_bar(
+                        event.event.position,
+                        drag.workspace_id,
+                        ctx,
+                    ) {
+                        view.update_region_drag(f32::from(event.event.position.x), ctx);
+                    }
                 },
             ))
             .on_mouse_up(
@@ -9867,9 +10035,23 @@ impl TerminalView {
             let pill = pill.child(label);
             row = row.child(pill);
         }
+        // Tabs flex to share the run after the pill, the same split
+        // `tab_bar_insertion_index` assumes, so this is the width a tab paints
+        // at and the width its ghost must take to sit where it was grabbed.
+        let badge_width = bar.badge.as_ref().map_or(0.0, badge_width_px);
+        let ghost_width = tab_run_slots(rect.x, rect.width, badge_width, bar.tabs.len().max(1))
+            .1
+            .clamp(TAB_MIN_WIDTH, TAB_WIDTH.max(rect.width));
+        let dragged = self.region_chrome.drag.map(|drag| drag.session_id);
         row = row.children((0..bar.tabs.len()).filter_map(|index| {
             let slot = RegionTabSlot { workspace_id, index };
-            Self::render_region_bar_tab(&bar.tabs, slot, colors, cx)
+            let ghost = TabDragGhost {
+                title: String::new(),
+                colors: *colors,
+                width: ghost_width,
+                height: rect.height,
+            };
+            Self::render_region_bar_tab(&bar.tabs, slot, ghost, dragged, cx)
         }));
         row.into_any_element()
     }
@@ -9883,6 +10065,7 @@ impl TerminalView {
         tab: gpui::Stateful<gpui::Div>,
         session_id: SessionId,
         slot: RegionTabSlot,
+        ghost: TabDragGhost,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let RegionTabSlot { workspace_id, index } = slot;
@@ -9905,7 +10088,7 @@ impl TerminalView {
             )
             // Registers the drag once the pressed pointer passes GPUI's
             // threshold; from then on the bar's `on_drag_move` sees every move.
-            .on_drag(RegionTabDrag, |_, _, _, cx| cx.new(|_| RegionTabDragGhost))
+            .on_drag(RegionTabDrag(ghost), |drag, _, _, cx| cx.new(|_| drag.0.clone()))
             .on_click(cx.listener(move |view, _, _window, ctx| {
                 // A drag that reordered is not a click: selecting here would
                 // fight the reorder the release just committed.
@@ -9930,15 +10113,19 @@ impl TerminalView {
     fn render_region_bar_tab(
         tabs: &[(SessionId, TabData)],
         slot: RegionTabSlot,
-        colors: &TabBarColors,
+        mut ghost: TabDragGhost,
+        dragged: Option<SessionId>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let (session_id, tab) = tabs.get(slot.index)?;
         let session_id = *session_id;
+        ghost.title.clone_from(&tab.title);
+        let colors = &ghost.colors;
         let separator = slot.index + 1 < tabs.len();
         let base_bg = if tab.is_active() { colors.active_bg } else { colors.bg };
         let bg = flash_blend(base_bg, colors.accent, tab.tab_flash);
         let fg = if tab.is_focused() { colors.active_text } else { colors.text };
+        let mark = tab.is_focused().then(|| focus_mark(tab.group_accent.unwrap_or(colors.accent)));
         let hover_bg = gpui::Rgba {
             r: (colors.bg.r + 0.04).min(1.0),
             g: (colors.bg.g + 0.04).min(1.0),
@@ -9979,16 +10166,29 @@ impl TerminalView {
             .flex_shrink_1()
             .flex_basis(px(TAB_WIDTH))
             .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(TAB_MAX_WIDTH))
             .overflow_hidden()
             .h_full()
             .px_2()
-            .bg(bg)
             .text_color(fg)
             .text_xs()
             .when(separator, |this| this.border_r_1().border_color(colors.separator))
             .cursor_pointer()
             .when(!tab.is_active(), |this| this.hover(move |s| s.bg(hover_bg)))
-            .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
+            // The same raised card the titlebar's open tab wears, edged like
+            // the pane card it bridges into; flash rides the same card.
+            .children(
+                (dragged != Some(session_id) && (tab.is_active() || tab.tab_flash.is_some()))
+                    .then(|| tab_card(bg, open_tab_edge(tab, colors))),
+            )
+            // The ghost in hand is the tab; its slot stays as a marked
+            // placeholder.
+            .children(
+                (dragged == Some(session_id))
+                    .then(|| drag_placeholder(colors.bg, colors.accent)),
+            )
+            .map(|tab| Self::region_tab_interactions(tab, session_id, slot, ghost, cx))
+            .children(mark)
             .children(agent_glyph)
             .children(ai_dot)
             // `truncate`, as in the titlebar: without it a title that outgrows
@@ -10048,6 +10248,9 @@ impl TerminalView {
             SessionActivation::FocusPane(workspace_id, pane) => {
                 self.shell.focus_pane(workspace_id, pane, cx);
                 self.focus_pane_session(cx);
+                // The focused region's open tab wears the accent edge and the
+                // bridge follows it; same repaint ordering as a switch.
+                cx.notify();
             }
             SessionActivation::Switch => self.switch_tab(move |_| Some(session_id), cx),
         }
@@ -12815,6 +13018,9 @@ impl TerminalView {
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(region_bars)
+            // After the panes and bars: each bridge paints over its pane
+            // card's top border and up to its bar's bottom edge.
+            .children(self.render_tab_bridges(cx))
             .children(ci_bars)
             .children(beads_boards)
             .children(self.render_beads_panels(cx))
@@ -13963,6 +14169,7 @@ impl Render for TerminalView {
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
         let workspace_drag_layers = self.render_workspace_drag_layers(window, cx);
+        let tab_drop_marker = self.tab_subtree_drop_marker(cx);
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -13986,6 +14193,7 @@ impl Render for TerminalView {
             .children(share)
             .children(remote_picker)
             .children(workspace_drag_layers)
+            .children(tab_drop_marker)
             // Last child, so the frozen banner covers every other overlay: while
             // a remote controller holds this window there is nothing else to
             // interact with.
@@ -16918,6 +17126,115 @@ fn pane_ground(bg: [f32; 4]) -> [f32; 4] {
 /// theme-background fill (skipped default-bg cells show this, not the
 /// ground), and the hairline card border — the focused pane's takes the
 /// region tone. The gap around it comes from the placement inset itself.
+/// The equal-share slots a bar's tabs occupy after its run inset and pill:
+/// the run's left edge and one slot's width, in the bar's own coordinates.
+fn tab_run_slots(bar_left: f32, bar_width: f32, badge_width: f32, count: usize) -> (f32, f32) {
+    let inner = (bar_width - 2.0 * TAB_RUN_INSET).max(0.0);
+    let badge = badge_width.min(inner);
+    let left = bar_left + TAB_RUN_INSET + badge;
+    // Tabs share the run equally up to their cap, then leave the rest bare.
+    let slot =
+        if count == 0 { 0.0 } else { ((inner - badge) / px_units(count)).min(TAB_MAX_WIDTH) };
+    (left, slot)
+}
+
+/// Where an open tab's bridge lands: from `bar_bottom` down over the top
+/// border of the pane card directly under the tab, or `None` when something
+/// else is reserved between the bar and the panes.
+fn tab_bridge_rect(
+    placements: &[PanePlacement],
+    workspace_id: WorkspaceId,
+    bar_bottom: f32,
+    left: f32,
+    width: f32,
+) -> Option<TabBridge> {
+    // The region's top card row: its top edge is the bar bottom plus the
+    // card margin only when nothing else is reserved.
+    let card_top = placements
+        .iter()
+        .filter(|placement| placement.workspace_id == workspace_id)
+        .map(|placement| placement.rect.y)
+        .min_by(f32::total_cmp)?;
+    if (card_top - bar_bottom - PANE_CARD_MARGIN).abs() > 0.5 {
+        return None;
+    }
+    let card = placements
+        .iter()
+        .find(|placement| {
+            placement.workspace_id == workspace_id
+                && (placement.rect.y - card_top).abs() <= 0.5
+                && placement.rect.x <= left + width
+                && left <= placement.rect.x + placement.rect.width
+        })?
+        .rect;
+    // A tab flush with the card's side squares that corner, as a browser tab
+    // does at its toolbar's edge; a tab edge that only nears a corner stops
+    // short of the curve instead.
+    let right = left + width;
+    let (card_left, card_right) = (card.x, card.x + card.width);
+    let flush_left = (left - card_left).abs() <= 1.0;
+    let flush_right = (right - card_right).abs() <= 1.0;
+    let left = if flush_left { card_left } else { left.max(card_left + PANE_CARD_RADIUS) };
+    let right = if flush_right { card_right } else { right.min(card_right - PANE_CARD_RADIUS) };
+    (right > left).then_some(TabBridge {
+        rect: Rect {
+            x: left,
+            y: bar_bottom,
+            width: right - left,
+            height: PANE_CARD_MARGIN + PANE_BORDER_WIDTH,
+        },
+        cap_left: flush_left,
+        cap_right: flush_right,
+    })
+}
+
+/// A bridge's geometry: the strip over the gap and the card's top border, and
+/// which card corners it squares off below that.
+struct TabBridge {
+    rect: Rect,
+    cap_left: bool,
+    cap_right: bool,
+}
+
+/// The strip of pane fill that joins an open tab's card to the pane card
+/// below it: it covers the window-ground gap and the card's top border under
+/// the tab, carrying the card's side outline down, so tab and pane read as
+/// one surface.
+fn tab_bridge(bridge: &TabBridge, fill: gpui::Rgba, edge: gpui::Rgba) -> gpui::AnyElement {
+    let TabBridge { rect, cap_left, cap_right } = *bridge;
+    // A squared corner runs the card's side outline straight down over its
+    // curve; the cap sits inside the card's content padding, so no glyph is
+    // under it.
+    let cap = |x: f32, outer_left: bool| {
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(rect.y + rect.height))
+            .w(px(PANE_CARD_RADIUS))
+            .h(px(PANE_CARD_RADIUS - PANE_BORDER_WIDTH))
+            .bg(fill)
+            .when(outer_left, gpui::Styled::border_l_1)
+            .when(!outer_left, gpui::Styled::border_r_1)
+            .border_color(edge)
+            .into_any_element()
+    };
+    let strip = div()
+        .absolute()
+        .left(px(rect.x))
+        .top(px(rect.y))
+        .w(px(rect.width))
+        .h(px(rect.height))
+        .bg(fill)
+        .border_l_1()
+        .border_r_1()
+        .border_color(edge);
+    div()
+        .child(strip)
+        .children(cap_left.then(|| cap(rect.x, true)))
+        .children(cap_right.then(|| cap(rect.x + rect.width - PANE_CARD_RADIUS, false)))
+        .into_any_element()
+}
+
 fn pane_card(
     placement: &pane_shell::PanePlacement,
     viewport: Rect,

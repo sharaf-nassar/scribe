@@ -403,7 +403,11 @@ fn prepare_handoff_listener(
 
     info!(?path, "handoff listener ready");
 
-    tokio::io::unix::AsyncFd::new(listen_fd).map_err(|e| ScribeError::Io { source: e })
+    scribe_pty::async_fd::register_owned(
+        listen_fd,
+        tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
+    )
+    .map_err(|e| ScribeError::Io { source: e })
 }
 
 async fn accept_handoff_peer(

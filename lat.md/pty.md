@@ -10,6 +10,8 @@ The  wraps PTY master file descriptors for zero-copy async I/O using tokio's `As
 
 The fd is set to non-blocking mode via `fcntl(F_GETFL)` / `fcntl(F_SETFL, flags | O_NONBLOCK)` and registered with the current tokio reactor.
 
+Registration goes through tokio's `unsafe` `AsyncFd::register`, because tokio deprecated the safe-looking `AsyncFd::new` as unsound (RUSTSEC-2026-0386): it cannot itself prove the descriptor stays open and unchanged for the wrapper's lifetime. Taking the `OwnedFd` by value is exactly that guarantee, so [[crates/scribe-pty/src/async_fd.rs#register_owned]] is the workspace's single audited `unsafe_code` exception for it, listed in `tools/lint-suppressions-allowlist.txt`. The PTY wrapper, the server's pidfd child-exit watcher, and the handoff listener all register through it, so each stays under the workspace-wide deny.
+
 ### Read Implementation
 
 `AsyncRead` loops on `poll_read_ready`, calls `libc::read` with non-blocking semantics, and clears the ready guard on EAGAIN/EWOULDBLOCK to re-register the waker.

@@ -315,6 +315,12 @@ Prompt routing covers two capable windows with the origin window lexicographical
 
 The `scribe-test` daemon and IPC fixtures explicitly advertise `agent_api: false`; they tolerate the additive variants without claiming to implement an agent consumer. The dedicated recipes below instead drive the surface through the real `scribe` CLI inside live panes, so the harness itself never claims the capability.
 
+### Background wait snapshot compatibility
+
+One-shot World and Siblings replies remain decodable by older callers while current callers receive the background-wait state.
+
+A server fixture retains a Pi session in `WaitingForBackground` and dispatches both snapshot requests without Hello. Missing and false `ai_background_wait` fields must produce framed replies that decode through the old five-state enum as `Processing`; true preserves `WaitingForBackground`. Context metadata and retained session state stay unchanged. CLI tests require both commands to advertise support.
+
 ### Functional agent E2E scripts
 
 Container scripts exercise the real CLI-to-server control path from inside live sessions against a freshly configured server.
@@ -3464,6 +3470,12 @@ Layout-restore only ever moves the window, and a reparenting window manager answ
 
 Phase 0 moves the window and records the offset between the live, root-relative `xdotool` reading and the persisted record. Phase 1 resizes without moving and requires that offset to be bit-for-bit the same; a parent-relative capture would collapse it to the whole frame offset instead. Phase 2 restarts the client and requires it to land exactly where phase 1 left it.
 
+### Tabs grow to the cap and divide the run
+
+`tests/e2e/visual/tab-width.sh` (`just e2e-visual tab-width.sh`) measures the painted tab chrome in a 1400px window: one tab lights more than its 176px basis and at most `TAB_MAX_WIDTH` (230px) plus slack, and a second tab about doubles that ink.
+
+It captures the client window itself (`import -window`) and crops the 36px strip. The earlier root-screen crop at the window manager's reported origin sat 20px low under openbox, into the pane card, whose full-width top outline lit 1394 of 1400 columns regardless of the tabs; that is what let the test pass for years while measuring nothing about them. The lower bound is what a fixed-basis tab fails, the upper bound is what an uncapped tab fails, and the two-tab ratio is what one tab sitting at an edge fails.
+
 ### Tab drag reorders in every bar
 
 `tests/e2e/visual/tab-drag-reorder.sh` (`just e2e-visual-tab-drag-reorder`) drives a real pointer drag and is the only coverage that joins the two halves of tab reordering.
@@ -3474,7 +3486,7 @@ Phase 0 opens three tabs. Phase 1 drags the first onto the third slot and requir
 
 Layout chords dispatch from the pane's focus handle, so the script clicks back into the grid before the split: the drag it just performed leaves GPUI focus on a titlebar tab, where a chord never reaches the layout path.
 
-Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. `tests/e2e/visual/tab-drag-cross-region.sh` now owns the atomic lower-bar→titlebar pointer route: it cancels a live gesture with Escape, then moves one retained tab subtree and requires the correlated `MoveTab`, one same-window full refresh, and no replacement `SessionCreated`. The cancel holds a titlebar tab over the lower bar, where a release commits a `MoveTab`, and sends Escape with the button still down. `--clearmodifiers` would release the button first and commit that drop before the key arrived.
+Cross-region tab transfer deliberately does not change these phases: same-bar drags still use `TabSessions::reorder` and report the same leaf order. `tests/e2e/visual/tab-drag-cross-region.sh` now owns the atomic lower-bar→titlebar pointer route: it cancels a live gesture with Escape, then moves one retained tab subtree and requires the correlated `MoveTab`, one same-window full refresh, and no replacement `SessionCreated`. The cancel holds a titlebar tab over the lower bar, where a release commits a `MoveTab`, and sends Escape with the button still down. `--clearmodifiers` would release the button first and commit that drop before the key arrived. Its last phase splits the top region vertically and drags a titlebar tab from the left group's first slot into the right group, requiring the same atomic `MoveTab` between the two top-row workspaces: side-by-side regions share the titlebar strip, and this is the gesture the strip's whole-row reorder used to swallow. Phase 3 then drags a top-right tab onto the lower workspace's panes rather than its bar and requires the same atomic `MoveTab`, with the tab appended as that workspace's last. Its dragged tab is an inactive one, and the source must keep showing the tab it showed in every `ReportWorkspaceTree` the gesture produced, not only the last: a release that selected the dragged tab raced the move, so the final state could come out right by luck. Against the build with that selection restored the phase fails; checking only the final state passed against it. The oracle's `SessionCreated` rule is the one `assert-workspace-move` already applies: the client may re-attach the panes it shows after adopting the refreshed tree, and the server answers each with an id the single `SessionList` already named, so only an id that list never carried counts as a replacement session.
 
 ### Warm multi-window restore drives the real client
 
@@ -3536,7 +3548,7 @@ After restoring the 16px tab row and 8px status band, the suite fills the shared
 
 `tests/e2e/visual/titlebar.sh` is the blocking smoke for both titlebar renderers: the window titlebar and a lower region's own bar must each paint a compact tab title, vertically centred in the bar.
 
-The title is located per bar rather than in a fixed crop, because the current chrome puts two other things in the same near-gray ink band. The focused tab's accent tick is a NEUTRAL muted gray whenever no project has named the workspace (see [[client#Client#Tab Bar]]), so it passes a "bright near-gray" filter and its full-width rule stretched the measured title box from 10px to 17px; rows spanning almost the whole scan are therefore dropped, since a title never does and a rule always does. A window holding more than one region also grows a workspace pill at each bar's left, whose label carries descenders a tab title does not, so a crop anchored at the bar's left edge measured the pill and read 4.5px low; the scan starts after the pill's filled card when one is present. Captures retry until the client has actually painted, because a debug-profile client can still be blank at a fixed sleep and an empty capture fails the assertions as though the titlebar had regressed.
+The title is located per bar rather than in a fixed crop, because the current chrome puts two other things in the same near-gray ink band. The focused tab's accent tick is a NEUTRAL muted gray whenever no project has named the workspace (see [[client#Client#Tab Bar]]), so it passes a "bright near-gray" filter and its full-width rule stretched the measured title box from 10px to 17px; rows spanning almost the whole scan are therefore dropped, since a title never does and a rule always does. A window holding more than one region also grows a workspace pill at each bar's left, whose label carries descenders a tab title does not, so a crop anchored at the bar's left edge measured the pill and read 4.5px low; the scan starts after the pill's filled card when one is present. The open tab's card now wears its pane's outline and a short keyboard mark in that same muted gray ([[client#Client#GPUI Titlebar#The open tab joins its pane]]): the side outlines are one-pixel columns lit down most of the band, so those columns are dropped, and every remaining pixel in the outline's own colour (its top edge, corner, and the mark) is dropped with them, which leaves the far brighter title. The pill and run-end probes sit 8px inside each window edge, past the `TAB_RUN_INSET` every bar keeps, so an inset run is still read as the pill or the card rather than the ground beside it. Captures retry until the client has actually painted, because a debug-profile client can still be blank at a fixed sleep and an empty capture fails the assertions as though the titlebar had regressed.
 
 ### Published columns fit one rendered row
 

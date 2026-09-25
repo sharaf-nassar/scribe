@@ -2380,7 +2380,17 @@ see [[rendering#Chrome Rendering]].
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Known context is always visible: Ok uses fixed `#5fa05f`, while Warn and Danger keep their existing colors. Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 
-Tabs wear a browser-style raised card: an active, hovered, or flashing tab's fill is an absolute child inset `TAB_CARD_TOP_GAP` (5px) from the strip's top edge ([[crates/scribe-client/src/titlebar.rs#TitlebarView#tab_card]]), rounded at its top corners and running to the band's bottom edge, while resting tabs paint no fill and sit flat on the strip. No hairline closes the strip off — the ground-tone band meets the work area directly — and because the active card wears `tab_bar_active_bg` (the pane fill), the active tab reads as opening into the content below it, the way a browser tab meets its toolbar. The strip paints the window-ground tone itself: `tab_bar_bg` derives through [[crates/scribe-common/src/theme.rs#ground_tone]], the same function behind [[crates/scribe-client/src/main.rs#pane_ground]], so the titlebar band and the pane gaps are one surface and the active card — wearing the pane fill — reads as a pane against both, the layered chrome mock's two-surface model (`--ground` under `--pane`). Active splits into two tiers ([[crates/scribe-client/src/tab_bar.rs#TabShown]]): every region's shown tab keeps the raised card — its open-tab marker — but only the window-focused region's shown tab (`Focused`, promoted in [[crates/scribe-client/src/main.rs#TerminalView#partition_tab_strip]] from the shell's focused workspace) wears the mock's mark: a 2px tick riding the card's top edge, inset 8px from each side, in the workspace's effective accent — quiet gray until a project names the workspace — plus the bright title and standing close button. Other regions' shown tabs go quiet (dim title, hover-only close), so the tick answers "where is my keyboard" while the card answers "which tab is open here".
+Tabs wear a browser-style raised card: an active, hovered, or flashing tab's fill is an absolute child inset `TAB_CARD_TOP_GAP` (5px) from the strip's top edge ([[crates/scribe-client/src/titlebar.rs#tab_card]]), rounded at its top corners and running to the band's bottom edge, while resting tabs paint no fill and sit flat on the strip. No hairline closes the strip off — the ground-tone band meets the work area directly — and because the active card wears `tab_bar_active_bg` (the pane fill), the active tab reads as opening into the content below it, the way a browser tab meets its toolbar. The strip paints the window-ground tone itself: `tab_bar_bg` derives through [[crates/scribe-common/src/theme.rs#ground_tone]], the same function behind [[crates/scribe-client/src/main.rs#pane_ground]], so the titlebar band and the pane gaps are one surface and the active card — wearing the pane fill — reads as a pane against both, the layered chrome mock's two-surface model (`--ground` under `--pane`). Active splits into two tiers ([[crates/scribe-client/src/tab_bar.rs#TabShown]]): every region's shown tab keeps the raised card — its open-tab marker — but only the window-focused region's shown tab (`Focused`, promoted in [[crates/scribe-client/src/main.rs#TerminalView#partition_tab_strip]] from the shell's focused workspace) wears the keyboard mark: [[crates/scribe-client/src/titlebar.rs#focus_mark]], a short accent bar leading the title in the workspace's effective accent — quiet gray until a project names the workspace — plus the bright title and standing close button. Other regions' shown tabs go quiet (dim title, hover-only close), so the mark answers "where is my keyboard" while the card answers "which tab is open here".
+
+### The open tab joins its pane
+
+An open tab's card is the top of its pane card, not a box on the strip: it wears the pane's outline on its top and sides, and the grid bridges it across the gap into the pane.
+
+Before this the active card was a borderless rectangle of pane fill with a 2px tick on top, ending at the band's bottom edge 6px above a pane card that kept its own top border and corners, so on a near-black theme it floated as a soft box with a bar over it. Three pieces make the join. [[crates/scribe-client/src/titlebar.rs#open_tab_edge]] gives an open tab's card the pane card's own outline (`TabBarColors::pane_edge`, the divider at 40% alpha, or the region accent where the pane wears its focus ring) on its top and sides through `tab_card`'s `edge`; hover and flash cards pass none and still float. Every bar insets its pill-and-tab run by [[crates/scribe-client/src/titlebar.rs#TAB_RUN_INSET]], which is the shell's `PANE_CARD_MARGIN`, so a tab card always sits over the pane card's straight top edge and never overhangs its side or rounds into its corner; [[crates/scribe-client/src/main.rs#tab_run_slots]] folds the same inset into the equal-share slot math behind insertion targets, drop markers, and ghost widths. [[crates/scribe-client/src/main.rs#TerminalView#render_tab_bridges]] then paints one [[crates/scribe-client/src/main.rs#tab_bridge]] per open tab in the grid band, after the panes and region bars: a strip of pane fill from the bar's bottom edge down over the pane card's top border, carrying the card's side outline, so the tab card, the bridge, and the pane are one outlined surface. Titlebar tabs supply their painted runs through [[crates/scribe-client/src/titlebar.rs#TitlebarView#open_tab_runs]]; a lower region's bar supplies its active slot. A bridge is withheld when the region's top card row does not start exactly one card margin below the bar — a CI band or pinned board is reserved there and the tab opens onto that instead — and it is clipped to the card's straight edge between its corner radii. The lower region bar's active tab now wears the same card and mark rather than a full-bleed fill, so the two bars read as one component.
+
+The card and its bridge are painted by two entities: the titlebar paints the card on its own notify, while the bridge is a child of this view's grid. A tab switch therefore notifies the view at the end of [[crates/scribe-client/src/main.rs#TerminalView#switch_tab]] (and a pane-focus activation does the same), because without it the titlebar repainted the new tab's card while the grid kept the bridge under the old tab until the next unrelated repaint, which showed for a frame or two as a card whose edge broke at the strip's bottom.
+
+The second source of that same break was the Tab-key focus ring. A click focuses the tab's tracked handle for the frame before the terminal takes focus back, and the ring was a 2px element border, which is a box inset: the card and its outline moved 2px inside the slot the bridge is painted for and stopped 2px above the band's bottom, so the edge broke on every pointer switch. [[crates/scribe-client/src/titlebar.rs#TitlebarView#keyboard_focus_ring]] is now an absolute child that insets nothing, and it is shown only while `Window::last_input_was_keyboard`, the same gate GPUI's own `focus_visible` uses, so a pointer-originated focus never paints it.
 
 [[crates/scribe-client/src/titlebar.rs#TitlebarView]] assembles the custom chrome: move region, workspace group bars, integrated terminal tabs, and equalize control. Native decorations own window controls, and Settings opens from the status bar; equalize appears only when the focused tab has multiple panes. Activating it runs [[crates/scribe-client/src/main.rs#TerminalView#equalize_layout]], resetting every workspace-region and pane split to equal space — the same handler behind the status bar's balance button and the `equalize` keybinding (`ctrl+shift+e` by default), so the layout can be rebalanced without a pointer.
 
@@ -2476,8 +2486,18 @@ Verifies  leaves short titles intact, truncates an overflowing title to exactly 
 
 ### Tabs divide the strip and titles use it
 
-Tabs flex: each takes an equal share of its group bar, so the strip fills the
-band instead of leaving it empty to the right of a fixed slot.
+Tabs flex: each takes an equal share of its group bar up to
+[[crates/scribe-client/src/titlebar.rs#TAB_MAX_WIDTH]] (230px, the layered
+chrome mock's `max-width`), so a crowded strip divides the band while a lone tab
+stays a tab rather than a bar-wide slab.
+
+The cap is in the slot math as well as the layout: [[crates/scribe-client/src/main.rs#tab_run_slots]]
+clamps the equal share to it, so insertion targets, the drop marker, drag ghosts,
+and the lower bar's bridge all name the slot a capped tab paints in, and a
+pointer in the bare run past the last tab resolves to an append. The titlebar's
+own reorder reads measured geometry and needs nothing extra. The region bar's
+live reorder still anchors on `TAB_WIDTH`, an approximation it had before the
+cap.
 
 The bar itself is what makes that possible. A group row sizes to its content, so
 its tabs had nothing to grow into and every one stayed at its `TAB_WIDTH` basis
@@ -2493,11 +2513,64 @@ own width empty. Both bars render `tab.title` directly and let the layout end
 it, so the two cannot drift apart again. `TAB_WIDTH` survives as the flex basis
 and as the drag geometry's fallback, never as an appearance setting.
 
-Drag-reorder follows the painted width rather than the basis: `TitlebarView`
-measures the first tab from the frame and feeds that width to
-[[crates/scribe-client/src/tab_bar.rs#reorder_target_index]] and the slide
-offset. A tab that grew to fill the strip would otherwise be dragged against a
-176px grid it no longer occupies.
+Drag-reorder follows the painted geometry rather than the basis: every tab
+carries a zero-ink probe ([[crates/scribe-client/src/titlebar.rs#TitlebarView#tab_geometry_probe]])
+that records its painted left edge and width, and
+[[crates/scribe-client/src/titlebar.rs#TitlebarView#tab_geometry]] feeds that
+to [[crates/scribe-client/src/tab_bar.rs#reorder_target_index]] and sizes the
+drag ghost. A tab that grew to fill the strip would otherwise be dragged against
+a 176px grid it no longer occupies, and side-by-side regions give each group its
+own width, which one first-tab measurement could not express.
+
+The tab in hand is a cursor-following ghost, not a slide inside its bar. Both
+drag markers (`TabDrag` and the view's `RegionTabDrag`) carry a
+[[crates/scribe-client/src/titlebar.rs#TabDragGhost]] sized to the tab's
+painted width and the bar's height, and GPUI's native drag overlay paints it at
+the press offset inside the tab's hitbox, so the ghost starts exactly where the
+tab was under the pointer and follows it anywhere in the window, over the bar
+it will be dropped on included. The slot it left is painted as
+[[crates/scribe-client/src/titlebar.rs#drag_placeholder]], a dashed
+accent-outlined card in the workspace's tab tone, because a dimmed copy of a
+title every tab in the bar shares was no landmark at all. The earlier in-bar
+slide was clamped to the source bar, so a tab dragged toward another region
+visibly stayed home while the move committed on release, and users read that
+as the drag doing nothing.
+
+The bar a cross-section drag is aimed at paints
+[[crates/scribe-client/src/titlebar.rs#drop_marker]] at the slot boundary the
+release will use: [[crates/scribe-client/src/main.rs#TerminalView#tab_subtree_drop_marker]]
+resolves the live `TabSubtreeDropTarget` into window coordinates with the same
+equal-share geometry `tab_bar_insertion_index` divides by, and the view draws
+it as a root child beside the workspace drag layers, so neither bar needs to
+know about the other's drag. The mark spans the whole band in the theme accent
+and the ghost card is translucent (`GHOST_OPACITY`): the resolved boundary is
+within half a slot of the pointer, which is under the ghost, so a mark the
+ghost could hide would never be seen, and an unnamed region's muted identity
+tone was too faint to read through it. `update_tab_subtree_drag` notifies the view when
+the target changes, which is what repaints the mark as the pointer crosses
+slots.
+
+A titlebar drag that leaves its own group bar is never treated as a jittered click on release (`DragState::left_bar`). That path exists so an engaged-but-unmoved press still selects its tab, but a drag aimed at another section never reorders either, and selecting it switched the source section onto the dragged tab just before the move took it away: the source then showed a neighbour instead of the tab it had been showing, and the selection's own attach and tree report raced the move.
+
+A release anywhere over another workspace's region lands too, not only over its bar: [[crates/scribe-client/src/main.rs#TerminalView#region_body_tab_subtree_target]] resolves a pointer over the region's panes, boards, or bands to that workspace with the tab appended last, after the top-row and lower-bar targets have declined. A drag aimed at a workspace routinely ends a few pixels into its panes, and the bar is only 36px tall, so before this the most natural gesture resolved no target and the release silently did nothing. While any target is live the receiving workspace is outlined and lightly tinted in the theme accent alongside the slot mark, because with the ghost over a pane the 3px mark alone is easy to miss. The overlay wrapper is absolutely pinned to the window: the root is a flex column, and an unpositioned wrapper laid out below the status bar and took its absolutely placed children off-screen.
+
+Reordering only happens while the pointer is inside the dragged tab's own bar.
+`TitlebarView::update_drag` takes the full pointer and freezes the slot when
+it leaves the band or the group's painted run; the region bar's `on_drag_move`
+gates `update_region_drag` on `point_in_workspace_tab_bar` the same way. Before
+this the source strip kept shuffling from the pointer's x while the ghost sat
+over another section, which contradicted what the pointer showed.
+
+A titlebar drag reorders inside the dragged tab's own workspace group
+([[crates/scribe-client/src/titlebar.rs#TitlebarView#group_of]]) and nowhere
+else: the target index is clamped to the group's run. The strip used to walk the whole row, so a tab dragged toward a
+side-by-side region was moved across the group boundary inside `TitlebarView`
+while the shell dropped the cross-region `ReorderTab` and re-set the strip on
+the next frame. The view's drag then pointed at a different tab than the one
+the user held, the subtree drag reset to that tab's identity, and the release
+resolved no move at all, which left the top row of a wide window the only bars a
+tab could not cross. The cross-region transfer belongs to the shell's release
+path, so the titlebar now declines it by construction.
 
 ### Context suffix bands and suppression
 
@@ -2535,13 +2608,23 @@ Verifies `end_drag` with `click_swallowed` set selects the pressed tab when the 
 
 Verifies a swap requires the dragged tab's centre to cross into the neighbour's slot: a grab near the tab's edge does not swap the moment the cursor enters the neighbour, so slots cannot thrash near a boundary.
 
+### A drag reorders within its workspace group only
+
+Verifies a drag in a two-group strip (two side-by-side top regions) clamps the reorder target to the dragged tab's own group.
+
+An update inside the first group past its second slot swaps once; a later update far into the second group's run freezes the slot there, so one in-group `ReorderTab` is emitted and the second group's tabs stay where they were.
+
 ### A drag survives leaving the tab strip
 
-Verifies drag updates far past either end of the strip keep the drag live, clamp the target to the first or last slot, and clamp the slide offset so the dragged tab never renders outside the strip.
+Verifies drag updates far past the strip's end or below its band keep the drag live and leave the slot where it was, since only a pointer inside the bar reorders.
 
 ### Release outside the strip commits the reorder
 
 Verifies ending a drag after the pointer wanders out of the titlebar band clears the drag state and keeps the reorders committed while dragging — the `on_mouse_up_out` path in the rendered titlebar.
+
+### A drag that left its bar does not select
+
+Verifies a drag carried out of its own group bar and released without reordering emits no `SelectTab`: it was aimed at another section, and selecting it switched the source section onto the tab just before the move took it away.
 
 ### Out-of-range interactions are no-ops
 

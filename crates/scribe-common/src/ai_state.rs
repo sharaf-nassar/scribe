@@ -121,6 +121,15 @@ pub enum AiState {
     WaitingForBackground,
 }
 
+impl AiState {
+    /// Preserve a working state for peers that cannot decode a background wait.
+    pub fn make_background_wait_compatible(&mut self) {
+        if *self == Self::WaitingForBackground {
+            *self = Self::Processing;
+        }
+    }
+}
+
 /// Full AI process state with optional metadata keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProcessState {

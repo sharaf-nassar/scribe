@@ -5,7 +5,32 @@ use std::task::{Context, Poll};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
+
+/// Register an owned descriptor with the current tokio reactor.
+///
+/// The workspace's one sound entry point to tokio's `unsafe`
+/// `AsyncFd::register_with_interest`, which replaced the deprecated and
+/// unsound `AsyncFd::new`/`with_interest` (RUSTSEC-2026-0386). Taking the
+/// `OwnedFd` by value is what discharges the safety contract, so callers stay
+/// under the workspace-wide `unsafe_code` deny.
+///
+/// # Errors
+///
+/// Returns the reactor's registration error. Must be called from within a
+/// tokio runtime.
+#[allow(
+    unsafe_code,
+    reason = "tokio's only non-deprecated AsyncFd constructor is the unsafe `register` (RUSTSEC-2026-0386)"
+)]
+pub fn register_owned(fd: OwnedFd, interest: Interest) -> io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: `register_with_interest` requires the fd to stay open, refer to
+    // the same file description, and be reported unchanged by `as_raw_fd` for
+    // the `AsyncFd`'s whole lifetime. The `AsyncFd` takes sole ownership of
+    // this `OwnedFd`, which closes only when dropped with it, and
+    // `OwnedFd::as_raw_fd` always returns the descriptor it owns.
+    Ok(unsafe { AsyncFd::register_with_interest(fd, interest) }?)
+}
 
 /// Zero-thread non-blocking PTY I/O wrapper.
 ///
@@ -31,7 +56,8 @@ impl AsyncPtyFd {
     /// Returns an error if `fcntl` fails or if the reactor registration fails.
     pub fn new(fd: OwnedFd) -> io::Result<Self> {
         set_nonblocking(&fd)?;
-        let inner = AsyncFd::new(fd)?;
+        // `AsyncFd::new`'s default interest.
+        let inner = register_owned(fd, Interest::READABLE | Interest::WRITABLE)?;
         Ok(Self { inner })
     }
 }

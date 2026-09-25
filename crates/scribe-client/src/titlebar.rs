@@ -3,7 +3,7 @@
 //! The rebuild has a no-native-decorations mandate: the window is undecorated
 //! and this [`TitlebarView`] draws the entire top chrome — a draggable move
 //! region, the workspace-badge pills, the tab strip (active accent, per-tab
-//! close button, drag-reorder slide, attention flash, AI activity dot, and the
+//! close button, drag-reorder ghost, attention flash, AI activity dot, and the
 //! context-% suffix), and the equalize icon. Window controls belong to the
 //! native decorations and settings lives in the bottom status bar, so neither
 //! is drawn here. It is a `gpui::Entity` so its interactions mutate state and
@@ -13,12 +13,12 @@
 use gpui::{
     AnyElement, Context, DragMoveEvent, ElementId, EventEmitter, FocusHandle, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
-    WindowControlArea, deferred, div, prelude::*, px,
+    WindowControlArea, div, prelude::*, px,
 };
 use scribe_common::ids::{SessionId, WorkspaceId};
 
 use crate::tab_bar::{
-    GroupBadge, TabBarColors, TabData, TabShown, flash_blend, pill_fill, px_units,
+    GroupBadge, TabBarColors, TabData, TabShown, accent_tab_tone, flash_blend, pill_fill, px_units,
     reorder_target_index, tab_display_title,
 };
 use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
@@ -39,12 +39,74 @@ pub const TAB_WIDTH: f32 = 176.0;
 /// crowded lower region compresses identically.
 pub const TAB_MIN_WIDTH: f32 = 56.0;
 
+/// Ceiling a growing tab stops at (the layered chrome mock's `max-width`).
+/// Tabs still divide their run equally, but a lone tab no longer stretches
+/// across a wide window; the run's remaining width stays bare strip. Shared
+/// with the shell's in-region bars and with the slot math behind insertion
+/// targets, so a capped tab's slot is the one the drop lands in.
+pub const TAB_MAX_WIDTH: f32 = 230.0;
+
 /// Vertical inset between the strip's top edge and a tab's raised card. The
 /// strip shows through this gap, so the card's rounded top corners read as a
 /// browser-style physical tab instead of a flat full-height band segment.
 /// Workspace pills share the same inset and bottom-flush height so pills and
 /// tab cards sit on one line, as in the layered chrome mock.
 pub const TAB_CARD_TOP_GAP: f32 = 5.0;
+
+/// Horizontal inset of a bar's pill-and-tab run from its region's edges.
+///
+/// The pane card below sits this far inside its region (it is the shell's
+/// `PANE_CARD_MARGIN`), so a run inset by the same amount puts every tab card
+/// over the pane card's straight top edge: the open tab can then bridge into
+/// its pane without overhanging the card's side or rounding into its corner.
+pub const TAB_RUN_INSET: f32 = 6.0;
+
+/// The raised card behind an active, hovered, or flashing tab.
+///
+/// The fill is an absolute child rather than a full-bleed element background:
+/// inset `TAB_CARD_TOP_GAP` from the top, the strip shows above its rounded
+/// corners and the shape reads as a browser-style tab. The card runs to the
+/// band's bottom edge — and the active card wears the pane fill plus, through
+/// `edge`, the pane card's own outline on its top and sides, so the active tab
+/// reads as the top of the pane below it rather than a box on the strip. The
+/// grid finishes that join with [`crate::main`]'s tab bridge over the gap.
+/// Hover and flash cards pass no edge and float on the strip.
+#[must_use]
+pub fn tab_card(bg: Rgba, edge: Option<Rgba>) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(TAB_CARD_TOP_GAP))
+        .bottom_0()
+        .rounded_t(px(6.0))
+        .bg(bg)
+        .when_some(edge, |card, edge| {
+            card.border_t_1().border_l_1().border_r_1().border_color(edge)
+        })
+        .into_any_element()
+}
+
+/// The keyboard mark on the window-focused region's open tab: a short accent
+/// bar leading the title, in the workspace's effective accent.
+#[must_use]
+pub fn focus_mark(accent: Rgba) -> AnyElement {
+    div().flex_none().w(px(3.0)).h(px(10.0)).rounded(px(1.5)).mr_2().bg(accent).into_any_element()
+}
+
+/// The outline an open tab's card shares with its pane: the region accent
+/// where the pane wears its focus ring, the whisper edge elsewhere, nothing
+/// for a tab that is not open.
+#[must_use]
+pub fn open_tab_edge(tab: &TabData, colors: &TabBarColors) -> Option<Rgba> {
+    if tab.is_focused() {
+        Some(tab.group_accent.unwrap_or(colors.accent))
+    } else if tab.is_active() {
+        Some(colors.pane_edge)
+    } else {
+        None
+    }
+}
 
 /// Pointer travel, in pixels, required before an armed press on the move region
 /// hands the window to the compositor. Absorbs the jitter of an ordinary click
@@ -92,21 +154,92 @@ pub enum TitlebarEvent {
     ToggleStandaloneBeadsBoard(WorkspaceId),
 }
 
-/// Marker value handed to GPUI's native drag system when a tab press turns
+/// Value handed to GPUI's native drag system when a titlebar tab press turns
 /// into a drag. Its presence as the active drag keeps mouse-move events
 /// flowing to [`TitlebarView`]'s `on_drag_move` listener anywhere in the
-/// window, so the drag survives the cursor leaving the titlebar band.
-pub struct TabDrag;
+/// window, so the drag survives the cursor leaving the titlebar band. It
+/// carries the ghost GPUI paints under the cursor.
+pub struct TabDrag(pub TabDragGhost);
 
-/// Invisible view for the native drag's cursor-following overlay. The real tab
-/// is rendered offset inside the strip instead, so the overlay paints nothing.
-struct TabDragGhost;
+/// The cursor-following copy of a dragged tab, painted by GPUI's native drag
+/// overlay at the grab point for as long as the drag lives.
+///
+/// The overlay is positioned by the press offset inside the tab's hitbox, so a
+/// ghost of the tab's own size sits exactly where the tab was under the
+/// pointer and then follows it anywhere in the window, including over the bar
+/// it will be dropped on. The tab left behind in its strip is dimmed to a
+/// placeholder, so the solid card is always the one in hand.
+#[derive(Clone)]
+pub struct TabDragGhost {
+    pub title: String,
+    pub colors: TabBarColors,
+    pub width: f32,
+    pub height: f32,
+}
 
 impl Render for TabDragGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
+        div().w(px(self.width)).h(px(self.height)).pt(px(TAB_CARD_TOP_GAP)).child(
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .px_2()
+                .rounded_t(px(6.0))
+                .border_1()
+                .border_color(self.colors.accent)
+                .bg(self.colors.active_bg)
+                .text_color(self.colors.active_text)
+                .text_xs()
+                .overflow_hidden()
+                .opacity(GHOST_OPACITY)
+                .child(div().flex_1().truncate().child(self.title.clone())),
+        )
     }
 }
+
+/// The slot a dragged tab left behind: an accent-outlined card in the
+/// workspace's tab tone, so the landing slot reads at a glance even when every
+/// tab in the bar shares a title.
+#[must_use]
+pub fn drag_placeholder(bg: Rgba, accent: Rgba) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(TAB_CARD_TOP_GAP))
+        .bottom_0()
+        .rounded_t(px(6.0))
+        .border_1()
+        .border_dashed()
+        .border_color(accent)
+        .bg(accent_tab_tone(accent, bg))
+        .into_any_element()
+}
+
+/// The insertion mark a bar paints where a tab from another section will
+/// land: a full-band accent bar at the slot boundary.
+///
+/// It spans the whole band, not just the card, and the ghost is translucent:
+/// the boundary the pointer resolves is by construction within half a slot of
+/// the pointer, which is under the ghost in hand, so a mark the ghost could
+/// hide would never be seen.
+#[must_use]
+pub fn drop_marker(x: f32, y: f32, height: f32, accent: Rgba) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(x - 1.5))
+        .top(px(y))
+        .w(px(3.0))
+        .h(px(height))
+        .rounded(px(1.5))
+        .bg(accent)
+        .into_any_element()
+}
+
+/// Ghost translucency, so the drop marker and the bar it lands on read through
+/// the card in hand.
+const GHOST_OPACITY: f32 = 0.8;
 
 /// In-flight tab drag.
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +256,9 @@ struct DragState {
     cursor_x: f32,
     /// Whether the cursor actually crossed into another tab slot.
     reordered: bool,
+    /// Whether the pointer ever left the dragged tab's own group bar. Such a
+    /// drag was aimed somewhere else, so its release is never a click.
+    left_bar: bool,
 }
 
 struct IconButton {
@@ -148,7 +284,7 @@ struct TabChildren {
     ai_indicator: Option<AnyElement>,
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
-    tick: Option<AnyElement>,
+    mark: Option<AnyElement>,
 }
 
 #[derive(Clone, Copy)]
@@ -195,12 +331,13 @@ pub struct TitlebarView {
     equalize_focus_handle: FocusHandle,
     beads_focus_handles: Vec<FocusHandle>,
     standalone_beads_focus_handles: Vec<FocusHandle>,
-    /// Width one tab actually received, measured from the first painted tab.
+    /// Painted `(left, width)` of every tab, by strip index.
     ///
-    /// Tabs flex to fill the strip, so their width is a layout result rather
-    /// than a constant. Drag-reorder geometry has to use the width the user is
-    /// looking at, not the basis it started from.
-    measured_tab_width: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Tabs flex to fill their group, so their geometry is a layout result
+    /// rather than a constant, and side-by-side regions give each group its
+    /// own width. Drag-reorder geometry has to use what the user is looking
+    /// at, not the basis it started from.
+    measured_tabs: std::rc::Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -224,7 +361,7 @@ impl TitlebarView {
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
             beads_focus_handles: Vec::new(),
             standalone_beads_focus_handles: Vec::new(),
-            measured_tab_width: std::rc::Rc::new(std::cell::Cell::new(TAB_WIDTH)),
+            measured_tabs: std::rc::Rc::default(),
         }
     }
 
@@ -242,25 +379,47 @@ impl TitlebarView {
 
     /// A zero-ink overlay that records the tab it sits in.
     ///
-    /// Tabs flex, so their width is a layout result. The drag geometry needs
-    /// the width the user is looking at, and this is the only place the painted
-    /// value exists.
-    fn tab_width_probe(&self) -> AnyElement {
-        let measured = std::rc::Rc::clone(&self.measured_tab_width);
+    /// Tabs flex, so their geometry is a layout result. The drag geometry
+    /// needs what the user is looking at, and this is the only place the
+    /// painted value exists.
+    fn tab_geometry_probe(&self, index: usize) -> AnyElement {
+        let measured = std::rc::Rc::clone(&self.measured_tabs);
         gpui::canvas(
-            move |bounds, _window, _cx| measured.set(f32::from(bounds.size.width)),
+            move |bounds, _window, _cx| {
+                if let Some(slot) = measured.borrow_mut().get_mut(index) {
+                    *slot = (f32::from(bounds.origin.x), f32::from(bounds.size.width));
+                }
+            },
             |_, (), _window, _cx| {},
         )
+        // Pinned to every edge so the record is the tab's own box, not its
+        // padding-inset content box: the card and the bridge both span the
+        // full tab.
         .absolute()
-        .size_full()
+        .inset_0()
         .into_any_element()
     }
 
-    /// The width one tab occupies right now: measured when a frame has painted,
-    /// the fixed basis before that.
-    fn tab_width(&self) -> f32 {
-        let measured = self.measured_tab_width.get();
-        if measured.is_finite() && measured >= TAB_MIN_WIDTH { measured } else { TAB_WIDTH }
+    /// `(left, width)` of the tab at `index`: measured when a frame has
+    /// painted, the fixed basis from `origin_x` before that.
+    fn tab_geometry(&self, index: usize, origin_x: f32) -> (f32, f32) {
+        let measured = self.measured_tabs.borrow().get(index).copied();
+        match measured {
+            Some((left, width)) if left.is_finite() && width >= TAB_MIN_WIDTH => (left, width),
+            _ => (origin_x + px_units(index) * TAB_WIDTH, TAB_WIDTH),
+        }
+    }
+
+    /// The half-open run of strip indices sharing `index`'s workspace region.
+    ///
+    /// A drag reorders inside this run only: the strip holds every top-row
+    /// region's tabs, and crossing into another region's run is a tab-subtree
+    /// move the shell commits on release, not a reorder.
+    fn group_of(&self, index: usize) -> (usize, usize) {
+        workspace_group_ranges(&self.tabs)
+            .into_iter()
+            .find(|&(start, end)| (start..end).contains(&index))
+            .unwrap_or((0, self.tabs.len()))
     }
 
     /// Release the titlebar's workspace-pill press ownership after Escape,
@@ -379,7 +538,7 @@ impl TitlebarView {
         if source >= self.tabs.len() {
             return;
         }
-        let tab_x = origin_x + px_units(source) * self.tab_width();
+        let (tab_x, _) = self.tab_geometry(source, origin_x);
         let grab_offset = cursor_x - tab_x;
         self.drag = Some(DragState {
             origin: source,
@@ -388,6 +547,7 @@ impl TitlebarView {
             grab_offset,
             cursor_x,
             reordered: false,
+            left_bar: false,
         });
         cx.notify();
     }
@@ -400,20 +560,37 @@ impl TitlebarView {
         Some((drag.origin, drag.source, session_id))
     }
 
-    /// Update the active drag to `cursor_x`, reordering when the dragged tab's
+    /// Update the active drag to `cursor`, reordering when the dragged tab's
     /// centre crosses into a neighbour's slot. Emits
     /// [`TitlebarEvent::ReorderTab`] on each swap.
-    pub fn update_drag(&mut self, cursor_x: f32, cx: &mut Context<Self>) {
+    ///
+    /// Only a pointer inside the dragged tab's own group bar reorders. Once it
+    /// leaves (down into a pane, or over another section's bar) the slot it
+    /// last held freezes as the placeholder: the ghost is then aimed at
+    /// another bar, and a source strip still shuffling under it read as the
+    /// drag doing something other than what the pointer showed.
+    pub fn update_drag(&mut self, cursor: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(mut drag) = self.drag else { return };
+        let cursor_x = f32::from(cursor.x);
         drag.cursor_x = cursor_x;
+        let (start, end) = self.group_of(drag.source);
+        let (group_left, width) = self.tab_geometry(start, drag.origin_x);
+        let group_right = group_left + px_units(end - start) * width;
+        let in_bar = (0.0..=self.height).contains(&f32::from(cursor.y))
+            && (group_left..=group_right).contains(&cursor_x);
+        if !in_bar {
+            drag.left_bar = true;
+            self.drag = Some(drag);
+            cx.notify();
+            return;
+        }
         // Resolve the slot from the dragged tab's centre, not the raw cursor:
         // a swap then always requires half a tab of overlap regardless of
         // where inside the tab the grab landed, so slots cannot thrash when
         // the pointer sits near a boundary.
-        let width = self.tab_width();
         let center = cursor_x - drag.grab_offset + width / 2.0;
-        let target =
-            reorder_target_index(center, drag.origin_x, width, self.tabs.len(), drag.source);
+        let target = start
+            + reorder_target_index(center, group_left, width, end - start, drag.source - start);
         if target != drag.source {
             self.move_tab(drag.source, target);
             cx.emit(TitlebarEvent::ReorderTab { from: drag.source, to: target });
@@ -427,11 +604,16 @@ impl TitlebarView {
     /// End the active drag. `click_swallowed` reports whether GPUI's native
     /// drag engaged for this press (any pressed movement past its ~2 px
     /// threshold): engaging cancels the element's pending click, so an
-    /// engaged press that never reordered was a jittered real-mouse click
-    /// and must still select the pressed tab here.
+    /// engaged press that never reordered and never left its bar was a
+    /// jittered real-mouse click and must still select the pressed tab here.
+    ///
+    /// A drag that left the bar was aimed at another section. Selecting it
+    /// here switched the source section onto the tab in the frame before the
+    /// move took it away, so the source ended up showing a neighbour instead
+    /// of the tab it had been showing.
     pub fn end_drag(&mut self, click_swallowed: bool, cx: &mut Context<Self>) {
         if let Some(drag) = self.drag.take() {
-            if click_swallowed && !drag.reordered {
+            if click_swallowed && !drag.reordered && !drag.left_bar {
                 self.select(drag.source, TabActivationSource::Pointer, cx);
             }
             cx.notify();
@@ -482,13 +664,34 @@ impl TitlebarView {
     }
 
     /// Left edge of the first tab: region edge plus an optional badge pill.
-    // ponytail: spacers and badges between later workspace runs skew drag
-    // targeting by their width; per-slot offsets if cross-group reorder ever
-    // matters.
+    ///
+    /// Only the fallback for a strip no frame has measured yet; painted
+    /// geometry comes from [`Self::tab_geometry`].
     fn tabs_origin_x(&self) -> f32 {
         self.tabs.first().map_or(0.0, |tab| {
-            tab.group_region_x.unwrap_or(0.0) + tab.badge.as_ref().map_or(0.0, badge_width_px)
+            tab.group_region_x.unwrap_or(0.0)
+                + TAB_RUN_INSET
+                + tab.badge.as_ref().map_or(0.0, badge_width_px)
         })
+    }
+
+    /// Painted `(left, width, edge)` of every open tab, in window pixels, for
+    /// the grid to bridge each one into the pane card below it.
+    ///
+    /// Measured geometry only: a tab no frame has painted yet has nothing to
+    /// join to.
+    #[must_use]
+    pub fn open_tab_runs(&self) -> Vec<(f32, f32, Rgba)> {
+        let measured = self.measured_tabs.borrow();
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let edge = open_tab_edge(tab, &self.colors)?;
+                let (left, width) = measured.get(index).copied()?;
+                (left.is_finite() && width > 0.0).then_some((left, width, edge))
+            })
+            .collect()
     }
 
     /// Whether a titlebar control owns keyboard focus. The shell uses this to
@@ -694,26 +897,6 @@ impl TitlebarView {
         })
     }
 
-    /// The raised card behind an active, hovered, or flashing tab.
-    ///
-    /// The fill is an absolute child rather than a full-bleed element
-    /// background: inset `TAB_CARD_TOP_GAP` from the top, the strip shows
-    /// above its rounded corners and the shape reads as a browser-style tab.
-    /// The card runs to the band's bottom edge — and the active card wears
-    /// the pane fill, so the active tab visually opens into the content
-    /// below it. Resting tabs paint no card and sit flat on the strip.
-    fn tab_card(bg: Rgba) -> AnyElement {
-        div()
-            .absolute()
-            .left_0()
-            .right_0()
-            .top(px(TAB_CARD_TOP_GAP))
-            .bottom_0()
-            .rounded_t(px(6.0))
-            .bg(bg)
-            .into_any_element()
-    }
-
     /// Base tab background before the attention flash is blended in.
     fn tab_base_bg(&self, tab: &TabData, is_hovered: bool) -> Rgba {
         if tab.is_active() {
@@ -731,21 +914,6 @@ impl TitlebarView {
             // blend's base — the strip's own background.
             self.colors.bg
         }
-    }
-
-    /// Drag slide offset for the dragged tab (it follows the cursor), clamped
-    /// so the tab never slides out of the strip.
-    fn tab_slide_offset(&self, index: usize) -> Option<f32> {
-        self.drag.and_then(|d| {
-            (d.source == index).then(|| {
-                let width = self.tab_width();
-                let origin = self.tabs_origin_x();
-                let max_left = origin + px_units(self.tabs.len().saturating_sub(1)) * width;
-                let left = (d.cursor_x - d.grab_offset).clamp(origin, max_left);
-                let tab_x = origin + px_units(index) * width;
-                left - tab_x
-            })
-        })
     }
 
     fn render_tab_close(&self, close: TabClose<'_>, cx: &mut Context<Self>) -> AnyElement {
@@ -819,26 +987,29 @@ impl TitlebarView {
             },
             cx,
         ));
-        // The mock's active mark: a 2px tick riding the card's top edge,
-        // inset 8px from each side, in the workspace's effective accent —
-        // the same color the pill dot wears, so it stays a muted gray until
-        // a project names the workspace and takes its palette color. Only
-        // the window-focused region's shown tab wears it: other regions'
-        // shown tabs keep the raised card (their open-tab marker) but go
-        // quiet, so the tick answers "where is my keyboard" while the card
-        // answers "which tab is open here".
-        let tick = tab.is_focused().then(|| {
-            div()
-                .absolute()
-                .top(px(TAB_CARD_TOP_GAP))
-                .left(px(8.0))
-                .right(px(8.0))
-                .h(px(2.0))
-                .rounded_b(px(2.0))
-                .bg(tab.group_accent.unwrap_or(self.colors.accent))
-                .into_any_element()
-        });
-        TabChildren { display, agent_indicator, ai_indicator, suffix, close, tick }
+        // The active mark, in the workspace's effective accent — the same
+        // color the pill dot wears, so it stays a muted gray until a project
+        // names the workspace and takes its palette color. Only the
+        // window-focused region's shown tab wears it: other regions' shown
+        // tabs keep the raised card (their open-tab marker) but go quiet, so
+        // the mark answers "where is my keyboard" while the card answers
+        // "which tab is open here".
+        let mark =
+            tab.is_focused().then(|| focus_mark(tab.group_accent.unwrap_or(self.colors.accent)));
+        TabChildren { display, agent_indicator, ai_indicator, suffix, close, mark }
+    }
+
+    /// The Tab-key focus ring: an absolute child, not a border, because a
+    /// border is a box inset that would shift the card and its outline 2px
+    /// inside the slot the bridge below is painted for.
+    fn keyboard_focus_ring(&self) -> AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .rounded_t(px(6.0))
+            .border_2()
+            .border_color(self.colors.accent)
+            .into_any_element()
     }
 
     fn render_tab(
@@ -856,7 +1027,11 @@ impl TitlebarView {
         let Some(tab_focus) = self.tab_focus_handles.get(index).cloned() else {
             return div().into_any_element();
         };
-        let focused = tab_focus.is_focused(focused_window);
+        // The keyboard ring is for Tab-key navigation only. A click focuses
+        // the tab too, for the one frame before the terminal takes focus
+        // back, and a ring that flashed then read as the card's edge breaking.
+        let focused =
+            tab_focus.is_focused(focused_window) && focused_window.last_input_was_keyboard();
         let close_focused = self
             .tab_close_focus_handles
             .get(index)
@@ -886,26 +1061,28 @@ impl TitlebarView {
             .flex_shrink_1()
             .flex_basis(px(TAB_WIDTH))
             .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(TAB_MAX_WIDTH))
             .overflow_hidden()
             .h_full()
             .px_2()
             .text_color(fg)
             .text_xs();
-        let show_card = tab.is_active() || is_hovered || tab.tab_flash.is_some();
+        let dragging = self.drag.is_some_and(|drag| drag.source == index);
+        let show_card = !dragging && (tab.is_active() || is_hovered || tab.tab_flash.is_some());
         tab_el = tab_el
-            .children(show_card.then(|| Self::tab_card(bg)))
+            .children(show_card.then(|| tab_card(bg, open_tab_edge(tab, &self.colors))))
+            .children(dragging.then(|| drag_placeholder(self.colors.bg, self.colors.accent)))
             .children(self.tab_boundary_mark(index, tab));
-        if focused {
-            tab_el = tab_el.border_2().border_color(self.colors.accent);
-        }
-        if index == 0 {
-            tab_el = tab_el.child(self.tab_width_probe());
-        }
-        let slide = self.tab_slide_offset(index);
-        if let Some(dx) = slide {
-            tab_el = tab_el.left(px(dx));
-        }
+        tab_el = tab_el.children(focused.then(|| self.keyboard_focus_ring()));
+        tab_el = tab_el.child(self.tab_geometry_probe(index));
+        let ghost = TabDragGhost {
+            title: tab.title.clone(),
+            colors: self.colors,
+            width: self.tab_geometry(index, self.tabs_origin_x()).1,
+            height: self.height,
+        };
         let tab_el = tab_el
+            .children(children.mark)
             .children(children.agent_indicator)
             .children(children.ai_indicator)
             // `truncate` keeps the title a single clipped line; without it a
@@ -915,7 +1092,6 @@ impl TitlebarView {
             .child(div().flex_1().truncate().child(children.display))
             .children(children.suffix)
             .children(children.close)
-            .children(children.tick)
             .on_hover(cx.listener(move |this, hovered: &bool, _win, ctx| {
                 this.hovered_tab = if *hovered { Some(index) } else { None };
                 ctx.notify();
@@ -924,7 +1100,7 @@ impl TitlebarView {
             // Registers [`TabDrag`] as GPUI's active drag once the pressed
             // pointer travels past the drag threshold; from then on the root's
             // `on_drag_move` receives every mouse move in the window.
-            .on_drag(TabDrag, |_, _, _, cx| cx.new(|_| TabDragGhost))
+            .on_drag(TabDrag(ghost), |drag, _, _, cx| cx.new(|_| drag.0.clone()))
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 if !this.drag.as_ref().is_some_and(|drag| drag.reordered) {
                     this.select(index, TabActivationSource::Pointer, ctx);
@@ -934,13 +1110,7 @@ impl TitlebarView {
                 ctx.stop_propagation();
                 this.tab_key(index, event, window, ctx);
             }));
-        if slide.is_some() {
-            // Defer the dragged tab's paint past its siblings so it slides
-            // over them instead of underneath the tabs to its right.
-            deferred(tab_el).with_priority(1).into_any_element()
-        } else {
-            tab_el.into_any_element()
-        }
+        tab_el.into_any_element()
     }
 
     fn render_icon_button(
@@ -1007,6 +1177,9 @@ impl TitlebarView {
     /// edge) the groups flow left-to-right as one row.
     fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let tabs = self.tabs.clone();
+        // Stale slots are refreshed by this frame's probes; a shorter strip
+        // drops the tail so no removed tab's geometry outlives it.
+        self.measured_tabs.borrow_mut().resize(tabs.len(), (f32::NAN, 0.0));
         let groups = workspace_group_ranges(&tabs);
         let edges: Vec<Option<f32>> = groups
             .iter()
@@ -1026,7 +1199,7 @@ impl TitlebarView {
                 // No hairline closes the group off: the strip is the bare
                 // window ground, and region identity lives in the pill dot,
                 // the focused tab's tick, and the pane focus ring below.
-                let mut row = div().flex().flex_row().items_center().h_full();
+                let mut row = div().flex().flex_row().items_center().h_full().px(px(TAB_RUN_INSET));
                 if let Some(badge) = tabs.get(start).and_then(|tab| tab.badge.as_ref()) {
                     row = row.child(self.render_group_badge(start, badge, cx));
                 }
@@ -1255,7 +1428,13 @@ impl TitlebarView {
         } else {
             pill = pill.child(workspace_pill_dot(standalone.badge.accent));
         }
-        let row = div().absolute().top_0().left(px(standalone.region_x)).h_full().overflow_hidden();
+        let row = div()
+            .absolute()
+            .top_0()
+            .left(px(standalone.region_x))
+            .h_full()
+            .px(px(TAB_RUN_INSET))
+            .overflow_hidden();
         let row = match next_region_x {
             Some(next) => row.w(px((next - standalone.region_x).max(0.0))),
             None => row.right_0(),
@@ -1331,7 +1510,7 @@ impl Render for TitlebarView {
             // [`TabDrag`] is active, so the drag keeps tracking the cursor
             // after it leaves the titlebar band.
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _win, ctx| {
-                this.update_drag(f32::from(event.event.position.x), ctx);
+                this.update_drag(event.event.position, ctx);
             }))
             // `has_active_drag` is read before GPUI clears the drag (that
             // happens only after event dispatch), so it tells `end_drag`
@@ -1396,12 +1575,17 @@ mod tests {
     use scribe_common::{ids::WorkspaceId, theme::minimal_dark};
 
     use super::{
-        StandaloneBadge, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px,
-        tab_accessible_label, workspace_group_ranges,
+        StandaloneBadge, TAB_RUN_INSET, TabActivationSource, TitlebarEvent, TitlebarView,
+        badge_width_px, tab_accessible_label, workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData, TabShown};
 
     const TEST_TAB_BAR_HEIGHT: f32 = 36.0;
+
+    /// A pointer at `x` inside the titlebar band.
+    fn drag_point(x: f32) -> gpui::Point<gpui::Pixels> {
+        gpui::point(gpui::px(x), gpui::px(TEST_TAB_BAR_HEIGHT / 2.0))
+    }
 
     /// Create a titlebar seeded with `n` tabs (the first active) and a captured
     /// event log.
@@ -1542,7 +1726,8 @@ mod tests {
         let (bar, _) = titlebar_with_tabs(1, cx);
         bar.update(cx, |bar, _| {
             bar.tabs[0].group_region_x = Some(24.0);
-            assert!((bar.tabs_origin_x() - 24.0).abs() < f32::EPSILON);
+            let run = 24.0 + TAB_RUN_INSET;
+            assert!((bar.tabs_origin_x() - run).abs() < f32::EPSILON);
 
             bar.tabs[0].badge = Some(GroupBadge {
                 label: "scribe".to_owned(),
@@ -1550,7 +1735,7 @@ mod tests {
                 beads: true,
             });
             let badge = bar.tabs[0].badge.as_ref().expect("badge");
-            assert!((bar.tabs_origin_x() - 24.0 - badge_width_px(badge)).abs() < f32::EPSILON);
+            assert!((bar.tabs_origin_x() - run - badge_width_px(badge)).abs() < f32::EPSILON);
         });
     }
 
@@ -1598,7 +1783,7 @@ mod tests {
         // Grab tab 0 at its left edge and drag past tab 2.
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
-            bar.update_drag(super::TAB_WIDTH * 2.5, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH * 2.5), cx);
             bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {
@@ -1615,14 +1800,14 @@ mod tests {
         // almost immediately, but the tab's centre has barely moved.
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, super::TAB_WIDTH - 6.0, 0.0, cx);
-            bar.update_drag(super::TAB_WIDTH + 40.0, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH + 40.0), cx);
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[0].title, "tab-0"));
         assert!(log.lock().unwrap().is_empty());
         // Once the centre crosses into slot 1 (tab left past half a width),
         // the swap happens.
         bar.update(cx, |bar, cx| {
-            bar.update_drag(super::TAB_WIDTH * 1.5 - 5.0, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH * 1.5 - 5.0), cx);
             bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[1].title, "tab-0"));
@@ -1635,18 +1820,42 @@ mod tests {
         let (bar, _) = titlebar_with_tabs(3, cx);
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
-            // Way past the strip's right edge: the drag stays live, the target
-            // clamps to the last slot, and the slide keeps the tab in-strip.
-            bar.update_drag(super::TAB_WIDTH * 40.0, cx);
-            assert!(bar.drag.is_some());
-            assert_eq!(bar.tab_slide_offset(2), Some(0.0));
-            // And back past the left edge: clamped to the first slot.
-            bar.update_drag(-500.0, cx);
-            assert!(bar.drag.is_some());
-            assert_eq!(bar.tab_slide_offset(0), Some(0.0));
+            // Way past the strip's right edge: the drag stays live and the
+            // slot freezes where it was, since the pointer left the bar.
+            bar.update_drag(drag_point(super::TAB_WIDTH * 40.0), cx);
+            assert!(bar.drag.is_some_and(|drag| drag.source == 0));
+            // Below the band likewise: a pointer over the panes reorders nothing.
+            bar.update_drag(gpui::point(gpui::px(super::TAB_WIDTH * 2.5), gpui::px(200.0)), cx);
+            assert!(bar.drag.is_some_and(|drag| drag.source == 0));
             bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[0].title, "tab-0"));
+    }
+
+    // @lat: [[client#GPUI Titlebar#A drag reorders within its workspace group only]]
+    #[gpui::test]
+    fn drag_stays_inside_its_workspace_group(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(4, cx);
+        // Two side-by-side top regions: tabs 0-1 and tabs 2-3.
+        bar.update(cx, |bar, cx| {
+            bar.tabs[0].group_region_x = Some(0.0);
+            bar.tabs[2].group_region_x = Some(super::TAB_WIDTH * 2.0);
+            bar.begin_drag(0, 0.0, 0.0, cx);
+            // Inside the first group, past slot 1's centre: an ordinary swap.
+            bar.update_drag(drag_point(super::TAB_WIDTH * 1.4), cx);
+            assert!(bar.drag.is_some_and(|drag| drag.source == 1));
+            // Far into the second group's run: the slot freezes at the end of
+            // the first group, leaving the cross-region move to the shell's
+            // release path.
+            bar.update_drag(drag_point(super::TAB_WIDTH * 3.5), cx);
+            assert!(bar.drag.is_some_and(|drag| drag.source == 1));
+            bar.end_drag(true, cx);
+        });
+        bar.read_with(cx, |bar, _| {
+            assert_eq!(bar.tabs()[1].title, "tab-0");
+            assert_eq!(bar.tabs()[2].title, "tab-2");
+        });
+        assert_eq!(log.lock().unwrap().as_slice(), &[TitlebarEvent::ReorderTab { from: 0, to: 1 }]);
     }
 
     // @lat: [[client#GPUI Titlebar#Release outside the strip commits the reorder]]
@@ -1656,7 +1865,7 @@ mod tests {
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
             // The pointer wanders below the titlebar band mid-drag...
-            bar.update_drag(super::TAB_WIDTH * 2.5, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH * 2.5), cx);
             // ...and the mouse-up lands there too (the root's `up_out` path).
             bar.end_drag(true, cx);
             assert!(bar.drag.is_none());
@@ -1675,7 +1884,7 @@ mod tests {
             // pending click, so the release itself must select the pressed
             // tab (`click_swallowed = true`, no reorder).
             bar.begin_drag(1, super::TAB_WIDTH + 4.0, 0.0, cx);
-            bar.update_drag(super::TAB_WIDTH + 20.0, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH + 20.0), cx);
             assert!(bar.drag.as_ref().is_some_and(|drag| !drag.reordered));
             bar.end_drag(true, cx);
         });
@@ -1687,6 +1896,21 @@ mod tests {
             log.lock().unwrap().as_slice(),
             &[TitlebarEvent::SelectTab { index: 1, source: TabActivationSource::Pointer }]
         );
+    }
+
+    // @lat: [[client#GPUI Titlebar#A drag that left its bar does not select]]
+    #[gpui::test]
+    fn drag_that_left_its_bar_does_not_select(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(3, cx);
+        bar.update(cx, |bar, cx| {
+            // Grab tab 1 and carry it below the band, as a drag aimed at
+            // another section does; it never reorders.
+            bar.begin_drag(1, super::TAB_WIDTH + 4.0, 0.0, cx);
+            bar.update_drag(gpui::point(gpui::px(super::TAB_WIDTH + 4.0), gpui::px(300.0)), cx);
+            bar.end_drag(true, cx);
+        });
+        bar.read_with(cx, |bar, _| assert!(bar.tabs()[0].is_active()));
+        assert!(log.lock().unwrap().is_empty());
     }
 
     // @lat: [[client#GPUI Titlebar#Out-of-range interactions are no-ops]]
@@ -1713,7 +1937,7 @@ mod tests {
 
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
-            bar.update_drag(super::TAB_WIDTH * 2.5, cx);
+            bar.update_drag(drag_point(super::TAB_WIDTH * 2.5), cx);
             bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {

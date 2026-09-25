@@ -85,7 +85,7 @@ impl ChildExitWatcher {
     /// called from inside a tokio runtime.
     #[must_use]
     pub fn arm(pidfd: OwnedFd, child_pid: u32) -> Option<Self> {
-        match AsyncFd::with_interest(pidfd, Interest::READABLE) {
+        match scribe_pty::async_fd::register_owned(pidfd, Interest::READABLE) {
             Ok(pidfd) => Some(Self { pidfd, child_pid }),
             Err(err) => {
                 warn!(child_pid, %err, "pidfd reactor registration failed — no child-exit watcher");

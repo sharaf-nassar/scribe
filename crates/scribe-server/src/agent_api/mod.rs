@@ -397,6 +397,15 @@ where
         Err(_) => "deny",
     };
     let mut response = AgentResponse { request_id: metadata.request_id, result };
+    // One-shot callers negotiate without Hello. Downgrade before measuring
+    // the reply so the response ceiling and audit count describe sent bytes.
+    if !matches!(
+        request,
+        AgentRequest::World { ai_background_wait: true, .. }
+            | AgentRequest::Siblings { ai_background_wait: true, .. }
+    ) {
+        response.make_background_wait_compatible();
+    }
     enforce_serialized_response_ceiling(&mut response);
     emit_audit(&metadata, decision, serialized_response_bytes(&response));
     AgentDispatch { response, _permit: permit, _activity: activity }
@@ -753,6 +762,7 @@ mod tests {
             agent_label: "socket-test".into(),
             origin_session_id: None,
             progress_ack: false,
+            ai_background_wait: true,
         }
     }
 
@@ -762,6 +772,7 @@ mod tests {
             agent_label: "world-test".into(),
             origin_session_id: origin,
             progress_ack: false,
+            ai_background_wait: true,
         }
     }
 
@@ -771,6 +782,7 @@ mod tests {
             agent_label: "world-test".into(),
             origin_session_id: origin,
             progress_ack: false,
+            ai_background_wait: true,
         }
     }
 
@@ -1654,6 +1666,7 @@ mod tests {
                 agent_label: "target-test".into(),
                 origin_session_id: Some(session_id),
                 progress_ack: false,
+                ai_background_wait: true,
             },
             screen_request(4, session_id),
             AgentRequest::DispatchAction {
@@ -1791,6 +1804,7 @@ mod tests {
             agent_label: "busy-agent".into(),
             origin_session_id: None,
             progress_ack: false,
+            ai_background_wait: true,
         };
         let busy = dispatch_headless(&busy_state, &busy_request).await;
         drop(permits);

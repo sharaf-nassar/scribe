@@ -58,8 +58,10 @@ const FALLBACK_PANE_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
 
 /// Half the window-ground gap between two adjacent pane cards.
 const PANE_GAP_HALF: f32 = 3.0;
-/// Margin a pane card keeps to its region's content edge.
-const PANE_CARD_MARGIN: f32 = 6.0;
+/// Margin a pane card keeps to its region's content edge. The tab bars inset
+/// their runs by the same amount so an open tab sits over the card's straight
+/// top edge.
+pub const PANE_CARD_MARGIN: f32 = scribe_client::titlebar::TAB_RUN_INSET;
 
 /// Frame-local inputs for geometry inside workspace regions.
 #[derive(Debug, Clone, Copy)]

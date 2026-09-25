@@ -67,6 +67,14 @@ ignore = [
   "RUSTSEC-2026-0190", # anyhow — Error::downcast_mut() unsoundness (via gpui)
   "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (build-time proc-macro)
   "RUSTSEC-2026-0097", # rand — unsoundness with a custom logger using rng()
+  # Owner: Scribe maintainers. Review by 2027-01-01 or when the gpui pin and
+  # scribe-client move to zbus >=6.
+  # zvariant/zvariant_derive/zbus_names unmaintained (merged into zbus 6), no
+  # safe upgrade — transitive via zbus 5 (gpui_linux accesskit/ashpd/oo7 and
+  # the client's notification dispatcher); local D-Bus only.
+  "RUSTSEC-2026-0370", # zvariant
+  "RUSTSEC-2026-0371", # zbus_names
+  "RUSTSEC-2026-0372", # zvariant_derive
 ]
 
 [bans]

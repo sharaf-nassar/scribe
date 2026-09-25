@@ -461,12 +461,14 @@ fn build_agent_request(
             agent_label,
             origin_session_id,
             progress_ack: true,
+            ai_background_wait: true,
         },
         AgentCommand::Siblings => AgentRequest::Siblings {
             request_id: AGENT_REQUEST_ID,
             agent_label,
             origin_session_id,
             progress_ack: true,
+            ai_background_wait: true,
         },
         AgentCommand::Read { session_id, scrollback } => AgentRequest::ReadScreen {
             request_id: AGENT_REQUEST_ID,
@@ -1004,6 +1006,15 @@ mod tests {
         assert_eq!(origin_session_id(None).unwrap(), None);
     }
 
+    #[test]
+    fn agent_snapshot_requests_advertise_background_wait() {
+        for command in [super::AgentCommand::World, super::AgentCommand::Siblings] {
+            let request = super::build_agent_request(command, "runner".into(), None).unwrap();
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["ai_background_wait"], true);
+        }
+    }
+
     #[tokio::test]
     async fn agent_exchange_uses_framed_one_shot_request_and_response() {
         let session_id = scribe_common::ids::SessionId::new();
@@ -1012,6 +1023,7 @@ mod tests {
             agent_label: String::from("runner [model-x]"),
             origin_session_id: Some(session_id),
             progress_ack: true,
+            ai_background_wait: true,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -1023,6 +1035,7 @@ mod tests {
                     agent_label,
                     origin_session_id: Some(origin),
                     progress_ack: true,
+                    ai_background_wait: true,
                 }) if agent_label == "runner [model-x]" && origin == session_id
             ));
             write_message(
@@ -1048,6 +1061,7 @@ mod tests {
             agent_label: String::from("runner"),
             origin_session_id: None,
             progress_ack: true,
+            ai_background_wait: true,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -1079,6 +1093,7 @@ mod tests {
             agent_label: String::from("runner"),
             origin_session_id: None,
             progress_ack: true,
+            ai_background_wait: true,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {

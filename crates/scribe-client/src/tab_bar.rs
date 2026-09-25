@@ -100,6 +100,9 @@ pub struct TabBarColors {
     pub gradient_top: Rgba,
     /// Theme accent, reused for the attention flash and focus chrome.
     pub accent: Rgba,
+    /// The whisper edge a resting pane card wears (the divider tone at 40% of
+    /// its own alpha), so an open tab's card can share its pane's outline.
+    pub pane_edge: Rgba,
 }
 
 /// Convert a sRGB `[f32; 4]` chrome channel to a GPUI [`Rgba`].
@@ -118,6 +121,10 @@ impl From<&ChromeColors> for TabBarColors {
             separator: srgba(chrome.tab_separator),
             gradient_top: srgba(chrome.tab_bar_gradient_top),
             accent: srgba(chrome.accent),
+            pane_edge: {
+                let edge = srgba(chrome.divider);
+                Rgba { a: edge.a * 0.4, ..edge }
+            },
         }
     }
 }

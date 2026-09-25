@@ -165,7 +165,9 @@ def assert_workspace_move(path, source_workspace, target_workspace, operation):
 
 def assert_tab_subtree_move(path, source_workspace, target_workspace, session_id):
     request = moved = False
-    creates = lists = 0
+    lists = 0
+    created = set()
+    known = set()
     for row in rows(path):
         current = message(row)
         if row.get("dir") == "client" and current.get("type") == "MoveWorkspace":
@@ -179,10 +181,20 @@ def assert_tab_subtree_move(path, source_workspace, target_workspace, session_id
             moved = moved or str(current.get("result", "")).lower() == "moved"
         if row.get("dir") == "server" and current.get("type") == "SessionList":
             lists += 1
+            known.update(session.get("session_id") for session in current.get("sessions", []))
         if row.get("dir") == "server" and current.get("type") == "SessionCreated":
-            creates += 1
-    assert request and moved and lists == 1 and creates == 0, (request, moved, lists, creates)
-    print(json.dumps({"session_id": session_id, "session_created": creates, "session_lists": lists}))
+            created.add(current.get("session_id"))
+    # Same rule as assert_workspace_move: the client may re-attach the panes it
+    # shows after adopting the refreshed tree, and the server answers each with
+    # a SessionCreated for an id the one SessionList already named. A
+    # replacement session would be an id that list never carried.
+    assert request and moved and lists == 1 and created <= known, (
+        request,
+        moved,
+        lists,
+        created - known,
+    )
+    print(json.dumps({"session_id": session_id, "session_created_ids_preexisting": True, "session_lists": lists}))
     return 0
 
 

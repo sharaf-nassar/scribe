@@ -20,17 +20,20 @@ fail() {
 # Locate the tab title inside one bar, as `count x y width height` with `y`
 # relative to the bar's top.
 #
-# Two things in the current chrome defeat a plain "bright near-gray ink" crop:
+# Three things in the current chrome defeat a plain "bright near-gray ink" crop:
 #
-#   * The focused tab's accent tick is a NEUTRAL muted gray whenever no project
-#     has named the workspace, so it passes the near-gray title filter. Its
-#     full-width 2px rule stretched the reported title box from 10px to 17px.
-#     Rows that span almost the whole window are therefore dropped: a title
-#     never does, a rule always does.
+#   * The open tab's card wears its pane's outline and a keyboard mark in a
+#     NEUTRAL muted gray whenever no project has named the workspace, so both
+#     pass the near-gray title filter. The outline's vertical rules are found
+#     first (columns lit down most of the band), everything in their colour is
+#     dropped, and rows spanning almost the whole card (its top edge) go too.
 #   * A window holding more than one region grows a workspace pill at each
 #     bar's left. Its label carries descenders the tab title does not, so a
-#     crop anchored at x=8 measured the pill and read 4.5px low. The scan
-#     starts after the pill's filled card when one is present.
+#     crop anchored at the bar's edge measured the pill and read 4.5px low.
+#   * Tabs cap at 230px, so a lone tab's title sits in the first fraction of
+#     a wide bar and a fixed crop could miss it entirely.
+#   The scan is therefore bounded by the open tab's own two outline rules,
+#   which the pill lies left of and the bare run right of.
 title_geometry() {
     local image="$1" bar_top="$2"
     python3 - "$image" "$bar_top" "$TITLEBAR_HEIGHT" "$TITLE_SCAN_WIDTH" <<'PY'
@@ -57,27 +60,32 @@ for line in raw.splitlines():
 def dist(a, b):
     return max(abs(a[i] - b[i]) for i in range(3))
 
-mid = bar_h // 2
-edge = px[(width - 4, mid)]
-pill = px[(2, mid)]
-left = 0
-if dist(pill, edge) > 6:
-    run = 0
-    for x in range(width):
-        if dist(px[(x, mid)], pill) <= 6:
-            left, run = x, 0
-        else:
-            run += 1
-            if run >= 8 and left:
-                break
-    left += 6
+def near_gray(c):
+    return c[0] > 102 and abs(c[0] - c[1]) < 8 and abs(c[1] - c[2]) < 8
 
-lo, hi = left, min(left + crop_w, width)
+# The open tab's card wears its pane's outline: two one-pixel vertical rules
+# the full card tall, in a muted gray that passes the title filter. They are
+# chrome, not title ink, but they also bound the title: the open tab is the
+# first card in the bar, so its title lies between the first two rules. A
+# workspace pill to the left and a bare run to the right both fall outside.
+span = {}
+for y in range(bar_h):
+    for x in range(width):
+        if near_gray(px[(x, y)]):
+            span[x] = span.get(x, 0) + 1
+rules = sorted(x for x, n in span.items() if n > 14)
+if len(rules) < 2:
+    print("0 0 0 0 0")
+    raise SystemExit
+lo, hi = rules[0] + 1, min(rules[1], rules[0] + 1 + crop_w)
+outline = {px[(x, y)] for x in rules[:2] for y in range(bar_h) if near_gray(px[(x, y)])}
+
 rows = {}
 for y in range(bar_h):
+    # Drop the outline's own colour too: its top edge, corner, and the
+    # keyboard mark share it, while the title is far brighter.
     ink = [x for x in range(lo, hi)
-           if px[(x, y)][0] > 102 and abs(px[(x, y)][0] - px[(x, y)][1]) < 8
-           and abs(px[(x, y)][1] - px[(x, y)][2]) < 8]
+           if near_gray(px[(x, y)]) and all(dist(px[(x, y)], c) > 6 for c in outline)]
     if ink and len(ink) < 0.9 * (hi - lo):
         rows[y] = ink
 

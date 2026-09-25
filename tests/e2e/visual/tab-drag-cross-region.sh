@@ -50,6 +50,10 @@ leaf_tabs() {
     oracle leaf "$1" | python3 -c 'import json,sys; print(*json.load(sys.stdin)["session_ids"])'
 }
 
+shown_tab() {
+    oracle leaf "$1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["session_ids"][d["active_tab_index"]])'
+}
+
 tab_center() {
     local index=$1 width=$2 count=$3
     echo $(( index * width / count + width / (2 * count) ))
@@ -151,4 +155,80 @@ oracle assert-tab-subtree-move "$LOWER" "$TOP" "$LOWER_MOVED" \
 leaf_tabs "$TOP" | tr ' ' '\n' | grep -Fx "$LOWER_MOVED" >/dev/null \
     || fail "lower-to-top transfer lost the selected tab identity"
 echo "PHASE 1 PASS: lower-region tab moved atomically into titlebar chrome"
+
+# Side-by-side top regions share the titlebar strip as two aligned groups.
+# The titlebar's own reorder used to run across both groups, so the dragged
+# tab's identity drifted and the release never resolved a move: this is the
+# gesture a wide window's top row depends on.
+xdotool mousemove --sync "$((WIN_X + 200))" "$((WIN_Y + WIN_H / 4))"
+xdotool click 1
+send_keys ctrl+alt+backslash
+ids=$(oracle wait-leaves 3 1) || fail "top-right workspace never became live"
+TOP_RIGHT=$(printf '%s\n' "$ids" | tr ' ' '\n' | grep -vx "$TOP" | grep -vx "$LOWER" | head -1)
+[ -n "$TOP_RIGHT" ] || fail "could not name the top-right workspace"
+sleep 0.5
+TOP_COUNT=$(leaf_tabs "$TOP" | wc -w)
+TOP_RIGHT_COUNT=$(leaf_tabs "$TOP_RIGHT" | wc -w)
+TOP_MOVED=$(leaf_tabs "$TOP" | awk '{ print $1 }')
+# The left group fills the window's left half after its pill; its first tab
+# sits just right of the pill. The drop lands past the right group's pill.
+reset_record
+drag 150 17 "$((WIN_W * 3 / 4))" 17
+oracle wait-leaf-session-count "$TOP_RIGHT" "$((TOP_RIGHT_COUNT + 1))" >/dev/null \
+    || fail "top-right region did not gain the dragged tab"
+oracle wait-leaf-session-count "$TOP" "$((TOP_COUNT - 1))" >/dev/null \
+    || fail "top-left region did not lose the dragged tab"
+oracle assert-tab-subtree-move "$TOP" "$TOP_RIGHT" "$TOP_MOVED" \
+    >/output/tab-cross-region-top-to-top.json \
+    || fail "side-by-side titlebar transfer did not use one atomic workspace move"
+leaf_tabs "$TOP_RIGHT" | tr ' ' '\n' | grep -Fx "$TOP_MOVED" >/dev/null \
+    || fail "side-by-side titlebar transfer lost the selected tab identity"
+echo "PHASE 2 PASS: titlebar tab moved atomically into the side-by-side region's group"
+
+# A release over another workspace's panes, not its bar, still lands: the tab
+# joins that workspace as its last tab. The bars are 36px and a drag aimed at a
+# workspace routinely ends inside it.
+TOP_RIGHT_COUNT=$(leaf_tabs "$TOP_RIGHT" | wc -w)
+LOWER_COUNT=$(leaf_tabs "$LOWER" | wc -w)
+PANE_MOVED=$(leaf_tabs "$TOP_RIGHT" | awk '{ print $1 }')
+# Show the source's last tab so the dragged first tab is an inactive one. This
+# drag leaves the bar at once without reordering, the gesture whose release
+# used to select the dragged tab and leave the source on a neighbour.
+xdotool mousemove --sync "$((WIN_X + WIN_W * 3 / 4))" "$((WIN_Y + WIN_H / 4))"
+xdotool click 1
+sleep 0.4
+send_keys "alt+$TOP_RIGHT_COUNT"
+TOP_SHOWN=$(shown_tab "$TOP_RIGHT")
+[ "$TOP_SHOWN" != "$PANE_MOVED" ] || fail "source still shows the tab about to be dragged"
+reset_record
+drag "$((WIN_W / 2 + 150))" 17 "$((WIN_W / 4))" "$((WIN_H * 3 / 4))"
+oracle wait-leaf-session-count "$LOWER" "$((LOWER_COUNT + 1))" >/dev/null \
+    || fail "lower region did not gain the tab dropped on its panes"
+oracle wait-leaf-session-count "$TOP_RIGHT" "$((TOP_RIGHT_COUNT - 1))" >/dev/null \
+    || fail "top-right region did not lose the tab dropped on another's panes"
+oracle assert-tab-subtree-move "$TOP_RIGHT" "$LOWER" "$PANE_MOVED" \
+    >/output/tab-cross-region-pane-drop.json \
+    || fail "pane drop did not use one atomic workspace move"
+[ "$(leaf_tabs "$LOWER" | awk '{ print $NF }')" = "$PANE_MOVED" ] \
+    || fail "pane drop did not append the tab as the workspace's last"
+[ "$(shown_tab "$TOP_RIGHT")" = "$TOP_SHOWN" ] \
+    || fail "dragging an inactive tab out switched the source off the tab it showed"
+# The final state alone can come out right by luck: the bad selection and the
+# move race, and either may reach the server first. Every report the drag
+# produced must have kept the source on its own tab.
+python3 - "$RECORD" "$TOP_RIGHT" "$PANE_MOVED" <<'PY' || fail "source flipped onto the dragged tab during the drag"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("o", "/tests/visual/workspace-tree-oracle.py")
+o = importlib.util.module_from_spec(spec); spec.loader.exec_module(o)
+path, source, moved = sys.argv[1:4]
+for row in o.rows(path):
+    m = o.message(row)
+    if row.get("dir") != "client" or m.get("type") != "ReportWorkspaceTree":
+        continue
+    for leaf in o.leaves(m["tree"]):
+        ids = leaf["session_ids"]
+        if str(leaf["workspace_id"]) == source and ids and ids[leaf["active_tab_index"]] == moved:
+            sys.exit(1)
+PY
+echo "PHASE 3 PASS: tab dropped on another workspace's panes joined it as its last tab"
 echo "PASS: tab subtree moves from lower-region bar into titlebar chrome"

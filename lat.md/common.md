@@ -44,6 +44,8 @@ Shared agent types expose a narrow, versioned local contract without serializing
 
 Every request carries `request_id`, a caller-supplied label, optional origin session, and serde-defaulted `progress_ack`. The opt-in acknowledgement makes the transient protocol forward-compatible: a new CLI waits longer only after a new server confirms it received an operation that can park or wait. [[crates/scribe-common/src/agent.rs#AgentResponse]] echoes the id and wraps either a successful payload or [[crates/scribe-common/src/agent.rs#AgentError]]. `AGENT_SURFACE_VERSION` is 1 and is reported by the capability payload.
 
+`World` and `Siblings` also carry serde-defaulted `ai_background_wait`. Current CLIs set it true; absent or false keeps replies compatible with the old AI-state enum. [[crates/scribe-common/src/agent.rs#AgentResponse#make_background_wait_compatible]] converts only background waits to `Processing`, sharing the state conversion used by persistent client frames. See [[protocol#Agent Control Request Family#Negotiation and compatibility]].
+
 World DTOs expose window/workspace/session identity and status, with optional title, CWD, provider, AI state, task label, and context fill omitted when unavailable. They deliberately exclude launch ids, retained prompt state and text, conversation ids, model/tool/agent metadata, environment envelopes, controller identity, and participant identity. Screen replies identify the pane and include normalized text, line count, truncation, capture time, and snapshot id.
 
 ### Capabilities, actions, and errors

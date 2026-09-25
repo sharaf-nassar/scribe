@@ -2369,18 +2369,14 @@ impl ServerMessage {
     /// did not advertise `Hello.ai_background_wait` and cannot decode it. Work
     /// is still underway, and `Processing` never raises a notification.
     pub fn make_background_wait_compatible(&mut self) {
-        fn downgrade(state: &mut AiProcessState) {
-            if state.state == AiState::WaitingForBackground {
-                state.state = AiState::Processing;
-            }
-        }
         match self {
-            ServerMessage::AiStateChanged { ai_state, .. } => downgrade(ai_state),
+            ServerMessage::AiStateChanged { ai_state, .. } => {
+                ai_state.state.make_background_wait_compatible();
+            }
             ServerMessage::SessionList { sessions, .. } => {
-                sessions
-                    .iter_mut()
-                    .filter_map(|session| session.ai_state.as_mut())
-                    .for_each(downgrade);
+                for state in sessions.iter_mut().filter_map(|session| session.ai_state.as_mut()) {
+                    state.state.make_background_wait_compatible();
+                }
             }
             _ => {}
         }
