@@ -15071,6 +15071,8 @@ fn resolve_window_assignment<V>(
 
 #[cfg(test)]
 mod tests {
+    mod agent_compat;
+
     use super::*;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
     use scribe_common::framing::{MAX_MESSAGE_SIZE, read_message};
@@ -16026,6 +16028,7 @@ mod tests {
             agent_label: "origin-test".into(),
             origin_session_id: Some(origin_session),
             progress_ack: true,
+            ai_background_wait: true,
         };
 
         let mut server =
@@ -16156,6 +16159,7 @@ mod tests {
             agent_label: "origin-test".into(),
             origin_session_id: Some(origin_session),
             progress_ack: false,
+            ai_background_wait: true,
         };
 
         assert!(
@@ -16223,6 +16227,7 @@ mod tests {
             agent_label: "dismiss-test".into(),
             origin_session_id: None,
             progress_ack: false,
+            ai_background_wait: true,
         }
     }
 

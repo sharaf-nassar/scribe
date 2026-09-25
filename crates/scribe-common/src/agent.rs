@@ -23,6 +23,9 @@ pub enum AgentRequest {
         origin_session_id: Option<SessionId>,
         #[serde(default)]
         progress_ack: bool,
+        /// Whether the caller can decode `AiState::WaitingForBackground`.
+        #[serde(default)]
+        ai_background_wait: bool,
     },
     Siblings {
         request_id: u64,
@@ -31,6 +34,9 @@ pub enum AgentRequest {
         origin_session_id: Option<SessionId>,
         #[serde(default)]
         progress_ack: bool,
+        /// Whether the caller can decode `AiState::WaitingForBackground`.
+        #[serde(default)]
+        ai_background_wait: bool,
     },
     ReadScreen {
         request_id: u64,
@@ -108,6 +114,21 @@ impl AgentRequest {
 pub struct AgentResponse {
     pub request_id: u64,
     pub result: Result<AgentPayload, AgentError>,
+}
+
+impl AgentResponse {
+    /// Downgrade snapshot states for callers that did not advertise support.
+    pub fn make_background_wait_compatible(&mut self) {
+        if let Ok(AgentPayload::World { snapshot } | AgentPayload::Siblings { snapshot }) =
+            &mut self.result
+        {
+            for state in
+                snapshot.sessions.iter_mut().filter_map(|session| session.ai_state.as_mut())
+            {
+                state.make_background_wait_compatible();
+            }
+        }
+    }
 }
 
 /// Version of the local agent control surface this build implements.
@@ -388,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_dto_excludes_session_and_ai_metadata() {
+    fn agent_requests_exclude_session_and_ai_metadata() {
         let sid = session_id();
         let wid = window_id();
         let requests = [
@@ -397,12 +418,14 @@ mod tests {
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
                 progress_ack: false,
+                ai_background_wait: true,
             },
             AgentRequest::Siblings {
                 request_id: 1,
                 agent_label: String::from("runner"),
                 origin_session_id: Some(sid),
                 progress_ack: false,
+                ai_background_wait: true,
             },
             AgentRequest::ReadScreen {
                 request_id: 1,
@@ -439,7 +462,10 @@ mod tests {
         for request in &requests {
             assert_redacted(request);
         }
+    }
 
+    #[test]
+    fn agent_responses_exclude_session_and_ai_metadata() {
         let payloads = [
             AgentPayload::World { snapshot: snapshot() },
             AgentPayload::Siblings { snapshot: snapshot() },

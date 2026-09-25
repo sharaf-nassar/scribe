@@ -210,6 +210,10 @@ timestamp. Deliberately absent: prompt text, conversation ids, launch ids,
 and other participants' identities. The response never carries terminal
 content — that is `read`'s job, under its own capability.
 
+When an older CLI queries `world` or `siblings`, a new server reports
+`waiting_for_background` as `processing` so the CLI can decode its snapshot.
+Current CLIs advertise support and receive the full state.
+
 ### `scribe agent siblings`
 
 Capability: **read-metadata**. The same snapshot shape as `world`, filtered

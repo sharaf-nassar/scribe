@@ -315,6 +315,12 @@ Prompt routing covers two capable windows with the origin window lexicographical
 
 The `scribe-test` daemon and IPC fixtures explicitly advertise `agent_api: false`; they tolerate the additive variants without claiming to implement an agent consumer. The dedicated recipes below instead drive the surface through the real `scribe` CLI inside live panes, so the harness itself never claims the capability.
 
+### Background wait snapshot compatibility
+
+One-shot World and Siblings replies remain decodable by older callers while current callers receive the background-wait state.
+
+A server fixture retains a Pi session in `WaitingForBackground` and dispatches both snapshot requests without Hello. Missing and false `ai_background_wait` fields must produce framed replies that decode through the old five-state enum as `Processing`; true preserves `WaitingForBackground`. Context metadata and retained session state stay unchanged. CLI tests require both commands to advertise support.
+
 ### Functional agent E2E scripts
 
 Container scripts exercise the real CLI-to-server control path from inside live sessions against a freshly configured server.

@@ -59,7 +59,9 @@ Five additive exchanges connect a one-shot caller to the long-lived GPUI client 
 
 A new server sends prompt and activity frames only to participants that advertised the bit, so an older client's exhaustive `ServerMessage` match never sees an unknown top-level variant. An old Hello or Welcome decodes as incapable, while old schemas ignore the new named MessagePack field.
 
-`AgentRequest` is a local transient first frame: it registers no window and receives at most one reply. The remote handshake and authorization paths do not expose this request family. Same-UID socket admission remains the transport boundary; agent capability policy constrains cooperative use of this supported surface and is not a sandbox against other same-UID raw IPC callers.
+`AgentRequest` is a local transient first frame: it registers no window and receives at most one terminal reply. The remote handshake and authorization paths do not expose this request family. Same-UID socket admission remains the transport boundary; agent capability policy constrains cooperative use of this supported surface and is not a sandbox against other same-UID raw IPC callers.
+
+`World` and `Siblings` negotiate `ai_background_wait` on the request itself because one-shot callers never send `Hello`. Missing or false means their snapshot reports `WaitingForBackground` as `Processing`; current CLI requests set it true. Old servers ignore the additive field. The agent dispatcher downgrades before response sizing and audit logging, using the same [[crates/scribe-common/src/ai_state.rs#AiState#make_background_wait_compatible|state conversion]] as local client frames. Retained session state is unchanged. See [[test#Agent Control Surface#Background wait snapshot compatibility]].
 
 ## Client Messages
 

@@ -68,6 +68,8 @@ Metadata reads copy one coherent, allowlisted view from the live-session, window
 
 `World` returns every window, workspace, and live session server-wide. A matching `origin_session_id` marks exactly one session as `is_caller`; a missing or stale origin marks none. `Siblings` filters the same captured snapshot to the origin session's window and returns typed `NotFound` when the origin is absent or stale.
 
+The dispatcher applies [[protocol#Agent Control Request Family#Negotiation and compatibility|request-level background-wait compatibility]] to the copied reply before response sizing and audit logging. Old callers receive `Processing` without changing retained session state; capable callers receive `WaitingForBackground`. The [[test#Agent Control Surface#Background wait snapshot compatibility|socket regression]] covers both snapshot operations without a Hello handshake.
+
 ### Screen reads
 
 Screen reads copy only the requested viewport and bounded trailing scrollback while holding the terminal lock, then normalize text after releasing it.
