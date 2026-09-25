@@ -224,6 +224,7 @@ pub fn ai_states() -> Vec<(&'static str, &'static str)> {
     vec![
         ("processing", "Processing"),
         ("waiting_for_input", "Waiting for input"),
+        ("waiting_for_background", "Waiting for background"),
         ("permission_prompt", "Permission prompt"),
         ("error", "Error"),
     ]

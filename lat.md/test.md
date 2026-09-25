@@ -1760,6 +1760,12 @@ Mixed local client/server generations never exchange a Pi enum the older peer ca
 
 Old `Hello` and `Welcome` maps default `pi_provider` to false, while old schemas ignore the new field. The compatibility helper selects structured fresh Pi metadata for a capable peer and `ShellTool::Pi` for an incapable one. The server withholds live Pi-only frames from an old client, downgrades `SessionList`, and resumes structured delivery once capability is enabled.
 
+### Background wait compatibility
+
+A client that did not advertise `Hello.ai_background_wait` never receives a `WaitingForBackground` it cannot decode.
+
+The server's per-connection output sink reports the state as `Processing` in both a live `AiStateChanged` and a `SessionList`, then delivers it unchanged once the capability is recorded.
+
 ### Remote and handoff version gates
 
 Remote protocol v8 returns the existing typed incompatibility refusal to a v7 peer. Handoff state carrying Pi AI state or a Pi provider hint declares v8; a v8 receiver accepts v6-v8 senders, while v6/v7 receivers reject v8 before acknowledging.
@@ -1901,6 +1907,12 @@ message reaches the normal stop classifier, or the latest error is restored.
 The ready event and a reloaded adapter's startup restore already-running work.
 Late replies and malformed fleet snapshots cannot change state, and shutdown
 removes liveness listeners so pending replies or later events emit nothing.
+
+### Background task wait
+
+A settled parent with running pi-background-tasks work reports `waiting_for_background` when a task will wake it and `waiting_for_input` when none will, holding its reply back from the stop classifier until the work ends.
+
+The fake owner answers read-only `status` requests with a suite that will wake the agent beside a server started with `triggerOnCompletion:false`, and the pending wake-up wins. Completion keeps the background wait until the wake-up `agent_start` reports processing, without a settled flash in between. That turn's settle then waits on the user while the server runs, even when a repeated terminal frame for the delivered task arrives, and the server stopping hands the retained reply to the classifier. A task that finishes mid-run cannot hold the next settle, and foreign or failed replies start no wait.
 
 ### Malformed messages and no polling
 
@@ -4519,6 +4531,8 @@ Unit coverage for the decision half of desktop notifications (): which AI transi
 ### Non-attention states never fire
 
 `Processing` and `Error` are not attention states, so reaching them never produces a payload even under `NotifyCondition::Always`, while the following `Processing → PermissionPrompt` cycle still does.
+
+`WaitingForBackground` never fires either: a run parked on background work stays silent, and only the wake-up turn's `Processing → IdlePrompt` does.
 
 ### Disabled notifications never fire
 

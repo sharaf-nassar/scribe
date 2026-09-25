@@ -928,6 +928,8 @@ Per-session terminal-image state is the one additive field that could not stay o
 
 `AiProvider::Pi` requires the same fail-safe treatment for a different reason: an older receiver cannot deserialize the new enum value. [[crates/scribe-server/src/handoff.rs#handoff_state_version]] declares v8 whenever any session's live state or provider hint names Pi, ahead of the image check. A v8 receiver accepts v6, v7, and v8 senders so both image-free and image-bearing forward upgrades remain hot; v6/v7 receivers refuse v8 before acknowledging, leaving the current server and its Pi session running instead of silently losing or misreading state. See [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]].
 
+`AiState::WaitingForBackground` deliberately stays on v8. It only appears on Pi sessions, which already require a v8 receiver. An older v8 receiver fails to decode it in `read_state` before acknowledging, which is the same outcome as a version refusal: the current server keeps running. Forward upgrades are unaffected.
+
 The sender uses `rmp_serde::to_vec_named` so `HandoffState` and `HandoffSession` serialize as MessagePack **maps** keyed by field name (since v6). Earlier versions used the default `rmp_serde::to_vec` which emitted MessagePack **arrays** — positional encoding where any field insertion in the middle of the struct silently mis-aligned every later field, breaking even "previous-version" hot-reloads despite `#[serde(default)]` annotations. Named encoding makes the invariant honest: as long as renames go through `#[serde(rename = "old_name")]` or `#[serde(alias = "old_name")]`, every additive struct change preserves backward compatibility. Cross-encoding handoff (v5 positional sender → v6 named receiver) is not supported; the old server remains active while the client asks for cold-restart approval.
 
 Cold-restart is permitted only when hot-reload is genuinely impossible: incompatible state format (deserialization error — the underlying `rmp_serde` error is now propagated verbatim instead of being masked as "version mismatch"), version number outside the receiver's supported range, operational failure (OOM, fd/size limits, socket or zstd decode error, corrupted payload), or downgrade. A normal forward upgrade through any two consecutive releases that both use the named-map wire must hot-reload without terminating sessions.
@@ -1230,7 +1232,9 @@ Only documented Pi lifecycle events are used:
 - `agent_settled` records `state_changed { error }` for an error stop, otherwise
   `session_stopped { last_message }` for the server's stop classifier to resolve
   into `IdlePrompt` or `WaitingForInput`. Active background work or an open
-  questionnaire overrides emission until it ends.
+  questionnaire overrides emission until it ends: background tasks report
+  `waiting_for_background`, or `waiting_for_input` when none will wake the
+  agent, and background subagents report `processing`.
 - `turn_end` and `agent_settled` → `context_changed` from
   `ctx.getContextUsage()` through [[dist/pi-extension.ts#contextPercent]]
   (rounded and clamped to 0-100 so an out-of-range reading cannot paint an
@@ -1268,6 +1272,38 @@ generation counter and discards every queued event from the previous
 generation, awaits only the in-flight child, then sends `state_cleared`. A
 reload therefore clears the pane in roughly one helper timeout instead of
 replaying a backlog Pi is no longer running.
+
+#### Background task wait
+
+A settled parent with running pi-background-tasks work reports a wait instead
+of reaching the stop classifier: `waiting_for_background` when a task will wake
+it, otherwise `waiting_for_input`, because nothing else will resume it.
+
+The adapter reads pi-background-tasks' public EventBus v1 API: `status` requests
+on `pi-background-tasks:request:v1`, replies on `pi-background-tasks:response:v1`
+matched by the newest `request_id`, and task snapshots on
+`pi-background-tasks:terminal:v1`. A running task wakes the agent only with
+both `notifyOnCompletion` and `triggerOnCompletion`, because only then does its
+completion notification start another turn, and a waking task takes
+precedence. Any other running task, such as a server started with
+`triggerOnCompletion:false` or a `/bg` task, leaves the agent waiting on the
+user; snapshots do not say who launched a task. When the last running task
+ends, the retained reply reaches the stop classifier. Session start, every
+`turn_end` (which follows the tool results that launch tasks), settle, and
+terminal frames request fresh snapshots.
+
+A terminal frame for a tracked task keeps the wait until the wake-up turn's
+`agent_start`. Restoring the parent state first would flash the settled state
+between completion and wake-up. `turn_end` also clears that pending wake,
+because a completion delivered mid-run is consumed by the next turn. Pi
+subagents keep precedence and still report Processing. The oracle is
+[[test#Test Harness#Pi Extension Harness#Background task wait]].
+
+A status request that reaches pi-background-tasks before its own
+`session_start` fails and is ignored, so a task that survived a reload is
+first seen at the next turn boundary or terminal frame. An older helper or
+server drops the unknown state, so a partially upgraded install shows
+Processing through a background wait: never a false idle or notification.
 
 ### Pi Extension Installation
 

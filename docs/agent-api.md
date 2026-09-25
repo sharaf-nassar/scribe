@@ -203,7 +203,8 @@ scribe agent --agent my-agent --model my-model world
 
 `provider` is one of `claude_code`, `codex_code`, `pi`, `system`. `ai_state`
 is one of `idle_prompt`, `processing`, `waiting_for_input`,
-`permission_prompt`, `error`. `sharing_mode` is one of `single_controller`,
+`permission_prompt`, `error`, `waiting_for_background` (the turn ended, but
+background work the agent launched will wake it). `sharing_mode` is one of `single_controller`,
 `shared_single_typist`, `free_for_all`. `captured_at` is the server's capture
 timestamp. Deliberately absent: prompt text, conversation ids, launch ids,
 and other participants' identities. The response never carries terminal

@@ -10,6 +10,9 @@ import { randomUUID } from "node:crypto";
 const here = dirname(fileURLToPath(import.meta.url));
 const extensionPath = resolve(here, "../../../dist/pi-extension.ts");
 const ASK_USER_BLOCKED_EVENT = "rpiv:ask-user:blocked";
+const BG_REQUEST = "pi-background-tasks:request:v1";
+const BG_RESPONSE = "pi-background-tasks:response:v1";
+const BG_TERMINAL = "pi-background-tasks:terminal:v1";
 const tempDir = await mkdtemp(join(tmpdir(), "scribe-pi-extension-"));
 const helperPath = join(tempDir, "fake-helper.mjs");
 
@@ -504,6 +507,124 @@ async function testBackgroundSubagentActivity() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Background task wait]]
+async function testBackgroundTaskWait() {
+  const logPath = join(tempDir, "background-tasks.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  const ctx = makeContext(10);
+  let tasks = [];
+  let held;
+  const respond = (request, frame) => api.events.emit(BG_RESPONSE, {
+    schema_version: "pi-background-tasks.extension-response.v1",
+    request_id: request.request_id,
+    operation: "status",
+    ...frame,
+  });
+  api.events.on(BG_REQUEST, (request) => {
+    assert.equal(request.schema_version, "pi-background-tasks.extension-request.v1");
+    assert.equal(request.operation, "status", "liveness must never launch or control tasks");
+    assert.deepEqual(request.payload, {});
+    if (held !== undefined) {
+      held.push(request);
+      return;
+    }
+    const result = { tasks: tasks.map((task) => ({ ...task })) };
+    queueMicrotask(() => respond(request, { ok: true, result }));
+  });
+  extensionFactory(api);
+  const pause = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+  const states = async () => parsedCalls(await starts(logPath))
+    .filter(({ event }) => event === "state_changed" || event === "session_stopped");
+  const expectState = async (expected, message) => {
+    await waitFor(async () => JSON.stringify((await states()).at(-1)) === JSON.stringify(expected), message);
+  };
+  const task = (id, status, triggerOnCompletion = true) =>
+    ({ id, status, notifyOnCompletion: true, triggerOnCompletion });
+  const finished = (snapshot) => ({
+    schema_version: "pi-background-tasks.extension-terminal.v1",
+    task: snapshot,
+  });
+  const reply = (text) => api.handler("message_end")({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+  }, ctx);
+  const processing = { event: "state_changed", payload: { state: "processing" } };
+  const waiting = { event: "state_changed", payload: { state: "waiting_for_background" } };
+  const input = { event: "state_changed", payload: { state: "waiting_for_input" } };
+  const classified = () => states().then((all) => all.some(({ event }) => event === "session_stopped"));
+
+  // The run launches a suite that will wake it beside a server that will not;
+  // the pending wake-up wins.
+  api.handler("input")({ type: "input", text: "Run the suite", source: "interactive" }, ctx);
+  api.handler("agent_start")({ type: "agent_start" }, ctx);
+  tasks = [task("suite", "running"), task("server", "running", false)];
+  api.handler("turn_end")({ type: "turn_end" }, ctx);
+  await pause();
+  reply("Waiting for the suite.");
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await expectState(waiting, "a settled agent must wait on the task that will wake it");
+  assert.ok(!(await classified()), "a waiting agent must not reach the stop classifier");
+
+  // Completion keeps the wait until the wake-up turn starts: no settled flash.
+  tasks = [task("suite", "completed"), task("server", "running", false)];
+  api.events.emit(BG_TERMINAL, finished(task("suite", "completed")));
+  await pause(150);
+  assert.deepEqual((await states()).at(-1), waiting, "completion must not flash the settled state");
+  api.handler("agent_start")({ type: "agent_start" }, ctx);
+  await expectState(processing, "the wake-up turn must report processing");
+  reply("Suite passed.");
+  api.handler("turn_end")({ type: "turn_end" }, ctx);
+  await pause();
+  // Nothing will wake the agent while the server runs, so its settle waits on
+  // the user; a repeated frame for the delivered task cannot revive the
+  // background wait.
+  api.events.emit(BG_TERMINAL, finished(task("suite", "completed")));
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await expectState(input, "a task that will not wake the agent must leave it waiting on the user");
+  assert.ok(!(await classified()), "a waiting agent must not reach the stop classifier");
+
+  // Once the server stops, the retained reply reaches the stop classifier.
+  tasks = [task("suite", "completed"), task("server", "killed", false)];
+  api.events.emit(BG_TERMINAL, finished(task("server", "killed", false)));
+  await expectState({ event: "session_stopped", payload: { last_message: "Suite passed." } },
+    "the settle must reach the classifier once no task runs");
+
+  // A task finishing mid-run is consumed by the next turn and cannot hold the settle.
+  api.handler("input")({ type: "input", text: "Lint too", source: "interactive" }, ctx);
+  api.handler("agent_start")({ type: "agent_start" }, ctx);
+  tasks = [task("lint", "running")];
+  api.handler("turn_end")({ type: "turn_end" }, ctx);
+  await pause();
+  tasks = [task("lint", "completed")];
+  api.events.emit(BG_TERMINAL, finished(task("lint", "completed")));
+  await pause();
+  reply("Lint passed.");
+  api.handler("turn_end")({ type: "turn_end" }, ctx);
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await expectState({ event: "session_stopped", payload: { last_message: "Lint passed." } },
+    "a mid-run completion must not hold the settle");
+
+  // While a settle's request is pending, a reply to someone else's request and
+  // then a failed reply to its own both change nothing.
+  held = [];
+  const before = (await states()).length;
+  reply("Done.");
+  api.handler("agent_settled")({ type: "agent_settled" }, ctx);
+  await expectState({ event: "session_stopped", payload: { last_message: "Done." } },
+    "the settle must report before its snapshot arrives");
+  assert.equal(held.length, 1, "the settle must request one snapshot");
+  respond({ request_id: randomUUID() }, { ok: true, result: { tasks: [task("x", "running")] } });
+  respond(held[0], { ok: false, error: "unavailable before session_start" });
+  await pause(150);
+  assert.ok(!(await states()).slice(before).some(({ payload }) =>
+    ["waiting_for_background", "waiting_for_input"].includes(payload.state)),
+    "foreign or failed replies must not start a wait");
+
+  await shutdown(api);
+  return starts(logPath);
+}
+
 // @lat: [[test#Test Harness#Pi Extension Harness#Mid-run context and compaction]]
 async function testMidRunContextAndCompaction() {
   const logPath = join(tempDir, "context.jsonl");
@@ -830,6 +951,7 @@ try {
   allStarts.push(...await testSharedQuestionnaireWait());
   allStarts.push(...await testRetryAndSettleBehavior());
   allStarts.push(...await testBackgroundSubagentActivity());
+  allStarts.push(...await testBackgroundTaskWait());
   allStarts.push(...await testMidRunContextAndCompaction());
   allStarts.push(...await testMalformedMessagesAndNoPolling());
   allStarts.push(...await testIssueFocusedFromBdClaim());

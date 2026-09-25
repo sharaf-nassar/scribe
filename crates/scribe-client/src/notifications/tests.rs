@@ -36,6 +36,12 @@ fn non_attention_states_never_fire() {
     assert_eq!(center.on_ai_state_changed(session, &AiState::Error), None);
     assert_eq!(center.on_ai_state_changed(session, &AiState::Processing), None);
     assert!(center.on_ai_state_changed(session, &AiState::PermissionPrompt).is_some());
+    // A run parked on background work is not finished: its wake-up turn is
+    // `Processing` again, and only that turn's settle notifies.
+    assert_eq!(center.on_ai_state_changed(session, &AiState::Processing), None);
+    assert_eq!(center.on_ai_state_changed(session, &AiState::WaitingForBackground), None);
+    assert_eq!(center.on_ai_state_changed(session, &AiState::Processing), None);
+    assert!(center.on_ai_state_changed(session, &AiState::IdlePrompt).is_some());
 }
 
 // @lat: [[test#GPUI Notification Gate#Disabled notifications never fire]]

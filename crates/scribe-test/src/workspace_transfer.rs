@@ -107,6 +107,7 @@ impl Peer {
                 agent_api: false,
                 workspace_transfer,
                 workspace_move,
+                ai_background_wait: false,
             },
         )
         .await?;

@@ -751,6 +751,7 @@ fn apply_ai_state_key(
     let entry = match state_name {
         "processing" => &mut states.processing,
         "idle_prompt" | "waiting_for_input" => &mut states.waiting_for_input,
+        "waiting_for_background" => &mut states.waiting_for_background,
         "permission_prompt" => &mut states.permission_prompt,
         "error" => &mut states.error,
         _ => return Err(format!("unknown AI state: {state_name}")),

@@ -434,6 +434,8 @@ pub struct AiStateStylesConfig {
     pub permission_prompt: AiStateEntry,
     #[serde(default = "default_error_entry")]
     pub error: AiStateEntry,
+    #[serde(default = "default_waiting_for_background_entry")]
+    pub waiting_for_background: AiStateEntry,
 }
 
 impl Default for AiStateStylesConfig {
@@ -443,6 +445,7 @@ impl Default for AiStateStylesConfig {
             waiting_for_input: default_waiting_for_input_entry(),
             permission_prompt: default_permission_prompt_entry(),
             error: default_error_entry(),
+            waiting_for_background: default_waiting_for_background_entry(),
         }
     }
 }
@@ -563,11 +566,12 @@ fn default_processing_entry() -> AiStateEntry {
     }
 }
 
+/// Violet (`#a855f7`), so it never reads as a background wait's orange.
 fn default_waiting_for_input_entry() -> AiStateEntry {
     AiStateEntry {
         tab_indicator: true,
         pane_border: true,
-        color: AiColor::Hex([1.0, 0.55, 0.0, 1.0]),
+        color: AiColor::Hex([168.0 / 255.0, 85.0 / 255.0, 247.0 / 255.0, 1.0]),
         pulse_ms: 2000,
         timeout_secs: 0.0,
     }
@@ -583,13 +587,25 @@ fn default_permission_prompt_entry() -> AiStateEntry {
     }
 }
 
+/// Red (`#a51d2d`).
 fn default_error_entry() -> AiStateEntry {
     AiStateEntry {
         tab_indicator: true,
         pane_border: true,
-        color: AiColor::Hex([0.6, 0.2, 0.8, 1.0]),
+        color: AiColor::Hex([165.0 / 255.0, 29.0 / 255.0, 45.0 / 255.0, 1.0]),
         pulse_ms: 0,
         timeout_secs: 3.0,
+    }
+}
+
+/// Orange (`#f97316`), steady: nobody needs to act while the agent waits.
+fn default_waiting_for_background_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Hex([249.0 / 255.0, 115.0 / 255.0, 22.0 / 255.0, 1.0]),
+        pulse_ms: 0,
+        timeout_secs: 0.0,
     }
 }
 

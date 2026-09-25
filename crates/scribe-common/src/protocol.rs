@@ -52,7 +52,10 @@ use crate::terminal_images::{
 /// Bumped to `10` for per-cell underline styles in `CellDecorationFlags`: a
 /// v9 peer replays every underline as SGR `4` (single), so the two sides no
 /// longer agree on what a reattached grid looks like.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 10;
+///
+/// Bumped to `11` because remote session metadata and live AI state may now
+/// carry [`AiState::WaitingForBackground`].
+pub const REMOTE_PROTOCOL_VERSION: u32 = 11;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -970,6 +973,10 @@ pub enum ClientMessage {
         /// participate in an existing-window workspace or tab-subtree move.
         #[serde(default)]
         workspace_move: bool,
+        /// [`AiState::WaitingForBackground`] support. Missing means the peer
+        /// cannot decode it and receives `Processing` in its place.
+        #[serde(default)]
+        ai_background_wait: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -2231,12 +2238,14 @@ impl SessionPromptState {
     ///
     /// Leaving `Processing` stamps the instant the timer freezes at, so the
     /// figure reads prompt-to-finish rather than wall-clock-since-prompt; a
-    /// return to `Processing` clears the stamp and the timer ticks again. The
+    /// return to `Processing` clears the stamp and the timer ticks again. A
+    /// background wait counts as work: the run resumes when the task finishes,
+    /// and freezing through the wait would only make the figure jump then. The
     /// stamp is taken once per run rather than on every non-`Processing` edge,
     /// because an idle provider keeps emitting them and each one would push a
     /// frozen value forward.
     pub fn note_prompt_progress(&mut self, state: &AiState, at: SystemTime) {
-        if matches!(state, AiState::Processing) {
+        if matches!(state, AiState::Processing | AiState::WaitingForBackground) {
             self.latest_prompt_finished_at = None;
         } else if self.latest_prompt_finished_at.is_none() {
             self.latest_prompt_finished_at = epoch_secs(at);
@@ -2353,6 +2362,27 @@ impl ServerMessage {
                 true
             }
             _ => true,
+        }
+    }
+
+    /// Report [`AiState::WaitingForBackground`] as `Processing` for a peer that
+    /// did not advertise `Hello.ai_background_wait` and cannot decode it. Work
+    /// is still underway, and `Processing` never raises a notification.
+    pub fn make_background_wait_compatible(&mut self) {
+        fn downgrade(state: &mut AiProcessState) {
+            if state.state == AiState::WaitingForBackground {
+                state.state = AiState::Processing;
+            }
+        }
+        match self {
+            ServerMessage::AiStateChanged { ai_state, .. } => downgrade(ai_state),
+            ServerMessage::SessionList { sessions, .. } => {
+                sessions
+                    .iter_mut()
+                    .filter_map(|session| session.ai_state.as_mut())
+                    .for_each(downgrade);
+            }
+            _ => {}
         }
     }
 }
@@ -2829,6 +2859,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: false,
             workspace_move: false,
+            ai_background_wait: true,
         };
         let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize new Hello");
         let _: HelloWithoutPiProvider =
@@ -2940,6 +2971,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: false,
+            ai_background_wait: true,
         };
         let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
         let _: HelloWithoutWorkspaceTransfer =
@@ -3014,6 +3046,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: true,
+            ai_background_wait: true,
         };
         let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
         let _: HelloWithoutWorkspaceMove =
@@ -3379,12 +3412,11 @@ mod tests {
         assert!(!live.make_pi_provider_compatible(false));
     }
 
-    /// Bumped for per-cell underline styles: a v9 peer replays every underline
-    /// as a single line, so the two sides no longer agree on what a reattached
-    /// grid looks like.
+    /// Bumped for `AiState::WaitingForBackground`: a v10 peer cannot decode
+    /// session metadata or live AI state that carries it.
     #[test]
-    fn remote_protocol_advances_for_underline_styles() {
-        assert_eq!(REMOTE_PROTOCOL_VERSION, 10);
+    fn remote_protocol_advances_for_background_wait() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 11);
     }
 
     /// The bump must keep the refusal legible: a v8 dialer meeting this server

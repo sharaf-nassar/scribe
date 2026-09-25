@@ -159,9 +159,9 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, `workspace_transfer`, and `workspace_move`. The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, `workspace_transfer`, `workspace_move`, and `ai_background_wait`. The server responds with [[protocol#Server Messages]] `Welcome`.
 
-Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` or `workspace_move` is false, no frame from that transaction family is sent.
+Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` or `workspace_move` is false, no frame from that transaction family is sent. When `ai_background_wait` is false, `AiStateChanged` and `SessionList` report `WaitingForBackground` as `Processing`, which an older client can decode and which never raises a notification; see [[test#Test Harness#Pi Provider Compatibility#Background wait compatibility]].
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
@@ -555,6 +555,8 @@ Suppressed AI ED 3 changes bump the constant to `7`: the server no longer emits 
 
 Structured Pi provider support bumps the constant to `8` because remote session metadata, live AI state, and task-label frames may now carry `AiProvider::Pi`. The local Unix-socket path stays on additive capability negotiation rather than a version gate: `Hello.pi_provider` / `Welcome.pi_provider` default `false` via serde, and a peer that did not advertise support receives session and live frames downgraded to legacy `ShellTool::Pi` metadata in place of structured Pi state.
 
+`AiState::WaitingForBackground` bumps the constant to `11` for the same reason: session metadata and live AI state may carry a value a v10 peer cannot decode. Locally, `Hello.ai_background_wait` negotiates it the same additive way, downgrading the state to `Processing` for a client that did not advertise it.
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -652,7 +654,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, `7` for suppressed AI ED 3 terminal-frame semantics, `8` for structured Pi provider remote state, `9` for the Beads flow capability, and `10` for per-cell underline styles ([[protocol#Screen Snapshots#ScreenCell]]), without which a peer replays every underline as a single line — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, `7` for suppressed AI ED 3 terminal-frame semantics, `8` for structured Pi provider remote state, `9` for the Beads flow capability, `10` for per-cell underline styles ([[protocol#Screen Snapshots#ScreenCell]]), without which a peer replays every underline as a single line, and `11` for the `WaitingForBackground` AI state — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 
@@ -702,7 +704,7 @@ UUID-based newtypes defined in [[crates/scribe-common/src/ids.rs]] provide type-
 
 Defined in [[crates/scribe-common/src/ai_state.rs#AiProcessState]]. Tracks the current AI state and optional metadata for resuming provider sessions.
 
-Tracked fields include state (`idle_prompt`, `processing`, `waiting_for_input`, `permission_prompt`, `error`), tool name, agent identifier, model name, context usage percentage (0-100), and optional provider conversation IDs.
+Tracked fields include state (`idle_prompt`, `processing`, `waiting_for_input`, `permission_prompt`, `error`, `waiting_for_background`), tool name, agent identifier, model name, context usage percentage (0-100), and optional provider conversation IDs.
 
 Optional metadata fields are sticky across same-provider state changes via [[crates/scribe-common/src/ai_state.rs#AiProcessState#merge_partial_from_previous]] — the [[server]] applies the merge before broadcasting `AiStateChanged` so partial events from state-only hooks do not erase live values like the context-window fill last set by an earlier same-provider state event. Stickiness stops at a conversation boundary: an event naming a different conversation than the stored state starts from nothing, so the retired conversation's fill cannot leak into the new one's meter.
 

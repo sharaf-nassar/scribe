@@ -420,6 +420,7 @@ pub async fn observe_ci_run(
             agent_api: false,
             workspace_transfer: false,
             workspace_move: false,
+            ai_background_wait: false,
         },
     )
     .await?;
@@ -597,6 +598,8 @@ pub async fn run() -> Result<(), ScribeError> {
             agent_api: false,
             workspace_transfer: false,
             workspace_move: false,
+            // The Pi-capable stand-in is a current client in every AI respect.
+            ai_background_wait: pi_provider_capability(),
         },
     )
     .await?;

@@ -340,17 +340,21 @@ impl AiStateTracker {
     /// to a steady alpha) and (b) lets `needs_animation` report idle so the
     /// shared redraw loop retires and GPU use drops to zero.
     ///
-    /// `state` is guaranteed to satisfy `requires_animation` (i.e. one of
-    /// `Processing` / `IdlePrompt` / `WaitingForInput` / `PermissionPrompt`)
-    /// — `Error` never reaches here.
+    /// `state` is guaranteed to satisfy `requires_animation`, so it is never
+    /// `Error`.
     fn pulse_is_active(&self, session_id: SessionId, state: &AiState) -> bool {
         let now = self.animation_time;
         match state {
             // Attention states block on the human; the pulse is a bounded
             // attention grab measured from when the state was entered. After
             // it, rest (still tracked + visible); a keystroke still clears
-            // instantly via `clear_attention_states`.
-            AiState::IdlePrompt | AiState::WaitingForInput | AiState::PermissionPrompt => {
+            // instantly via `clear_attention_states`. A background wait (steady
+            // by default) announces its entry the same bounded way when a
+            // pulse is configured, but never clears on a keystroke.
+            AiState::IdlePrompt
+            | AiState::WaitingForInput
+            | AiState::PermissionPrompt
+            | AiState::WaitingForBackground => {
                 let entered = self.state_enter_times.get(&session_id).copied().unwrap_or(now);
                 (now - entered).max(0.0) < ATTENTION_PULSE_SECS
             }
@@ -448,7 +452,8 @@ impl AiStateTracker {
     /// Compute the highest-priority animated border colour across a set of
     /// sessions (for workspace-level aggregation).
     ///
-    /// Priority: `PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing`.
+    /// Priority: `PermissionPrompt > WaitingForInput > IdlePrompt > Error >
+    /// WaitingForBackground > Processing`.
     pub fn workspace_border_color(
         &self,
         session_ids: &[SessionId],
@@ -500,7 +505,8 @@ impl AiStateTracker {
             AiState::Processing
             | AiState::IdlePrompt
             | AiState::WaitingForInput
-            | AiState::PermissionPrompt => {
+            | AiState::PermissionPrompt
+            | AiState::WaitingForBackground => {
                 if self.motion_enabled
                     && entry.pulse_ms > 0
                     && self.pulse_is_active(session_id, &state.state)
@@ -549,28 +555,24 @@ fn entry_for_config<'a>(config: &'a AiStateStylesConfig, state: &AiState) -> &'a
         AiState::IdlePrompt | AiState::WaitingForInput => &config.waiting_for_input,
         AiState::PermissionPrompt => &config.permission_prompt,
         AiState::Error => &config.error,
+        AiState::WaitingForBackground => &config.waiting_for_background,
     }
 }
 
 /// Return `true` if the given state requires continuous animation updates.
 fn requires_animation(state: &AiState) -> bool {
-    matches!(
-        state,
-        AiState::Processing
-            | AiState::IdlePrompt
-            | AiState::WaitingForInput
-            | AiState::PermissionPrompt
-    )
+    !matches!(state, AiState::Error)
 }
 
 /// Numeric priority for workspace-level aggregation.
 /// Higher value = more urgent.
 fn state_priority(state: &AiState) -> u8 {
     match state {
-        AiState::PermissionPrompt => 4,
-        AiState::WaitingForInput => 3,
-        AiState::IdlePrompt => 2,
-        AiState::Error => 1,
+        AiState::PermissionPrompt => 5,
+        AiState::WaitingForInput => 4,
+        AiState::IdlePrompt => 3,
+        AiState::Error => 2,
+        AiState::WaitingForBackground => 1,
         AiState::Processing => 0,
     }
 }

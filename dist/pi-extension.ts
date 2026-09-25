@@ -10,6 +10,10 @@ const MAX_OUTSTANDING = 32;
 const HELPER_TIMEOUT_MS = 100;
 const TASK_LABEL_LIMIT = 120;
 const ASK_USER_BLOCKED_EVENT = "rpiv:ask-user:blocked";
+// pi-background-tasks' EventBus API v1 (its docs/api/eventbus-v1.md).
+const BG_REQUEST_CHANNEL = "pi-background-tasks:request:v1";
+const BG_RESPONSE_CHANNEL = "pi-background-tasks:response:v1";
+const BG_TERMINAL_CHANNEL = "pi-background-tasks:terminal:v1";
 
 type EventName =
   | "state_changed"
@@ -94,6 +98,19 @@ function assistantText(message: unknown): string | undefined {
     )
     .map((part) => part.text)
     .join("\n");
+}
+
+type RunningTask = { id: string; notifyOnCompletion?: unknown; triggerOnCompletion?: unknown };
+
+/** Whether a pi-background-tasks snapshot is work that is still running. */
+function runningTask(task: unknown): task is RunningTask {
+  const snapshot = task as { id?: unknown; status?: unknown } | null;
+  return typeof snapshot?.id === "string" && snapshot.status === "running";
+}
+
+/** Whether a task's completion notification will start another turn of this agent. */
+function wakesAgent(task: RunningTask) {
+  return task.notifyOnCompletion === true && task.triggerOnCompletion === true;
 }
 
 function contextPercent(ctx: { getContextUsage(): { percent: number | null } | undefined }) {
@@ -360,13 +377,31 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   };
   let askingUser = false;
   let subagentsRunning = false;
+  // Running pi-background-tasks work: the tasks that will wake this agent,
+  // whether one of them has finished but the turn it wakes has not started
+  // yet, and whether any running task will not wake it.
+  let wakingTasks = new Set<string>();
+  let backgroundWake = false;
+  let manualTasks = false;
+  let backgroundRequestId: string | undefined;
+  let backgroundRefreshQueued = false;
   let lastPercent: number | undefined;
   let refreshQueued = false;
   let unsubscribeSubagentStatus: (() => void) | undefined;
 
+  // What running background work leaves a settled agent waiting on: its own
+  // wake-up when a task will start another turn, otherwise the user, because
+  // a task that will not wake it leaves only the user able to resume it.
+  function backgroundWait() {
+    if (wakingTasks.size > 0 || backgroundWake) return "waiting_for_background";
+    return manualTasks ? "waiting_for_input" : undefined;
+  }
+
   function reportState() {
+    const wait = parentState.payload.state === "processing" ? undefined : backgroundWait();
     if (askingUser) enqueue("state_changed", { state: "waiting_for_input" });
     else if (subagentsRunning) enqueue("state_changed", { state: "processing" });
+    else if (wait) enqueue("state_changed", { state: wait });
     else enqueue(parentState.event, parentState.payload);
   }
 
@@ -432,6 +467,51 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     "subagent:process-terminal",
     "subagent:child-status",
   ].map((event) => pi.events.on(event, refreshSubagents));
+
+  // Ask the optional pi-background-tasks owner which of its tasks still run.
+  // Only tasks that notify and trigger a turn count: the agent resumes when
+  // they finish, so the pane waits on them rather than on the user. The newest
+  // request supersedes any reply still in flight.
+  function refreshBackgroundTasks() {
+    if (shuttingDown || backgroundRefreshQueued) return;
+    backgroundRefreshQueued = true;
+    queueMicrotask(() => {
+      backgroundRefreshQueued = false;
+      if (shuttingDown) return;
+      backgroundRequestId = randomUUID();
+      pi.events.emit(BG_REQUEST_CHANNEL, {
+        schema_version: "pi-background-tasks.extension-request.v1",
+        request_id: backgroundRequestId,
+        operation: "status",
+        payload: {},
+      });
+    });
+  }
+
+  const unsubscribeBackgroundStatus = pi.events.on(BG_RESPONSE_CHANNEL, (payload) => {
+    const response = payload as
+      | { request_id?: unknown; ok?: unknown; result?: { tasks?: unknown } }
+      | undefined;
+    if (!response || !backgroundRequestId || response.request_id !== backgroundRequestId) return;
+    backgroundRequestId = undefined;
+    const tasks = response.ok === true ? response.result?.tasks : undefined;
+    if (!Array.isArray(tasks)) return;
+    const before = backgroundWait();
+    const running = tasks.filter(runningTask);
+    wakingTasks = new Set(running.filter(wakesAgent).map((task) => task.id));
+    manualTasks = running.some((task) => !wakesAgent(task));
+    if (before !== backgroundWait()) reportState();
+  });
+
+  // A tracked task's completion notification is about to wake the agent, so
+  // keep waiting until that turn starts instead of flashing the settled state
+  // (and its desktop notification) in between. Once the refresh drops the id,
+  // a repeated frame for the same task changes nothing.
+  const unsubscribeBackgroundTerminal = pi.events.on(BG_TERMINAL_CHANNEL, (payload) => {
+    const id = (payload as { task?: { id?: unknown } } | undefined)?.task?.id;
+    if (typeof id === "string" && wakingTasks.has(id)) backgroundWake = true;
+    refreshBackgroundTasks();
+  });
 
   const unsubscribeAskUserBlocked = pi.events.on(ASK_USER_BLOCKED_EVENT, (payload) => {
     if (!payload || typeof payload !== "object" || typeof (payload as { active?: unknown }).active !== "boolean") return;
@@ -500,6 +580,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     enqueue("task_label_cleared");
     setParentState("state_changed", { state: "idle_prompt" });
     refreshSubagents();
+    refreshBackgroundTasks();
   });
 
   pi.on("input", (event) => {
@@ -517,6 +598,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    backgroundWake = false;
     if (capturedInputs > 0) capturedInputs -= 1;
     else setParentState("state_changed", { state: "processing" });
   });
@@ -525,7 +607,13 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     if (event.toolName === "subagent") refreshSubagents();
   });
 
-  pi.on("turn_end", (_event, ctx) => reportContext(ctx));
+  // A turn's tool results may have launched background work, and a completion
+  // delivered mid-run is consumed by the next turn rather than waking a new one.
+  pi.on("turn_end", (_event, ctx) => {
+    backgroundWake = false;
+    refreshBackgroundTasks();
+    reportContext(ctx);
+  });
 
   pi.on("message_end", (event) => {
     const text = assistantText(event.message);
@@ -542,6 +630,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     if (latestError) setParentState("state_changed", { state: "error" });
     else setParentState("session_stopped", { last_message: latestAssistant });
     refreshSubagents();
+    refreshBackgroundTasks();
     reportContext(ctx);
   });
 
@@ -566,6 +655,8 @@ export default function scribePiExtension(pi: ExtensionAPI) {
       unsubscribeAskUserBlocked();
       for (const unsubscribe of unsubscribeSubagents) unsubscribe();
       unsubscribeSubagentStatus?.();
+      unsubscribeBackgroundStatus();
+      unsubscribeBackgroundTerminal();
       generation += 1;
       pending = [];
       if (active) await active;

@@ -186,6 +186,7 @@ fn ai_value(config: &ScribeConfig, key: &str) -> Option<Value> {
     let entry = match state {
         "processing" => &states.processing,
         "idle_prompt" | "waiting_for_input" => &states.waiting_for_input,
+        "waiting_for_background" => &states.waiting_for_background,
         "permission_prompt" => &states.permission_prompt,
         "error" => &states.error,
         _ => return Some(Value::Null),

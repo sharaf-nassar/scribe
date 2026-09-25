@@ -2244,6 +2244,8 @@ struct OutputQueueShared {
     image_capabilities: std::sync::atomic::AtomicU32,
     /// Whether this connection can deserialize structured Pi provider metadata.
     pi_provider: AtomicBool,
+    /// Whether this connection can deserialize `AiState::WaitingForBackground`.
+    ai_background_wait: AtomicBool,
 }
 
 /// Pack a capability set into one atomic word: the low bits are feature bits,
@@ -2378,6 +2380,25 @@ impl OutputSink {
         self.0.pi_provider.store(supported, Ordering::Relaxed);
     }
 
+    /// Record whether this connection can decode `AiState::WaitingForBackground`.
+    pub(crate) fn set_ai_background_wait_capability(&self, supported: bool) {
+        self.0.ai_background_wait.store(supported, Ordering::Relaxed);
+    }
+
+    /// Downgrade `msg` to what this connection can decode, or `None` to withhold it.
+    fn compatible_message<'a>(&self, msg: &'a ServerMessage) -> Option<Cow<'a, ServerMessage>> {
+        let mut msg = self.pi_compatible_message(msg)?;
+        if !self.0.ai_background_wait.load(Ordering::Relaxed)
+            && matches!(
+                *msg,
+                ServerMessage::AiStateChanged { .. } | ServerMessage::SessionList { .. }
+            )
+        {
+            msg.to_mut().make_background_wait_compatible();
+        }
+        Some(msg)
+    }
+
     fn pi_compatible_message<'a>(&self, msg: &'a ServerMessage) -> Option<Cow<'a, ServerMessage>> {
         if self.0.pi_provider.load(Ordering::Relaxed) {
             return Some(Cow::Borrowed(msg));
@@ -2419,7 +2440,7 @@ impl OutputSink {
     /// Returns `false` only when the connection is already closed — the enqueue
     /// equivalent of the pre-queue "dead socket" write error.
     fn enqueue(&self, msg: &ServerMessage) -> bool {
-        let Some(msg) = self.pi_compatible_message(msg) else {
+        let Some(msg) = self.compatible_message(msg) else {
             return true;
         };
         let msg = msg.as_ref();
@@ -2676,6 +2697,7 @@ where
         // Incapable until this connection's `Hello` says otherwise.
         image_capabilities: std::sync::atomic::AtomicU32::new(0),
         pi_provider: AtomicBool::new(false),
+        ai_background_wait: AtomicBool::new(false),
     });
     let drain = tokio::spawn(output_queue_drain(Arc::clone(&shared), write_half, live_sessions));
     (OutputSink(shared), drain)
@@ -5082,6 +5104,7 @@ async fn claim_hello_window(
         agent_api,
         workspace_transfer,
         workspace_move,
+        ai_background_wait,
         ..
     } = hello
     else {
@@ -5094,6 +5117,7 @@ async fn claim_hello_window(
         return None;
     }
     record_pi_provider_capability(conn.writer, pi_provider).await;
+    conn.writer.lock().await.queue().set_ai_background_wait_capability(ai_background_wait);
     let claim = HelloClaim {
         requested_window_id: window_id,
         clipboard_gating,
@@ -13823,6 +13847,7 @@ fn metadata_starts_ai_scrollback_epoch(event: &MetadataEvent) -> bool {
                 | AiState::WaitingForInput
                 | AiState::PermissionPrompt
                 | AiState::Error
+                | AiState::WaitingForBackground
         ),
         MetadataEvent::AiStateCleared | MetadataEvent::PromptReceived { .. } => true,
         _ => false,
@@ -15072,6 +15097,7 @@ mod tests {
             notify: tokio::sync::Notify::new(),
             image_capabilities: std::sync::atomic::AtomicU32::new(0),
             pi_provider: AtomicBool::new(false),
+            ai_background_wait: AtomicBool::new(false),
         }))
     }
 
@@ -15486,6 +15512,65 @@ mod tests {
             ServerMessage::AiStateChanged { ai_state: received_state, .. }
                 if received_state.provider == AiProvider::Pi
         ));
+    }
+
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Background wait compatibility]]
+    #[tokio::test]
+    async fn old_client_output_reports_background_wait_as_processing() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        writer.lock().await.queue().set_pi_provider_capability(true);
+        let session_id = SessionId::new();
+        let waiting =
+            AiProcessState::new_with_provider(AiProvider::Pi, AiState::WaitingForBackground);
+        let live = ServerMessage::AiStateChanged { session_id, ai_state: waiting.clone() };
+        let received_state = |msg: ServerMessage| match msg {
+            ServerMessage::AiStateChanged { ai_state, .. } => ai_state.state,
+            ServerMessage::SessionList { mut sessions, .. } => {
+                sessions.remove(0).ai_state.expect("listed AI state").state
+            }
+            other => panic!("unexpected frame {other:?}"),
+        };
+
+        send_message(&writer, &live).await;
+        let live_frame = read_message(&mut client_read).await.expect("live frame");
+        assert_eq!(received_state(live_frame), AiState::Processing);
+
+        send_message(
+            &writer,
+            &ServerMessage::SessionList {
+                sessions: vec![SessionInfo {
+                    session_id,
+                    workspace_id: WorkspaceId::new(),
+                    launch_id: None,
+                    shell_name: "bash".to_owned(),
+                    title: None,
+                    icon_title: None,
+                    context: None,
+                    task_label: None,
+                    codex_task_label: None,
+                    cwd: None,
+                    git_branch: None,
+                    ai_state: Some(waiting),
+                    ai_provider_hint: Some(AiProvider::Pi),
+                    ai_launch_origin: None,
+                    shell_tool: None,
+                    prompt_state: None,
+                }],
+                workspace_tree: None,
+                workspaces: Vec::new(),
+            },
+        )
+        .await;
+        let list_frame = read_message(&mut client_read).await.expect("list frame");
+        assert_eq!(received_state(list_frame), AiState::Processing);
+
+        writer.lock().await.queue().set_ai_background_wait_capability(true);
+        send_message(&writer, &live).await;
+        let capable_frame = read_message(&mut client_read).await.expect("capable frame");
+        assert_eq!(received_state(capable_frame), AiState::WaitingForBackground);
     }
 
     #[tokio::test]

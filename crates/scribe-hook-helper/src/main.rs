@@ -339,6 +339,7 @@ fn parse_ai_state(s: &str) -> Result<AiState, ()> {
         "waiting_for_input" => Ok(AiState::WaitingForInput),
         "permission_prompt" => Ok(AiState::PermissionPrompt),
         "error" => Ok(AiState::Error),
+        "waiting_for_background" => Ok(AiState::WaitingForBackground),
         _ => Err(()),
     }
 }
@@ -356,6 +357,7 @@ mod tests {
         assert_eq!(parse_ai_state("waiting_for_input"), Ok(AiState::WaitingForInput));
         assert_eq!(parse_ai_state("permission_prompt"), Ok(AiState::PermissionPrompt));
         assert_eq!(parse_ai_state("error"), Ok(AiState::Error));
+        assert_eq!(parse_ai_state("waiting_for_background"), Ok(AiState::WaitingForBackground));
     }
 
     #[test]

@@ -16016,6 +16016,7 @@ where
             // the pointer's cross-window target stay hidden until `Welcome`
             // confirms the server can complete the move transaction.
             workspace_move: true,
+            ai_background_wait: true,
         },
     )
     .await
@@ -21368,6 +21369,11 @@ mod tests {
         // Back to work: the timer resumes from the original prompt instant.
         ai.apply_state_change(session, edge(AiState::Processing), at(500));
         assert_eq!(shown(&ai, at(520)).as_deref(), Some("7m 00s"));
+
+        // A background wait is still work: the timer keeps ticking through it
+        // instead of freezing and then jumping when the wake-up turn starts.
+        ai.apply_state_change(session, edge(AiState::WaitingForBackground), at(530));
+        assert_eq!(shown(&ai, at(700)).as_deref(), Some("10m 00s"));
     }
 
     // @lat: [[client#GPUI Client Spike#Hot Restart Reattach#Session list seeds the AI chrome]]

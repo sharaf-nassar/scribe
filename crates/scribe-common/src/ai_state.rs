@@ -116,6 +116,9 @@ pub enum AiState {
     WaitingForInput,
     PermissionPrompt,
     Error,
+    /// The agent's turn ended, but background work it launched will wake it for
+    /// another turn. Not an attention state: nobody needs to act yet.
+    WaitingForBackground,
 }
 
 /// Full AI process state with optional metadata keys.
