@@ -415,6 +415,51 @@ fn should_disarm_tear(point: DragPoint, bounds: Rect) -> bool {
         && point.y < bounds.y + bounds.height - TEAR_DISARM_DISTANCE
 }
 
+/// What a tab drag's pointer is over, for the tear-out rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TearSurface {
+    /// The titlebar strip or a lower region's bar: a release inserts there.
+    TabBar,
+    /// Anywhere else in the window.
+    Content,
+}
+
+/// Whether a tab drag at `point` is armed to tear the tab out of its window.
+///
+/// The workspace rule's 8px arm and >24px disarm bands, with two tab-specific
+/// differences. The window's top edge is where the tab strip itself sits, so
+/// at the top only a pointer that has actually left the window (or is
+/// delivered above it) arms; and a pointer over any tab bar never arms, since
+/// a bar there means "insert into this bar" (the leftmost and rightmost slots
+/// of an edge-touching strip lie inside the side bands). `was_armed` carries
+/// the hysteresis, so arming does not flicker at the band's edge.
+#[must_use]
+pub fn tab_tear_armed(
+    point: DragPoint,
+    bounds: Rect,
+    surface: TearSurface,
+    was_armed: bool,
+) -> bool {
+    let outside = point.x < bounds.x
+        || point.y < bounds.y
+        || point.x > bounds.x + bounds.width
+        || point.y > bounds.y + bounds.height;
+    if outside {
+        return true;
+    }
+    if surface == TearSurface::TabBar {
+        return false;
+    }
+    let in_band = point.x <= bounds.x + TEAR_ARM_DISTANCE
+        || point.x >= bounds.x + bounds.width - TEAR_ARM_DISTANCE
+        || point.y >= bounds.y + bounds.height - TEAR_ARM_DISTANCE;
+    let held = was_armed
+        && (point.x <= bounds.x + TEAR_DISARM_DISTANCE
+            || point.x >= bounds.x + bounds.width - TEAR_DISARM_DISTANCE
+            || point.y >= bounds.y + bounds.height - TEAR_DISARM_DISTANCE);
+    in_band || held
+}
+
 /// Which way a zone highlight is animating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneFade {
@@ -731,6 +776,31 @@ mod tests {
         }
         update_drag(&mut drag, DragPoint { x: 105.0, y: 150.0 }, &regions, false);
         assert_eq!(drag.preview().map(|preview| preview.zone), Some(WorkspaceDropZone::Center));
+    }
+
+    // @lat: [[client#GPUI Titlebar#Tab tear-out arms past the window edge]]
+    #[test]
+    fn tab_tear_arms_outside_or_in_side_and_bottom_bands_but_never_over_a_bar() {
+        let bounds = Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let at = |x: f32, y: f32| DragPoint { x, y };
+        // The top band is the tab strip: it arms only once the pointer leaves.
+        assert!(!tab_tear_armed(at(400.0, 4.0), bounds, TearSurface::Content, false));
+        assert!(tab_tear_armed(at(400.0, -1.0), bounds, TearSurface::Content, false));
+        // Side and bottom bands arm, unless a tab bar is under the pointer.
+        assert!(tab_tear_armed(at(8.0, 300.0), bounds, TearSurface::Content, false));
+        assert!(tab_tear_armed(at(400.0, 593.0), bounds, TearSurface::Content, false));
+        assert!(!tab_tear_armed(at(4.0, 17.0), bounds, TearSurface::TabBar, false));
+        assert!(
+            tab_tear_armed(at(-2.0, 17.0), bounds, TearSurface::TabBar, false),
+            "leaving always arms"
+        );
+        // Hysteresis: armed holds to 24px in, and releases strictly past it.
+        assert!(tab_tear_armed(at(24.0, 300.0), bounds, TearSurface::Content, true));
+        assert!(!tab_tear_armed(at(25.0, 300.0), bounds, TearSurface::Content, true));
+        assert!(
+            !tab_tear_armed(at(20.0, 300.0), bounds, TearSurface::TabBar, true),
+            "a bar disarms"
+        );
     }
 
     #[test]

@@ -474,6 +474,24 @@ e2e-visual-tab-drag-reorder: e2e-visual-image-current
 e2e-visual-tab-drag-cross-region: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-cross-region.sh
 
+# Drag a tab into another window, out into its own window, or (as a window's
+# only tab) carry its window; plus the palette's non-drag tear-out.
+e2e-visual-tab-drag-cross-window: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-cross-window.sh
+
+# Tab drags under a real Wayland compositor (sway nested in Xvfb; see the
+# visual entrypoint's SCRIBE_DISPLAY_SERVER=wayland): a window's only tab
+# carries the window through `xdg_toplevel.move`, and a tear-out opens a
+# compositor-placed window.
+e2e-visual-tab-drag-wayland: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_DISPLAY_SERVER=wayland -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-wayland.sh
+
+# The same suite on a HiDPI X11 session: scale 2 on a desktop twice the size,
+# so the logical layout is unchanged and every pixel the drag maps between
+# windows crosses the device/logical boundary.
+e2e-visual-tab-drag-cross-window-hidpi: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -e GPUI_X11_SCALE_FACTOR=2 -e RESOLUTION=3840x2160 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-cross-window.sh
+
 # Run the warm multi-window restore E2E against the real client. No wire tap:
 # it quits and relaunches the client several times, which the tap's renamed
 # socket does not survive. It opens a second window, quits, relaunches, and
@@ -614,6 +632,10 @@ e2e-visual-workspace-drag-palette: e2e-visual-image-current
 # Drive palette and measured-X11 pointer workspace moves into a sibling window.
 e2e-visual-workspace-cross-window: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-cross-window.sh
+
+# The workspace cross-window suite at scale 2; see the tab suite's HiDPI recipe.
+e2e-visual-workspace-cross-window-hidpi: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -e GPUI_X11_SCALE_FACTOR=2 -e RESOLUTION=3840x2160 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-cross-window.sh
 
 # Run the workspace Beads board visual contract against the generated mock manifest.
 e2e-visual-beads-board: e2e-visual-image-current
@@ -788,7 +810,9 @@ e2e-all-visual: build-release docker-visual
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
         'visual/tab-drag-cross-region.sh|e2e-visual-tab-drag-cross-region'
+        'visual/tab-drag-cross-window.sh|e2e-visual-tab-drag-cross-window'
         'visual/tab-drag-reorder.sh|e2e-visual-tab-drag-reorder'
+        'visual/tab-drag-wayland.sh|e2e-visual-tab-drag-wayland'
         'visual/tab-switching.sh|e2e-visual-tab-switching'
         'visual/tab-window-chords.sh|e2e-visual'
         'visual/terminal-image-apps.sh|e2e-visual'

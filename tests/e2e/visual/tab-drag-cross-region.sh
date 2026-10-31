@@ -231,4 +231,34 @@ for row in o.rows(path):
             sys.exit(1)
 PY
 echo "PHASE 3 PASS: tab dropped on another workspace's panes joined it as its last tab"
+
+# A relaunched client's first move must still move. The server's idempotency
+# ledger outlives the client (it even rides upgrades) and is keyed by the move
+# id alone, so a client that numbered its moves from 1 again had every drag
+# answered with the replayed result of the earlier client's move 1: `Moved`,
+# with nothing moved. That was every cross-workspace tab drag after a restart.
+kill "$SCRIBE_CLIENT_PID" 2>/dev/null || true
+for _ in $(seq 1 40); do
+    pgrep -f scribe-client >/dev/null || break
+    sleep 0.25
+done
+scribe-client >>"$CLIENT_LOG" 2>&1 &
+for _ in $(seq 1 40); do
+    [ -n "$(find_window | head -1)" ] && break
+    sleep 0.5
+done
+sleep 2
+focus
+TOP_COUNT=$(leaf_tabs "$TOP" | wc -w)
+TOP_RIGHT_COUNT=$(leaf_tabs "$TOP_RIGHT" | wc -w)
+RELAUNCH_MOVED=$(leaf_tabs "$TOP_RIGHT" | awk '{ print $1 }')
+reset_record
+drag "$((WIN_W / 2 + 150))" 17 "$((WIN_W / 4))" 17
+oracle wait-leaf-session-count "$TOP" "$((TOP_COUNT + 1))" >/dev/null \
+    || fail "a relaunched client's tab drag reported success without moving the tab"
+leaf_tabs "$TOP" | tr ' ' '\n' | grep -Fx "$RELAUNCH_MOVED" >/dev/null \
+    || fail "the relaunched client moved the wrong tab"
+[ "$(leaf_tabs "$TOP_RIGHT" | wc -w)" -eq "$((TOP_RIGHT_COUNT - 1))" ] \
+    || fail "the relaunched client's drag left the source region unchanged"
+echo "PHASE 4 PASS: a relaunched client's tab drag still moves the tab"
 echo "PASS: tab subtree moves from lower-region bar into titlebar chrome"

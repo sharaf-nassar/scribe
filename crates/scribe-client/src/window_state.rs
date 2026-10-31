@@ -666,7 +666,9 @@ fn u32_to_logical_px(value: u32) -> f32 {
     f32::from(u16::try_from(value.min(MAX_WINDOW_EDGE)).unwrap_or(u16::MAX))
 }
 
-fn i32_to_logical_px(value: i32) -> f32 {
+/// A recorded signed coordinate as a pixel value, clamped to the `i16` range
+/// real displays fit in (written without a lint-tripping cast).
+pub fn i32_to_logical_px(value: i32) -> f32 {
     let clamped = value.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
     f32::from(i16::try_from(clamped).unwrap_or(0))
 }

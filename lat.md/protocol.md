@@ -133,6 +133,15 @@ The exchange is capability-gated by `Hello.workspace_transfer` and
 local peers neither offer nor accept the additive frames. A client must wait
 for a true `Welcome` bit before sending a transfer request.
 
+`TransferTab { transfer_id, workspace_id, tab_session_id, target_window_id }`
+tears one complete tab subtree out into a freshly claimed target window and
+shares the same [[protocol#Server Messages#Workspace transfer]]
+`WorkspaceTransferResult` reply, gate, and idempotency ledger. When the named
+tab is the sole tab of its workspace the moved workspace keeps its identity,
+name, and accent; otherwise the server mints a fresh workspace for the tab and
+derives its name from the moved root session's CWD. It is gated by the separate
+`tab_transfer` capability (below), not `workspace_transfer`.
+
 ### Workspace move
 
 `MoveWorkspace` requests one atomic move into an existing destination window
@@ -141,10 +150,22 @@ using IDs only.
 It carries `move_id`, source and target window/workspace IDs, and an `operation`
 of `InsertAtEdge { edge: WorkspaceTreeEdge }`, `Swap`, or `MoveTab {
 tab_session_id, target_index }`; no client workspace tree is accepted. The tab
-form names the same source/target window and transfers the complete server-held
-parallel tab/pane payload rather than emitting one `MoveSession` per pane. The
-matching [[protocol#Server Messages#Workspace move]] reply repeats the
-client-minted `move_id`.
+form transfers the complete server-held parallel tab/pane payload rather than
+emitting one `MoveSession` per pane, and the destination leaf always activates
+the moved tab at `target_index`. A same-window `MoveTab` needs only
+`workspace_move`; a `MoveTab` whose `target_window_id` is a different window is
+a cross-window transfer that additionally requires the `tab_transfer`
+capability (below). The matching [[protocol#Server Messages#Workspace move]]
+reply repeats the client-minted `move_id`.
+
+The server's idempotency ledger outlives clients and rides upgrades, so the
+client mints each id at random
+([[crates/scribe-client/src/main.rs#next_workspace_move_id]]) and the server
+replays a recorded result only when the retried request matches the one it
+recorded ([[server#Workspace Transfer#Transfer gate and ledger]]). Either
+alone fixes the failure both guard against: a per-process counter starting at
+1 collided with an earlier client's moves, and every drag after a client
+restart was answered `Moved` while nothing moved.
 
 The exchange is independently gated by `Hello.workspace_move` and
 `Welcome.workspace_move`. Both fields serde-default to `false`, so current
@@ -161,9 +182,9 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, `workspace_transfer`, `workspace_move`, and `ai_background_wait`. The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID plus additive capability fields such as `clipboard_gating`, `agent_api`, the workspace and tab transfer bits, and `ai_background_wait`. The server answers with [[protocol#Server Messages]] `Welcome`.
 
-Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` or `workspace_move` is false, no frame from that transaction family is sent. When `ai_background_wait` is false, `AiStateChanged` and `SessionList` report `WaitingForBackground` as `Processing`, which an older client can decode and which never raises a notification; see [[test#Test Harness#Pi Provider Compatibility#Background wait compatibility]].
+Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` or `workspace_move` is false, no frame from that transaction family is sent. `tab_transfer` (serde-default `false`, placed directly after `workspace_move` on both `Hello` and `Welcome`) additionally gates cross-window `MoveWorkspace { operation: MoveTab, .. }` and `TransferTab`; a participant lacking it is refused `CapabilityAbsent`. When `ai_background_wait` is false, `AiStateChanged` and `SessionList` report `WaitingForBackground` as `Processing`, which an older client can decode and which never raises a notification; see [[test#Test Harness#Pi Provider Compatibility#Background wait compatibility]].
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 

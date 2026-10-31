@@ -33,7 +33,6 @@ struct MovedTabSubtree {
     tab_session_id: SessionId,
     pane_tree: Option<PaneTreeNode>,
     sessions: Vec<SessionId>,
-    was_active: bool,
 }
 
 /// Session ownership changes derived for one existing-window workspace move.
@@ -42,6 +41,23 @@ pub struct WorkspaceMoveCandidates {
     pub source_sessions: Vec<SessionId>,
     pub target_sessions: Vec<SessionId>,
     pub source_closed: bool,
+}
+
+/// Ids-only input to one `TransferTab`: which tab leaves which window, and the
+/// fresh window it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabTransferRequest {
+    pub source_window: WindowId,
+    pub workspace_id: WorkspaceId,
+    pub tab_session_id: SessionId,
+    pub target_window: WindowId,
+}
+
+/// A validated `TransferTab` plan: the sessions to re-home and whether the
+/// moved tab is its workspace's only tab (so the whole workspace travels).
+pub struct TabTransferPlan {
+    moved: Vec<SessionId>,
+    whole_workspace: bool,
 }
 
 /// Ids-only input to one server-derived existing-window workspace move.
@@ -473,6 +489,149 @@ impl WorkspaceManager {
         Ok((moved, (source_tree, extracted)))
     }
 
+    /// Validate a `TransferTab` request without mutation, returning the
+    /// sessions it would re-home so the caller can stage their env envelopes
+    /// before committing.
+    pub fn validate_tab_transfer(
+        &self,
+        request: TabTransferRequest,
+    ) -> Result<Vec<SessionId>, WorkspaceTransferRefusal> {
+        self.check_tab_transfer(request).map(|plan| plan.moved)
+    }
+
+    /// Atomically commit a `TransferTab`. A sole-tab workspace travels whole
+    /// through [`Self::transfer_workspace`] (keeping identity, name, accent);
+    /// otherwise a fresh workspace is minted for the tab (named from
+    /// `root_cwd` with the same roots logic as `on_cwd_changed`, when the
+    /// server knows that CWD) and the moved sessions are re-keyed to the new
+    /// target window. Returns the target workspace id and the re-homed
+    /// sessions. Refusal leaves every map byte-identical: validation and the
+    /// tree edit happen on clones before the first mutation.
+    pub fn transfer_tab(
+        &mut self,
+        request: TabTransferRequest,
+        root_cwd: Option<&Path>,
+    ) -> Result<(WorkspaceId, Vec<SessionId>), WorkspaceTransferRefusal> {
+        let plan = self.check_tab_transfer(request)?;
+        let TabTransferRequest { source_window, workspace_id, tab_session_id, target_window } =
+            request;
+        if plan.whole_workspace {
+            let moved = self.transfer_workspace(source_window, workspace_id, target_window)?;
+            return Ok((workspace_id, moved));
+        }
+        let mut source_tree = self
+            .window_trees
+            .get(&source_window)
+            .cloned()
+            .ok_or(WorkspaceTransferRefusal::NotWorkspaceOwner)?;
+        let moved = Self::take_tab_subtree(&mut source_tree, workspace_id, tab_session_id)
+            .map_err(|_| WorkspaceTransferRefusal::NotWorkspaceOwner)?;
+        let moved_sessions = moved.sessions.clone();
+
+        crate::state_dump::mark_dirty();
+        let new_workspace = self.create_workspace();
+        let info = root_cwd.and_then(|cwd| {
+            let roots = self.roots.clone();
+            Self::extract_workspace_info_with_roots(cwd, &roots)
+        });
+        if let Some((name, project_root)) = info
+            && let Some(ws) = self.workspaces.get_mut(&new_workspace)
+        {
+            info!(%new_workspace, %name, "transferred tab workspace named from CWD");
+            ws.name = Some(name);
+            ws.project_root = Some(project_root);
+        }
+        let target_tree = WorkspaceTreeNode::Leaf {
+            workspace_id: new_workspace,
+            session_ids: vec![tab_session_id],
+            pane_trees: vec![moved.pane_tree],
+            active_tab_index: 0,
+        };
+        self.window_trees.insert(source_window, source_tree);
+        self.window_trees.insert(target_window, target_tree);
+        self.move_tab_membership(&moved_sessions, workspace_id, new_workspace);
+        for &session_id in &moved_sessions {
+            self.session_to_window.insert(session_id, target_window);
+        }
+        info!(
+            %workspace_id,
+            %new_workspace,
+            %source_window,
+            %target_window,
+            sessions = moved_sessions.len(),
+            "transferred tab into a new window"
+        );
+        Ok((new_workspace, moved_sessions))
+    }
+
+    /// Pure validation for [`Self::validate_tab_transfer`] and
+    /// [`Self::transfer_tab`]: derives the re-homed sessions and whether the
+    /// moved tab is its workspace's only tab.
+    fn check_tab_transfer(
+        &self,
+        request: TabTransferRequest,
+    ) -> Result<TabTransferPlan, WorkspaceTransferRefusal> {
+        let TabTransferRequest { source_window, workspace_id, tab_session_id, target_window } =
+            request;
+        if target_window == source_window
+            || self.window_trees.contains_key(&target_window)
+            || self.session_to_window.values().any(|&window| window == target_window)
+        {
+            return Err(WorkspaceTransferRefusal::TargetWindowIdCollision);
+        }
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(WorkspaceTransferRefusal::UnknownWorkspace);
+        }
+        let tree = self
+            .window_trees
+            .get(&source_window)
+            .ok_or(WorkspaceTransferRefusal::NotWorkspaceOwner)?;
+        let tabs = Self::workspace_leaf_session_ids(tree, workspace_id)
+            .ok_or(WorkspaceTransferRefusal::NotWorkspaceOwner)?;
+        if !tabs.contains(&tab_session_id) {
+            return Err(WorkspaceTransferRefusal::NotWorkspaceOwner);
+        }
+        let whole_workspace = tabs.len() == 1;
+        let mut source_clone = tree.clone();
+        let moved = Self::take_tab_subtree(&mut source_clone, workspace_id, tab_session_id)
+            .map_err(|_| WorkspaceTransferRefusal::NotWorkspaceOwner)?;
+        if !moved.sessions.iter().all(|session_id| {
+            self.session_to_window.get(session_id) == Some(&source_window)
+                && self.session_to_workspace.get(session_id) == Some(&workspace_id)
+        }) {
+            return Err(WorkspaceTransferRefusal::NotWorkspaceOwner);
+        }
+        if whole_workspace {
+            // The tab is the workspace's only tab, so it travels whole, exactly
+            // as `TransferWorkspace` would — including the `SoleWorkspace`
+            // refusal when it is the source window's only workspace.
+            let whole =
+                self.validate_workspace_transfer(source_window, workspace_id, target_window)?;
+            return Ok(TabTransferPlan { moved: whole, whole_workspace: true });
+        }
+        Ok(TabTransferPlan { moved: moved.sessions, whole_workspace: false })
+    }
+
+    /// The tab ordering (`session_ids`) of the leaf naming `workspace_id`, or
+    /// `None` when no leaf does. First-match like `workspace_tree_leaf`.
+    fn workspace_leaf_session_ids(
+        node: &WorkspaceTreeNode,
+        workspace_id: WorkspaceId,
+    ) -> Option<&[SessionId]> {
+        match node {
+            WorkspaceTreeNode::Leaf { workspace_id: leaf_id, session_ids, .. }
+                if *leaf_id == workspace_id =>
+            {
+                Some(session_ids)
+            }
+            WorkspaceTreeNode::Leaf { .. } => None,
+            WorkspaceTreeNode::Split { first, second, .. } => {
+                Self::workspace_leaf_session_ids(first, workspace_id)
+                    .or_else(|| Self::workspace_leaf_session_ids(second, workspace_id))
+            }
+        }
+    }
+
     // ── Workspace move (existing destination window) ────────────────
 
     /// Validate an edge insertion or bidirectional swap without mutation.
@@ -502,26 +661,21 @@ impl WorkspaceManager {
         } = request;
 
         crate::state_dump::mark_dirty();
-        if matches!(operation, WorkspaceMoveOperation::MoveTab { .. }) {
+        let tab_move = matches!(operation, WorkspaceMoveOperation::MoveTab { .. });
+        if tab_move && source_window == target_window {
+            // One window: the single derived tree is both sides of the move.
             self.window_trees.insert(source_window, target_tree);
+        } else {
+            self.store_move_trees(source_window, source_tree, target_window, target_tree);
+            self.rekey_sessions_to_window(&candidates.source_sessions, target_window);
+            self.rekey_sessions_to_window(&candidates.target_sessions, source_window);
+        }
+        if tab_move {
             self.move_tab_membership(
                 &candidates.source_sessions,
                 workspace_id,
                 target_workspace_id,
             );
-        } else {
-            if let Some(source_tree) = source_tree {
-                self.window_trees.insert(source_window, source_tree);
-            } else {
-                self.window_trees.remove(&source_window);
-            }
-            self.window_trees.insert(target_window, target_tree);
-            for &session_id in &candidates.source_sessions {
-                self.session_to_window.insert(session_id, target_window);
-            }
-            for &session_id in &candidates.target_sessions {
-                self.session_to_window.insert(session_id, source_window);
-            }
         }
         info!(
             %workspace_id,
@@ -533,6 +687,30 @@ impl WorkspaceManager {
             "moved workspace between existing windows"
         );
         Ok(candidates)
+    }
+
+    /// Store both post-move window trees; a source with no tree left (its
+    /// last workspace moved out) loses its entry.
+    fn store_move_trees(
+        &mut self,
+        source_window: WindowId,
+        source_tree: Option<WorkspaceTreeNode>,
+        target_window: WindowId,
+        target_tree: WorkspaceTreeNode,
+    ) {
+        if let Some(source_tree) = source_tree {
+            self.window_trees.insert(source_window, source_tree);
+        } else {
+            self.window_trees.remove(&source_window);
+        }
+        self.window_trees.insert(target_window, target_tree);
+    }
+
+    /// Point every one of `sessions` at `window`.
+    fn rekey_sessions_to_window(&mut self, sessions: &[SessionId], window: WindowId) {
+        for &session_id in sessions {
+            self.session_to_window.insert(session_id, window);
+        }
     }
 
     /// Pure validation and post-tree derivation for [`Self::move_workspace`].
@@ -622,10 +800,8 @@ impl WorkspaceManager {
             target_workspace_id,
             ..
         } = request;
-        if source_window != target_window {
-            return Err(WorkspaceMoveRefusal::TargetWindowUnavailable);
-        }
-        if workspace_id == target_workspace_id {
+        let same_window = source_window == target_window;
+        if same_window && workspace_id == target_workspace_id {
             return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
         }
         if !self.workspaces.contains_key(&workspace_id) {
@@ -640,12 +816,12 @@ impl WorkspaceManager {
         if !self.sessions_owned_by_window(&target_sessions, target_window) {
             return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
         }
-        let mut tree = self
+        let mut source_tree = self
             .window_trees
             .get(&source_window)
             .cloned()
             .ok_or(WorkspaceMoveRefusal::NotWorkspaceOwner)?;
-        let moved = Self::take_tab_subtree(&mut tree, workspace_id, tab_session_id)?;
+        let moved = Self::take_tab_subtree(&mut source_tree, workspace_id, tab_session_id)?;
         if !moved.sessions.iter().all(|session_id| {
             self.session_to_window.get(session_id) == Some(&source_window)
                 && self.session_to_workspace.get(session_id) == Some(&workspace_id)
@@ -653,7 +829,8 @@ impl WorkspaceManager {
             return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
         }
         let moved_sessions = moved.sessions.clone();
-        if Self::workspace_leaf_is_empty(&tree, workspace_id) {
+        let mut source_closed = false;
+        if Self::workspace_leaf_is_empty(&source_tree, workspace_id) {
             let source_sessions = &self
                 .workspaces
                 .get(&workspace_id)
@@ -662,17 +839,43 @@ impl WorkspaceManager {
             if source_sessions.iter().any(|session_id| !moved.sessions.contains(session_id)) {
                 return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
             }
-            tree.extract_workspace(workspace_id)
-                .map_err(|_| WorkspaceMoveRefusal::NotWorkspaceOwner)?;
+            if matches!(&source_tree, WorkspaceTreeNode::Leaf { workspace_id: id, .. } if *id == workspace_id)
+            {
+                // The moved tab was the source window's only tab; the window
+                // closes after commit, exactly like the reattach path. (A
+                // same-window move cannot reach here: its target workspace is a
+                // sibling leaf, so the source tree is still a `Split`.)
+                source_closed = true;
+            } else {
+                source_tree
+                    .extract_workspace(workspace_id)
+                    .map_err(|_| WorkspaceMoveRefusal::NotWorkspaceOwner)?;
+            }
         }
-        Self::insert_tab_subtree(&mut tree, target_workspace_id, target_index, moved)?;
+        if same_window {
+            Self::insert_tab_subtree(&mut source_tree, target_workspace_id, target_index, moved)?;
+            return Ok((
+                WorkspaceMoveCandidates {
+                    source_sessions: moved_sessions,
+                    target_sessions: Vec::new(),
+                    source_closed: false,
+                },
+                (Some(source_tree.clone()), source_tree),
+            ));
+        }
+        let mut target_tree = self
+            .window_trees
+            .get(&target_window)
+            .cloned()
+            .ok_or(WorkspaceMoveRefusal::TargetWindowUnavailable)?;
+        Self::insert_tab_subtree(&mut target_tree, target_workspace_id, target_index, moved)?;
         Ok((
             WorkspaceMoveCandidates {
                 source_sessions: moved_sessions,
                 target_sessions: Vec::new(),
-                source_closed: false,
+                source_closed,
             },
-            (Some(tree.clone()), tree),
+            ((!source_closed).then_some(source_tree), target_tree),
         ))
     }
 
@@ -694,8 +897,6 @@ impl WorkspaceManager {
                     .ok_or(WorkspaceMoveRefusal::NotWorkspaceOwner)?;
                 pane_trees.resize(session_ids.len(), None);
                 let previously_active_index = *active_tab_index;
-                let showing = session_ids.get(previously_active_index).copied();
-                let was_active = showing == Some(tab_session_id);
                 session_ids.remove(index);
                 let pane_tree = pane_trees.remove(index);
                 *active_tab_index = active_tab_index_after_departure(
@@ -710,7 +911,7 @@ impl WorkspaceManager {
                 if !sessions.contains(&tab_session_id) {
                     sessions.insert(0, tab_session_id);
                 }
-                Ok(MovedTabSubtree { tab_session_id, pane_tree, sessions, was_active })
+                Ok(MovedTabSubtree { tab_session_id, pane_tree, sessions })
             }
             WorkspaceTreeNode::Split { first, second, .. } => {
                 if workspace_tree_contains(first, workspace_id) {
@@ -740,14 +941,11 @@ impl WorkspaceManager {
                     return Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable);
                 }
                 pane_trees.resize(session_ids.len(), None);
-                let showing = session_ids.get(*active_tab_index).copied();
                 session_ids.insert(target_index, moved.tab_session_id);
                 pane_trees.insert(target_index, moved.pane_tree);
-                *active_tab_index = if moved.was_active {
-                    target_index
-                } else {
-                    Self::active_index_or(session_ids, showing)
-                };
+                // The moved tab always becomes the destination's active tab
+                // (same-window and cross-window alike).
+                *active_tab_index = target_index;
                 Ok(())
             }
             WorkspaceTreeNode::Split { first, second, .. } => {
@@ -759,14 +957,6 @@ impl WorkspaceManager {
             }
             WorkspaceTreeNode::Leaf { .. } => Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable),
         }
-    }
-
-    fn active_index_or(session_ids: &[SessionId], showing: Option<SessionId>) -> usize {
-        showing
-            .and_then(|session_id| {
-                session_ids.iter().position(|candidate| *candidate == session_id)
-            })
-            .unwrap_or(0)
     }
 
     /// Whether any leaf naming this workspace has no sessions left.
@@ -2169,8 +2359,9 @@ mod tests {
         );
     }
 
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
     #[test]
-    fn moving_an_inactive_tab_keeps_both_regions_showing_the_same_tabs() {
+    fn moving_an_inactive_tab_activates_it_in_the_destination() {
         let (mut manager, window, top, lower, sessions, _) = tab_subtree_fixture();
         manager
             .move_workspace(WorkspaceMoveRequest {
@@ -2190,6 +2381,8 @@ mod tests {
         else {
             panic!("both regions still have tabs")
         };
+        // The source region keeps its shown tab by identity; the destination
+        // always activates the moved tab at its inserted slot.
         assert!(matches!(
             first.as_ref(),
             WorkspaceTreeNode::Leaf { session_ids, active_tab_index: 0, .. }
@@ -2197,7 +2390,7 @@ mod tests {
         ));
         assert!(matches!(
             second.as_ref(),
-            WorkspaceTreeNode::Leaf { session_ids, active_tab_index: 2, .. }
+            WorkspaceTreeNode::Leaf { session_ids, active_tab_index: 0, .. }
                 if session_ids == &[sessions[2], sessions[3], sessions[4]]
         ));
     }
@@ -2306,6 +2499,378 @@ mod tests {
         assert_eq!(pane_trees, &[None, Some(split), None, None]);
         assert_eq!(*active_tab_index, 1);
         assert!(manager.workspace_info(top).is_none(), "empty source workspace is retired");
+    }
+
+    fn cross_window_fixture() -> (
+        WorkspaceManager,
+        WindowId,
+        WindowId,
+        WorkspaceId,
+        WorkspaceId,
+        [SessionId; 5],
+        PaneTreeNode,
+    ) {
+        let mut manager = manager_with_roots(vec![]);
+        let window_a = WindowId::new();
+        let window_b = WindowId::new();
+        let wa = manager.create_workspace();
+        let wb = manager.create_workspace();
+        let sessions = std::array::from_fn(|_| SessionId::new());
+        let pane = pane_subtree(sessions[0], sessions[1]);
+        for session in [sessions[0], sessions[1], sessions[2]] {
+            manager.add_session(wa, session, None);
+            manager.assign_session_to_window(window_a, session);
+        }
+        for session in [sessions[3], sessions[4]] {
+            manager.add_session(wb, session, None);
+            manager.assign_session_to_window(window_b, session);
+        }
+        manager.set_window_tree(
+            window_a,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[0], sessions[2]],
+                pane_trees: vec![Some(pane.clone()), None],
+                active_tab_index: 0,
+            },
+        );
+        manager.set_window_tree(
+            window_b,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wb,
+                session_ids: vec![sessions[3], sessions[4]],
+                pane_trees: vec![None, None],
+                active_tab_index: 1,
+            },
+        );
+        (manager, window_a, window_b, wa, wb, sessions, pane)
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn cross_window_tab_move_inactive_tab_rehomes_and_activates() {
+        let (mut manager, window_a, window_b, wa, wb, sessions, _) = cross_window_fixture();
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window_a,
+                workspace_id: wa,
+                target_window: window_b,
+                target_workspace_id: wb,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[2],
+                    target_index: 1,
+                },
+            })
+            .expect("cross-window inactive tab move commits");
+        assert!(!moved.source_closed);
+        assert_eq!(moved.source_sessions, vec![sessions[2]]);
+        assert_eq!(manager.window_for_session(sessions[2]), Some(window_b));
+        assert_eq!(manager.workspace_for_session(sessions[2]), Some(wb));
+        assert_eq!(
+            manager.window_tree(window_a),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[0]],
+                pane_trees: vec![Some(pane_subtree(sessions[0], sessions[1]))],
+                active_tab_index: 0,
+            })
+        );
+        assert_eq!(
+            manager.window_tree(window_b),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wb,
+                session_ids: vec![sessions[3], sessions[2], sessions[4]],
+                pane_trees: vec![None, None, None],
+                active_tab_index: 1,
+            })
+        );
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn cross_window_tab_move_active_tab_carries_its_pane_subtree() {
+        let (mut manager, window_a, window_b, wa, wb, sessions, pane) = cross_window_fixture();
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window_a,
+                workspace_id: wa,
+                target_window: window_b,
+                target_workspace_id: wb,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[0],
+                    target_index: 0,
+                },
+            })
+            .expect("cross-window active tab move commits");
+        assert_eq!(moved.source_sessions, vec![sessions[0], sessions[1]]);
+        assert_eq!(manager.window_for_session(sessions[0]), Some(window_b));
+        assert_eq!(manager.window_for_session(sessions[1]), Some(window_b));
+        assert_eq!(manager.workspace_for_session(sessions[1]), Some(wb));
+        assert_eq!(
+            manager.window_tree(window_b),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wb,
+                session_ids: vec![sessions[0], sessions[3], sessions[4]],
+                pane_trees: vec![Some(pane), None, None],
+                active_tab_index: 0,
+            })
+        );
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn cross_window_tab_move_sole_workspace_tab_extracts_the_workspace() {
+        let mut manager = manager_with_roots(vec![]);
+        let window_a = WindowId::new();
+        let window_b = WindowId::new();
+        let wa = manager.create_workspace();
+        let wx = manager.create_workspace();
+        let wb = manager.create_workspace();
+        let sessions: [SessionId; 3] = std::array::from_fn(|_| SessionId::new());
+        manager.add_session(wa, sessions[0], None);
+        manager.assign_session_to_window(window_a, sessions[0]);
+        manager.add_session(wx, sessions[1], None);
+        manager.assign_session_to_window(window_a, sessions[1]);
+        manager.add_session(wb, sessions[2], None);
+        manager.assign_session_to_window(window_b, sessions[2]);
+        manager.set_window_tree(
+            window_a,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: wa,
+                    session_ids: vec![sessions[0]],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: wx,
+                    session_ids: vec![sessions[1]],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+            },
+        );
+        manager.set_window_tree(
+            window_b,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wb,
+                session_ids: vec![sessions[2]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            },
+        );
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window_a,
+                workspace_id: wa,
+                target_window: window_b,
+                target_workspace_id: wb,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[0],
+                    target_index: 1,
+                },
+            })
+            .expect("cross-window sole-workspace tab move commits");
+        assert!(!moved.source_closed, "source window keeps its other workspace");
+        assert!(manager.workspace_info(wa).is_none(), "emptied source workspace is retired");
+        assert_eq!(
+            manager.window_tree(window_a),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wx,
+                session_ids: vec![sessions[1]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            })
+        );
+        assert_eq!(manager.window_for_session(sessions[0]), Some(window_b));
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn cross_window_tab_move_sole_window_tab_closes_source() {
+        let mut manager = manager_with_roots(vec![]);
+        let window_a = WindowId::new();
+        let window_b = WindowId::new();
+        let wa = manager.create_workspace();
+        let wb = manager.create_workspace();
+        let sessions: [SessionId; 2] = std::array::from_fn(|_| SessionId::new());
+        manager.add_session(wa, sessions[0], None);
+        manager.assign_session_to_window(window_a, sessions[0]);
+        manager.add_session(wb, sessions[1], None);
+        manager.assign_session_to_window(window_b, sessions[1]);
+        manager.set_window_tree(
+            window_a,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[0]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            },
+        );
+        manager.set_window_tree(
+            window_b,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wb,
+                session_ids: vec![sessions[1]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            },
+        );
+        let moved = manager
+            .move_workspace(WorkspaceMoveRequest {
+                source_window: window_a,
+                workspace_id: wa,
+                target_window: window_b,
+                target_workspace_id: wb,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[0],
+                    target_index: 1,
+                },
+            })
+            .expect("cross-window sole-window tab move commits");
+        assert!(moved.source_closed, "the source window had only this tab");
+        assert!(manager.window_tree(window_a).is_none());
+        assert!(manager.sessions_for_window(window_a).is_empty());
+        assert_eq!(manager.window_for_session(sessions[0]), Some(window_b));
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[test]
+    fn cross_window_tab_move_out_of_bounds_index_refuses_without_mutation() {
+        let (mut manager, window_a, window_b, wa, wb, sessions, _) = cross_window_fixture();
+        let snapshot = |state: &WorkspaceManager| {
+            let (workspaces, tree, mut windows) = state.serialize_for_handoff();
+            windows.sort_by_key(|window| window.window_id.to_full_string());
+            rmp_serde::to_vec_named(&(workspaces, tree, windows)).expect("serialize manager")
+        };
+        let before = snapshot(&manager);
+        assert_eq!(
+            manager.move_workspace(WorkspaceMoveRequest {
+                source_window: window_a,
+                workspace_id: wa,
+                target_window: window_b,
+                target_workspace_id: wb,
+                operation: WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: sessions[0],
+                    target_index: 99,
+                },
+            }),
+            Err(WorkspaceMoveRefusal::TargetWorkspaceUnavailable)
+        );
+        assert_eq!(before, snapshot(&manager), "a refused move leaves every map byte-identical");
+    }
+
+    // @lat: [[server#Workspace Transfer]]
+    #[test]
+    fn transfer_tab_sole_tab_keeps_workspace_identity() {
+        let mut manager = manager_with_roots(vec![]);
+        let window_a = WindowId::new();
+        let fresh_window = WindowId::new();
+        let wa = manager.create_workspace();
+        let wx = manager.create_workspace();
+        let sessions: [SessionId; 2] = std::array::from_fn(|_| SessionId::new());
+        manager.add_session(wa, sessions[0], None);
+        manager.assign_session_to_window(window_a, sessions[0]);
+        manager.add_session(wx, sessions[1], None);
+        manager.assign_session_to_window(window_a, sessions[1]);
+        manager.set_window_tree(
+            window_a,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: wa,
+                    session_ids: vec![sessions[0]],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: wx,
+                    session_ids: vec![sessions[1]],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+            },
+        );
+        let (target_workspace, moved) = manager
+            .transfer_tab(
+                TabTransferRequest {
+                    source_window: window_a,
+                    workspace_id: wa,
+                    tab_session_id: sessions[0],
+                    target_window: fresh_window,
+                },
+                None,
+            )
+            .expect("sole-tab transfer commits");
+        assert_eq!(target_workspace, wa, "a sole-tab workspace keeps its identity");
+        assert_eq!(moved, vec![sessions[0]]);
+        assert_eq!(manager.window_for_session(sessions[0]), Some(fresh_window));
+        assert_eq!(manager.workspace_for_session(sessions[0]), Some(wa));
+        assert_eq!(
+            manager.window_tree(fresh_window),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[0]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            })
+        );
+    }
+
+    // @lat: [[server#Workspace Transfer]]
+    #[test]
+    fn transfer_tab_multi_tab_mints_named_workspace() {
+        let root = PathBuf::from("/projects");
+        let mut manager = manager_with_roots(vec!["/projects"]);
+        let window_a = WindowId::new();
+        let fresh_window = WindowId::new();
+        let wa = manager.create_workspace();
+        let sessions: [SessionId; 2] = std::array::from_fn(|_| SessionId::new());
+        manager.add_session(wa, sessions[0], None);
+        manager.assign_session_to_window(window_a, sessions[0]);
+        manager.add_session(wa, sessions[1], None);
+        manager.assign_session_to_window(window_a, sessions[1]);
+        manager.set_window_tree(
+            window_a,
+            WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[0], sessions[1]],
+                pane_trees: vec![None, None],
+                active_tab_index: 0,
+            },
+        );
+        let (target_workspace, moved) = manager
+            .transfer_tab(
+                TabTransferRequest {
+                    source_window: window_a,
+                    workspace_id: wa,
+                    tab_session_id: sessions[0],
+                    target_window: fresh_window,
+                },
+                Some(&root.join("scribe")),
+            )
+            .expect("multi-tab transfer commits");
+        assert_ne!(target_workspace, wa, "a multi-tab transfer mints a new workspace");
+        assert_eq!(moved, vec![sessions[0]]);
+        assert_eq!(manager.window_for_session(sessions[0]), Some(fresh_window));
+        assert_eq!(manager.workspace_for_session(sessions[0]), Some(target_workspace));
+        assert_eq!(
+            manager.workspace_info(target_workspace).and_then(|info| info.0),
+            Some("scribe".to_owned()),
+            "the minted workspace is named from the moved tab's CWD"
+        );
+        assert_eq!(
+            manager.window_tree(window_a),
+            Some(&WorkspaceTreeNode::Leaf {
+                workspace_id: wa,
+                session_ids: vec![sessions[1]],
+                pane_trees: vec![None],
+                active_tab_index: 0,
+            })
+        );
     }
 
     #[test]

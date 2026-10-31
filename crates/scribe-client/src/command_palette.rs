@@ -47,6 +47,11 @@ pub enum PaletteAction {
         target_workspace: WorkspaceId,
         operation: WorkspaceMoveOperation,
     },
+    /// Tear the focused region's shown tab out into a fresh window.
+    MoveTabToNewWindow,
+    /// Move the focused region's shown tab into another connected window's
+    /// named region, appended as its last tab and shown there.
+    MoveTabToWindow { target_window: WindowId, target_workspace: WorkspaceId },
 }
 
 // `AutomationAction` (frozen scribe-common) derives neither `PartialEq` nor
@@ -56,7 +61,12 @@ impl PartialEq for PaletteAction {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::OpenRemoteConnect, Self::OpenRemoteConnect)
-            | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow) => true,
+            | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow)
+            | (Self::MoveTabToNewWindow, Self::MoveTabToNewWindow) => true,
+            (
+                Self::MoveTabToWindow { target_window: aw, target_workspace: ar },
+                Self::MoveTabToWindow { target_window: bw, target_workspace: br },
+            ) => aw == bw && ar == br,
             (Self::MoveWorkspace(a), Self::MoveWorkspace(b)) => a == b,
             (
                 Self::MoveWorkspaceToWindow {
@@ -167,6 +177,28 @@ pub fn workspace_move_entries(targets: &[WorkspaceMoveTarget]) -> Vec<CommandPal
             ]
         })
         .collect()
+}
+
+/// The tab-move rows offered once the server negotiated tab transfer: tear the
+/// shown tab into a new window, then one "move into" row per eligible sibling
+/// window's focused region. The non-pointer path to the same transactions the
+/// tab drag commits, reachable on every platform.
+#[must_use]
+pub fn tab_move_entries(targets: &[WorkspaceMoveTarget]) -> Vec<CommandPaletteEntry> {
+    std::iter::once(CommandPaletteEntry::new(
+        "Move tab to new window",
+        PaletteAction::MoveTabToNewWindow,
+    ))
+    .chain(targets.iter().map(|target| {
+        CommandPaletteEntry::new(
+            format!("Move tab to {} in {}", target.label(), target.window),
+            PaletteAction::MoveTabToWindow {
+                target_window: target.window,
+                target_workspace: target.workspace,
+            },
+        )
+    }))
+    .collect()
 }
 
 /// The fixed base command-palette rows, in display order. Ported verbatim from

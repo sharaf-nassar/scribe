@@ -10,17 +10,23 @@
 //! emit [`TitlebarEvent`]s the shell reacts to; the pure layout/decay math lives
 //! in [`crate::tab_bar`].
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, Context, DragMoveEvent, ElementId, EventEmitter, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
-    WindowControlArea, div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, BoxShadow, Context, DragMoveEvent, ElementId,
+    EventEmitter, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Rgba, Role, Window, WindowControlArea, div, ease_out_quint, hsla,
+    prelude::*, px,
 };
 use scribe_common::ids::{SessionId, WorkspaceId};
 
 use crate::tab_bar::{
-    GroupBadge, TabBarColors, TabData, TabShown, accent_tab_tone, flash_blend, pill_fill, px_units,
+    GroupBadge, TabBarColors, TabData, TabShown, flash_blend, lifted_tone, pill_fill, px_units,
     reorder_target_index, tab_display_title,
 };
+use crate::tab_drop_motion::{GapSlot, TabDropMotion, TabDropTarget};
 use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
 
 /// Approximate advance width of one label character.
@@ -167,79 +173,165 @@ pub struct TabDrag(pub TabDragGhost);
 /// The overlay is positioned by the press offset inside the tab's hitbox, so a
 /// ghost of the tab's own size sits exactly where the tab was under the
 /// pointer and then follows it anywhere in the window, including over the bar
-/// it will be dropped on. The tab left behind in its strip is dimmed to a
-/// placeholder, so the solid card is always the one in hand.
+/// it will be dropped on. The slot it left stays as a quiet recess while the
+/// pointer is in the source bar and closes once the tab is aimed elsewhere.
 #[derive(Clone)]
 pub struct TabDragGhost {
     pub title: String,
     pub colors: TabBarColors,
     pub width: f32,
     pub height: f32,
+    /// Where inside the ghost the pointer holds it, recorded by the `on_drag`
+    /// constructor from GPUI's cursor offset. The release settle starts the
+    /// card from exactly where GPUI last painted it.
+    pub grab: Rc<Cell<(f32, f32)>>,
 }
 
-impl Render for TabDragGhost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+impl TabDragGhost {
+    /// The ghost card itself, sized like the tab it lifts.
+    ///
+    /// One definition for every painter: GPUI's drag overlay in the source
+    /// window, a sibling window that paints the same card under the pointer
+    /// once a cross-window drag has left the source surface (GPUI cannot paint
+    /// a drag view outside its origin window), and the release settle.
+    ///
+    /// A lifted card: fully opaque, so neither the strip nor the tab under it
+    /// bleeds through the title, rounded on all four corners because it no
+    /// longer joins a pane, filled a step above the strip ([`lifted_tone`])
+    /// and outlined in the accent so it reads on a black theme too, with an
+    /// accent cap across its top and a two-layer drop shadow that separates
+    /// it from the chrome it floats over.
+    #[must_use]
+    pub fn element(&self) -> gpui::Div {
+        let colors = self.colors;
         div().w(px(self.width)).h(px(self.height)).pt(px(TAB_CARD_TOP_GAP)).child(
             div()
+                .relative()
                 .size_full()
                 .flex()
                 .items_center()
                 .px_2()
-                .rounded_t(px(6.0))
+                .rounded(px(6.0))
                 .border_1()
-                .border_color(self.colors.accent)
-                .bg(self.colors.active_bg)
-                .text_color(self.colors.active_text)
+                .border_color(Rgba { a: 0.75, ..colors.accent })
+                .bg(lifted_tone(&colors))
+                .text_color(colors.active_text)
                 .text_xs()
                 .overflow_hidden()
-                .opacity(GHOST_OPACITY)
+                .shadow(vec![
+                    BoxShadow::new(px(0.0), px(6.0), hsla(0.0, 0.0, 0.0, 0.5))
+                        .blur_radius(px(16.0)),
+                    BoxShadow::new(px(0.0), px(1.0), hsla(0.0, 0.0, 0.0, 0.4)).blur_radius(px(3.0)),
+                ])
+                .child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(colors.accent))
                 .child(div().flex_1().truncate().child(self.title.clone())),
         )
     }
 }
 
-/// The slot a dragged tab left behind: an accent-outlined card in the
-/// workspace's tab tone, so the landing slot reads at a glance even when every
-/// tab in the bar shares a title.
+impl Render for TabDragGhost {
+    /// The pickup: the card rises a few pixels out of the strip as it is lifted.
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.element().with_animation(
+            "tab-ghost-lift",
+            Animation::new(Duration::from_millis(TAB_DRAG_ANIMATION_MS))
+                .with_easing(ease_out_quint()),
+            |card, lift| card.mt(px(-GHOST_LIFT * lift)),
+        )
+    }
+}
+
+/// How long the drag's pickup, slot open/close, and release settle run.
+pub const TAB_DRAG_ANIMATION_MS: u64 = 140;
+
+/// How far the ghost rises out of the strip when picked up.
+pub const GHOST_LIFT: f32 = 3.0;
+
+/// What the shell asks the strip to show for a tab drag it is resolving.
+///
+/// `landings` counts released tabs that have arrived; a new count snaps the
+/// strip's gaps shut on the frame the tab itself appears in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TitlebarDropPreview {
+    pub target: TabDropTarget,
+    pub landings: u64,
+}
+
+/// A landing gap `width` wide: the slot a dragged tab will land in, shown as
+/// an accent hairline card over a faint accent tint (a solid accent tone read
+/// as a slab louder than the tab being dropped). Its width is animated by the
+/// caller's [`TabDropMotion`], so it can open, close, and slide between slots.
 #[must_use]
-pub fn drag_placeholder(bg: Rgba, accent: Rgba) -> AnyElement {
+pub fn drop_gap(width: f32, colors: &TabBarColors) -> AnyElement {
+    let accent = colors.accent;
+    div()
+        .flex_none()
+        .relative()
+        .h_full()
+        .w(px(width))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left(px(2.0))
+                .right(px(2.0))
+                .top(px(TAB_CARD_TOP_GAP))
+                .bottom_0()
+                .rounded_t(px(6.0))
+                .border_1()
+                .border_color(Rgba { a: 0.6, ..accent })
+                .bg(Rgba { a: 0.1, ..accent }),
+        )
+        .into_any_element()
+}
+
+/// A tab's slot narrowed to `width` while it closes (the tab is aimed at
+/// another bar, or was released and is on its way) or reopens. The dragged
+/// tab's own slot keeps its recess; a released tab's is bare.
+#[must_use]
+pub fn narrowed_slot(width: f32, recess: Option<&TabBarColors>) -> AnyElement {
+    div()
+        .flex_none()
+        .relative()
+        .h_full()
+        .w(px(width))
+        .overflow_hidden()
+        .children(recess.map(drag_placeholder))
+        .into_any_element()
+}
+
+/// The chip that rides beside the pointer while a tab drag is armed to tear
+/// out: it names the outcome a release will have, because nothing else in the
+/// window can show a window that does not exist yet.
+#[must_use]
+pub fn new_window_chip(colors: &TabBarColors) -> gpui::Div {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(colors.accent)
+        .bg(colors.active_bg)
+        .text_color(colors.active_text)
+        .text_xs()
+        .child("New window")
+}
+
+/// The slot a dragged tab occupies while the pointer is still in its own bar:
+/// a quiet recess in the strip's own tone, so the eye stays on the card in
+/// hand. It is where the tab goes back if released here.
+#[must_use]
+pub fn drag_placeholder(colors: &TabBarColors) -> AnyElement {
     div()
         .absolute()
-        .left_0()
-        .right_0()
+        .left(px(2.0))
+        .right(px(2.0))
         .top(px(TAB_CARD_TOP_GAP))
         .bottom_0()
         .rounded_t(px(6.0))
-        .border_1()
-        .border_dashed()
-        .border_color(accent)
-        .bg(accent_tab_tone(accent, bg))
+        .bg(pill_fill(colors))
         .into_any_element()
 }
-
-/// The insertion mark a bar paints where a tab from another section will
-/// land: a full-band accent bar at the slot boundary.
-///
-/// It spans the whole band, not just the card, and the ghost is translucent:
-/// the boundary the pointer resolves is by construction within half a slot of
-/// the pointer, which is under the ghost in hand, so a mark the ghost could
-/// hide would never be seen.
-#[must_use]
-pub fn drop_marker(x: f32, y: f32, height: f32, accent: Rgba) -> AnyElement {
-    div()
-        .absolute()
-        .left(px(x - 1.5))
-        .top(px(y))
-        .w(px(3.0))
-        .h(px(height))
-        .rounded(px(1.5))
-        .bg(accent)
-        .into_any_element()
-}
-
-/// Ghost translucency, so the drop marker and the bar it lands on read through
-/// the card in hand.
-const GHOST_OPACITY: f32 = 0.8;
 
 /// In-flight tab drag.
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +377,22 @@ struct TabChildren {
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
     mark: Option<AnyElement>,
+}
+
+impl TabChildren {
+    /// The tab's content, left to right.
+    fn attach(self, tab: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
+        tab.children(self.mark)
+            .children(self.agent_indicator)
+            .children(self.ai_indicator)
+            // `truncate` keeps the title a single clipped line; without it a
+            // title that outgrows the flexed slot (the AI dot appearing, a
+            // narrow group bar) wraps to a second line inside the fixed-height
+            // tab and the visible text rides up.
+            .child(div().flex_1().truncate().child(self.display))
+            .children(self.suffix)
+            .children(self.close)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -338,6 +446,12 @@ pub struct TitlebarView {
     /// own width. Drag-reorder geometry has to use what the user is looking
     /// at, not the basis it started from.
     measured_tabs: std::rc::Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
+    /// The shell's resolved tab drag: the landing gap and closed slot.
+    drop_preview: TitlebarDropPreview,
+    /// The animated widths `drop_preview` is moving toward, and the landing
+    /// count they last snapped for.
+    drop_motion: TabDropMotion,
+    drop_landings_seen: u64,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -362,6 +476,36 @@ impl TitlebarView {
             beads_focus_handles: Vec::new(),
             standalone_beads_focus_handles: Vec::new(),
             measured_tabs: std::rc::Rc::default(),
+            drop_preview: TitlebarDropPreview::default(),
+            drop_motion: TabDropMotion::default(),
+            drop_landings_seen: 0,
+        }
+    }
+
+    /// Adopt the shell's drop preview; returns whether anything changed.
+    pub fn set_drop_preview(&mut self, preview: TitlebarDropPreview) -> bool {
+        if preview == self.drop_preview {
+            return false;
+        }
+        self.drop_preview = preview;
+        true
+    }
+
+    /// Advance the drop motion to this frame, and keep frames coming while it
+    /// moves. Motion off (`reduce_motion`) lands every width at once.
+    fn advance_drop_motion(&mut self, now: std::time::Instant, window: &Window, cx: &App) {
+        if self.drop_preview.landings != self.drop_landings_seen {
+            self.drop_landings_seen = self.drop_preview.landings;
+            self.drop_motion.snap_gaps_shut();
+        }
+        let duration = if cx.reduce_motion() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(TAB_DRAG_ANIMATION_MS)
+        };
+        self.drop_motion.update(self.drop_preview.target, now, duration);
+        if self.drop_motion.animating(now) {
+            window.request_animation_frame();
         }
     }
 
@@ -1027,6 +1171,10 @@ impl TitlebarView {
         let Some(tab_focus) = self.tab_focus_handles.get(index).cloned() else {
             return div().into_any_element();
         };
+        let dragging = self.drag.is_some_and(|drag| drag.source == index);
+        if let Some(narrowed) = self.narrowed_tab_slot(index, tab, dragging) {
+            return narrowed;
+        }
         // The keyboard ring is for Tab-key navigation only. A click focuses
         // the tab too, for the one frame before the terminal takes focus
         // back, and a ring that flashed then read as the card's edge breaking.
@@ -1067,11 +1215,10 @@ impl TitlebarView {
             .px_2()
             .text_color(fg)
             .text_xs();
-        let dragging = self.drag.is_some_and(|drag| drag.source == index);
         let show_card = !dragging && (tab.is_active() || is_hovered || tab.tab_flash.is_some());
         tab_el = tab_el
             .children(show_card.then(|| tab_card(bg, open_tab_edge(tab, &self.colors))))
-            .children(dragging.then(|| drag_placeholder(self.colors.bg, self.colors.accent)))
+            .children(dragging.then(|| drag_placeholder(&self.colors)))
             .children(self.tab_boundary_mark(index, tab));
         tab_el = tab_el.children(focused.then(|| self.keyboard_focus_ring()));
         tab_el = tab_el.child(self.tab_geometry_probe(index));
@@ -1080,18 +1227,13 @@ impl TitlebarView {
             colors: self.colors,
             width: self.tab_geometry(index, self.tabs_origin_x()).1,
             height: self.height,
+            grab: Rc::default(),
         };
+        // The slot in hand is an empty recess: its title travels with the ghost.
+        if !dragging {
+            tab_el = children.attach(tab_el);
+        }
         let tab_el = tab_el
-            .children(children.mark)
-            .children(children.agent_indicator)
-            .children(children.ai_indicator)
-            // `truncate` keeps the title a single clipped line; without it a
-            // title that outgrows the flexed slot (the AI dot appearing, a
-            // narrow group bar) wraps to a second line inside the fixed-height
-            // tab and the visible text rides up.
-            .child(div().flex_1().truncate().child(children.display))
-            .children(children.suffix)
-            .children(children.close)
             .on_hover(cx.listener(move |this, hovered: &bool, _win, ctx| {
                 this.hovered_tab = if *hovered { Some(index) } else { None };
                 ctx.notify();
@@ -1100,7 +1242,10 @@ impl TitlebarView {
             // Registers [`TabDrag`] as GPUI's active drag once the pressed
             // pointer travels past the drag threshold; from then on the root's
             // `on_drag_move` receives every mouse move in the window.
-            .on_drag(TabDrag(ghost), |drag, _, _, cx| cx.new(|_| drag.0.clone()))
+            .on_drag(TabDrag(ghost), |drag, grab, _, cx| {
+                drag.0.grab.set((f32::from(grab.x), f32::from(grab.y)));
+                cx.new(|_| drag.0.clone())
+            })
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 if !this.drag.as_ref().is_some_and(|drag| drag.reordered) {
                     this.select(index, TabActivationSource::Pointer, ctx);
@@ -1111,6 +1256,19 @@ impl TitlebarView {
                 this.tab_key(index, event, window, ctx);
             }));
         tab_el.into_any_element()
+    }
+
+    /// The tab's slot while it is not fully open: closing because the tab
+    /// is aimed at another bar or was released elsewhere, or reopening
+    /// because the pointer came back. Its geometry probe is left out, so drag
+    /// geometry keeps the last full-width measurement.
+    fn narrowed_tab_slot(&self, index: usize, tab: &TabData, dragging: bool) -> Option<AnyElement> {
+        let session_id = tab.session_id?;
+        let open = self.drop_motion.slot(session_id, std::time::Instant::now());
+        (open < 1.0).then(|| {
+            let width = self.tab_geometry(index, self.tabs_origin_x()).1 * open;
+            narrowed_slot(width, dragging.then_some(&self.colors))
+        })
     }
 
     fn render_icon_button(
@@ -1203,9 +1361,7 @@ impl TitlebarView {
                 if let Some(badge) = tabs.get(start).and_then(|tab| tab.badge.as_ref()) {
                     row = row.child(self.render_group_badge(start, badge, cx));
                 }
-                let row = row.children((start..end).filter_map(|index| {
-                    tabs.get(index).map(|tab| self.render_tab(index, tab, window, cx))
-                }));
+                let row = row.children(self.render_group_cells((start, end), &tabs, window, cx));
                 if !aligned {
                     // The group bar takes the strip so its tabs have something
                     // to grow into. Without this the row sizes to its content
@@ -1224,6 +1380,35 @@ impl TitlebarView {
                 }
             })
             .collect()
+    }
+
+    /// One group's tabs, each preceded by its landing gap while one is open
+    /// or closing there, and the group's trailing gap after the last.
+    fn render_group_cells(
+        &self,
+        (start, end): (usize, usize),
+        tabs: &[TabData],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let now = std::time::Instant::now();
+        // One tab's width of this group, so a gap is the slot a tab fills.
+        let full =
+            self.tab_geometry(start, self.tabs_origin_x()).1.clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+        let gap = |slot: Option<GapSlot>| {
+            let open = slot.map_or(0.0, |slot| self.drop_motion.gap(slot, now));
+            (open > 0.0).then(|| drop_gap(full * open, &self.colors))
+        };
+        let mut cells = Vec::new();
+        for index in start..end {
+            let Some(tab) = tabs.get(index) else { continue };
+            cells.extend(gap(tab.session_id.map(GapSlot::Before)));
+            cells.push(self.render_tab(index, tab, window, cx));
+        }
+        let last =
+            end.checked_sub(1).and_then(|last| tabs.get(last)).and_then(|tab| tab.session_id);
+        cells.extend(gap(last.map(GapSlot::After)));
+        cells
     }
 
     /// The workspace pill opening `index`'s group. Clicking it selects the
@@ -1469,6 +1654,7 @@ impl Render for TitlebarView {
         focused_window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.advance_drop_motion(std::time::Instant::now(), focused_window, cx);
         let tabs = self.render_tabs(focused_window, cx);
         let standalone_badges = self.render_standalone_badges(cx);
         let equalize = self.render_equalize_button(focused_window, cx);

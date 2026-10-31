@@ -385,6 +385,23 @@ pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
     }
 }
 
+/// The fill of a card lifted off the strip: the open-tab fill pulled 14%
+/// toward the text colour, so it rises above the strip on any theme.
+///
+/// The open-tab fill alone is the terminal background, which on a theme with
+/// a pure black background (`wez`) is black on a near-black strip: the ghost
+/// in hand read as an empty card, and its shadow vanished on black.
+#[must_use]
+pub fn lifted_tone(colors: &TabBarColors) -> Rgba {
+    let (base, toward) = (colors.active_bg, colors.active_text);
+    Rgba {
+        r: toward.r.mul_add(0.14, base.r * 0.86),
+        g: toward.g.mul_add(0.14, base.g * 0.86),
+        b: toward.b.mul_add(0.14, base.b * 0.86),
+        a: 1.0,
+    }
+}
+
 /// The uniform quiet fill every workspace pill wears — the theme foreground
 /// at 5% alpha over the strip, the layered chrome mock's `--fill`. Identity
 /// color lives in the pill's leading dot or Beads icon, never in the fill.

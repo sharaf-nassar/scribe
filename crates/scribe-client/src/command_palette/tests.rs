@@ -10,7 +10,7 @@ use scribe_common::theme::minimal_dark;
 use super::{
     CommandPaletteColors, CommandPaletteEntry, CommandPaletteEvent, CommandPaletteView,
     PaletteAction, WorkspaceMoveTarget, base_entries, build_entries, filter_entries,
-    profile_entries, workspace_move_entries,
+    profile_entries, tab_move_entries, workspace_move_entries,
 };
 use crate::layout::FocusDirection;
 use crate::workspace_drag::swap_hint_text;
@@ -23,6 +23,29 @@ fn base_entries_lead_with_settings_and_end_with_remote_connect() {
     let last = entries.last().unwrap();
     assert_eq!(last.label, "Connect to remote machine…");
     assert_eq!(last.action, PaletteAction::OpenRemoteConnect);
+}
+
+// @lat: [[client#GPUI Overlays#Palette tab move rows]]
+#[test]
+fn tab_move_rows_lead_with_new_window_then_one_row_per_sibling() {
+    let window = WindowId::new();
+    let workspace = WorkspaceId::new();
+    let named = WorkspaceMoveTarget { window, workspace, workspace_name: Some("api".to_owned()) };
+    assert_eq!(
+        tab_move_entries(&[])
+            .into_iter()
+            .map(|entry| (entry.label, entry.action))
+            .collect::<Vec<_>>(),
+        vec![("Move tab to new window".to_owned(), PaletteAction::MoveTabToNewWindow)]
+    );
+    let rows = tab_move_entries(&[named]);
+    assert_eq!(rows.len(), 2);
+    let row = rows.get(1).unwrap();
+    assert_eq!(row.label, format!("Move tab to api in {window}"));
+    assert_eq!(
+        row.action,
+        PaletteAction::MoveTabToWindow { target_window: window, target_workspace: workspace }
+    );
 }
 
 #[test]

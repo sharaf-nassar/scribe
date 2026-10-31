@@ -484,6 +484,18 @@ source shell closed, so a lost-ACK retry replays both `WorkspaceMoveResult` and
 phase-1 transfer entry map remains decode-compatible. A latched handoff refuses
 new transactions, and handoff failure clears the latch.
 
+A move record also keeps the request it answered (source window, workspaces,
+target window, operation), and only a retry, meaning the same `move_id` and the
+same request, replays it. The ledger is shared by every client and outlives
+them, so a move id is only as unique as whoever minted it: clients that
+numbered moves from 1 per launch had every move after a restart answered with
+an earlier client's recorded `Moved`, and nothing moved. A reused id carrying
+a different request is new work; it runs, is logged, and its own result is the
+newest match for its own retries. Entries an older server recorded have no
+request and still replay by id alone until capacity evicts them. Transfer ids
+need no such check: they are derived from the fresh destination `WindowId`, so
+two different transfers cannot share one.
+
 ### In-gate commit
 
 The request carries ids only; the server derives and commits both post-move
@@ -574,13 +586,21 @@ sole-source swap returns the specific `SoleWorkspace` refusal.
 
 ### Atomic tab-subtree transfer
 
-`WorkspaceMoveOperation::MoveTab` reuses the workspace-move capability, gate, result ledger, and full-state refresh for one same-window tab/pane subtree.
+`WorkspaceMoveOperation::MoveTab` reuses the workspace-move capability, gate, result ledger, and full-state refresh for one tab/pane subtree, inside one window or into another.
 
 [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_workspace]] extracts the tab root and its parallel `pane_trees` entry as one subtree, derives every child `SessionId`, inserts the untouched payload at `target_index`, and re-files all of those live sessions under the target workspace in one mutable borrow. No PTY, scrollback, program, window owner, env coordinate, sink, attachment, or agent route changes.
 
-The source leaf keeps its shown tab by identity, clamping successor-then-predecessor only when the moved tab was active. The destination likewise keeps its shown tab for an inactive move; an active moved tab remains active at its inserted slot. A source leaf that loses its last tab is extracted only when the moved subtree accounts for every session in that workspace, then its empty workspace record is retired after commit. Refusal, including an invalid root/index or a handoff in progress, happens against cloned trees before any registry mutation.
+The source leaf keeps its shown tab by identity, clamping successor-then-predecessor only when the moved tab was active. The destination always shows the moved tab at its inserted slot, whether or not it was active in the source: a tab the user just dropped is the one they want to see, and leaving an inactive arrival hidden behind the destination's current tab read as a drop that did nothing. A source leaf that loses its last tab is extracted only when the moved subtree accounts for every session in that workspace, then its empty workspace record is retired after commit. Refusal, including an invalid root/index or a handoff in progress, happens against cloned trees before any registry mutation.
 
-The finalizer emits one full `SessionList` (and, when the window is shared, one full `ShareRoster`) for the surviving window. Its existing routes remain attached: unlike a cross-window move there is no env staging, severance, destination attach, or activity re-broadcast.
+For a same-window move the finalizer emits one full `SessionList` (and, when the window is shared, one full `ShareRoster`) for the surviving window. Its existing routes remain attached: there is no env staging, severance, destination attach, or activity re-broadcast.
+
+A `MoveTab` whose `target_window_id` names another window is the cross-window form, and it additionally requires the participant's `tab_transfer` capability ([[crates/scribe-server/src/ipc_server.rs#validate_workspace_move_control]]). It runs the same machinery a cross-window workspace move does: the moved sessions' env envelopes are staged against the destination window before commit, [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_workspace]] stores both windows' derived trees and re-keys every moved session's window, the routes into the source window are severed as in [[server#Workspace Move#Share route migration]], and both windows get the full refresh. The live sessions are then re-filed into the destination workspace. When the moved tab was the source window's only tab, the source tree is removed and the window closes after commit, exactly as a sole-workspace reattach does.
+
+### Tab tear-out into a new window
+
+`ClientMessage::TransferTab` moves one tab subtree into a freshly claimed window, sharing `TransferWorkspace`'s gate, idempotency ledger, env staging, severance, and finalizer.
+
+[[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#transfer_tab]] has two branches. A tab that is its workspace's only tab takes the whole workspace through `transfer_workspace`, so its identity, name, and accent travel with it and a window's only workspace is refused `SoleWorkspace`. Any other tab gets a freshly minted workspace whose name and project root come from the moved root session's server-known CWD through the same roots rule `on_cwd_changed` uses, and the target window's tree is a single leaf holding that tab and its pane tree. Either way every moved session is re-keyed to the target window before the result is recorded, so the client's claim of `target_window_id` lists the new workspace's metadata on its first `SessionList`. Refusals are the existing `WorkspaceTransferRefusal` set plus `CapabilityAbsent` for a participant without `tab_transfer`, and all of them are decided against clones before any mutation.
 
 ### Share route migration
 

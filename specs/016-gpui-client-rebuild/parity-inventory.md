@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (56 variants, 50 reachable)
+## Client messages (57 variants, 51 reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -105,6 +105,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `CreateWorkspace` | workspace creation | scripted-E2E | `main.rs::TerminalView::split_workspace` → `IpcSink::create_workspace` | required |
 | `CloseWorkspace` | workspace close | scripted-E2E | `main.rs::TerminalView::close_pane` / `reconcile_panes` → `TerminalView::close_workspace` → `IpcSink::close_workspace` | required |
 | `TransferWorkspace` | workspace tear-out transaction | unit | — (unwired; client tear-out flow pending) | required |
+| `TransferTab` | tab tear-out transaction | scripted-E2E | `main.rs::TerminalView::finish_tab_subtree_drag` armed release and `execute_palette_action` `MoveTabToNewWindow` arm → `TerminalView::begin_tab_transfer` → `ipc_bridge.rs::IpcSink::transfer_tab` — `tests/e2e/visual/tab-drag-cross-window.sh` | required |
 | `MoveWorkspace` | existing-window workspace move transaction | unit | `main.rs::TerminalView::execute_palette_action` `MoveWorkspaceToWindow` arm and `TerminalView::finish_workspace_drag` cross-window release → `TerminalView::begin_workspace_move` → `ipc_bridge.rs::IpcSink::move_workspace` | required |
 | `MoveSession` | session relocation | scripted-E2E | `main.rs::TerminalView::follow_session_to_region` → `IpcSink::move_session` | required |
 | `Subscribe` | session stream subscription | scripted-E2E | `main.rs::attach_session` / `TerminalView::attach` → `IpcSink::subscribe` | required |
@@ -155,7 +156,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `BeadsIssueWrite` | workspace Beads issue detail edits | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `RequestBeadsEpicGraph` | workspace Beads Flow epic dependency graph | unit | `beads_board.rs::BeadsBoards::request_card_flow` → `main.rs::TerminalView::sync_beads_board_strips` → `ipc_bridge.rs::IpcSink::request_beads_epic_graph` | required |
 
-**Reachability:** 50 of 56 rows name a live-path symbol; 6 are unwired and 0
+**Reachability:** 51 of 57 rows name a live-path symbol; 6 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
@@ -486,19 +487,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 56 | 50 | 6 | 0 |
+| Client messages | 57 | 51 | 6 | 0 |
 | Server messages | 76 | 69 | 7 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **231** | **218** | **13** | **0** |
+| **Total** | **232** | **219** | **13** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **222 rows, of which 209 are
-reachable (94%)** and 13 are not. **1 of those 222** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **223 rows, of which 210 are
+reachable (94%)** and 13 are not. **1 of those 223** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **208 of 222**.
+the in-client figure is **209 of 223**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

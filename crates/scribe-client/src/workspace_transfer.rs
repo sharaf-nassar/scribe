@@ -10,7 +10,7 @@ use std::{
 };
 
 use scribe_common::{
-    ids::{WindowId, WorkspaceId},
+    ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         WorkspaceMoveOperation, WorkspaceMoveRefusal, WorkspaceMoveResult,
         WorkspaceTransferRefusal, WorkspaceTransferResult,
@@ -30,10 +30,15 @@ pub struct TransferWindowSpec {
 }
 
 /// Ids-only request sent to the server.
+///
+/// `tab` names one tab of `workspace` to tear out on its own
+/// (`TransferTab`); `None` moves the whole workspace (`TransferWorkspace`).
+/// Both share one correlation space, retry rule, and window-open outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceTransferRequest {
     pub correlation: u64,
     pub workspace: WorkspaceId,
+    pub tab: Option<SessionId>,
     pub target_window: WindowId,
 }
 
@@ -61,34 +66,34 @@ impl WorkspaceTransferFeedback {
     pub const fn message(self) -> &'static str {
         match self {
             Self::CapabilityAbsent | Self::Refused(WorkspaceTransferRefusal::CapabilityAbsent) => {
-                "Workspace tear-out is unavailable with this server"
+                "Moving to a new window is unavailable with this server"
             }
             Self::SoleWorkspace | Self::Refused(WorkspaceTransferRefusal::SoleWorkspace) => {
                 "This is the window's only workspace; nothing to detach"
             }
-            Self::AlreadyPending => "A workspace tear-out is already pending",
-            Self::SendFailed => "Workspace was not detached because the request could not be sent",
+            Self::AlreadyPending => "A move to a new window is already pending",
+            Self::SendFailed => "Nothing was moved because the request could not be sent",
             Self::Disconnected => {
-                "Workspace tear-out was interrupted; retrying safely after reconnect"
+                "Move to a new window was interrupted; retrying safely after reconnect"
             }
-            Self::TimedOutRetrying => "Workspace tear-out has not answered; retrying safely",
+            Self::TimedOutRetrying => "Move to a new window has not answered; retrying safely",
             Self::Refused(WorkspaceTransferRefusal::UnknownWorkspace) => {
-                "Workspace could not be detached because it no longer exists"
+                "Could not move to a new window because the workspace no longer exists"
             }
             Self::Refused(WorkspaceTransferRefusal::NotWorkspaceOwner) => {
-                "Workspace could not be detached because source ownership changed"
+                "Could not move to a new window because source ownership changed"
             }
             Self::Refused(WorkspaceTransferRefusal::NoWindowControl) => {
-                "Workspace could not be detached without window control"
+                "Could not move to a new window without window control"
             }
             Self::Refused(WorkspaceTransferRefusal::TargetWindowIdCollision) => {
-                "Workspace target collided with an existing window; try again"
+                "The new window collided with an existing window; try again"
             }
             Self::Refused(WorkspaceTransferRefusal::HandoffInProgress) => {
-                "Workspace could not be detached during server handoff; try again"
+                "Could not move to a new window during server handoff; try again"
             }
             Self::Refused(WorkspaceTransferRefusal::EnvironmentRebindFailed) => {
-                "Workspace environment restore data could not be rebound; source was unchanged"
+                "Environment restore data could not be rebound; nothing was moved"
             }
         }
     }
@@ -457,6 +462,7 @@ mod tests {
         WorkspaceTransferRequest {
             correlation: transfer_id,
             workspace: WorkspaceId::new(),
+            tab: None,
             target_window: WindowId::new(),
         }
     }

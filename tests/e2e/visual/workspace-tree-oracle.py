@@ -198,6 +198,114 @@ def assert_tab_subtree_move(path, source_workspace, target_workspace, session_id
     return 0
 
 
+def latest_leaf(path, wanted):
+    """The most recently reported leaf for `wanted`, from whichever window
+    reported it. With several windows on one wire record, the newest tree
+    overall belongs to whichever window spoke last, so a per-workspace lookup
+    has to search every tree rather than only the latest."""
+    found = None
+    for tree in trees(path):
+        for item in leaves(tree):
+            if str(item.get("workspace_id")) == wanted:
+                found = item
+    return found
+
+
+def wait_latest_leaf_count(path, wanted, count):
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        item = latest_leaf(path, wanted)
+        if item is not None and len(item.get("session_ids", [])) == count:
+            print(json.dumps(item, sort_keys=True, separators=(",", ":")))
+            return 0
+        time.sleep(0.2)
+    return 1
+
+
+def wait_tabs_together(path, anchor, moved):
+    """Wait until the newest report of some workspace holds both `anchor` and
+    `moved`: the drop landed in the window that already held `anchor`."""
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        newest = {}
+        for tree in trees(path):
+            for item in leaves(tree):
+                newest[str(item.get("workspace_id"))] = item
+        for item in newest.values():
+            ids = [str(session) for session in item.get("session_ids", [])]
+            if anchor in ids and moved in ids:
+                print(json.dumps(item, sort_keys=True, separators=(",", ":")))
+                return 0
+        time.sleep(0.2)
+    return 1
+
+
+def known_workspaces(path):
+    seen = []
+    for tree in trees(path):
+        for item in leaves(tree):
+            workspace = str(item.get("workspace_id"))
+            if workspace not in seen:
+                seen.append(workspace)
+    print(" ".join(seen))
+    return 0
+
+
+def _no_replacement_sessions(path):
+    created = set()
+    known = set()
+    for row in rows(path):
+        current = message(row)
+        if row.get("dir") != "server":
+            continue
+        if current.get("type") == "SessionList":
+            known.update(session.get("session_id") for session in current.get("sessions", []))
+        if current.get("type") == "SessionCreated":
+            created.add(current.get("session_id"))
+    return created - known
+
+
+def assert_cross_window_tab_move(path, source_workspace, target_workspace, session_id, source_closed=False):
+    request = moved = closed = False
+    lists = 0
+    for row in rows(path):
+        current = message(row)
+        if row.get("dir") == "client" and current.get("type") == "MoveWorkspace":
+            operation = current.get("operation", {}).get("move_tab", {})
+            request = request or (
+                str(current.get("workspace_id")) == source_workspace
+                and str(current.get("target_workspace_id")) == target_workspace
+                and str(operation.get("tab_session_id")) == session_id
+            )
+        if row.get("dir") == "server" and current.get("type") == "WorkspaceMoveResult":
+            moved = moved or str(current.get("result", "")).lower() == "moved"
+        if row.get("dir") == "server" and current.get("type") == "SessionList":
+            lists += 1
+        if row.get("dir") == "server" and current.get("type") == "WindowClosed":
+            closed = True
+    stray = _no_replacement_sessions(path)
+    # Both windows' connections are refreshed, so at least two lists, unless
+    # the move emptied the source: it is closed instead of refreshed.
+    refreshed = (closed and lists >= 1) if source_closed else lists >= 2
+    assert request and moved and refreshed and not stray, (request, moved, lists, closed, stray)
+    print(json.dumps({"session_id": session_id, "session_lists": lists}))
+    return 0
+
+
+def assert_tab_transfer(path, session_id):
+    request = transferred = False
+    for row in rows(path):
+        current = message(row)
+        if row.get("dir") == "client" and current.get("type") == "TransferTab":
+            request = request or str(current.get("tab_session_id")) == session_id
+        if row.get("dir") == "server" and current.get("type") == "WorkspaceTransferResult":
+            transferred = transferred or str(current.get("result", "")).lower() == "transferred"
+    stray = _no_replacement_sessions(path)
+    assert request and transferred and not stray, (request, transferred, stray)
+    print(json.dumps({"session_id": session_id, "transferred": True}))
+    return 0
+
+
 def wait_report(path):
     deadline = time.time() + 25
     while time.time() < deadline:
@@ -341,6 +449,24 @@ def main(argv):
         return assert_workspace_move(path, argv[3], argv[4], argv[5])
     if command == "assert-tab-subtree-move":
         return assert_tab_subtree_move(path, argv[3], argv[4], argv[5])
+    if command == "latest-leaf":
+        item = latest_leaf(path, argv[3])
+        if item is None:
+            return 1
+        print(json.dumps(item, sort_keys=True, separators=(",", ":")))
+        return 0
+    if command == "wait-latest-leaf-count":
+        return wait_latest_leaf_count(path, argv[3], int(argv[4]))
+    if command == "wait-tabs-together":
+        return wait_tabs_together(path, argv[3], argv[4])
+    if command == "known-workspaces":
+        return known_workspaces(path)
+    if command == "assert-cross-window-tab-move":
+        return assert_cross_window_tab_move(
+            path, argv[3], argv[4], argv[5], len(argv) > 6 and argv[6] == "source-closed"
+        )
+    if command == "assert-tab-transfer":
+        return assert_tab_transfer(path, argv[3])
     if command == "assert-transfer":
         return assert_transfer(path, argv[3], argv[4], argv[5] if len(argv) > 5 else None)
     if command == "frame-types":

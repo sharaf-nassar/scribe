@@ -849,6 +849,22 @@ pub enum ClientMessage {
         target_workspace_id: WorkspaceId,
         operation: WorkspaceMoveOperation,
     },
+    /// Atomically tear one complete tab subtree out of its workspace into a
+    /// freshly claimed target window.
+    ///
+    /// The client mints `transfer_id` to correlate this request with
+    /// [`ServerMessage::WorkspaceTransferResult`] (shared with
+    /// [`ClientMessage::TransferWorkspace`]). When the named tab is the sole
+    /// tab of its workspace the moved workspace keeps its identity, name, and
+    /// accent; otherwise the server mints a fresh workspace for the tab. The
+    /// server derives the resulting trees from authoritative state; no client
+    /// tree crosses this boundary.
+    TransferTab {
+        transfer_id: u64,
+        workspace_id: WorkspaceId,
+        tab_session_id: SessionId,
+        target_window_id: WindowId,
+    },
     /// Request the cached Beads board for one authoritative server workspace.
     RequestBeadsBoard {
         workspace_id: WorkspaceId,
@@ -973,6 +989,11 @@ pub enum ClientMessage {
         /// participate in an existing-window workspace or tab-subtree move.
         #[serde(default)]
         workspace_move: bool,
+        /// Tab-transfer protocol support. Missing means the peer cannot
+        /// participate in a cross-window [`WorkspaceMoveOperation::MoveTab`] or
+        /// a [`ClientMessage::TransferTab`] transaction.
+        #[serde(default)]
+        tab_transfer: bool,
         /// [`AiState::WaitingForBackground`] support. Missing means the peer
         /// cannot decode it and receives `Processing` in its place.
         #[serde(default)]
@@ -1459,6 +1480,10 @@ pub enum ServerMessage {
         /// Missing from older servers means unsupported.
         #[serde(default)]
         workspace_move: bool,
+        /// Tab-transfer protocol support negotiated with the client. Missing
+        /// from older servers means unsupported.
+        #[serde(default)]
+        tab_transfer: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -2784,6 +2809,43 @@ mod tests {
 
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
+    enum HelloWithoutTabTransfer {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            join_window: bool,
+            terminal_images: TerminalImageCapabilities,
+            ci_run_bar: bool,
+            pi_provider: bool,
+            agent_api: bool,
+            workspace_transfer: bool,
+            workspace_move: bool,
+            ai_background_wait: bool,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutTabTransfer {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+            beads_write: bool,
+            beads_flow: bool,
+            pi_provider: bool,
+            agent_api: bool,
+            workspace_transfer: bool,
+            workspace_move: bool,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
     enum WelcomeWithoutPiProvider {
         Welcome {
             window_id: WindowId,
@@ -2855,6 +2917,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: false,
             workspace_move: false,
+            tab_transfer: false,
             ai_background_wait: true,
         };
         let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize new Hello");
@@ -2874,6 +2937,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: false,
             workspace_move: false,
+            tab_transfer: false,
         };
         let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize new Welcome");
         let _: WelcomeWithoutPiProvider =
@@ -2967,6 +3031,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: false,
+            tab_transfer: false,
             ai_background_wait: true,
         };
         let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
@@ -2986,6 +3051,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: false,
+            tab_transfer: false,
         };
         let new_welcome_bytes =
             rmp_serde::to_vec_named(&new_welcome).expect("serialize new Welcome");
@@ -3042,6 +3108,7 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: true,
+            tab_transfer: false,
             ai_background_wait: true,
         };
         let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
@@ -3061,11 +3128,120 @@ mod tests {
             agent_api: true,
             workspace_transfer: true,
             workspace_move: true,
+            tab_transfer: false,
         };
         let new_welcome_bytes =
             rmp_serde::to_vec_named(&new_welcome).expect("serialize new Welcome");
         let _: WelcomeWithoutWorkspaceMove = rmp_serde::from_slice(&new_welcome_bytes)
             .expect("old server schema decodes new Welcome");
+    }
+
+    // @lat: [[protocol#Client Messages#Workspace transfer]]
+    #[test]
+    fn tab_transfer_capability_defaults_for_old_peers() {
+        let old_hello = HelloWithoutTabTransfer::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+            ai_background_wait: true,
+        };
+        let old_hello_bytes = rmp_serde::to_vec_named(&old_hello).expect("serialize old Hello");
+        let decoded_hello: ClientMessage =
+            rmp_serde::from_slice(&old_hello_bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded_hello, ClientMessage::Hello { tab_transfer: false, .. }));
+
+        let old_welcome = WelcomeWithoutTabTransfer::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            beads_flow: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+        };
+        let old_welcome_bytes =
+            rmp_serde::to_vec_named(&old_welcome).expect("serialize old Welcome");
+        let decoded_welcome: ServerMessage =
+            rmp_serde::from_slice(&old_welcome_bytes).expect("deserialize old Welcome");
+        assert!(matches!(decoded_welcome, ServerMessage::Welcome { tab_transfer: false, .. }));
+
+        let new_hello = ClientMessage::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+            tab_transfer: true,
+            ai_background_wait: true,
+        };
+        let new_hello_bytes = rmp_serde::to_vec_named(&new_hello).expect("serialize new Hello");
+        let _: HelloWithoutTabTransfer =
+            rmp_serde::from_slice(&new_hello_bytes).expect("old client schema decodes new Hello");
+
+        let new_welcome = ServerMessage::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            beads_flow: true,
+            pi_provider: true,
+            agent_api: true,
+            workspace_transfer: true,
+            workspace_move: true,
+            tab_transfer: true,
+        };
+        let new_welcome_bytes =
+            rmp_serde::to_vec_named(&new_welcome).expect("serialize new Welcome");
+        let _: WelcomeWithoutTabTransfer = rmp_serde::from_slice(&new_welcome_bytes)
+            .expect("old server schema decodes new Welcome");
+    }
+
+    // @lat: [[protocol#Client Messages#Workspace transfer]]
+    #[test]
+    fn transfer_tab_message_round_trips_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let tab_session_id = SessionId::new();
+        let target_window_id = WindowId::new();
+        let request = ClientMessage::TransferTab {
+            transfer_id: 77,
+            workspace_id,
+            tab_session_id,
+            target_window_id,
+        };
+        let request_bytes = rmp_serde::to_vec_named(&request).expect("serialize transfer-tab");
+        let decoded_request: ClientMessage =
+            rmp_serde::from_slice(&request_bytes).expect("deserialize transfer-tab");
+        assert!(matches!(
+            decoded_request,
+            ClientMessage::TransferTab {
+                transfer_id: 77,
+                workspace_id: decoded_workspace_id,
+                tab_session_id: decoded_tab_session_id,
+                target_window_id: decoded_target_window_id,
+            } if decoded_workspace_id == workspace_id
+                && decoded_tab_session_id == tab_session_id
+                && decoded_target_window_id == target_window_id
+        ));
     }
 
     // @lat: [[protocol#Server Messages#Workspace transfer]]
@@ -3899,6 +4075,7 @@ mod tests {
             agent_api: false,
             workspace_transfer: false,
             workspace_move: false,
+            tab_transfer: false,
         };
         let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
         let decoded_write: ServerMessage =
@@ -3948,6 +4125,7 @@ mod tests {
                 agent_api: false,
                 workspace_transfer: false,
                 workspace_move: false,
+                tab_transfer: false,
             };
             let bytes = rmp_serde::to_vec_named(&message).expect("serialize Welcome");
             let decoded: ServerMessage =

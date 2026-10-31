@@ -22,12 +22,12 @@ use std::{
 };
 
 use gpui::{
-    AnimationExt as _, App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId,
-    Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollWheelEvent, Size, StyleRefinement, Subscription, Task, TitlebarOptions, WeakEntity,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div,
-    point, prelude::*, px, relative, size,
+    Animation, AnimationExt as _, App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent,
+    ElementId, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    Render, ScrollWheelEvent, Size, StyleRefinement, Subscription, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
+    canvas, div, ease_out_quint, point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -54,7 +54,7 @@ use scribe_client::clipboard_cleanup::{self, CopyTextOptions};
 use scribe_client::color::TerminalColors as CellColors;
 use scribe_client::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction,
-    WorkspaceMoveTarget, build_entries,
+    WorkspaceMoveTarget, build_entries, tab_move_entries,
 };
 use scribe_client::config::{ConfigChangeSignal, ConfigReloadPlan, ConfigRuntime};
 use scribe_client::context_menu::{
@@ -85,7 +85,7 @@ use scribe_client::link_feedback::{
 use scribe_client::lost_control::{
     LostControlColors, LostControlState, ReclaimKey, lost_control_overlay,
 };
-use scribe_client::monitor;
+use scribe_client::monitor::{self, RootHit};
 use scribe_client::mouse_reporting::{self, MouseModes, ScrollDirection, WheelAction};
 use scribe_client::mouse_state::{ClickKind, MouseClickState};
 use scribe_client::notification_dispatcher::{self, NotifOutput, NotifReq, ShowReq};
@@ -146,10 +146,10 @@ use scribe_client::window_state::{
     normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::workspace_drag::{
-    self, DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, WorkspaceDrag,
-    WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate, WorkspaceDropTarget, ZONE_FADE,
-    ZoneFade, ghost_origin, ghost_travel_frame, record_input_to_paint, tear_candidate_at,
-    zone_fade_opacity, zone_preview_rect,
+    self, DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, TearSurface,
+    WorkspaceDrag, WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate,
+    WorkspaceDropTarget, ZONE_FADE, ZoneFade, ghost_origin, ghost_travel_frame,
+    record_input_to_paint, tab_tear_armed, tear_candidate_at, zone_fade_opacity, zone_preview_rect,
 };
 use scribe_client::workspace_layout::{
     self, WorkspaceDividerDrag, workspace_move_no_neighbor_message,
@@ -167,12 +167,14 @@ use scribe_client::{
         GroupBadge, TabBarColors, TabData, TabShown, accent_tab_tone, context_suffix, flash_blend,
         pill_fill, px_units, reorder_target_index, workspace_pill_label,
     },
+    tab_drop_motion::{GapSlot, TabDropMotion, TabDropTarget},
     tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        StandaloneBadge, TAB_CARD_TOP_GAP, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH,
-        TabActivationSource, TabDrag, TabDragGhost, TitlebarEvent, TitlebarView,
-        TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px, beads_graph_icon,
-        drag_placeholder, drop_marker, focus_mark, open_tab_edge, tab_card, workspace_pill_dot,
+        GHOST_LIFT, StandaloneBadge, TAB_CARD_TOP_GAP, TAB_DRAG_ANIMATION_MS, TAB_MAX_WIDTH,
+        TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag, TabDragGhost,
+        TitlebarDropPreview, TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource,
+        agent_active_glyph, badge_width_px, beads_graph_icon, drag_placeholder, drop_gap,
+        focus_mark, narrowed_slot, new_window_chip, open_tab_edge, tab_card, workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -811,6 +813,9 @@ struct Shared {
     /// Whether the server accepted this client's existing-window move support.
     /// False until each connection's `Welcome` confirms support.
     workspace_move: Arc<AtomicBool>,
+    /// Whether the server accepted cross-window tab moves and single-tab
+    /// tear-out. False until each connection's `Welcome` confirms support.
+    tab_transfer: Arc<AtomicBool>,
     /// Correlated existing-window move request and refusal state.
     workspace_moves: Arc<Mutex<WorkspaceMoves>>,
     /// Set by the IPC reader once the server has answered this connection's
@@ -2186,6 +2191,23 @@ struct TerminalView {
     region_chrome: RegionChrome,
     /// Cross-region destination tracked while a top or lower tab drag is live.
     tab_subtree_drag: Option<TabSubtreeDragState>,
+    /// Another window's tab drag currently aimed at this window.
+    tab_drop_guest: Option<TabGuestDrop>,
+    /// The ghost card of the live tab drag, kept for the release settle.
+    tab_drag_ghost: Option<TabDragGhost>,
+    /// A released tab drag between the release and the server's list moving
+    /// the tab: the ghost settling into its gap, the gap held open, and the
+    /// tab's old slot held closed.
+    tab_drop_settle: Option<TabDropSettle>,
+    tab_drop_settle_seq: u64,
+    /// The lower region bars' animated gap and slot widths (the titlebar
+    /// animates its own groups from the same target).
+    tab_drop_motion: TabDropMotion,
+    /// Released tabs that have arrived, so the titlebar snaps its gaps shut
+    /// on the frame each one appears.
+    tab_drop_landings: u64,
+    /// A dropped tab this window should show and focus once it lands.
+    pending_drop_focus: Option<PendingDropFocus>,
     /// Client-local workspace pill drag lifecycle and actionable preview.
     workspace_drag: WorkspaceDrag,
     /// Source bounds sampled with the last drag update, used by release paths
@@ -2361,6 +2383,12 @@ struct TerminalView {
     /// reuses the answer instead of asking X11 twice per frame. See
     /// [`TerminalView::resolve_root_origin`].
     x11_origin: Option<(Bounds<Pixels>, Point<Pixels>)>,
+    /// This window's X11 top-level (its frame, or itself), keyed like
+    /// `x11_origin` by the cached bounds it was resolved under.
+    x11_toplevel: Option<(Bounds<Pixels>, u32)>,
+    /// Whether a sibling window overlaps this one, measured once per drag
+    /// that can leave the window and dropped when no such drag is live.
+    drag_sibling_overlap: Option<bool>,
     /// This view has retired from the process-wide active-view count.
     process_shutdown_finished: bool,
     /// Held to keep the window-bounds observer alive, which is what notices a
@@ -2442,7 +2470,177 @@ struct TabSubtreeDragState {
     source: TabAddress,
     target: Option<TabSubtreeDropTarget>,
     left_source_bar: bool,
+    /// Last delivered pointer and the window bounds it was measured in; a
+    /// tear-out opens its window from them at release.
+    pointer: Option<(DragPoint, Bounds<Pixels>)>,
+    /// The drag has reached the window edge or left the window: a release
+    /// opens a new window (or, for a window's only tab, the window itself is
+    /// already moving with the pointer).
+    tear_armed: bool,
+    /// A sibling window's bar or region under the pointer (X11 only).
+    external: Option<TabExternalTarget>,
+    /// The first pointer the drag saw, window-local: where the tab was
+    /// grabbed, so a window carried to the release point keeps it under the
+    /// cursor.
+    grab: Option<DragPoint>,
+    /// The pointer-following preview of the window a release would open,
+    /// shown once the pointer has left this window (X11 only).
+    preview: Option<WindowHandle<TabTearPreview>>,
 }
+
+impl TabSubtreeDragState {
+    const fn new(source: TabAddress) -> Self {
+        Self {
+            source,
+            target: None,
+            left_source_bar: false,
+            pointer: None,
+            tear_armed: false,
+            external: None,
+            grab: None,
+            preview: None,
+        }
+    }
+}
+
+/// The small window that follows the pointer once a tab drag has left its
+/// window: a miniature of the window a release will open, with the tab card
+/// in its strip and "New window" where its pane would be.
+///
+/// GPUI paints a drag's ghost only inside the window that owns the drag, so
+/// past the edge the user saw nothing in hand and no sign of what a release
+/// would do. This is its own `WindowKind::PopUp` (override-redirect on X11:
+/// placed by us, never focused, never managed), made click-through so the
+/// X server still names the real window under the pointer for sibling drops.
+struct TabTearPreview {
+    ghost: TabDragGhost,
+    ground: gpui::Rgba,
+}
+
+/// Padding around the tab card inside the preview, and the pane band below it.
+const TEAR_PREVIEW_INSET: f32 = 8.0;
+const TEAR_PREVIEW_PANE_HEIGHT: f32 = 40.0;
+
+impl TabTearPreview {
+    fn size(ghost: &TabDragGhost) -> Size<Pixels> {
+        size(
+            px(ghost.width + 2.0 * TEAR_PREVIEW_INSET),
+            px(ghost.height + TEAR_PREVIEW_PANE_HEIGHT + TEAR_PREVIEW_INSET),
+        )
+    }
+}
+
+impl Render for TabTearPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.ghost.colors;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .rounded(px(PANE_CARD_RADIUS))
+            .border_1()
+            .border_color(colors.accent)
+            .bg(gpui::Rgba { a: 1.0, ..self.ground })
+            .overflow_hidden()
+            .child(div().flex_none().pl(px(TEAR_PREVIEW_INSET)).child(self.ghost.element()))
+            .child(
+                div()
+                    .flex_1()
+                    .mx(px(TEAR_PREVIEW_INSET))
+                    .mb(px(TEAR_PREVIEW_INSET))
+                    .rounded_t(px(4.0))
+                    .border_1()
+                    .border_color(colors.pane_edge)
+                    .bg(colors.active_bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(colors.text)
+                    .child("New window"),
+            )
+    }
+}
+
+/// A sibling window's drop target for a tab drag, with the handle that asked
+/// it to paint so the preview can be cleared without re-walking every window.
+#[derive(Debug, Clone, Copy)]
+struct TabExternalTarget {
+    handle: WindowHandle<TerminalView>,
+    window_id: WindowId,
+    target: TabSubtreeDropTarget,
+}
+
+/// What a sibling window paints while another window's tab drag is over it:
+/// the same slot mark and region outline a local drag gets, plus the ghost
+/// card the source window can no longer paint once the pointer has left it.
+#[derive(Clone)]
+struct TabGuestDrop {
+    target: TabSubtreeDropTarget,
+    ghost: TabDragGhost,
+    local: DragPoint,
+}
+
+/// A released tab on its way to its destination. See
+/// [`TerminalView::tab_drop_settle`].
+#[derive(Clone)]
+struct TabDropSettle {
+    id: u64,
+    session_id: SessionId,
+    source_workspace: WorkspaceId,
+    /// The gap this window keeps open until the tab arrives in it.
+    target: Option<TabSubtreeDropTarget>,
+    /// This window is the destination of another window's drag, so the tab
+    /// has landed once it appears here at all; otherwise it has landed once
+    /// it has left `source_workspace`.
+    arriving: bool,
+    /// The tab has arrived; the hold is over and only the flight may remain.
+    landed: bool,
+    /// The ghost card and its flight, window-local: from where GPUI last
+    /// painted it to the gap's slot.
+    flight: Option<TabSettleFlight>,
+    started: Instant,
+}
+
+#[derive(Clone)]
+struct TabSettleFlight {
+    ghost: TabDragGhost,
+    from: DragPoint,
+    to: Rect,
+}
+
+/// The settle flight plus one frame, after which the card is taken down.
+fn tab_settle_flight_time() -> Duration {
+    Duration::from_millis(TAB_DRAG_ANIMATION_MS + 20)
+}
+
+/// The longest a released tab is held out of its old slot (and its gap held
+/// open) waiting for the server's list; a refused or lost move gives the tab
+/// back after this.
+const TAB_DROP_SETTLE_HOLD: Duration = Duration::from_millis(900);
+
+/// One delivered pointer move of a tab drag: the tab it carries (when the
+/// source bar can still name it), where the pointer is, and the ghost card.
+#[derive(Clone, Copy)]
+struct TabDragMove<'a> {
+    source: Option<TabAddress>,
+    point: Point<Pixels>,
+    ghost: &'a TabDragGhost,
+}
+
+/// Show and focus a dropped tab once the server's authoritative list puts it
+/// in its destination region.
+#[derive(Debug, Clone, Copy)]
+struct PendingDropFocus {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    /// Raise the destination window too: true for a cross-window drop.
+    activate_window: bool,
+    deadline: Instant,
+}
+
+/// How long a drop waits for its destination list before giving up focusing.
+const DROP_FOCUS_WINDOW: Duration = Duration::from_secs(5);
 
 struct RegionBarData {
     /// The region this bar belongs to, keyed by its (server) workspace.
@@ -2722,6 +2920,18 @@ impl TerminalView {
         let origin = monitor::logical_window_origin(window)?;
         self.x11_origin = Some((raw, origin));
         Some(origin)
+    }
+
+    /// This window's bounds with the root origin X11 measures, where it can.
+    ///
+    /// A tear-out opens its window at the release point, which is this
+    /// window's origin plus the pointer, so the origin must be where the
+    /// window really is: GPUI's cached one can be frame-relative under a
+    /// reparenting window manager (see [`Self::resolve_root_origin`]).
+    fn root_window_bounds(&mut self, window: &Window) -> Bounds<Pixels> {
+        let raw = window.bounds();
+        let origin = self.resolve_root_origin(raw, window).unwrap_or(raw.origin);
+        Bounds { origin, size: raw.size }
     }
 
     /// Check where the restored window actually landed, once.
@@ -3027,6 +3237,13 @@ impl TerminalView {
             titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
             tab_subtree_drag: None,
+            tab_drop_guest: None,
+            tab_drag_ghost: None,
+            tab_drop_settle: None,
+            tab_drop_settle_seq: 0,
+            tab_drop_motion: TabDropMotion::default(),
+            tab_drop_landings: 0,
+            pending_drop_focus: None,
             workspace_drag: WorkspaceDrag::default(),
             workspace_drag_bounds: None,
             gpui_window: window.window_handle(),
@@ -3081,6 +3298,8 @@ impl TerminalView {
             restore: RestoreRuntime::from_seed(seed),
             last_window_bounds: None,
             x11_origin: None,
+            x11_toplevel: None,
+            drag_sibling_overlap: None,
             process_shutdown_finished: false,
             _bounds_observer: bounds_observer,
         }
@@ -4290,7 +4509,84 @@ impl TerminalView {
                 );
                 self.begin_workspace_move(request, resolved, cx);
             }
+            PaletteAction::MoveTabToNewWindow => self.move_tab_to_new_window(cx),
+            PaletteAction::MoveTabToWindow { target_window, target_workspace } => {
+                self.move_tab_to_window(target_window, target_workspace, cx);
+            }
         }
+    }
+
+    /// The tab the focused region is showing, as the strip addresses it.
+    fn focused_tab_address(&self, cx: &App) -> Option<TabAddress> {
+        let session_id = self.shell.region_shown_session(self.shell.focused_workspace_id(cx))?;
+        self.rendered_tabs.addresses().find(|address| address.session_id == session_id)
+    }
+
+    /// The palette's "Move tab to new window": the drag's tear-out without a
+    /// pointer, so the new window takes this window's size and the
+    /// compositor's placement.
+    fn move_tab_to_new_window(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.focused_tab_address(cx) else { return };
+        if self.rendered_tabs.addresses().count() <= 1 {
+            set_status(
+                &self.shared.status,
+                &self.shared.generation,
+                "This is the window's only tab; it already has its own window".to_owned(),
+            );
+            return;
+        }
+        let Some(geometry) = self.restore.geometry.as_ref() else {
+            set_status(
+                &self.shared.status,
+                &self.shared.generation,
+                "Tab move is unavailable until window geometry is ready".to_owned(),
+            );
+            return;
+        };
+        let spec = TransferWindowSpec {
+            width: f32::from(u16::try_from(geometry.width).unwrap_or(u16::MAX)),
+            height: f32::from(u16::try_from(geometry.height).unwrap_or(u16::MAX)),
+            origin: None,
+        };
+        self.begin_tab_transfer(source, spec, cx);
+    }
+
+    /// The palette's "Move tab to … in …": append the shown tab to a sibling
+    /// window's region and show it there.
+    fn move_tab_to_window(
+        &mut self,
+        target_window: WindowId,
+        target_workspace: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.focused_tab_address(cx) else { return };
+        let resolved = self.workspace_move_target_live(target_window, target_workspace, cx);
+        let sibling = self
+            .workspace_move_siblings(cx)
+            .into_iter()
+            .find_map(|(handle, sibling)| (sibling.window == target_window).then_some(handle));
+        let target_index = sibling
+            .and_then(|handle| {
+                handle.read(cx).ok().map(|view| {
+                    view.rendered_tabs.region(target_workspace).map_or(0, WorkspaceTabs::len)
+                })
+            })
+            .unwrap_or(0);
+        if let Some(handle) = sibling {
+            drop(handle.update(cx, |view, _, _| {
+                view.expect_drop_focus(source.session_id, target_workspace, true);
+            }));
+        }
+        self.begin_workspace_move(
+            workspace_move_request(
+                source.workspace_id,
+                target_window,
+                target_workspace,
+                WorkspaceMoveOperation::MoveTab { tab_session_id: source.session_id, target_index },
+            ),
+            resolved,
+            cx,
+        );
     }
 
     /// Move the workspace holding focus through the same edge operation as a drag.
@@ -6096,6 +6392,12 @@ impl TerminalView {
             .lock()
             .ok()
             .and_then(|mut transfers| transfers.retry_if_due(Instant::now(), can_retry));
+        // A tab tear-out retries only over a connection that negotiated it: an
+        // older server cannot decode `TransferTab`. Unsent, it stays due and
+        // goes out once a capable connection answers.
+        let retry = retry.filter(|request| {
+            request.tab.is_none() || self.shared.tab_transfer.load(Ordering::Acquire)
+        });
         if let Some(request) = retry {
             self.send_workspace_transfer_request(request, "retry");
         }
@@ -6135,10 +6437,22 @@ impl TerminalView {
         request: WorkspaceTransferRequest,
         context: &'static str,
     ) {
-        let sent = self.sink.transfer_workspace(
-            request.correlation,
-            request.workspace,
-            request.target_window,
+        let sent = request.tab.map_or_else(
+            || {
+                self.sink.transfer_workspace(
+                    request.correlation,
+                    request.workspace,
+                    request.target_window,
+                )
+            },
+            |tab| {
+                self.sink.transfer_tab(
+                    request.correlation,
+                    request.workspace,
+                    tab,
+                    request.target_window,
+                )
+            },
         );
         let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
             tracing::warn!(context, "workspace transfer state mutex poisoned");
@@ -8747,7 +9061,7 @@ impl TerminalView {
             layout_pointer.y,
         )
         .is_some();
-        let bounds = window.bounds();
+        let bounds = self.root_window_bounds(window);
         self.workspace_drag_bounds = Some(bounds);
         self.workspace_drag.update(WorkspaceDragUpdate {
             window_pointer: pointer,
@@ -8784,7 +9098,13 @@ impl TerminalView {
         self.resolve_external_drop(pointer, window, cx);
         let viewport = self.pane_viewport();
         let layout_pointer = self.workspace_drag_layout_point(pointer);
-        let regions = self.shell.workspace_rects(viewport, cx);
+        // A sibling stacked over this window owns the pointer even inside
+        // it, so no local zone may resolve under the sibling's preview.
+        let regions = if self.workspace_drag_external.is_some() {
+            Vec::new()
+        } else {
+            self.shell.workspace_rects(viewport, cx)
+        };
         let dividers = self.shell.workspace_dividers(viewport, cx);
         let divider_blocked = workspace_layout::hit_test_workspace_divider(
             &dividers,
@@ -8792,7 +9112,7 @@ impl TerminalView {
             layout_pointer.y,
         )
         .is_some();
-        let bounds = window.bounds();
+        let bounds = self.root_window_bounds(window);
         self.workspace_drag_bounds = Some(bounds);
         self.workspace_drag.update(WorkspaceDragUpdate {
             window_pointer: pointer,
@@ -8830,6 +9150,95 @@ impl TerminalView {
         false
     }
 
+    /// Who owns the pointer of a drag that can reach another window.
+    ///
+    /// The pointer belongs to this window while it is inside it, unless a
+    /// sibling stacked above covers that spot: the press that starts a drag
+    /// raises this window on every stacking window manager, so that needs a
+    /// window kept above it, and the X11 hit test only runs inside the window
+    /// once a sibling is known to overlap it (measured once per drag). An
+    /// ordinary in-window drag therefore still costs no X11 round trip.
+    /// Outside, the X server names the top-level visible at the root point,
+    /// so only a sibling that is really on top there is probed.
+    fn drag_pointer_owner(
+        &mut self,
+        pointer: DragPoint,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> PointerOwner {
+        let size = window.bounds().size;
+        let inside = pointer.x >= 0.0
+            && pointer.y >= 0.0
+            && pointer.x <= f32::from(size.width)
+            && pointer.y <= f32::from(size.height);
+        if inside && !self.siblings_overlap(window, cx) {
+            return PointerOwner::Source;
+        }
+        let Some(frame) = monitor::mapped_window_bounds(window) else {
+            return PointerOwner::Source;
+        };
+        let root = DragPoint { x: frame.x + pointer.x, y: frame.y + pointer.y };
+        let top = monitor::toplevel_at(window, (root.x, root.y));
+        if inside && (top.is_none() || top == self.own_toplevel(window).map(RootHit::Toplevel)) {
+            return PointerOwner::Source;
+        }
+        PointerOwner::Root { root, top }
+    }
+
+    /// Whether some sibling window's rect overlaps this window's, measured
+    /// on the first ask of a drag and kept until no drag is live.
+    fn siblings_overlap(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        if let Some(overlap) = self.drag_sibling_overlap {
+            return overlap;
+        }
+        let own = monitor::mapped_window_bounds(window);
+        let overlap = own.is_some_and(|own| {
+            self.workspace_move_siblings(cx).into_iter().any(|(handle, _)| {
+                handle
+                    .update(cx, |_, guest_window, _| monitor::mapped_window_bounds(guest_window))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|other| rects_overlap(own, other))
+            })
+        });
+        self.drag_sibling_overlap = Some(overlap);
+        overlap
+    }
+
+    /// This window's X11 top-level, re-resolved only when its bounds move.
+    fn own_toplevel(&mut self, window: &Window) -> Option<u32> {
+        let raw = window.bounds();
+        if let Some((cached, toplevel)) = self.x11_toplevel
+            && cached == raw
+        {
+            return Some(toplevel);
+        }
+        let toplevel = monitor::toplevel_of(window)?;
+        self.x11_toplevel = Some((raw, toplevel));
+        Some(toplevel)
+    }
+
+    /// Whether this sibling is the window a drag at the root point should
+    /// probe: the visible top-level there, or, when the X server could not
+    /// say, any window whose rect holds the point (`adopt_*` checks that).
+    fn sibling_owns_pointer(
+        handle: WindowHandle<TerminalView>,
+        top: Option<RootHit>,
+        cx: &mut App,
+    ) -> bool {
+        match top {
+            None => true,
+            Some(RootHit::Desktop) => false,
+            Some(RootHit::Toplevel(top)) => {
+                handle
+                    .update(cx, |view, guest_window, _| view.own_toplevel(guest_window))
+                    .ok()
+                    .flatten()
+                    == Some(top)
+            }
+        }
+    }
+
     /// Resolve the pointer onto a sibling window's region, and make that window
     /// paint the matching preview.
     ///
@@ -8842,35 +9251,25 @@ impl TerminalView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let size = window.bounds().size;
-        let inside = pointer.x >= 0.0
-            && pointer.y >= 0.0
-            && pointer.x <= f32::from(size.width)
-            && pointer.y <= f32::from(size.height);
-        if inside
-            || !self.shared.workspace_move.load(Ordering::Acquire)
+        if !self.shared.workspace_move.load(Ordering::Acquire)
             || !Self::cross_window_pointer_supported()
         {
             self.clear_external_drop(cx);
             return;
         }
-        // Only now is the measured frame worth two round trips: it is the one
-        // answer that turns this window's local pointer into a root position
-        // every sibling can be tested against.
-        let Some(frame) = monitor::mapped_window_bounds(window) else {
+        let PointerOwner::Root { root: root_pointer, top } =
+            self.drag_pointer_owner(pointer, window, cx)
+        else {
             self.clear_external_drop(cx);
             return;
         };
-        let root_pointer = DragPoint { x: frame.x + pointer.x, y: frame.y + pointer.y };
         let mut resolved = None;
         for (handle, sibling) in self.workspace_move_siblings(cx) {
+            let probe = (resolved.is_none() && Self::sibling_owns_pointer(handle, top, cx))
+                .then_some(root_pointer);
             let hit = handle
                 .update(cx, |view, guest_window, ctx| {
-                    view.adopt_guest_drop(
-                        resolved.is_none().then_some(root_pointer),
-                        guest_window,
-                        ctx,
-                    )
+                    view.adopt_guest_drop(probe, guest_window, ctx)
                 })
                 .ok()
                 .flatten();
@@ -9129,6 +9528,7 @@ impl TerminalView {
         let request = WorkspaceTransferRequest {
             correlation: workspace_transfer_id(target_window_id),
             workspace: workspace_id,
+            tab: None,
             target_window: target_window_id,
         };
         let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
@@ -9570,7 +9970,7 @@ impl TerminalView {
     fn top_tab_subtree_target(
         &self,
         pointer: DragPoint,
-        source_workspace: WorkspaceId,
+        source_workspace: Option<WorkspaceId>,
         cx: &App,
     ) -> Option<TabSubtreeDropTarget> {
         if !(0.0..=self.tab_bar_height).contains(&pointer.y) {
@@ -9578,7 +9978,7 @@ impl TerminalView {
         }
         let origin = self.workspace_drag_grid_origin();
         for (workspace_id, rect) in self.shell.workspace_rects(self.pane_viewport(), cx) {
-            if workspace_id == source_workspace || rect.y > f32::EPSILON {
+            if Some(workspace_id) == source_workspace || rect.y > f32::EPSILON {
                 continue;
             }
             let left = origin.x + rect.x;
@@ -9598,14 +9998,14 @@ impl TerminalView {
     fn lower_tab_subtree_target(
         &self,
         pointer: DragPoint,
-        source_workspace: WorkspaceId,
+        source_workspace: Option<WorkspaceId>,
         cx: &App,
     ) -> Option<TabSubtreeDropTarget> {
         let origin = self.workspace_drag_grid_origin();
         for (workspace_id, rect) in
             self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx)
         {
-            if workspace_id == source_workspace {
+            if Some(workspace_id) == source_workspace {
                 continue;
             }
             let rect = Rect {
@@ -9632,14 +10032,10 @@ impl TerminalView {
         None
     }
 
-    /// The insertion mark on the bar a tab from another section is aimed at.
-    ///
-    /// Window coordinates: the mark is a root child, drawn with the drag
-    /// layers so it sits over both bars without either bar knowing about the
-    /// other's drag. Its x is the slot boundary `tab_bar_insertion_index`
-    /// resolved, in the same equal-share geometry.
-    fn tab_subtree_drop_marker(&self, cx: &App) -> Option<gpui::AnyElement> {
-        let target = self.tab_subtree_drag.as_ref()?.target?;
+    /// The window-local rect of the slot a drop on `target` fills: the
+    /// target bar's band at the boundary `tab_bar_insertion_index` resolved,
+    /// one equal-share slot wide.
+    fn tab_drop_slot_rect(&self, target: TabSubtreeDropTarget, cx: &App) -> Option<Rect> {
         let origin = self.workspace_drag_grid_origin();
         let viewport = self.pane_viewport();
         let lower_bar = self
@@ -9669,42 +10065,122 @@ impl TerminalView {
             )
         };
         let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, count);
-        let x = run_left + px_units(target.index.min(count)) * slot;
-        // The theme accent, as the placeholder uses: an unnamed region's muted
-        // identity tone is too faint for a mark that has to read through the
-        // ghost.
-        let accent = TabBarColors::from_chrome(&self.chrome, self.opacity).accent;
-        // The whole receiving workspace lights up too: a drop anywhere over it
-        // lands, and the 3px slot mark alone is easy to miss with the ghost
-        // over a pane.
-        let region = self.shell.workspace_rect(target.workspace_id, viewport, cx)?;
-        let outline = div()
-            .absolute()
-            .left(px(origin.x + region.x))
-            .top(px(if region.y <= f32::EPSILON { 0.0 } else { origin.y + region.y }))
-            .w(px(region.width))
-            .h(px(region.height + if region.y <= f32::EPSILON { origin.y } else { 0.0 }))
-            .rounded(px(PANE_CARD_RADIUS))
-            .border_2()
-            .border_color(accent)
-            .bg(gpui::Rgba { a: 0.08, ..accent });
-        // Pinned to the window: the root is a flex column, and an unpositioned
-        // wrapper would lay out below the status bar, taking its absolutely
-        // placed children off-screen with it.
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .child(outline)
-                .child(drop_marker(x, rect.y, rect.height, accent))
-                .into_any_element(),
-        )
+        Some(Rect {
+            x: run_left + px_units(target.index.min(count)) * slot,
+            y: rect.y,
+            width: drop_gap_width(slot),
+            height: rect.height,
+        })
     }
 
+    /// Where this window opens a landing gap: its own drag's in-window
+    /// target, another window's drag aimed here, or a released tab's
+    /// destination until the tab arrives in it.
+    fn tab_drop_gap_target(&self) -> Option<TabSubtreeDropTarget> {
+        self.tab_subtree_drag
+            .filter(|drag| drag.external.is_none() && !drag.tear_armed)
+            .and_then(|drag| drag.target)
+            .or_else(|| self.tab_drop_guest.as_ref().map(|guest| guest.target))
+            .or_else(|| self.pending_tab_drop_settle().and_then(|settle| settle.target))
+    }
+
+    /// The release hold, while its tab has not yet arrived.
+    fn pending_tab_drop_settle(&self) -> Option<&TabDropSettle> {
+        self.tab_drop_settle
+            .as_ref()
+            .filter(|settle| !settle.landed && !self.tab_drop_arrived(settle))
+    }
+
+    /// Whether the server's list has moved `settle`'s tab where it went.
+    fn tab_drop_arrived(&self, settle: &TabDropSettle) -> bool {
+        {
+            let current = self
+                .rendered_tabs
+                .addresses()
+                .find(|address| address.session_id == settle.session_id)
+                .map(|address| address.workspace_id);
+            if settle.arriving {
+                current.is_some()
+            } else {
+                current != Some(settle.source_workspace)
+            }
+        }
+    }
+
+    /// The dragged tab's own slot is closed: the tab is aimed at another bar,
+    /// another window, or a new window.
+    fn tab_source_collapsed(&self) -> bool {
+        self.tab_subtree_drag
+            .is_some_and(|drag| drag.target.is_some() || drag.external.is_some() || drag.tear_armed)
+    }
+
+    /// A released tab still held out of its old slot.
+    fn tab_held_out(&self) -> Option<SessionId> {
+        self.pending_tab_drop_settle()
+            .filter(|settle| !settle.arriving)
+            .map(|settle| settle.session_id)
+    }
+
+    /// What every bar of this window should show for the tab drag this
+    /// frame: the landing gap, keyed by the tab beside it, and the closed
+    /// slot (the dragged tab while it is aimed elsewhere, or a released tab
+    /// still on its way).
+    fn tab_drop_target(&self) -> TabDropTarget {
+        let gap = self.tab_drop_gap_target().map(|target| {
+            let tabs: Vec<SessionId> = self
+                .rendered_tabs
+                .region(target.workspace_id)
+                .map(|region| region.tabs().iter().map(|tab| tab.session_id).collect())
+                .unwrap_or_default();
+            GapSlot::at(target.workspace_id, &tabs, target.index)
+        });
+        let in_hand = self.tab_subtree_drag.map(|drag| drag.source.session_id);
+        let closed =
+            in_hand.filter(|_| self.tab_source_collapsed()).or_else(|| self.tab_held_out());
+        TabDropTarget { gap, closed }
+    }
+
+    /// Advance the drop motion one frame: mark a released tab landed the
+    /// frame it arrives (snapping its gap shut, since the tab now fills it),
+    /// move the lower bars' widths, and hand the titlebar the same target.
+    fn sync_tab_drop_motion(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let arrived = self
+            .tab_drop_settle
+            .as_ref()
+            .is_some_and(|settle| !settle.landed && self.tab_drop_arrived(settle));
+        if arrived && let Some(settle) = self.tab_drop_settle.as_mut() {
+            settle.landed = true;
+            self.tab_drop_landings += 1;
+            self.tab_drop_motion.snap_gaps_shut();
+        }
+        let target = self.tab_drop_target();
+        let now = Instant::now();
+        let duration = if cx.reduce_motion() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(TAB_DRAG_ANIMATION_MS)
+        };
+        self.tab_drop_motion.update(target, now, duration);
+        if self.tab_drop_motion.animating(now) {
+            window.request_animation_frame();
+        }
+        let preview = TitlebarDropPreview { target, landings: self.tab_drop_landings };
+        self.titlebar.update(cx, |titlebar, ctx| {
+            if titlebar.set_drop_preview(preview) {
+                ctx.notify();
+            }
+        });
+    }
+
+    /// The bar slot or region a tab released at `point` would land in.
+    ///
+    /// `source_workspace` is the dragged tab's own region, which is never a
+    /// target; `None` (a sibling window resolving another window's drag) has
+    /// no region of its own to exclude.
     fn tab_subtree_target_at(
         &self,
         point: Point<Pixels>,
-        source_workspace: WorkspaceId,
+        source_workspace: Option<WorkspaceId>,
         cx: &App,
     ) -> Option<TabSubtreeDropTarget> {
         let pointer = DragPoint { x: f32::from(point.x), y: f32::from(point.y) };
@@ -9722,7 +10198,7 @@ impl TerminalView {
     fn region_body_tab_subtree_target(
         &self,
         pointer: DragPoint,
-        source_workspace: WorkspaceId,
+        source_workspace: Option<WorkspaceId>,
         cx: &App,
     ) -> Option<TabSubtreeDropTarget> {
         let local = self.workspace_drag_layout_point(pointer);
@@ -9735,33 +10211,279 @@ impl TerminalView {
                         && local.y <= rect.y + rect.height
                 },
             )?;
-        (workspace_id != source_workspace).then(|| TabSubtreeDropTarget {
+        (Some(workspace_id) != source_workspace).then(|| TabSubtreeDropTarget {
             workspace_id,
             index: self.rendered_tabs.region(workspace_id).map_or(0, WorkspaceTabs::len),
         })
     }
 
+    /// Advance a tab drag past its own bar: resolve a sibling window or a
+    /// region of this one under the pointer, and arm tear-out at the edge.
+    ///
+    /// A window's only tab never tears out into a second window; once it
+    /// arms, the window itself is handed to the compositor's move and follows
+    /// the pointer instead.
     fn update_tab_subtree_drag(
         &mut self,
-        source: Option<TabAddress>,
-        point: Point<Pixels>,
+        moved: TabDragMove<'_>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let TabDragMove { source, point, ghost } = moved;
         let Some(source) = source else { return };
         if self.tab_subtree_drag.is_none_or(|drag| drag.source.session_id != source.session_id) {
-            self.tab_subtree_drag =
-                Some(TabSubtreeDragState { source, target: None, left_source_bar: false });
+            self.tab_subtree_drag = Some(TabSubtreeDragState::new(source));
+            self.tab_drag_ghost = Some(ghost.clone());
         }
-        let target = self.tab_subtree_target_at(point, source.workspace_id, cx);
-        let left_source_bar = !self.point_in_workspace_tab_bar(point, source.workspace_id, cx);
-        if let Some(drag) = self.tab_subtree_drag.as_mut() {
-            if drag.target != target {
-                // The drop marker is a root child, so it repaints with the view.
-                cx.notify();
+        let pointer = DragPoint { x: f32::from(point.x), y: f32::from(point.y) };
+        let bounds = self.root_window_bounds(window);
+        let external = self.resolve_external_tab_drop(pointer, ghost, window, cx);
+        let Some(mut drag) = self.tab_subtree_drag else { return };
+        let sole_tab = self.rendered_tabs.addresses().count() <= 1;
+        let tear_capable = sole_tab || self.shared.tab_transfer.load(Ordering::Acquire);
+        let tear_armed = tear_capable
+            && external.is_none()
+            && tab_tear_armed(
+                pointer,
+                rect_from_window_bounds(bounds),
+                if self.point_over_tab_bar(pointer, cx) {
+                    TearSurface::TabBar
+                } else {
+                    TearSurface::Content
+                },
+                drag.tear_armed,
+            );
+        let target = (external.is_none() && !tear_armed)
+            .then(|| self.tab_subtree_target_at(point, Some(source.workspace_id), cx))
+            .flatten();
+        if (drag.target, drag.tear_armed, drag.external.map(|e| (e.window_id, e.target)))
+            != (target, tear_armed, external.map(|e| (e.window_id, e.target)))
+        {
+            // Marker, outline, and chip are root children of this view.
+            cx.notify();
+        }
+        drag.target = target;
+        drag.tear_armed = tear_armed;
+        drag.external = external;
+        drag.pointer = Some((pointer, bounds));
+        drag.grab.get_or_insert(pointer);
+        drag.left_source_bar |= tear_armed
+            || external.is_some()
+            || !self.point_in_workspace_tab_bar(point, source.workspace_id, cx);
+        let outside = pointer.x < 0.0
+            || pointer.y < 0.0
+            || pointer.x > f32::from(bounds.size.width)
+            || pointer.y > f32::from(bounds.size.height);
+        let root = (tear_armed && outside)
+            .then(|| monitor::mapped_window_bounds(window))
+            .flatten()
+            .map(|frame| DragPoint { x: frame.x + pointer.x, y: frame.y + pointer.y });
+        Self::sync_tear_preview(&mut drag, root, ghost, cx);
+        self.tab_subtree_drag = Some(drag);
+        // The compositor's live move takes the pointer away for the rest of
+        // the gesture, so it is only used where no sibling could be the drop
+        // target. Otherwise a sweep toward a sibling crosses the edge band and
+        // the gap between windows, and would carry this window along instead
+        // of dropping its tab; that case is placed at release instead.
+        if tear_armed && sole_tab && !self.tab_siblings_targetable(cx) {
+            self.hand_sole_tab_to_window_move(window, cx);
+        }
+    }
+
+    /// Whether a sibling window can be this drag's drop target at all: X11,
+    /// a server that moves tabs between windows, and another window open.
+    fn tab_siblings_targetable(&self, cx: &App) -> bool {
+        Self::cross_window_pointer_supported()
+            && self.shared.tab_transfer.load(Ordering::Acquire)
+            && !self.workspace_move_siblings(cx).is_empty()
+    }
+
+    /// Whether `pointer` is over the titlebar strip or any lower region's bar.
+    fn point_over_tab_bar(&self, pointer: DragPoint, cx: &App) -> bool {
+        if (0.0..=self.tab_bar_height).contains(&pointer.y) {
+            return true;
+        }
+        let origin = self.workspace_drag_grid_origin();
+        self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx).into_iter().any(
+            |(_, rect)| {
+                pointer.x >= origin.x + rect.x
+                    && pointer.x <= origin.x + rect.x + rect.width
+                    && pointer.y >= origin.y + rect.y
+                    && pointer.y <= origin.y + rect.y + rect.height
+            },
+        )
+    }
+
+    /// End the tab drag and let the compositor move the whole window: the
+    /// dragged tab was the window's only one, so "tear it out" means "carry
+    /// this window", which needs no server transaction at all.
+    /// Show, move, or take down the tear-out preview for this pointer move.
+    ///
+    /// It lives only while the pointer is outside the window and a release
+    /// would open a new window: inside, GPUI's own ghost is in hand, and over
+    /// a sibling that window paints the ghost. `root` is the pointer in root
+    /// coordinates, or `None` when no preview is wanted; the card is placed so
+    /// the tab inside it sits where the ghost was grabbed, as the in-window
+    /// ghost does, which is why it is X11 only.
+    fn sync_tear_preview(
+        drag: &mut TabSubtreeDragState,
+        root: Option<DragPoint>,
+        ghost: &TabDragGhost,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else {
+            Self::close_tear_preview(drag, cx);
+            return;
+        };
+        let (grab_x, grab_y) = ghost.grab.get();
+        let origin = point(px(root.x - grab_x - TEAR_PREVIEW_INSET), px(root.y - grab_y));
+        if let Some(handle) = drag.preview {
+            let placed = handle
+                .update(cx, |_, preview_window, _| {
+                    monitor::place_popup(preview_window, f32::from(origin.x), f32::from(origin.y))
+                })
+                .unwrap_or(false);
+            if placed {
+                return;
             }
-            drag.target = target;
-            drag.left_source_bar |= left_source_bar;
+            Self::close_tear_preview(drag, cx);
         }
+        let preview = TabTearPreview { ghost: ghost.clone(), ground: ghost.colors.bg };
+        let bounds = Bounds::new(origin, TabTearPreview::size(ghost));
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                kind: gpui::WindowKind::PopUp,
+                focus: false,
+                show: true,
+                is_movable: false,
+                app_id: Some("scribe".to_owned()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                ..Default::default()
+            },
+            |preview_window, cx| {
+                if !monitor::make_click_through(preview_window) {
+                    tracing::debug!("tear preview is not click-through; hit tests may see it");
+                }
+                cx.new(|_| preview)
+            },
+        );
+        match opened {
+            Ok(handle) => drag.preview = Some(handle),
+            Err(error) => tracing::warn!(%error, "could not open the tear-out preview"),
+        }
+    }
+
+    fn close_tear_preview(drag: &mut TabSubtreeDragState, cx: &mut App) {
+        if let Some(handle) = drag.preview.take() {
+            drop(handle.update(cx, |_, preview_window, _| preview_window.remove_window()));
+        }
+    }
+
+    fn hand_sole_tab_to_window_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(mut drag) = self.tab_subtree_drag.take() {
+            Self::close_tear_preview(&mut drag, cx);
+        }
+        self.tab_subtree_drag = None;
+        self.region_chrome.drag = None;
+        self.titlebar.update(cx, |titlebar, ctx| titlebar.end_drag(false, ctx));
+        cx.stop_active_drag(window);
+        window.start_window_move();
+        tracing::info!("sole tab dragged out; handing the window to the compositor move");
+        cx.notify();
+    }
+
+    /// Resolve the pointer onto a sibling window's bar or region and make that
+    /// window paint the matching preview. X11 only, as for workspace drags:
+    /// only it reports every window's root frame and keeps delivering motion
+    /// past the source surface.
+    fn resolve_external_tab_drop(
+        &mut self,
+        pointer: DragPoint,
+        ghost: &TabDragGhost,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TabExternalTarget> {
+        let capable = self.shared.tab_transfer.load(Ordering::Acquire)
+            && self.shared.workspace_move.load(Ordering::Acquire);
+        let owner = (capable && Self::cross_window_pointer_supported())
+            .then(|| self.drag_pointer_owner(pointer, window, cx));
+        let Some(PointerOwner::Root { root: root_pointer, top }) = owner else {
+            self.clear_external_tab_drop(cx);
+            return None;
+        };
+        let mut resolved = None;
+        for (handle, sibling) in self.workspace_move_siblings(cx) {
+            let probe = (resolved.is_none() && Self::sibling_owns_pointer(handle, top, cx))
+                .then_some(root_pointer);
+            let hit = handle
+                .update(cx, |view, guest_window, ctx| {
+                    view.adopt_guest_tab_drop(probe, ghost, guest_window, ctx)
+                })
+                .ok()
+                .flatten();
+            if let Some(target) = hit {
+                resolved = Some(TabExternalTarget { handle, window_id: sibling.window, target });
+            }
+        }
+        resolved
+    }
+
+    /// Drop the sibling preview this window's tab drag last asked for.
+    fn clear_external_tab_drop(&mut self, cx: &mut Context<Self>) {
+        let Some(external) = self.tab_subtree_drag.as_mut().and_then(|drag| drag.external.take())
+        else {
+            return;
+        };
+        Self::clear_guest_tab_preview(external.handle, cx);
+        cx.notify();
+    }
+
+    fn clear_guest_tab_preview(handle: WindowHandle<TerminalView>, cx: &mut App) {
+        drop(handle.update(cx, |view, _, ctx| {
+            if view.tab_drop_guest.take().is_some() {
+                ctx.notify();
+            }
+        }));
+    }
+
+    /// Paint (or clear) the preview of another window's tab drag, and answer
+    /// which of this window's bars or regions the pointer is over.
+    ///
+    /// `root_pointer` is in root coordinates; `None` means "you are not the
+    /// window under the pointer".
+    fn adopt_guest_tab_drop(
+        &mut self,
+        root_pointer: Option<DragPoint>,
+        ghost: &TabDragGhost,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TabSubtreeDropTarget> {
+        let guest = root_pointer
+            .zip(monitor::mapped_window_bounds(window))
+            .and_then(|(root_pointer, frame)| {
+                let local = DragPoint { x: root_pointer.x - frame.x, y: root_pointer.y - frame.y };
+                (local.x >= 0.0
+                    && local.y >= 0.0
+                    && local.x <= frame.width
+                    && local.y <= frame.height)
+                    .then_some(local)
+            })
+            .and_then(|local| {
+                let at = point(px(local.x), px(local.y));
+                self.tab_subtree_target_at(at, None, cx).map(|target| TabGuestDrop {
+                    target,
+                    ghost: ghost.clone(),
+                    local,
+                })
+            });
+        let key = |preview: &TabGuestDrop| (preview.target, preview.local);
+        if guest.as_ref().map(key) != self.tab_drop_guest.as_ref().map(key) {
+            cx.notify();
+        }
+        let target = guest.as_ref().map(|guest| guest.target);
+        self.tab_drop_guest = guest;
+        target
     }
 
     fn rollback_tab_subtree_reorder(&mut self, drag: TabSubtreeDragState, cx: &mut Context<Self>) {
@@ -9780,43 +10502,318 @@ impl TerminalView {
         }
     }
 
-    fn finish_tab_subtree_drag(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(drag) = self.tab_subtree_drag.take() else { return false };
+    /// Commit a tab drag that left its own bar: into a sibling window, into a
+    /// new window, or into another region of this one.
+    fn finish_tab_subtree_drag(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let ghost = self.tab_drag_ghost.take();
+        let Some(mut drag) = self.tab_subtree_drag.take() else { return false };
+        Self::close_tear_preview(&mut drag, cx);
         if !drag.left_source_bar {
             return false;
         }
+        // The bars end their own drags from their mouse-up listeners, but a
+        // release outside the window reaches them only through the capture
+        // phase, where this root handler runs first and stops propagation.
+        // Left set, the titlebar kept painting whichever tab next occupied
+        // the dragged slot as the one in hand: a blank recess with no title.
+        self.region_chrome.drag = None;
+        self.titlebar.update(cx, |titlebar, ctx| titlebar.end_drag(false, ctx));
         self.rollback_tab_subtree_reorder(drag, cx);
-        let Some(target) = drag.target else { return true };
+        if let Some(external) = drag.external {
+            self.commit_external_tab_drop(drag.source, external, cx);
+            self.begin_tab_drop_settle(&drag, None, cx);
+        } else if drag.tear_armed && self.rendered_tabs.addresses().count() <= 1 {
+            Self::carry_window_to_release(drag, window);
+        } else if drag.tear_armed {
+            if let Some((pointer, bounds)) = drag.pointer {
+                let spec =
+                    transfer_window_spec(bounds, pointer, cursor_anchored_transfer_placement());
+                self.begin_tab_transfer(drag.source, spec, cx);
+                self.begin_tab_drop_settle(&drag, None, cx);
+            }
+        } else if let Some(target) = drag.target {
+            self.commit_local_tab_drop(drag.source, target, cx);
+            let flight = ghost.zip(drag.pointer).and_then(|(ghost, (pointer, _))| {
+                self.tab_settle_flight(ghost, pointer, target, cx)
+            });
+            self.begin_tab_drop_settle(&drag, flight.map(|flight| (target, flight)), cx);
+        } else if !self.shared.tab_transfer.load(Ordering::Acquire)
+            && drag.pointer.is_some_and(|(pointer, bounds)| {
+                tab_tear_armed(
+                    pointer,
+                    rect_from_window_bounds(bounds),
+                    TearSurface::Content,
+                    false,
+                )
+            })
+        {
+            self.show_workspace_transfer_feedback(WorkspaceTransferFeedback::CapabilityAbsent);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Put the window where the user let go of its only tab, with the grab
+    /// point under the cursor: the release-time form of the compositor move,
+    /// for an X11 window whose siblings kept the drag from handing off live.
+    fn carry_window_to_release(drag: TabSubtreeDragState, window: &Window) {
+        let (Some((pointer, _)), Some(grab)) = (drag.pointer, drag.grab) else { return };
+        let Some(frame) = monitor::mapped_window_bounds(window) else { return };
+        let x = logical_px_to_i32(frame.x + pointer.x - grab.x);
+        let y = logical_px_to_i32(frame.y + pointer.y - grab.y);
+        let moved = monitor::apply_saved_position(window, x, y, WindowState::Windowed);
+        tracing::info!(x, y, moved, "sole tab released outside; moved its window there");
+    }
+
+    /// Move the dragged tab into another region of this window.
+    fn commit_local_tab_drop(
+        &mut self,
+        source: TabAddress,
+        target: TabSubtreeDropTarget,
+        cx: &mut Context<Self>,
+    ) {
         let Some(window_id) =
             self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id())
         else {
-            return true;
+            return;
         };
-        let target_resolved = self.shell.has_region(drag.source.workspace_id, cx)
+        let target_resolved = self.shell.has_region(source.workspace_id, cx)
             && self.shell.has_region(target.workspace_id, cx)
             && self.shared.tabs.lock().is_ok_and(|tabs| {
-                tabs.region_of_tab(drag.source.session_id) == Some(drag.source.workspace_id)
+                tabs.region_of_tab(source.session_id) == Some(source.workspace_id)
             });
+        self.expect_drop_focus(source.session_id, target.workspace_id, false);
         self.begin_workspace_move(
             workspace_move_request(
-                drag.source.workspace_id,
+                source.workspace_id,
                 window_id,
                 target.workspace_id,
                 WorkspaceMoveOperation::MoveTab {
-                    tab_session_id: drag.source.session_id,
+                    tab_session_id: source.session_id,
                     target_index: target.index,
                 },
             ),
             target_resolved,
             cx,
         );
-        true
+    }
+
+    /// Move the dragged tab into a sibling window's bar slot or region.
+    ///
+    /// The destination is re-resolved here, as for a workspace drop: it was
+    /// chosen on an earlier pointer move, and a window closed since must end
+    /// the gesture rather than put a frame on the wire.
+    fn commit_external_tab_drop(
+        &mut self,
+        source: TabAddress,
+        external: TabExternalTarget,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(
+            session_id = %source.session_id,
+            target_window = %external.window_id,
+            target_workspace = %external.target.workspace_id,
+            "tab drag released over a sibling window"
+        );
+        let resolved =
+            self.workspace_move_target_live(external.window_id, external.target.workspace_id, cx);
+        drop(external.handle.update(cx, |view, _, ctx| {
+            view.expect_drop_focus(source.session_id, external.target.workspace_id, true);
+            view.settle_guest_tab_drop(source, ctx);
+        }));
+        self.begin_workspace_move(
+            workspace_move_request(
+                source.workspace_id,
+                external.window_id,
+                external.target.workspace_id,
+                WorkspaceMoveOperation::MoveTab {
+                    tab_session_id: source.session_id,
+                    target_index: external.target.index,
+                },
+            ),
+            resolved,
+            cx,
+        );
+    }
+
+    /// Tear one tab out into a fresh window through the correlated transfer
+    /// coordinator workspace tear-out uses; nothing local moves until the
+    /// server commits and the new window claims its id.
+    fn begin_tab_transfer(
+        &mut self,
+        source: TabAddress,
+        spec: TransferWindowSpec,
+        cx: &mut Context<Self>,
+    ) {
+        let target_window_id = WindowId::new();
+        let request = WorkspaceTransferRequest {
+            correlation: workspace_transfer_id(target_window_id),
+            workspace: source.workspace_id,
+            tab: Some(source.session_id),
+            target_window: target_window_id,
+        };
+        let tab_count = self.rendered_tabs.addresses().count();
+        let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
+            tracing::warn!("workspace transfer state mutex poisoned");
+            return;
+        };
+        let begin = transfers.begin(
+            self.shared.tab_transfer.load(Ordering::Acquire),
+            tab_count,
+            request,
+            spec,
+        );
+        drop(transfers);
+        match begin {
+            Ok(accepted) => {
+                self.send_workspace_transfer_request(accepted, "initial send");
+                self.apply_workspace_transfer_outcomes(cx);
+            }
+            Err(feedback) => self.show_workspace_transfer_feedback(feedback),
+        }
+    }
+
+    /// The ghost's flight from where GPUI last painted it (the pointer less
+    /// its grab offset, raised by the pickup lift) to the gap it lands in.
+    fn tab_settle_flight(
+        &self,
+        ghost: TabDragGhost,
+        pointer: DragPoint,
+        target: TabSubtreeDropTarget,
+        cx: &App,
+    ) -> Option<TabSettleFlight> {
+        let to = self.tab_drop_slot_rect(target, cx)?;
+        let (grab_x, grab_y) = ghost.grab.get();
+        let from = DragPoint { x: pointer.x - grab_x, y: pointer.y - grab_y - GHOST_LIFT };
+        Some(TabSettleFlight { ghost, from, to })
+    }
+
+    /// Hold a released tab between the release and the server's list: its
+    /// old slot stays closed, a local drop's gap stays open, and the ghost
+    /// settles into it. Without the hold the tab reappeared in its old slot
+    /// and the gap snapped shut for the round trip, then both jumped again.
+    fn begin_tab_drop_settle(
+        &mut self,
+        drag: &TabSubtreeDragState,
+        landing: Option<(TabSubtreeDropTarget, TabSettleFlight)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (target, flight) = landing.unzip();
+        self.start_tab_drop_settle(
+            TabDropSettle {
+                id: 0,
+                session_id: drag.source.session_id,
+                source_workspace: drag.source.workspace_id,
+                target,
+                arriving: false,
+                landed: false,
+                flight,
+                started: Instant::now(),
+            },
+            cx,
+        );
+    }
+
+    /// The destination half of a cross-window drop: this window's preview
+    /// of the other window's drag becomes its own settle, so the gap stays
+    /// open and the ghost it was painting lands in it.
+    fn settle_guest_tab_drop(&mut self, source: TabAddress, cx: &mut Context<Self>) {
+        let Some(guest) = self.tab_drop_guest.take() else { return };
+        let to = self.tab_drop_slot_rect(guest.target, cx);
+        let from = DragPoint {
+            x: guest.local.x - guest.ghost.width / 2.0,
+            y: guest.local.y - guest.ghost.height / 2.0,
+        };
+        self.start_tab_drop_settle(
+            TabDropSettle {
+                id: 0,
+                session_id: source.session_id,
+                source_workspace: source.workspace_id,
+                target: Some(guest.target),
+                arriving: true,
+                landed: false,
+                flight: to.map(|to| TabSettleFlight { ghost: guest.ghost, from, to }),
+                started: Instant::now(),
+            },
+            cx,
+        );
+    }
+
+    fn start_tab_drop_settle(&mut self, mut settle: TabDropSettle, cx: &mut Context<Self>) {
+        self.tab_drop_settle_seq += 1;
+        let id = self.tab_drop_settle_seq;
+        settle.id = id;
+        self.tab_drop_settle = Some(settle);
+        cx.notify();
+        cx.spawn(async move |view, app| {
+            // One frame after the flight ends, so the card leaves at rest.
+            app.background_executor().timer(tab_settle_flight_time()).await;
+            view.update(app, |_, ctx| ctx.notify()).ok();
+            app.background_executor().timer(TAB_DROP_SETTLE_HOLD).await;
+            view.update(app, |view, ctx| view.end_tab_drop_settle(id, ctx)).ok();
+        })
+        .detach();
+    }
+
+    /// Drop the release hold `id`, unless a newer drop has replaced it.
+    fn end_tab_drop_settle(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.tab_drop_settle.as_ref().is_some_and(|held| held.id == id) {
+            self.tab_drop_settle = None;
+            cx.notify();
+        }
+    }
+
+    /// Show and focus `session_id` once the server's list puts it in
+    /// `workspace_id` in this window.
+    fn expect_drop_focus(
+        &mut self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        activate_window: bool,
+    ) {
+        self.pending_drop_focus = Some(PendingDropFocus {
+            session_id,
+            workspace_id,
+            activate_window,
+            deadline: Instant::now() + DROP_FOCUS_WINDOW,
+        });
+    }
+
+    /// Land a pending drop focus once the dropped tab is in its destination.
+    ///
+    /// It waits for the authoritative list, never acting on the optimistic
+    /// state: activating the tab while it still sat in its source region
+    /// would switch the source onto it just before the move took it away.
+    fn apply_pending_drop_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_drop_focus else { return };
+        if Instant::now() > pending.deadline {
+            self.pending_drop_focus = None;
+            return;
+        }
+        let landed = self.shell.has_region(pending.workspace_id, cx)
+            && self.shared.tabs.lock().is_ok_and(|tabs| {
+                tabs.region_of_tab(pending.session_id) == Some(pending.workspace_id)
+            });
+        if !landed {
+            return;
+        }
+        self.pending_drop_focus = None;
+        self.activate_session_tab(pending.session_id, cx);
+        if pending.activate_window {
+            window.activate_window();
+        }
+        tracing::info!(session_id = %pending.session_id, "focused a dropped tab");
     }
 
     fn cancel_tab_subtree_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(drag) = self.tab_subtree_drag.take() else { return false };
+        self.tab_drag_ghost = None;
+        let Some(mut drag) = self.tab_subtree_drag.take() else { return false };
+        Self::close_tear_preview(&mut drag, cx);
         if !drag.left_source_bar {
             return false;
+        }
+        if let Some(external) = drag.external {
+            Self::clear_guest_tab_preview(external.handle, cx);
         }
         self.rollback_tab_subtree_reorder(drag, cx);
         self.region_chrome.drag = None;
@@ -9824,6 +10821,57 @@ impl TerminalView {
         cx.stop_active_drag(window);
         cx.notify();
         true
+    }
+
+    /// Every tab-drag layer for the root: the "New window" chip, the ghost of
+    /// a sibling window's drag aimed here, and a released ghost settling into
+    /// its gap. The gaps themselves open inside the bars.
+    fn render_tab_drag_overlay(&self, window: &Window) -> Vec<gpui::AnyElement> {
+        let mut layers = Vec::new();
+        if let Some(drag) = self.tab_subtree_drag {
+            let size = window.bounds().size;
+            if let Some((pointer, _)) = drag.pointer.filter(|_| drag.tear_armed)
+                && pointer.x >= 0.0
+                && pointer.y >= 0.0
+                && pointer.x <= f32::from(size.width)
+                && pointer.y <= f32::from(size.height)
+            {
+                let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+                let chip = new_window_chip(&colors)
+                    .absolute()
+                    .left(px(pointer.x + 16.0))
+                    .top(px(pointer.y + 18.0));
+                layers.push(gpui::deferred(chip).with_priority(3).into_any_element());
+            }
+        }
+        if let Some(guest) = &self.tab_drop_guest {
+            let ghost = guest
+                .ghost
+                .element()
+                .absolute()
+                .left(px(guest.local.x - guest.ghost.width / 2.0))
+                .top(px(guest.local.y - guest.ghost.height / 2.0));
+            layers.push(gpui::deferred(ghost).with_priority(2).into_any_element());
+        }
+        if let Some(settle) = &self.tab_drop_settle
+            && let Some(flight) = settle.flight.clone()
+            && settle.started.elapsed() < tab_settle_flight_time()
+        {
+            let TabSettleFlight { ghost, from, to } = flight;
+            let from_width = ghost.width;
+            let card = ghost.element().absolute().left(px(from.x)).top(px(from.y)).with_animation(
+                ElementId::from(format!("tab-drop-settle-{}", settle.id)),
+                Animation::new(Duration::from_millis(TAB_DRAG_ANIMATION_MS))
+                    .with_easing(ease_out_quint()),
+                move |card, t| {
+                    card.left(px((to.x - from.x).mul_add(t, from.x)))
+                        .top(px((to.y - from.y).mul_add(t, from.y)))
+                        .w(px((to.width - from_width).mul_add(t, from_width)))
+                },
+            );
+            layers.push(gpui::deferred(card).with_priority(2).into_any_element());
+        }
+        layers
     }
 
     /// Advance a region bar's tab drag to `cursor_x`, swapping slots as the
@@ -10043,17 +11091,34 @@ impl TerminalView {
             .1
             .clamp(TAB_MIN_WIDTH, TAB_WIDTH.max(rect.width));
         let dragged = self.region_chrome.drag.map(|drag| drag.session_id);
-        row = row.children((0..bar.tabs.len()).filter_map(|index| {
+        let now = Instant::now();
+        let motion = &self.tab_drop_motion;
+        let full_gap =
+            drop_gap_width(tab_run_slots(rect.x, rect.width, badge_width, bar.tabs.len()).1);
+        let gap = |slot: GapSlot| {
+            let open = motion.gap(slot, now);
+            (open > 0.0).then(|| drop_gap(full_gap * open, colors))
+        };
+        let mut cells: Vec<gpui::AnyElement> = Vec::new();
+        for index in 0..bar.tabs.len() {
+            let Some(&(session_id, _)) = bar.tabs.get(index) else { continue };
+            cells.extend(gap(GapSlot::Before(session_id)));
             let slot = RegionTabSlot { workspace_id, index };
             let ghost = TabDragGhost {
                 title: String::new(),
                 colors: *colors,
                 width: ghost_width,
                 height: rect.height,
+                grab: std::rc::Rc::default(),
             };
-            Self::render_region_bar_tab(&bar.tabs, slot, ghost, dragged, cx)
-        }));
-        row.into_any_element()
+            let open = motion.slot(session_id, now);
+            cells.extend(Self::render_region_bar_tab(&bar.tabs, slot, ghost, (dragged, open), cx));
+        }
+        cells.extend(gap(bar
+            .tabs
+            .last()
+            .map_or(GapSlot::Empty(workspace_id), |&(last, _)| GapSlot::After(last))));
+        row.children(cells).into_any_element()
     }
 
     /// One tab in a lower region's bar: the titlebar tab's look (flash blend,
@@ -10088,7 +11153,10 @@ impl TerminalView {
             )
             // Registers the drag once the pressed pointer passes GPUI's
             // threshold; from then on the bar's `on_drag_move` sees every move.
-            .on_drag(RegionTabDrag(ghost), |drag, _, _, cx| cx.new(|_| drag.0.clone()))
+            .on_drag(RegionTabDrag(ghost), |drag, grab, _, cx| {
+                drag.0.grab.set((f32::from(grab.x), f32::from(grab.y)));
+                cx.new(|_| drag.0.clone())
+            })
             .on_click(cx.listener(move |view, _, _window, ctx| {
                 // A drag that reordered is not a click: selecting here would
                 // fight the reorder the release just committed.
@@ -10114,11 +11182,16 @@ impl TerminalView {
         tabs: &[(SessionId, TabData)],
         slot: RegionTabSlot,
         mut ghost: TabDragGhost,
-        dragged: Option<SessionId>,
+        (dragged, open): (Option<SessionId>, f32),
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let (session_id, tab) = tabs.get(slot.index)?;
         let session_id = *session_id;
+        let in_hand = dragged == Some(session_id);
+        if open < 1.0 {
+            // Closing while aimed elsewhere or released, or reopening.
+            return Some(narrowed_slot(ghost.width * open, in_hand.then_some(&ghost.colors)));
+        }
         ghost.title.clone_from(&tab.title);
         let colors = &ghost.colors;
         let separator = slot.index + 1 < tabs.len();
@@ -10181,22 +11254,21 @@ impl TerminalView {
                 (dragged != Some(session_id) && (tab.is_active() || tab.tab_flash.is_some()))
                     .then(|| tab_card(bg, open_tab_edge(tab, colors))),
             )
-            // The ghost in hand is the tab; its slot stays as a marked
-            // placeholder.
-            .children(
-                (dragged == Some(session_id))
-                    .then(|| drag_placeholder(colors.bg, colors.accent)),
-            )
+            // The ghost in hand is the tab; its slot stays as an empty recess.
+            .children(in_hand.then(|| drag_placeholder(colors)))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, ghost, cx))
-            .children(mark)
-            .children(agent_glyph)
-            .children(ai_dot)
-            // `truncate`, as in the titlebar: without it a title that outgrows
-            // the flexed slot once the AI dot appears wraps onto a second line
-            // inside the fixed-height tab and the visible text rides up.
-            .child(div().flex_1().truncate().child(display))
-            .children(suffix)
-            .children(close)
+            .when(!in_hand, |tab| {
+                tab.children(mark)
+                    .children(agent_glyph)
+                    .children(ai_dot)
+                    // `truncate`, as in the titlebar: without it a title that
+                    // outgrows the flexed slot once the AI dot appears wraps
+                    // onto a second line inside the fixed-height tab and the
+                    // visible text rides up.
+                    .child(div().flex_1().truncate().child(display))
+                    .children(suffix)
+                    .children(close)
+            })
             .into_any_element();
         Some(element)
     }
@@ -10849,12 +11921,15 @@ impl TerminalView {
             } else {
                 Vec::new()
             };
-        let entries = build_entries(
+        let mut entries = build_entries(
             update_version.as_deref(),
             &profile_names,
             active.as_deref(),
             &move_targets,
         );
+        if self.shared.tab_transfer.load(Ordering::Acquire) {
+            entries.extend(tab_move_entries(&move_targets));
+        }
         let colors = CommandPaletteColors::from(&self.chrome);
         let palette = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
         cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| {
@@ -11972,6 +13047,7 @@ impl TerminalView {
         let active = window.is_window_active();
         if !active {
             self.cancel_workspace_drag(window, cx);
+            self.cancel_tab_subtree_drag(window, cx);
         }
         self.update_window_activation(active, cx);
         if !active {
@@ -14045,25 +15121,29 @@ impl TerminalView {
         .on_drag_move(cx.listener(|view, event: &DragMoveEvent<TabDrag>, win, ctx| {
             win.focus(&view.focus.root, ctx);
             let source = view.titlebar_tab_drag_source(ctx);
-            view.update_tab_subtree_drag(source, event.event.position, ctx);
+            let ghost = event.drag(ctx).0.clone();
+            let moved = TabDragMove { source, point: event.event.position, ghost: &ghost };
+            view.update_tab_subtree_drag(moved, win, ctx);
         }))
         .on_drag_move(cx.listener(|view, event: &DragMoveEvent<RegionTabDrag>, win, ctx| {
             win.focus(&view.focus.root, ctx);
             let source = view.lower_tab_drag_source();
-            view.update_tab_subtree_drag(source, event.event.position, ctx);
+            let ghost = event.drag(ctx).0.clone();
+            let moved = TabDragMove { source, point: event.event.position, ghost: &ghost };
+            view.update_tab_subtree_drag(moved, win, ctx);
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
-                if view.finish_tab_subtree_drag(ctx) || view.finish_workspace_drag(ctx) {
+            cx.listener(|view, _: &MouseUpEvent, win, ctx| {
+                if view.finish_tab_subtree_drag(win, ctx) || view.finish_workspace_drag(ctx) {
                     ctx.stop_propagation();
                 }
             }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
-            cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
-                if view.finish_tab_subtree_drag(ctx) || view.finish_workspace_drag(ctx) {
+            cx.listener(|view, _: &MouseUpEvent, win, ctx| {
+                if view.finish_tab_subtree_drag(win, ctx) || view.finish_workspace_drag(ctx) {
                     ctx.stop_propagation();
                 }
             }),
@@ -14128,6 +15208,13 @@ impl Render for TerminalView {
         self.sync_find_results(cx);
         self.sync_remote_connect();
         self.reconcile_panes(cx);
+        self.apply_pending_drop_focus(window, cx);
+        self.sync_tab_drop_motion(window, cx);
+        if self.tab_subtree_drag.is_none() && !self.workspace_drag.is_active() {
+            // The overlap reading belongs to one drag; the next one measures
+            // the layout it starts in.
+            self.drag_sibling_overlap = None;
+        }
         self.sync_equalize_visibility(cx);
         self.sync_ci_run_strips(window, cx);
         self.sync_beads_board_strips(cx);
@@ -14169,7 +15256,7 @@ impl Render for TerminalView {
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
         let workspace_drag_layers = self.render_workspace_drag_layers(window, cx);
-        let tab_drop_marker = self.tab_subtree_drop_marker(cx);
+        let tab_drag_overlay = self.render_tab_drag_overlay(window);
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -14193,7 +15280,7 @@ impl Render for TerminalView {
             .children(share)
             .children(remote_picker)
             .children(workspace_drag_layers)
-            .children(tab_drop_marker)
+            .children(tab_drag_overlay)
             // Last child, so the frozen banner covers every other overlay: while
             // a remote controller holds this window there is nothing else to
             // interact with.
@@ -14463,16 +15550,32 @@ fn rect_from_window_bounds(bounds: Bounds<Pixels>) -> Rect {
     }
 }
 
-/// Mint the next existing-window move correlation id.
+/// Who a drag's pointer belongs to; see [`TerminalView::drag_pointer_owner`].
+#[derive(Debug, Clone, Copy)]
+enum PointerOwner {
+    /// This window: resolve the drop in-window.
+    Source,
+    /// Another window may own it: probe siblings at `root` (logical root
+    /// pixels). `top` is the top-level the X server says is visible there,
+    /// or `None` when it could not say.
+    Root { root: DragPoint, top: Option<RootHit> },
+}
+
+/// Whether two rects share any area.
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// Mint a fresh existing-window move correlation id.
 ///
-/// A move names a destination that already exists, so — unlike a tear-out,
-/// whose fresh `WindowId` is itself unique — there is no id in the request to
-/// derive one from. A process-wide counter above the tear-out ids' hash space
-/// is enough: the server's ledger only has to tell this client's requests
-/// apart, and it keys them per connection.
+/// Random, never a counter. The server's idempotency ledger is keyed by the id
+/// alone, shared by every client, and carried across upgrades, so a counter
+/// that restarted at 1 with each client launch collided with moves an earlier
+/// client had made: the server replayed their recorded `Moved` and changed
+/// nothing, and every tab drag between workspaces silently did nothing.
 fn next_workspace_move_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    let (high, low) = WindowId::new().as_uuid().as_u64_pair();
+    (high ^ low).max(1)
 }
 
 /// One correlated existing-window move request, with a freshly minted id.
@@ -14536,9 +15639,9 @@ fn transferred_window_bounds(spec: TransferWindowSpec) -> Bounds<Pixels> {
 
 const fn transferred_window_status(opened: bool) -> &'static str {
     if opened {
-        "Workspace moved to a new window"
+        "Moved to a new window"
     } else {
-        "Workspace moved, but its window could not open; restart Scribe to recover it"
+        "Moved, but its new window could not open; restart Scribe to recover it"
     }
 }
 
@@ -14635,6 +15738,7 @@ fn prepare_window_backend(
         workspace_transfer: Arc::new(AtomicBool::new(false)),
         workspace_transfers: Arc::new(Mutex::new(WorkspaceTransfers::default())),
         workspace_move: Arc::new(AtomicBool::new(false)),
+        tab_transfer: Arc::new(AtomicBool::new(false)),
         workspace_moves: Arc::new(Mutex::new(WorkspaceMoves::default())),
         session_list_seen: Arc::new(AtomicBool::new(false)),
         initial_session: Arc::new(InitialSessionBootstrap::new(
@@ -16186,6 +17290,7 @@ where
     ctx.shared.pi_provider.store(false, Ordering::Release);
     ctx.shared.workspace_transfer.store(false, Ordering::Release);
     ctx.shared.workspace_move.store(false, Ordering::Release);
+    ctx.shared.tab_transfer.store(false, Ordering::Release);
 
     // Write the connection handshake directly before draining the shared
     // outbound queue. A reconnect may have queued UI work while no stream was
@@ -16224,6 +17329,8 @@ where
             // the pointer's cross-window target stay hidden until `Welcome`
             // confirms the server can complete the move transaction.
             workspace_move: true,
+            // Cross-window tab moves and tab tear-out, gated the same way.
+            tab_transfer: true,
             ai_background_wait: true,
         },
     )
@@ -16278,6 +17385,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         workspace_transfer: Arc::clone(&ctx.shared.workspace_transfer),
         workspace_transfers: Arc::clone(&ctx.shared.workspace_transfers),
         workspace_move: Arc::clone(&ctx.shared.workspace_move),
+        tab_transfer: Arc::clone(&ctx.shared.tab_transfer),
         workspace_moves: Arc::clone(&ctx.shared.workspace_moves),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
         initial_session: Arc::clone(&ctx.shared.initial_session),
@@ -16765,6 +17873,8 @@ struct ReaderCtx {
     workspace_transfers: Arc<Mutex<WorkspaceTransfers>>,
     /// Negotiated existing-window move support for this connection.
     workspace_move: Arc<AtomicBool>,
+    /// Negotiated cross-window tab move and tab tear-out support.
+    tab_transfer: Arc<AtomicBool>,
     /// Correlated existing-window move state shared with the foreground window.
     workspace_moves: Arc<Mutex<WorkspaceMoves>>,
     /// Negotiated structured Pi provider support for this connection.
@@ -17128,6 +18238,12 @@ fn pane_ground(bg: [f32; 4]) -> [f32; 4] {
 /// region tone. The gap around it comes from the placement inset itself.
 /// The equal-share slots a bar's tabs occupy after its run inset and pill:
 /// the run's left edge and one slot's width, in the bar's own coordinates.
+/// The width a landing gap opens to: the bar's slot, or a fresh tab's basis
+/// in a bar that has no tabs yet.
+fn drop_gap_width(slot: f32) -> f32 {
+    (if slot > 0.0 { slot } else { TAB_WIDTH }).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
 fn tab_run_slots(bar_left: f32, bar_width: f32, badge_width: f32, count: usize) -> (f32, f32) {
     let inner = (bar_width - 2.0 * TAB_RUN_INSET).max(0.0);
     let badge = badge_width.min(inner);
@@ -18975,6 +20091,7 @@ fn on_welcome(
         pi_provider,
         workspace_transfer,
         workspace_move,
+        tab_transfer,
         ..
     } = welcome
     else {
@@ -18984,6 +20101,7 @@ fn on_welcome(
     ctx.pi_provider.store(pi_provider, Ordering::Release);
     ctx.workspace_transfer.store(workspace_transfer, Ordering::Release);
     ctx.workspace_move.store(workspace_move, Ordering::Release);
+    ctx.tab_transfer.store(tab_transfer, Ordering::Release);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
     if ctx.fan_out_other_windows && !other_windows.is_empty() {
         tracing::info!(

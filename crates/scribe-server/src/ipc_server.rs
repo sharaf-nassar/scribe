@@ -84,7 +84,9 @@ use crate::terminal_image_state::{
     observe_terminal_resize, process_pty_reader_ingress,
 };
 use crate::updater::UpdaterHandle;
-use crate::workspace_manager::{WorkspaceManager, WorkspaceMoveCandidates, WorkspaceMoveRequest};
+use crate::workspace_manager::{
+    TabTransferRequest, WorkspaceManager, WorkspaceMoveCandidates, WorkspaceMoveRequest,
+};
 use crate::workspace_transfer::RecordedWorkspaceMove;
 
 /// Buffer size for PTY reads. 64 KiB balances throughput and latency.
@@ -770,6 +772,18 @@ impl From<bool> for WorkspaceMoveCapability {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabTransferCapability {
+    Unsupported,
+    Supported,
+}
+
+impl From<bool> for TabTransferCapability {
+    fn from(supported: bool) -> Self {
+        if supported { Self::Supported } else { Self::Unsupported }
+    }
+}
+
 /// Feature 015 (T006, D1): one attached machine's membership in a window share.
 /// Absorbs the per-connection state feature 013 spread across the three retired
 /// per-window maps plus the existing per-connection `OutputSink` queue (carried on
@@ -804,6 +818,10 @@ pub struct Participant {
     workspace_transfer: WorkspaceTransferCapability,
     /// Whether this connection advertised the existing-window move capability.
     workspace_move: WorkspaceMoveCapability,
+    /// Whether this connection advertised the cross-window tab-transfer
+    /// capability; absent it, cross-window `MoveTab` and `TransferTab` get the
+    /// typed `CapabilityAbsent` refusal.
+    tab_transfer: TabTransferCapability,
     /// This connection's attached-session set. Kept on the participant so a
     /// workspace transfer can revoke the moved sessions from every remaining
     /// source viewer, not only from the requester.
@@ -830,6 +848,7 @@ impl Participant {
             agent_api,
             workspace_transfer: WorkspaceTransferCapability::Unsupported,
             workspace_move: WorkspaceMoveCapability::Unsupported,
+            tab_transfer: TabTransferCapability::Unsupported,
             attached_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -862,6 +881,7 @@ impl Participant {
         participant.ci_run_bar = claim.ci_run_bar;
         participant.workspace_transfer = claim.workspace_transfer;
         participant.workspace_move = claim.workspace_move;
+        participant.tab_transfer = claim.tab_transfer;
         participant.attached_ids = Arc::clone(claim.attached_ids);
         participant
     }
@@ -5104,6 +5124,7 @@ async fn claim_hello_window(
         agent_api,
         workspace_transfer,
         workspace_move,
+        tab_transfer,
         ai_background_wait,
         ..
     } = hello
@@ -5134,6 +5155,7 @@ async fn claim_hello_window(
         agent_api: agent_api.into(),
         workspace_transfer: workspace_transfer.into(),
         workspace_move: workspace_move.into(),
+        tab_transfer: tab_transfer.into(),
         attached_ids: conn.attached_ids,
     };
     Some(handle_client_hello(claim, conn.server, conn.writer).await)
@@ -5779,6 +5801,8 @@ struct HelloClaim<'a> {
     workspace_transfer: WorkspaceTransferCapability,
     /// Existing-window workspace-move protocol support.
     workspace_move: WorkspaceMoveCapability,
+    /// Cross-window tab-transfer protocol support advertised by this connection.
+    tab_transfer: TabTransferCapability,
     /// This connection's attached-session set, retained on the registered
     /// participant for transfer-time viewer revocation.
     attached_ids: &'a AttachedSessionIds,
@@ -5808,6 +5832,10 @@ fn welcome_message(
         // the Hello capability it sent.
         workspace_transfer: true,
         workspace_move: true,
+        // The cross-window tab-transfer transaction is implemented, so every
+        // welcome advertises it; the client still gates its own commit on the
+        // Hello capability it sent.
+        tab_transfer: true,
     }
 }
 
@@ -6290,6 +6318,7 @@ async fn claim_window(
         agent_api: AgentApiCapability::Unsupported,
         workspace_transfer: WorkspaceTransferCapability::Unsupported,
         workspace_move: WorkspaceMoveCapability::Unsupported,
+        tab_transfer: TabTransferCapability::Unsupported,
         attached_ids: &attached_ids,
     };
     match resolve_and_register_claim(
@@ -6874,7 +6903,8 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::AgentPromptResponse { .. }
         | ClientMessage::EnvPreflight
         | ClientMessage::TransferWorkspace { .. }
-        | ClientMessage::MoveWorkspace { .. }) => {
+        | ClientMessage::MoveWorkspace { .. }
+        | ClientMessage::TransferTab { .. }) => {
             dispatch_window_message(msg, context).await;
         }
         msg @ (ClientMessage::ClipboardPromptResponse { .. }
@@ -7682,6 +7712,9 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
         message @ ClientMessage::MoveWorkspace { .. } => {
             handle_workspace_move_message(message, context).await;
         }
+        message @ ClientMessage::TransferTab { .. } => {
+            handle_transfer_tab(message, context).await;
+        }
         other => debug!(?other, "ignored non-window client message in window dispatcher"),
     }
 }
@@ -8059,6 +8092,217 @@ async fn finalize_workspace_transfer(
     );
 }
 
+// ── Tab transfer (spec: tear one tab into a fresh window) ────────────
+
+/// One `TransferTab` request: run the gated, idempotent transaction and answer
+/// with the correlated typed result (shared with `TransferWorkspace`).
+async fn handle_transfer_tab(message: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    let ClientMessage::TransferTab { transfer_id, workspace_id, tab_session_id, target_window_id } =
+        message
+    else {
+        return;
+    };
+    let result =
+        run_tab_transfer(transfer_id, workspace_id, tab_session_id, target_window_id, context)
+            .await;
+    send_message(context.writer, &ServerMessage::WorkspaceTransferResult { transfer_id, result })
+        .await;
+}
+
+/// The gated, idempotent tab-transfer transaction. Reuses the
+/// `TransferWorkspace` gate and ledger (both keyed by the client-minted
+/// `transfer_id`), so a retry replays the recorded outcome.
+async fn run_tab_transfer(
+    transfer_id: u64,
+    workspace_id: WorkspaceId,
+    tab_session_id: SessionId,
+    target_window_id: WindowId,
+    context: &mut ClientDispatchContext<'_>,
+) -> WorkspaceTransferResult {
+    let gate = Arc::clone(&context.server.workspace_transfers);
+    let mut transfers = gate.lock().await;
+    if let Some(recorded) = transfers.recorded(transfer_id) {
+        debug!(transfer_id, "replaying recorded tab-transfer result");
+        return recorded;
+    }
+    let handoff_in_progress = transfers.handoff_in_progress();
+    let result = execute_tab_transfer(
+        workspace_id,
+        tab_session_id,
+        target_window_id,
+        context,
+        handoff_in_progress,
+    )
+    .await;
+    transfers.record(transfer_id, result);
+    result
+}
+
+async fn execute_tab_transfer(
+    workspace_id: WorkspaceId,
+    tab_session_id: SessionId,
+    target_window_id: WindowId,
+    context: &mut ClientDispatchContext<'_>,
+    handoff_in_progress: bool,
+) -> WorkspaceTransferResult {
+    let candidates = match validate_tab_transfer_request(
+        workspace_id,
+        tab_session_id,
+        target_window_id,
+        context,
+        handoff_in_progress,
+    )
+    .await
+    {
+        Ok(candidates) => candidates,
+        Err(reason) => return WorkspaceTransferResult::Refused { reason },
+    };
+    let env_rebinds = match stage_workspace_transfer_env(
+        context.server,
+        workspace_id,
+        &candidates,
+        target_window_id,
+    )
+    .await
+    {
+        Ok(rebinds) => rebinds,
+        Err(reason) => return WorkspaceTransferResult::Refused { reason },
+    };
+    let commit = match commit_tab_transfer(
+        workspace_id,
+        tab_session_id,
+        target_window_id,
+        context,
+        &candidates,
+    )
+    .await
+    {
+        Ok(commit) => commit,
+        Err(reason) => return refuse_after_staging(reason, &env_rebinds).await,
+    };
+    finalize_workspace_transfer(context, commit, &env_rebinds, target_window_id).await;
+    WorkspaceTransferResult::Transferred
+}
+
+async fn validate_tab_transfer_request(
+    workspace_id: WorkspaceId,
+    tab_session_id: SessionId,
+    target_window_id: WindowId,
+    context: &ClientDispatchContext<'_>,
+    handoff_in_progress: bool,
+) -> Result<Vec<SessionId>, WorkspaceTransferRefusal> {
+    if handoff_in_progress {
+        return Err(WorkspaceTransferRefusal::HandoffInProgress);
+    }
+    let server = context.server;
+    let source_window = context.window_id;
+    {
+        let shares = server.window_shares.read().await;
+        let Some(share) = shares.get(&source_window) else {
+            return Err(WorkspaceTransferRefusal::NoWindowControl);
+        };
+        let capable = share.participant_for_writer(context.writer).is_some_and(|participant| {
+            participant.tab_transfer == TabTransferCapability::Supported
+        });
+        if !capable {
+            return Err(WorkspaceTransferRefusal::CapabilityAbsent);
+        }
+        if shares.contains_key(&target_window_id) {
+            return Err(WorkspaceTransferRefusal::TargetWindowIdCollision);
+        }
+    }
+    let probe = ClientMessage::TransferTab {
+        transfer_id: 0,
+        workspace_id,
+        tab_session_id,
+        target_window_id,
+    };
+    if !connection_may_type(&server.window_shares, source_window, context.writer, &probe).await {
+        return Err(WorkspaceTransferRefusal::NoWindowControl);
+    }
+    server.workspace_manager.read().await.validate_tab_transfer(TabTransferRequest {
+        source_window,
+        workspace_id,
+        tab_session_id,
+        target_window: target_window_id,
+    })
+}
+
+async fn commit_tab_transfer(
+    workspace_id: WorkspaceId,
+    tab_session_id: SessionId,
+    target_window_id: WindowId,
+    context: &ClientDispatchContext<'_>,
+    candidates: &[SessionId],
+) -> Result<TransferCommit, WorkspaceTransferRefusal> {
+    let server = context.server;
+    let source_window = context.window_id;
+    let probe = ClientMessage::TransferTab {
+        transfer_id: 0,
+        workspace_id,
+        tab_session_id,
+        target_window_id,
+    };
+    let mut sessions = server.live_sessions.write().await;
+    let shares = server.window_shares.read().await;
+    let mut wm = server.workspace_manager.write().await;
+
+    let Some(share) = shares.get(&source_window) else {
+        return Err(WorkspaceTransferRefusal::NoWindowControl);
+    };
+    let capable = share
+        .participant_for_writer(context.writer)
+        .is_some_and(|participant| participant.tab_transfer == TabTransferCapability::Supported);
+    if !capable {
+        return Err(WorkspaceTransferRefusal::CapabilityAbsent);
+    }
+    if !share_connection_may_type(share, context.writer, &probe) {
+        return Err(WorkspaceTransferRefusal::NoWindowControl);
+    }
+    if shares.contains_key(&target_window_id) {
+        return Err(WorkspaceTransferRefusal::TargetWindowIdCollision);
+    }
+    if !candidates.iter().all(|session_id| sessions.contains_key(session_id)) {
+        return Err(WorkspaceTransferRefusal::NotWorkspaceOwner);
+    }
+
+    let root_cwd = sessions.get(&tab_session_id).and_then(|session| session.cwd.clone());
+    let (target_workspace, moved) = wm.transfer_tab(
+        TabTransferRequest {
+            source_window,
+            workspace_id,
+            tab_session_id,
+            target_window: target_window_id,
+        },
+        root_cwd.as_deref(),
+    )?;
+    let viewers: Vec<TransferViewer> = share
+        .participants
+        .values()
+        .map(|participant| {
+            (
+                Arc::clone(&participant.writer),
+                matches!(participant.transport, ParticipantTransport::Remote),
+                Arc::clone(&participant.attached_ids),
+            )
+        })
+        .collect();
+    let mut attachments = Vec::with_capacity(moved.len());
+    for &session_id in &moved {
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.env_window_id = target_window_id;
+            // A minted workspace re-files its sessions; a whole-workspace
+            // transfer keeps the original id, so this is a no-op there.
+            session.workspace_id = target_workspace;
+            if sever_transfer_sinks(session, &viewers) {
+                lock_resize_pacer(&session.resize_pacer).discard_pending();
+            }
+            attachments.push((session_id, Arc::clone(&session.attachment)));
+        }
+    }
+    Ok(TransferCommit { moved, viewers, attachments })
+}
+
 // ── Workspace move (existing destination window) ─────────────────────
 
 #[derive(Clone, Copy)]
@@ -8081,6 +8325,20 @@ impl WorkspaceMoveCommand {
         }
     }
 
+    /// The request as the transfer ledger records it.
+    fn ledger_request(
+        self,
+        source_window: WindowId,
+    ) -> crate::workspace_transfer::WorkspaceMoveRequest {
+        crate::workspace_transfer::WorkspaceMoveRequest {
+            source_window,
+            workspace_id: self.workspace_id,
+            target_window: self.target_window_id,
+            target_workspace_id: self.target_workspace_id,
+            operation: self.operation,
+        }
+    }
+
     fn probe(self) -> ClientMessage {
         ClientMessage::MoveWorkspace {
             move_id: 0,
@@ -8089,6 +8347,13 @@ impl WorkspaceMoveCommand {
             target_workspace_id: self.target_workspace_id,
             operation: self.operation,
         }
+    }
+
+    /// Whether this is a cross-window tab move, which the tab-transfer
+    /// capability additionally gates.
+    fn requires_tab_transfer(self, source_window: WindowId) -> bool {
+        matches!(self.operation, WorkspaceMoveOperation::MoveTab { .. })
+            && self.target_window_id != source_window
     }
 }
 
@@ -8144,12 +8409,19 @@ async fn run_workspace_move(
 ) -> RecordedWorkspaceMove {
     let gate = Arc::clone(&context.server.workspace_transfers);
     let mut transfers = gate.lock().await;
-    if let Some(recorded) = transfers.recorded_move(command.move_id) {
+    let request = command.ledger_request(context.window_id);
+    if let Some(recorded) = transfers.recorded_move(command.move_id, request) {
         debug!(move_id = command.move_id, "replaying recorded workspace-move result");
         return recorded;
     }
+    if transfers.move_id_reused(command.move_id, request) {
+        warn!(
+            move_id = command.move_id,
+            "client reused a move id for a different request; running it as a new move"
+        );
+    }
     let recorded = execute_workspace_move(command, context, transfers.handoff_in_progress()).await;
-    transfers.record_move(command.move_id, recorded);
+    transfers.record_move(command.move_id, request, recorded);
     recorded
 }
 
@@ -8167,7 +8439,10 @@ async fn execute_workspace_move(
             Ok(candidates) => candidates,
             Err(reason) => return refused_workspace_move(reason),
         };
-    let env_rebinds = if matches!(command.operation, WorkspaceMoveOperation::MoveTab { .. }) {
+    // A same-window tab move keeps every env coordinate; a cross-window one
+    // (like edge insertion and swap) re-binds the moved sessions' envelopes to
+    // the destination window.
+    let env_rebinds = if command.target_window_id == context.window_id {
         Vec::new()
     } else {
         match stage_workspace_move_env(
@@ -8203,16 +8478,9 @@ async fn validate_workspace_move_request(
     if handoff_in_progress {
         return Err(WorkspaceMoveRefusal::HandoffInProgress);
     }
-    let probe = command.probe();
     {
         let shares = context.server.window_shares.read().await;
-        validate_workspace_move_control(
-            &shares,
-            context.window_id,
-            command.target_window_id,
-            context.writer,
-            &probe,
-        )?;
+        validate_workspace_move_control(&shares, command, context.window_id, context.writer)?;
     }
     context
         .server
@@ -8224,11 +8492,13 @@ async fn validate_workspace_move_request(
 
 fn validate_workspace_move_control(
     shares: &HashMap<WindowId, WindowShare>,
+    command: WorkspaceMoveCommand,
     source_window: WindowId,
-    target_window: WindowId,
     writer: &SharedWriter,
-    probe: &ClientMessage,
 ) -> Result<(), WorkspaceMoveRefusal> {
+    let target_window = command.target_window_id;
+    let probe = &command.probe();
+    let requires_tab_transfer = command.requires_tab_transfer(source_window);
     let Some(source) = shares.get(&source_window) else {
         return Err(WorkspaceMoveRefusal::NoSourceWindowControl);
     };
@@ -8241,6 +8511,11 @@ fn validate_workspace_move_control(
         return Err(WorkspaceMoveRefusal::NoSourceWindowControl);
     }
     if participant.workspace_move != WorkspaceMoveCapability::Supported {
+        return Err(WorkspaceMoveRefusal::CapabilityAbsent);
+    }
+    // A cross-window tab move is additionally gated by the tab-transfer
+    // capability, independent of the same-window move bit.
+    if requires_tab_transfer && participant.tab_transfer != TabTransferCapability::Supported {
         return Err(WorkspaceMoveRefusal::CapabilityAbsent);
     }
     let Some(target) = shares.get(&target_window) else {
@@ -8327,18 +8602,11 @@ async fn commit_workspace_move(
     let server = context.server;
     let source_window = context.window_id;
     let target_window_id = command.target_window_id;
-    let probe = command.probe();
     let mut sessions = server.live_sessions.write().await;
     let mut shares = server.window_shares.write().await;
     let mut wm = server.workspace_manager.write().await;
 
-    validate_workspace_move_control(
-        &shares,
-        source_window,
-        target_window_id,
-        context.writer,
-        &probe,
-    )?;
+    validate_workspace_move_control(&shares, command, source_window, context.writer)?;
     if !candidates
         .source_sessions
         .iter()
@@ -8353,7 +8621,10 @@ async fn commit_workspace_move(
         return Err(WorkspaceMoveRefusal::NotWorkspaceOwner);
     }
 
-    let same_window = matches!(command.operation, WorkspaceMoveOperation::MoveTab { .. });
+    // A tab move into this same window keeps every live route; any other
+    // destination (edge insertion, swap, or a cross-window tab move) is a
+    // two-window commit.
+    let same_window = target_window_id == source_window;
     let source_viewers = transfer_viewers(
         shares.get(&source_window).ok_or(WorkspaceMoveRefusal::NoSourceWindowControl)?,
     );
@@ -8369,13 +8640,23 @@ async fn commit_workspace_move(
     if same_window {
         return Ok(commit_tab_subtree_move(command, &committed, &mut sessions, source_viewers));
     }
-    Ok(commit_cross_window_move(
+    let commit = commit_cross_window_move(
         &committed,
         &mut sessions,
         &mut shares,
         (source_window, target_window_id),
         (source_viewers, target_viewers),
-    ))
+    );
+    // A cross-window tab move re-files its sessions into the destination
+    // workspace; a whole-workspace move keeps their workspace id.
+    if matches!(command.operation, WorkspaceMoveOperation::MoveTab { .. }) {
+        for &session_id in &committed.source_sessions {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.workspace_id = command.target_workspace_id;
+            }
+        }
+    }
+    Ok(commit)
 }
 
 fn commit_tab_subtree_move(
@@ -15841,6 +16122,7 @@ mod tests {
             agent_api: AgentApiCapability::Unsupported,
             workspace_transfer: WorkspaceTransferCapability::Unsupported,
             workspace_move: WorkspaceMoveCapability::Unsupported,
+            tab_transfer: TabTransferCapability::Unsupported,
             attached_ids: &attached_ids,
             controller: &controller,
         };
@@ -15859,6 +16141,7 @@ mod tests {
             agent_api: capable.into(),
             workspace_transfer: WorkspaceTransferCapability::Unsupported,
             workspace_move: WorkspaceMoveCapability::Unsupported,
+            tab_transfer: TabTransferCapability::Unsupported,
             attached_ids: &attached_ids,
             controller: &controller,
         };
@@ -18851,6 +19134,7 @@ mod tests {
             attach_transfer_controller(&live_sessions, &writer, &[left.1, right.1]).await;
         let mut participant = Participant::local(&writer, false);
         participant.workspace_transfer = WorkspaceTransferCapability::Supported;
+        participant.tab_transfer = TabTransferCapability::Supported;
         participant.attached_ids = Arc::clone(&attached_ids);
         shares.write().await.insert(source_window, WindowShare::new_single_controller(participant));
         TransferFixture {
@@ -18892,6 +19176,30 @@ mod tests {
                 is_remote: false,
             };
             run_workspace_transfer(transfer_id, workspace_id, target_window_id, &mut context).await
+        }
+
+        async fn run_tab(
+            &mut self,
+            transfer_id: u64,
+            workspace_id: WorkspaceId,
+            tab_session_id: SessionId,
+            target_window_id: WindowId,
+        ) -> WorkspaceTransferResult {
+            let mut context = ClientDispatchContext {
+                server: &self.server,
+                writer: &self.writer,
+                attached_ids: &self.attached_ids,
+                window_id: self.source_window,
+                is_remote: false,
+            };
+            run_tab_transfer(
+                transfer_id,
+                workspace_id,
+                tab_session_id,
+                target_window_id,
+                &mut context,
+            )
+            .await
         }
 
         /// Byte-serialized workspace-manager image plus each live session's
@@ -18980,6 +19288,7 @@ mod tests {
         let attached = attach_transfer_controller(live_sessions, &writer, session_ids).await;
         let mut participant = Participant::local(&writer, false);
         participant.workspace_move = WorkspaceMoveCapability::Supported;
+        participant.tab_transfer = TabTransferCapability::Supported;
         participant.attached_ids = Arc::clone(&attached);
         (writer, client_read, attached, participant)
     }
@@ -19101,6 +19410,21 @@ mod tests {
                 &mut context,
             )
             .await
+        }
+
+        fn ledger_request(
+            &self,
+            target_workspace_index: usize,
+            operation: WorkspaceMoveOperation,
+        ) -> crate::workspace_transfer::WorkspaceMoveRequest {
+            WorkspaceMoveCommand {
+                move_id: 0,
+                workspace_id: self.workspaces[0],
+                target_window_id: self.target_window,
+                target_workspace_id: self.workspaces[target_workspace_index],
+                operation,
+            }
+            .ledger_request(self.source_window)
         }
 
         async fn state_snapshot(&self) -> (Vec<u8>, Vec<(SessionId, WindowId)>, Vec<WindowId>) {
@@ -19544,6 +19868,223 @@ mod tests {
         assert_eq!(fixture.state_snapshot().await, before);
     }
 
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[tokio::test]
+    async fn cross_window_tab_move_without_tab_transfer_capability_refuses() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        {
+            let mut shares = fixture.server.window_shares.write().await;
+            shares
+                .get_mut(&fixture.source_window)
+                .and_then(|share| share.participant_for_writer_mut(&fixture.source_writer))
+                .expect("source participant")
+                .tab_transfer = TabTransferCapability::Unsupported;
+        }
+        let before = fixture.state_snapshot().await;
+        assert_eq!(
+            fixture
+                .run(
+                    210,
+                    2,
+                    WorkspaceMoveOperation::MoveTab {
+                        tab_session_id: fixture.sessions[0],
+                        target_index: 0,
+                    },
+                )
+                .await,
+            refused_workspace_move(WorkspaceMoveRefusal::CapabilityAbsent)
+        );
+        assert_eq!(
+            fixture.state_snapshot().await,
+            before,
+            "a refused cross-window tab move mutates nothing"
+        );
+    }
+
+    // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]
+    #[tokio::test]
+    async fn cross_window_tab_move_refreshes_both_windows() {
+        let mut fixture = move_fixture(2, [None; 4]).await;
+        assert_eq!(
+            fixture
+                .run(
+                    211,
+                    2,
+                    WorkspaceMoveOperation::MoveTab {
+                        tab_session_id: fixture.sessions[0],
+                        target_index: 0,
+                    },
+                )
+                .await,
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false }
+        );
+        {
+            let wm = fixture.server.workspace_manager.read().await;
+            assert_eq!(wm.window_for_session(fixture.sessions[0]), Some(fixture.target_window));
+        }
+        {
+            let live = fixture.server.live_sessions.read().await;
+            assert_eq!(live[&fixture.sessions[0]].env_window_id, fixture.target_window);
+            assert_eq!(live[&fixture.sessions[0]].workspace_id, fixture.workspaces[2]);
+            assert!(lock_sinks(&live[&fixture.sessions[0]].client_writer).is_empty());
+        }
+        // Each SingleController window gets exactly one full SessionList (no
+        // roster frame in that mode).
+        let source_list = read_move_frame(&mut fixture.source_read).await;
+        assert!(matches!(source_list, ServerMessage::SessionList { workspace_tree: Some(_), .. }));
+        assert_no_further_frame(&mut fixture.source_read).await;
+        let target_list = read_move_frame(&mut fixture.target_read).await;
+        assert!(matches!(target_list, ServerMessage::SessionList { workspace_tree: Some(_), .. }));
+        assert_no_further_frame(&mut fixture.target_read).await;
+    }
+
+    // @lat: [[server#Workspace Move#Sole-source reattachment]]
+    #[tokio::test]
+    async fn cross_window_tab_move_closes_the_emptied_source_window() {
+        let mut fixture = move_fixture(1, [None; 4]).await;
+        let mut context = ClientDispatchContext {
+            server: &fixture.server,
+            writer: &fixture.source_writer,
+            attached_ids: &fixture.source_attached,
+            window_id: fixture.source_window,
+            is_remote: false,
+        };
+        let command = WorkspaceMoveCommand {
+            move_id: 212,
+            workspace_id: fixture.workspaces[0],
+            target_window_id: fixture.target_window,
+            target_workspace_id: fixture.workspaces[1],
+            operation: WorkspaceMoveOperation::MoveTab {
+                tab_session_id: fixture.sessions[0],
+                target_index: 1,
+            },
+        };
+        handle_workspace_move(command, &mut context).await;
+
+        // The requester (source connection) hears the move, then the close.
+        read_move_close(&mut fixture.source_read, 212, fixture.source_window).await;
+        // The destination window is refreshed with one full SessionList.
+        let target_list = read_move_frame(&mut fixture.target_read).await;
+        assert!(matches!(target_list, ServerMessage::SessionList { workspace_tree: Some(_), .. }));
+        assert_no_further_frame(&mut fixture.target_read).await;
+
+        assert!(!fixture.server.window_shares.read().await.contains_key(&fixture.source_window));
+        let wm = fixture.server.workspace_manager.read().await;
+        assert!(wm.window_tree(fixture.source_window).is_none());
+        assert_eq!(wm.window_for_session(fixture.sessions[0]), Some(fixture.target_window));
+    }
+
+    // @lat: [[server#Workspace Transfer#Transfer gate and ledger]]
+    #[tokio::test]
+    async fn tab_transfer_retry_replays_the_recorded_result() {
+        let mut fixture = transfer_fixture([None, None]).await;
+        let target = WindowId::new();
+        assert_eq!(
+            fixture.run_tab(60, fixture.left_workspace, fixture.left_session, target).await,
+            WorkspaceTransferResult::Transferred
+        );
+        // The ledger replays the recorded success even though the workspace
+        // has moved and the target id now collides.
+        assert_eq!(
+            fixture.run_tab(60, fixture.left_workspace, fixture.left_session, target).await,
+            WorkspaceTransferResult::Transferred
+        );
+        // A fresh id re-executes and gets the honest refusal.
+        assert_eq!(
+            fixture.run_tab(61, fixture.left_workspace, fixture.left_session, target).await,
+            WorkspaceTransferResult::Refused {
+                reason: WorkspaceTransferRefusal::TargetWindowIdCollision
+            }
+        );
+    }
+
+    // @lat: [[server#Workspace Transfer]]
+    #[tokio::test]
+    async fn transfer_tab_claim_window_lists_the_minted_workspace() {
+        let (server_stream, client_stream) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server_stream);
+        let (_client_read, _client_write) = tokio::io::split(client_stream);
+        let writer = test_shared_writer(server_write);
+        let source_window = WindowId::new();
+        let workspace = WorkspaceId::new();
+        let tabs = [SessionId::new(), SessionId::new()];
+        let handoff = transfer_handoff(&[
+            (source_window, tabs[0], workspace, None),
+            (source_window, tabs[1], workspace, None),
+        ]);
+        let mut wm = WorkspaceManager::new(vec![]);
+        for &session in &tabs {
+            wm.add_session(workspace, session, None);
+            wm.assign_session_to_window(source_window, session);
+        }
+        wm.set_window_tree(source_window, transfer_leaf(workspace, tabs.to_vec()));
+        let workspace_manager = Arc::new(RwLock::new(wm));
+        let manager =
+            SessionManager::restore_from_handoff(&handoff.state, handoff.masters, 100).unwrap();
+        let live_sessions = new_live_session_registry();
+        let shares = new_window_shares();
+        activate_pending_sessions(
+            &manager,
+            &workspace_manager,
+            &live_sessions,
+            &shares,
+            &Arc::new(GitRefWatcherControl::new(false)),
+        )
+        .await;
+        wait_for_live_sessions(&live_sessions, 2).await;
+        let attached_ids = attach_transfer_controller(&live_sessions, &writer, &tabs).await;
+        let mut participant = Participant::local(&writer, false);
+        participant.tab_transfer = TabTransferCapability::Supported;
+        participant.attached_ids = Arc::clone(&attached_ids);
+        shares.write().await.insert(source_window, WindowShare::new_single_controller(participant));
+        let server = transfer_server_state(workspace_manager, live_sessions, shares);
+        let _slaves = handoff.slaves;
+
+        let target = WindowId::new();
+        let mut context = ClientDispatchContext {
+            server: &server,
+            writer: &writer,
+            attached_ids: &attached_ids,
+            window_id: source_window,
+            is_remote: false,
+        };
+        assert_eq!(
+            run_tab_transfer(70, workspace, tabs[0], target, &mut context).await,
+            WorkspaceTransferResult::Transferred
+        );
+
+        // The claim of the new window must list the minted workspace.
+        let (claim_server, claim_client) = unix_stream_pair();
+        let (_claim_server_read, claim_server_write) = tokio::io::split(claim_server);
+        let (mut claim_read, _claim_client_write) = tokio::io::split(claim_client);
+        let claim_writer = test_shared_writer(claim_server_write);
+        handle_list_sessions(
+            &server.live_sessions,
+            &server.workspace_manager,
+            &claim_writer,
+            target,
+            false,
+        )
+        .await;
+        let list = read_move_frame(&mut claim_read).await;
+        let ServerMessage::SessionList { sessions, workspaces, workspace_tree, .. } = list else {
+            panic!("expected a SessionList for the claimed window");
+        };
+        assert_eq!(
+            sessions.iter().map(|info| info.session_id).collect::<Vec<_>>(),
+            vec![tabs[0]],
+            "the new window lists only the moved tab"
+        );
+        assert_eq!(workspaces.len(), 1, "the new window lists exactly its minted workspace");
+        assert_ne!(workspaces[0].workspace_id, workspace, "a fresh workspace was minted");
+        assert_eq!(sessions[0].workspace_id, workspaces[0].workspace_id);
+        assert!(matches!(
+            workspace_tree,
+            Some(WorkspaceTreeNode::Leaf { workspace_id, .. })
+                if workspace_id == workspaces[0].workspace_id
+        ));
+    }
+
     // @lat: [[server#Workspace Move#Edge insertion]]
     #[tokio::test]
     async fn workspace_move_edge_preserves_live_sessions_and_refreshes_both_windows() {
@@ -19668,7 +20209,7 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("decode handoff");
         let restored = crate::workspace_transfer::restored_transfer_gate(decoded.transfer_ledger);
         assert_eq!(
-            restored.lock().await.recorded_move(102),
+            restored.lock().await.recorded_move(102, command.ledger_request(fixture.source_window)),
             Some(RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: true })
         );
     }
@@ -19684,8 +20225,40 @@ mod tests {
         );
         assert_eq!(fixture.state_snapshot().await, snapshot);
         assert_eq!(
-            fixture.server.workspace_transfers.lock().await.recorded_move(103),
+            fixture
+                .server
+                .workspace_transfers
+                .lock()
+                .await
+                .recorded_move(103, fixture.ledger_request(1, WorkspaceMoveOperation::Swap)),
             Some(refused_workspace_move(WorkspaceMoveRefusal::SoleWorkspace))
+        );
+    }
+
+    // @lat: [[server#Workspace Transfer#Transfer gate and ledger]]
+    #[tokio::test]
+    async fn a_reused_move_id_with_a_different_request_runs_instead_of_replaying() {
+        let mut fixture = move_fixture(1, [None; 4]).await;
+        assert_eq!(
+            fixture.run(104, 1, WorkspaceMoveOperation::Swap).await,
+            refused_workspace_move(WorkspaceMoveRefusal::SoleWorkspace)
+        );
+        // The same id from a client that restarted its numbering, for a move
+        // that can commit: it must run, not replay the earlier refusal.
+        let edge = WorkspaceMoveOperation::InsertAtEdge {
+            edge: scribe_common::protocol::WorkspaceTreeEdge::Right,
+        };
+        let moved = fixture.run(104, 1, edge).await;
+        assert_eq!(moved.result, WorkspaceMoveResult::Moved);
+        assert!(
+            fixture
+                .server
+                .workspace_manager
+                .read()
+                .await
+                .sessions_for_window(fixture.source_window)
+                .is_empty(),
+            "the second request really moved the workspace"
         );
     }
 

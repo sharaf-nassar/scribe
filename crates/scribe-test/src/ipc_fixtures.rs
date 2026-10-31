@@ -236,6 +236,7 @@ fn insert_local_fixtures(
             agent_api: false,
             workspace_transfer: true,
             workspace_move: false,
+            tab_transfer: false,
             ai_background_wait: false,
         },
     )?;
@@ -273,6 +274,7 @@ fn insert_local_fixtures(
             agent_api: false,
             workspace_transfer: true,
             workspace_move: false,
+            tab_transfer: false,
         },
     )
 }

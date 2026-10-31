@@ -10,13 +10,34 @@
 //! [`TRANSFER_LEDGER_CAP`] transfer/move results, serialized into handoff state
 //! so a retry after a lost ACK — even across an upgrade — replays the recorded
 //! result. Entries expire only by capacity, never by time.
+//!
+//! A move entry also records the request it answered, and only a retry (the
+//! same id *and* the same request) replays it. The ledger is shared by every
+//! client and outlives them all, and a move id is only as unique as the client
+//! that minted it: clients that numbered moves from 1 per launch had every
+//! post-restart move answered with an earlier client's `Moved`, and nothing
+//! moved. A reused id with a different request is new work, so it runs.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use scribe_common::protocol::{WorkspaceMoveResult, WorkspaceTransferResult};
+use scribe_common::ids::{WindowId, WorkspaceId};
+use scribe_common::protocol::{
+    WorkspaceMoveOperation, WorkspaceMoveResult, WorkspaceTransferResult,
+};
+
+/// Everything a `MoveWorkspace` asks for, with the window it came from: the
+/// identity a retry repeats exactly and an unrelated move never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMoveRequest {
+    pub source_window: WindowId,
+    pub workspace_id: WorkspaceId,
+    pub target_window: WindowId,
+    pub target_workspace_id: WorkspaceId,
+    pub operation: WorkspaceMoveOperation,
+}
 
 /// Most-recent workspace transaction results retained for idempotent retries.
 pub const TRANSFER_LEDGER_CAP: usize = 64;
@@ -24,12 +45,24 @@ pub const TRANSFER_LEDGER_CAP: usize = 64;
 /// One recorded workspace outcome, carried in handoff state.
 ///
 /// `untagged` preserves the phase-1 transfer wire map (`transfer_id`, `result`)
-/// while adding the disjoint move map (`move_id`, `result`, `source_closed`).
+/// while adding the disjoint move map (`move_id`, `result`, `source_closed`,
+/// `request`). `request` is absent from entries an older server recorded; those
+/// still replay by id alone, the contract they were recorded under, until
+/// capacity evicts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TransferLedgerEntry {
-    Transfer { transfer_id: u64, result: WorkspaceTransferResult },
-    Move { move_id: u64, result: WorkspaceMoveResult, source_closed: bool },
+    Transfer {
+        transfer_id: u64,
+        result: WorkspaceTransferResult,
+    },
+    Move {
+        move_id: u64,
+        result: WorkspaceMoveResult,
+        source_closed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<WorkspaceMoveRequest>,
+    },
 }
 
 /// The replayable outcome of one workspace move.
@@ -75,23 +108,50 @@ impl TransferState {
         self.push(TransferLedgerEntry::Transfer { transfer_id, result });
     }
 
-    /// The recorded result for a retried `move_id`, if any.
+    /// The recorded result if `request` under `move_id` is a retry, or `None`
+    /// when it is new work.
+    ///
+    /// The newest matching entry wins, so a reused id that ran fresh replays
+    /// its own result on its own retry. An entry without a request (recorded
+    /// by an older server) matches on the id alone.
     #[must_use]
-    pub fn recorded_move(&self, move_id: u64) -> Option<RecordedWorkspaceMove> {
-        self.entries.iter().find_map(|entry| match entry {
-            TransferLedgerEntry::Move { move_id: id, result, source_closed } if *id == move_id => {
+    pub fn recorded_move(
+        &self,
+        move_id: u64,
+        request: WorkspaceMoveRequest,
+    ) -> Option<RecordedWorkspaceMove> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            TransferLedgerEntry::Move { move_id: id, result, source_closed, request: recorded }
+                if *id == move_id && recorded.is_none_or(|recorded| recorded == request) =>
+            {
                 Some(RecordedWorkspaceMove { result: *result, source_closed: *source_closed })
             }
             TransferLedgerEntry::Transfer { .. } | TransferLedgerEntry::Move { .. } => None,
         })
     }
 
-    /// Record one workspace-move result.
-    pub fn record_move(&mut self, move_id: u64, result: RecordedWorkspaceMove) {
+    /// Whether `move_id` was already recorded for some other request: the
+    /// client reused an id, and the move about to run is not a retry.
+    #[must_use]
+    pub fn move_id_reused(&self, move_id: u64, request: WorkspaceMoveRequest) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, TransferLedgerEntry::Move { move_id: id, request: Some(recorded), .. }
+                if *id == move_id && *recorded != request)
+        })
+    }
+
+    /// Record one workspace-move result with the request it answered.
+    pub fn record_move(
+        &mut self,
+        move_id: u64,
+        request: WorkspaceMoveRequest,
+        result: RecordedWorkspaceMove,
+    ) {
         self.push(TransferLedgerEntry::Move {
             move_id,
             result: result.result,
             source_closed: result.source_closed,
+            request: Some(request),
         });
     }
 
@@ -150,6 +210,16 @@ mod tests {
 
     use super::*;
 
+    fn request(operation: WorkspaceMoveOperation) -> WorkspaceMoveRequest {
+        WorkspaceMoveRequest {
+            source_window: WindowId::new(),
+            workspace_id: WorkspaceId::new(),
+            target_window: WindowId::new(),
+            target_workspace_id: WorkspaceId::new(),
+            operation,
+        }
+    }
+
     // @lat: [[server#Workspace Transfer#Transfer gate and ledger]]
     #[test]
     fn ledger_replays_both_result_kinds_and_evicts_only_by_shared_capacity() {
@@ -161,7 +231,8 @@ mod tests {
         );
         let moved =
             RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: true };
-        state.record_move(1, moved);
+        let swap = request(WorkspaceMoveOperation::Swap);
+        state.record_move(1, swap, moved);
         assert_eq!(state.recorded(1), Some(WorkspaceTransferResult::Transferred));
         assert_eq!(
             state.recorded(2),
@@ -169,12 +240,13 @@ mod tests {
                 reason: WorkspaceTransferRefusal::SoleWorkspace
             })
         );
-        assert_eq!(state.recorded_move(1), Some(moved));
-        assert_eq!(state.recorded_move(2), None);
+        assert_eq!(state.recorded_move(1, swap), Some(moved));
+        assert_eq!(state.recorded_move(2, swap), None);
 
         for id in 3..(3 + TRANSFER_LEDGER_CAP as u64) {
             state.record_move(
                 id,
+                swap,
                 RecordedWorkspaceMove {
                     result: WorkspaceMoveResult::Refused {
                         reason: WorkspaceMoveRefusal::TargetWindowUnavailable,
@@ -186,8 +258,64 @@ mod tests {
         assert_eq!(state.entries().len(), TRANSFER_LEDGER_CAP);
         assert_eq!(state.recorded(1), None, "oldest entries expire by shared capacity");
         assert_eq!(state.recorded(2), None);
-        assert_eq!(state.recorded_move(1), None);
-        assert!(state.recorded_move(3).is_some());
+        assert_eq!(state.recorded_move(1, swap), None);
+        assert!(state.recorded_move(3, swap).is_some());
+    }
+
+    // @lat: [[server#Workspace Transfer#Transfer gate and ledger]]
+    #[test]
+    fn a_reused_move_id_replays_only_for_the_request_it_recorded() {
+        let mut state = TransferState::default();
+        let first = request(WorkspaceMoveOperation::Swap);
+        let other = WorkspaceMoveRequest {
+            operation: WorkspaceMoveOperation::MoveTab {
+                tab_session_id: scribe_common::ids::SessionId::new(),
+                target_index: 0,
+            },
+            ..request(WorkspaceMoveOperation::Swap)
+        };
+        let moved =
+            RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: false };
+        state.record_move(1, first, moved);
+        assert_eq!(state.recorded_move(1, first), Some(moved), "a retry replays");
+        assert_eq!(state.recorded_move(1, other), None, "another request reusing the id runs");
+        assert!(state.move_id_reused(1, other));
+        assert!(!state.move_id_reused(1, first));
+
+        // The reused id's own fresh result is what its own retry replays.
+        let refused = RecordedWorkspaceMove {
+            result: WorkspaceMoveResult::Refused {
+                reason: WorkspaceMoveRefusal::TargetWorkspaceUnavailable,
+            },
+            source_closed: false,
+        };
+        state.record_move(1, other, refused);
+        assert_eq!(state.recorded_move(1, other), Some(refused));
+        assert_eq!(state.recorded_move(1, first), Some(moved));
+    }
+
+    #[test]
+    fn a_move_entry_from_an_older_server_still_replays_by_id() {
+        #[derive(Serialize)]
+        struct OlderMoveEntry {
+            move_id: u64,
+            result: WorkspaceMoveResult,
+            source_closed: bool,
+        }
+
+        let bytes = rmp_serde::to_vec_named(&vec![OlderMoveEntry {
+            move_id: 4,
+            result: WorkspaceMoveResult::Moved,
+            source_closed: true,
+        }])
+        .expect("serialize older entry");
+        let entries: Vec<TransferLedgerEntry> =
+            rmp_serde::from_slice(&bytes).expect("decode older entry");
+        let restored = TransferState::restore(entries);
+        assert_eq!(
+            restored.recorded_move(4, request(WorkspaceMoveOperation::Swap)),
+            Some(RecordedWorkspaceMove { result: WorkspaceMoveResult::Moved, source_closed: true })
+        );
     }
 
     #[test]
@@ -223,8 +351,10 @@ mod tests {
                 reason: WorkspaceTransferRefusal::EnvironmentRebindFailed,
             },
         );
+        let swap = request(WorkspaceMoveOperation::Swap);
         state.record_move(
             9,
+            swap,
             RecordedWorkspaceMove {
                 result: WorkspaceMoveResult::Refused {
                     reason: WorkspaceMoveRefusal::EnvironmentRebindFailed,
@@ -245,7 +375,7 @@ mod tests {
             })
         );
         assert_eq!(
-            restored.recorded_move(9),
+            restored.recorded_move(9, swap),
             Some(RecordedWorkspaceMove {
                 result: WorkspaceMoveResult::Refused {
                     reason: WorkspaceMoveRefusal::EnvironmentRebindFailed,

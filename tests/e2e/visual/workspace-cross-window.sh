@@ -9,7 +9,7 @@ set -euo pipefail
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 ORACLE=/tests/visual/workspace-tree-oracle.py
-PILL_CENTER_X=44
+PILL_CENTER_X=$(dev 44)
 oracle() { python3 "$ORACLE" "$RECORD" "$@"; }
 
 fail() {
@@ -162,11 +162,12 @@ done
 TARGET_WID=""
 for wid in "${mapped[@]}"; do [ "$wid" != "$SOURCE_WID" ] && TARGET_WID=$wid; done
 [ -n "$TARGET_WID" ] || fail "could not identify sibling window"
-# Keep both rectangles disjoint on the standard 1920x1080 Xvfb desktop.
-xdotool windowsize "$SOURCE_WID" 800 600
-xdotool windowmove "$SOURCE_WID" 80 180
-xdotool windowsize "$TARGET_WID" 800 600
-xdotool windowmove "$TARGET_WID" 1040 180
+# Keep both rectangles disjoint on the standard 1920x1080 Xvfb desktop (scaled
+# with the desktop on a HiDPI run).
+xdotool windowsize "$SOURCE_WID" "$(dev 800)" "$(dev 600)"
+xdotool windowmove "$SOURCE_WID" "$(dev 80)" "$(dev 180)"
+xdotool windowsize "$TARGET_WID" "$(dev 800)" "$(dev 600)"
+xdotool windowmove "$TARGET_WID" "$(dev 1040)" "$(dev 180)"
 sleep 1
 remember_source_geometry
 remember_target_geometry
@@ -261,7 +262,7 @@ echo "PHASE 3 PASS: Escape and blur clear sibling previews without a move"
 # painted chrome, never inferred from the source frame.
 reset_record
 focus_window "$SOURCE_WID"
-drag_to_target "$((T_X + 18))" "$TARGET_CENTER_Y"
+drag_to_target "$((T_X + $(dev 18)))" "$TARGET_CENTER_Y"
 assert_move - left
 echo "PHASE 4 PASS: measured X11 pointer edge insert reached the sibling"
 

@@ -47,6 +47,12 @@ RUN apt-get update && \
         x11-utils \
         xclip \
         openbox \
+        # The Wayland E2Es (SCRIBE_DISPLAY_SERVER=wayland) run the client under
+        # a real compositor: sway, nested in Xvfb through wlroots' X11 backend
+        # so its seat has a pointer that `swaymsg seat ... cursor` drives, and
+        # grim for screenshots of what it composited.
+        sway \
+        grim \
         libwebkit2gtk-4.1-0 \
         dbus-x11 \
         xdg-desktop-portal \

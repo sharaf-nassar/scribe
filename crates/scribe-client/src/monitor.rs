@@ -15,7 +15,9 @@
 use gpui::{App, Pixels, Point, Window, point, px};
 
 use crate::layout::Rect;
-use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
+use crate::window_state::{
+    MonitorWorkArea, ObservedWindowState, WindowState, i32_to_logical_px, logical_px_to_i32,
+};
 use crate::x11_focus::xcb_window_id;
 
 /// Read the live window state off the window manager, falling back to GPUI.
@@ -92,7 +94,16 @@ pub fn apply_saved_desktop(window: &Window, desktop: u32) -> bool {
 }
 
 /// The window's mapped content rect as the X server measures it right now,
-/// in root coordinates.
+/// in root coordinates and logical pixels.
+///
+/// Logical pixels are GPUI's units: every pointer position and every
+/// `Window::bounds` this client sees is the X server's device pixels divided
+/// by the window's scale factor. The X server answers in device pixels, so the
+/// reading is scaled here, once, and nothing outside this module ever holds a
+/// device-pixel rect. Root coordinates added to a pointer otherwise stayed
+/// correct only at scale 1: on a `HiDPI` X11 session (`Xft.dpi` 192, or
+/// `GPUI_X11_SCALE_FACTOR=2`) a cross-window drag aimed at a sibling resolved
+/// twice as far down and right as the pointer.
 ///
 /// Targeting a *sibling* window under a drag pointer needs where that window is
 /// on the root at this instant, which GPUI cannot answer: its bounds are the
@@ -106,7 +117,86 @@ pub fn apply_saved_desktop(window: &Window, desktop: u32) -> bool {
 /// which is what keeps every non-X11 backend on the palette path.
 #[must_use]
 pub fn mapped_window_bounds(window: &Window) -> Option<Rect> {
-    x11::mapped_window_bounds(window)
+    x11::mapped_window_bounds(window).map(|device| device_to_logical(device, window.scale_factor()))
+}
+
+/// What is on top at a root point: bare desktop, or one top-level window.
+///
+/// A top-level is a child of the root window: a window manager's frame around
+/// a client, or the client itself where the window manager does not reparent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootHit {
+    Desktop,
+    Toplevel(u32),
+}
+
+/// The top-level window the user sees at `root` (logical root pixels), as
+/// the X server stacks and hit-tests it.
+///
+/// A drag aimed at another Scribe window used to take the first sibling, by
+/// window id, whose rect held the pointer, so where two windows overlapped
+/// the drop could land in the one underneath, and a window of another
+/// application covering a sibling did not stop a drop into the hidden
+/// sibling. `TranslateCoordinates` from the root to itself names the root
+/// child containing the point, walking children top-down and honouring their
+/// input shapes, which is the X server's own answer to "what is under here".
+///
+/// `None` off X11 or on any protocol failure; callers then fall back to rect
+/// containment alone.
+#[must_use]
+pub fn toplevel_at(window: &Window, root: (f32, f32)) -> Option<RootHit> {
+    let scale = window.scale_factor();
+    let device = |value: f32| logical_to_device(logical_px_to_i32(value), scale);
+    x11::toplevel_at(window, device(root.0), device(root.1))
+}
+
+/// This window's top-level: the root child that holds it (its window
+/// manager frame, or itself). `None` off X11 or on any protocol failure.
+#[must_use]
+pub fn toplevel_of(window: &Window) -> Option<u32> {
+    x11::toplevel_of(window)
+}
+
+/// Put an unmanaged (`WindowKind::PopUp`, override-redirect) window at a root
+/// position in logical pixels.
+///
+/// Such a window is not the window manager's to place, so the EWMH move
+/// [`apply_saved_position`] sends would be ignored; a plain `ConfigureWindow`
+/// is honoured directly. Returns whether the request went out.
+pub fn place_popup(window: &Window, x: f32, y: f32) -> bool {
+    let scale = window.scale_factor();
+    x11::configure_position_only(
+        window,
+        logical_to_device(logical_px_to_i32(x), scale),
+        logical_to_device(logical_px_to_i32(y), scale),
+    )
+}
+
+/// Make a window invisible to pointer hit tests: an empty input shape.
+///
+/// The X server's `TranslateCoordinates` honours input shapes when it names
+/// the top-level under a point, so a preview riding under the pointer with
+/// this set never masks the window a drag is really over. Returns whether the
+/// shape was applied (false off X11 or without the Shape extension).
+pub fn make_click_through(window: &Window) -> bool {
+    x11::clear_input_shape(window)
+}
+
+/// A device-pixel rect in logical pixels at `scale`.
+fn device_to_logical(device: Rect, scale: f32) -> Rect {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    Rect {
+        x: device.x / scale,
+        y: device.y / scale,
+        width: device.width / scale,
+        height: device.height / scale,
+    }
+}
+
+/// A logical root coordinate in the X server's device pixels at `scale`.
+fn logical_to_device(logical: i32, scale: f32) -> i32 {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    logical_px_to_i32(i32_to_logical_px(logical) * scale)
 }
 
 /// The window's root-relative content origin, in logical pixels.
@@ -123,9 +213,8 @@ pub fn mapped_window_bounds(window: &Window) -> Option<Rect> {
 /// callers fall back to the cached origin, which is all those platforms have.
 #[must_use]
 pub fn logical_window_origin(window: &Window) -> Option<Point<Pixels>> {
-    let frame = x11::mapped_window_bounds(window)?;
-    let scale = window.scale_factor();
-    Some(point(px(frame.x / scale), px(frame.y / scale)))
+    let frame = mapped_window_bounds(window)?;
+    Some(point(px(frame.x), px(frame.y)))
 }
 
 /// Whether the platform reports this window's real origin.
@@ -179,12 +268,16 @@ pub fn connected_monitors() -> Vec<MonitorWorkArea> {
 /// and vertical maximization to be altered together", so the window never
 /// passes through a half-maximized frame.
 ///
+/// `x` and `y` are logical pixels, like every position the client records,
+/// and are scaled to the X server's device pixels for the request.
+///
 /// Returns whether a request was actually sent (false off X11). Where the
 /// window ends up is still the window manager's answer, not ours: struts,
 /// snapping, or an off-screen clamp can move it further, which is why the
 /// caller verifies the monitor it landed on.
 pub fn apply_saved_position(window: &Window, x: i32, y: i32, state: WindowState) -> bool {
-    x11::move_window(window, x, y, state)
+    let scale = window.scale_factor();
+    x11::move_window(window, logical_to_device(x, scale), logical_to_device(y, scale), state)
 }
 
 /// Put a restored window into the maximized or fullscreen state its record
@@ -251,6 +344,39 @@ mod x11 {
                 height: f32::from(geometry.height),
             })
         })
+    }
+
+    pub(super) fn toplevel_at(window: &Window, x: i32, y: i32) -> Option<super::RootHit> {
+        let xid = xcb_window_id(window)?;
+        let (x, y) = (i16::try_from(x).ok()?, i16::try_from(y).ok()?);
+        with_connection(|conn| {
+            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            let hit = conn.translate_coordinates(root, root, x, y).ok()?.reply().ok()?;
+            Some(if hit.child == x11rb::NONE {
+                super::RootHit::Desktop
+            } else {
+                super::RootHit::Toplevel(hit.child)
+            })
+        })
+    }
+
+    /// Walk up from the client to the child of the root that holds it.
+    pub(super) fn toplevel_of(window: &Window) -> Option<u32> {
+        let client = xcb_window_id(window)?;
+        with_connection(|conn| root_child(conn, client))
+    }
+
+    fn root_child(conn: &RustConnection, mut current: u32) -> Option<u32> {
+        // Frames nest a few levels at most; the bound only guards a malformed
+        // tree.
+        for _ in 0..16 {
+            let tree = conn.query_tree(current).ok()?.reply().ok()?;
+            if tree.parent == tree.root || tree.parent == x11rb::NONE {
+                return Some(current);
+            }
+            current = tree.parent;
+        }
+        None
     }
 
     /// `RandR` connector name of the monitor containing the window center, or
@@ -496,6 +622,33 @@ mod x11 {
         .is_some()
     }
 
+    pub(super) fn configure_position_only(window: &Window, x: i32, y: i32) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| configure_position(conn, xid, x, y).then_some(())).is_some()
+    }
+
+    pub(super) fn clear_input_shape(window: &Window) -> bool {
+        use x11rb::connection::RequestConnection as _;
+        use x11rb::protocol::shape::{self, ConnectionExt as _};
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            conn.extension_information(shape::X11_EXTENSION_NAME).ok()??;
+            conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::INPUT,
+                x11rb::protocol::xproto::ClipOrdering::UNSORTED,
+                xid,
+                0,
+                0,
+                &[],
+            )
+            .ok()?
+            .check()
+            .ok()
+        })
+        .is_some()
+    }
+
     /// The ICCCM `ConfigureRequest` fallback, for a window manager that does
     /// not advertise `_NET_MOVERESIZE_WINDOW`.
     fn configure_position(conn: &RustConnection, xid: u32, x: i32, y: i32) -> bool {
@@ -676,6 +829,22 @@ mod x11 {
         None
     }
 
+    pub(super) fn toplevel_at(_window: &Window, _x: i32, _y: i32) -> Option<super::RootHit> {
+        None
+    }
+
+    pub(super) fn toplevel_of(_window: &Window) -> Option<u32> {
+        None
+    }
+
+    pub(super) fn configure_position_only(_window: &Window, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    pub(super) fn clear_input_shape(_window: &Window) -> bool {
+        false
+    }
+
     pub(super) fn connected_monitors() -> Vec<MonitorWorkArea> {
         Vec::new()
     }
@@ -694,5 +863,24 @@ mod x11 {
 
     pub(super) fn move_to_desktop(_window: &Window, _desktop: u32) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn device_rects_and_logical_positions_convert_at_the_window_scale() {
+        let device = Rect { x: 200.0, y: 100.0, width: 1600.0, height: 1200.0 };
+        assert_eq!(
+            device_to_logical(device, 2.0),
+            Rect { x: 100.0, y: 50.0, width: 800.0, height: 600.0 }
+        );
+        assert_eq!(device_to_logical(device, 1.0), device);
+        assert_eq!(device_to_logical(device, 0.0), device, "a bogus scale is treated as 1");
+        assert_eq!(logical_to_device(100, 2.0), 200);
+        assert_eq!(logical_to_device(-40, 1.5), -60);
+        assert_eq!(logical_to_device(7, 1.0), 7);
     }
 }

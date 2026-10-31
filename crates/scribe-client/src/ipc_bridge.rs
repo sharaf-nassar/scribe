@@ -1471,6 +1471,27 @@ impl IpcSink {
         })
     }
 
+    /// Ask the server to atomically tear one tab (and its panes) out into a
+    /// fresh window.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn transfer_tab(
+        &self,
+        transfer_id: u64,
+        workspace_id: WorkspaceId,
+        tab_session_id: SessionId,
+        target_window_id: WindowId,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::TransferTab {
+            transfer_id,
+            workspace_id,
+            tab_session_id,
+            target_window_id,
+        })
+    }
+
     /// Ask the server to atomically move one workspace into an existing window.
     ///
     /// Ids and one structural operation only: the server derives both

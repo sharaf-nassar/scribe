@@ -32,6 +32,7 @@ cleanup() {
     kill "${TAIL_PID:-}" 2>/dev/null || true
     kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
+    kill "${SWAY_PID:-}" 2>/dev/null || true
     kill "${NOTIFYD_PID:-}" 2>/dev/null || true
     kill "${PORTAL_PID:-}" 2>/dev/null || true
     kill "${PORTAL_GTK_PID:-}" 2>/dev/null || true
@@ -63,6 +64,19 @@ wait_for_window() {
         fi
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             echo "Timed out waiting for window: $name" >&2
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# Wait for a toplevel with `app_id` in sway's tree (the Wayland mode).
+wait_for_sway_window() {
+    local app_id="$1" timeout_secs="${2:-15}" started
+    started=$(date +%s)
+    until swaymsg -t get_tree 2>/dev/null | grep -q "\"app_id\": \"$app_id\""; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            echo "Timed out waiting for sway window: $app_id" >&2
             return 1
         fi
         sleep 0.2
@@ -329,14 +343,58 @@ XVFB_PID=$!
 export DISPLAY=:99
 sleep 0.5
 
-# A window manager must own _NET_ACTIVE_WINDOW: the GPUI client's active-window
-# guard (mirroring crates/scribe-client/src/x11_focus.rs) suppresses synthetic
-# key input whenever that root property does not name our window, and only a WM
-# sets it under Xvfb. openbox also gives xdotool a real window to focus and
-# raise before scrot captures the frame.
-openbox &
-WM_PID=$!
-sleep 0.6
+# SCRIBE_DISPLAY_SERVER=wayland runs the client on Wayland instead: sway, nested
+# in this Xvfb through wlroots' X11 backend, is the compositor. The nesting is
+# what gives sway's seat a real pointer: xdotool input on this Xvfb reaches sway
+# as its own seat's motion and buttons, serials included. (Its headless backend
+# has no pointer, and `swaymsg seat ... cursor set` does not deliver motion to a
+# surface holding an implicit grab, so neither can drive a held drag.) Tests
+# read window placement from `swaymsg -t get_tree` and capture with grim. No X
+# window manager runs, and the client is started without DISPLAY.
+DISPLAY_SERVER="${SCRIBE_DISPLAY_SERVER:-x11}"
+case "$DISPLAY_SERVER" in
+    x11)
+        # A window manager must own _NET_ACTIVE_WINDOW: the GPUI client's
+        # active-window guard (mirroring crates/scribe-client/src/x11_focus.rs)
+        # suppresses synthetic key input whenever that root property does not
+        # name our window, and only a WM sets it under Xvfb. openbox also gives
+        # xdotool a real window to focus and raise before scrot captures the
+        # frame.
+        openbox &
+        WM_PID=$!
+        sleep 0.6
+        ;;
+    wayland)
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/scribe-visual-runtime-$(id -u)}"
+        mkdir -p "$XDG_RUNTIME_DIR"
+        chmod 700 "$XDG_RUNTIME_DIR"
+        SWAY_CONFIG=/tmp/scribe-e2e-sway.config
+        cat >"$SWAY_CONFIG" <<CFG
+output * resolution ${RESOLUTION} position 0 0
+default_border none
+default_floating_border none
+focus_follows_mouse no
+# Floating, so a window carried by its tab moves freely instead of re-tiling.
+for_window [app_id="scribe"] floating enable
+CFG
+        WLR_BACKENDS=x11 WLR_RENDERER=pixman WLR_X11_OUTPUTS=1 \
+            sway -c "$SWAY_CONFIG" >/output/sway.log 2>&1 &
+        SWAY_PID=$!
+        for _ in $(seq 1 80); do
+            SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1 || true)
+            WAYLAND_DISPLAY=$(cd "$XDG_RUNTIME_DIR" && ls wayland-? 2>/dev/null | head -1 || true)
+            [ -n "$SWAYSOCK" ] && [ -n "$WAYLAND_DISPLAY" ] && break
+            sleep 0.25
+        done
+        [ -n "$SWAYSOCK" ] && [ -n "$WAYLAND_DISPLAY" ] \
+            || { echo "FATAL: sway never came up" >&2; cat /output/sway.log >&2; exit 2; }
+        export SWAYSOCK WAYLAND_DISPLAY
+        ;;
+    *)
+        echo "Unsupported SCRIBE_DISPLAY_SERVER value: $DISPLAY_SERVER" >&2
+        exit 2
+        ;;
+esac
 
 UID_DIR="/run/user/$(id -u)/scribe"
 mkdir -p "$UID_DIR"
@@ -451,10 +509,17 @@ case "$VISUAL_APP" in
         # runtime behaviour that leaves no pixels behind (e.g. the config
         # watcher's "config hot-reloaded" line) instead of guessing from a
         # screenshot diff.
-        scribe-client >"$SCRIBE_CLIENT_LOG" 2>&1 &
-        APP_PID=$!
-        export SCRIBE_CLIENT_PID="$APP_PID"
-        wait_for_window "Scribe" 15 || true
+        if [ "$DISPLAY_SERVER" = "wayland" ]; then
+            env -u DISPLAY scribe-client >"$SCRIBE_CLIENT_LOG" 2>&1 &
+            APP_PID=$!
+            export SCRIBE_CLIENT_PID="$APP_PID"
+            wait_for_sway_window scribe 20 || true
+        else
+            scribe-client >"$SCRIBE_CLIENT_LOG" 2>&1 &
+            APP_PID=$!
+            export SCRIBE_CLIENT_PID="$APP_PID"
+            wait_for_window "Scribe" 15 || true
+        fi
         if [ "${SCRIBE_SHARED_PANE:-0}" = "1" ]; then
             # Attaching is a full Hello / ListSessions / AttachSessions /
             # SessionReplay round trip. Gate on the client's own "attaching to

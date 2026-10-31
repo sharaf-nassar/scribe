@@ -2528,31 +2528,88 @@ drag markers (`TabDrag` and the view's `RegionTabDrag`) carry a
 painted width and the bar's height, and GPUI's native drag overlay paints it at
 the press offset inside the tab's hitbox, so the ghost starts exactly where the
 tab was under the pointer and follows it anywhere in the window, over the bar
-it will be dropped on included. The slot it left is painted as
-[[crates/scribe-client/src/titlebar.rs#drag_placeholder]], a dashed
-accent-outlined card in the workspace's tab tone, because a dimmed copy of a
-title every tab in the bar shares was no landmark at all. The earlier in-bar
+it will be dropped on included. The ghost is a lifted card: opaque (a
+translucent one let the strip and the tab beneath bleed through its title),
+rounded on every corner, filled a step above the open-tab fill
+([[crates/scribe-client/src/tab_bar.rs#lifted_tone]], the fill pulled 14%
+toward the text colour) and outlined in the accent, capped with a 2px accent
+bar, with a two-layer drop shadow, and it rises a few pixels out of the strip
+as it is picked up. The fill step exists because the open-tab fill is the
+terminal background, which on a theme with a pure black background (`wez`) is
+black on a near-black strip: the card in hand read as an empty slot, and its
+shadow vanished on black. The
+`on_drag` constructor records GPUI's grab offset in the ghost so a later
+settle can start from exactly where the card was painted. While the pointer
+is still in the source bar the slot it left is
+[[crates/scribe-client/src/titlebar.rs#drag_placeholder]], an empty recess in
+the strip's own tone that keeps the eye on the card in hand. The earlier in-bar
 slide was clamped to the source bar, so a tab dragged toward another region
 visibly stayed home while the move committed on release, and users read that
 as the drag doing nothing.
 
-The bar a cross-section drag is aimed at paints
-[[crates/scribe-client/src/titlebar.rs#drop_marker]] at the slot boundary the
-release will use: [[crates/scribe-client/src/main.rs#TerminalView#tab_subtree_drop_marker]]
-resolves the live `TabSubtreeDropTarget` into window coordinates with the same
-equal-share geometry `tab_bar_insertion_index` divides by, and the view draws
-it as a root child beside the workspace drag layers, so neither bar needs to
-know about the other's drag. The mark spans the whole band in the theme accent
-and the ghost card is translucent (`GHOST_OPACITY`): the resolved boundary is
-within half a slot of the pointer, which is under the ghost, so a mark the
-ghost could hide would never be seen, and an unnamed region's muted identity
-tone was too faint to read through it. `update_tab_subtree_drag` notifies the view when
-the target changes, which is what repaints the mark as the pointer crosses
-slots.
+A bar a drag is aimed at opens a gap where the tab will land
+([[crates/scribe-client/src/titlebar.rs#drop_gap]]): a landing card, an accent
+hairline over a faint accent tint, one slot wide, pushing the later tabs
+aside. At the same time the dragged tab's own slot closes
+([[crates/scribe-client/src/titlebar.rs#narrowed_slot]]), and it reopens if the
+pointer comes back. The gap's slot is the boundary `tab_bar_insertion_index`
+resolves, in the same equal-share geometry
+([[crates/scribe-client/src/main.rs#TerminalView#tab_drop_slot_rect]]). This
+replaced a 3px insertion mark plus an accent outline and wash over the whole
+receiving workspace, which read as noise and still left the landing slot to be
+inferred.
+
+Every one of those widths moves through
+[[crates/scribe-client/src/tab_drop_motion.rs#TabDropMotion]], a pure tween set
+retargeted from wherever each width is now. GPUI's `with_animation` restarts
+from its start value when its key changes, so the first version could open a
+gap but not move one: the gap jumped between slots, and a lower bar's closed
+slot snapped back open. Gaps are keyed by the tab beside them
+([[crates/scribe-client/src/tab_drop_motion.rs#GapSlot]]: before a tab, after a
+bar's last tab, or in an empty bar), never by index, so the keys are unique
+across a window's bars and a tab arriving cannot shift a gap onto its
+neighbour. Moving between slots closes the old gap while the new one opens,
+their widths summing to one slot, so the tabs between them slide; crossing
+bars closes one bar's gap as the next opens. With motion off (`reduce_motion`,
+which the visual E2E image sets) every width lands at once.
+
+The shell resolves one [[crates/scribe-client/src/tab_drop_motion.rs#TabDropTarget]]
+per frame in [[crates/scribe-client/src/main.rs#TerminalView#sync_tab_drop_motion]]:
+the gap, and the closed slot (the dragged tab while it is aimed elsewhere, or
+a released tab still on its way). It animates the lower region bars it paints
+from its own motion and hands the titlebar the same target in a
+[[crates/scribe-client/src/titlebar.rs#TitlebarDropPreview]]; the titlebar
+animates its groups from its own copy. Each requests animation frames only
+while a width is moving.
+
+Release is held until the server's list moves the tab
+([[crates/scribe-client/src/main.rs#TerminalView#begin_tab_drop_settle]]):
+the ghost settles from where GPUI last painted it into the gap, the gap stays
+open, and the tab's old slot stays closed. Without the hold the round trip
+showed the tab back in its old slot and the gap snapped shut, then both jumped
+again when the list arrived. The hold ends as soon as the tab arrives, or after
+`TAB_DROP_SETTLE_HOLD` if the move was refused. On the frame the tab arrives its
+gap is snapped shut rather than closed, because the tab now fills it and a gap
+still closing beside it would leave two slots of room for one tab; the
+`landings` count in the titlebar's preview carries that one-frame event. A cross-window drop hands the
+destination's preview to its own settle
+([[crates/scribe-client/src/main.rs#TerminalView#settle_guest_tab_drop]]).
 
 A titlebar drag that leaves its own group bar is never treated as a jittered click on release (`DragState::left_bar`). That path exists so an engaged-but-unmoved press still selects its tab, but a drag aimed at another section never reorders either, and selecting it switched the source section onto the dragged tab just before the move took it away: the source then showed a neighbour instead of the tab it had been showing, and the selection's own attach and tree report raced the move.
 
-A release anywhere over another workspace's region lands too, not only over its bar: [[crates/scribe-client/src/main.rs#TerminalView#region_body_tab_subtree_target]] resolves a pointer over the region's panes, boards, or bands to that workspace with the tab appended last, after the top-row and lower-bar targets have declined. A drag aimed at a workspace routinely ends a few pixels into its panes, and the bar is only 36px tall, so before this the most natural gesture resolved no target and the release silently did nothing. While any target is live the receiving workspace is outlined and lightly tinted in the theme accent alongside the slot mark, because with the ghost over a pane the 3px mark alone is easy to miss. The overlay wrapper is absolutely pinned to the window: the root is a flex column, and an unpositioned wrapper laid out below the status bar and took its absolutely placed children off-screen.
+A release anywhere over another workspace's region lands too, not only over its bar: [[crates/scribe-client/src/main.rs#TerminalView#region_body_tab_subtree_target]] resolves a pointer over the region's panes, boards, or bands to that workspace with the tab appended last, after the top-row and lower-bar targets have declined. A drag aimed at a workspace routinely ends a few pixels into its panes, and the bar is only 36px tall, so before this the most natural gesture resolved no target and the release silently did nothing. The workspace's bar opens its gap at the end, which is where such a drop lands.
+
+### Tabs between and out of windows
+
+A tab drag can leave its window: into a sibling window's bar or region, out into a new window of its own, or, for a window's only tab, carrying the whole window with it.
+
+[[crates/scribe-client/src/main.rs#TerminalView#update_tab_subtree_drag]] decides the outcome on every pointer move, and the order is the priority. A sibling window under the pointer wins: [[crates/scribe-client/src/main.rs#TerminalView#resolve_external_tab_drop]] asks each sibling, through [[crates/scribe-client/src/main.rs#TerminalView#adopt_guest_tab_drop]], whether the root-relative pointer is over one of its bars or regions, with the same `tab_subtree_target_at` geometry a local drop uses and no region excluded. That sibling then opens its landing gap and paints the ghost card itself, because GPUI cannot paint a drag view outside the window that owns it. This is X11 only, gated like workspace drags by `cross_window_pointer_supported`; Wayland and macOS use the palette rows for this destination. Next, [[crates/scribe-client/src/workspace_drag.rs#tab_tear_armed]] arms tear-out once the pointer leaves the window or sits in its left, right, or bottom 8px band; the top band is excluded because the tab strip lives there, and no bar under the pointer ever arms. While armed inside the window, [[crates/scribe-client/src/titlebar.rs#new_window_chip]] rides beside the pointer next to GPUI's ghost. Once the pointer leaves the window GPUI paints nothing, so the user saw nothing in hand and no sign of what a release would do; [[crates/scribe-client/src/main.rs#TabTearPreview]] takes over there: a small `WindowKind::PopUp` window (override-redirect on X11, placed by the client through [[crates/scribe-client/src/monitor.rs#place_popup]], never focused or managed) that follows the pointer and shows a miniature of the window a release opens, the tab card in its strip over a pane band reading "New window". The tab card is placed under the grab point exactly as the in-window ghost was, so the hand-over at the edge is seamless. It is made click-through with an empty input shape ([[crates/scribe-client/src/monitor.rs#make_click_through]]) so the X server's hit test still names the real window under the pointer, which is what sibling drops depend on. It closes when the pointer comes back in, lands over a sibling (which paints its own ghost), or the drag ends. Wayland has no root pointer to place it with, so it keeps the chip alone. Only when neither applies does the in-window target from earlier sections resolve.
+
+Release ends every bar's own drag state first ([[crates/scribe-client/src/main.rs#TerminalView#finish_tab_subtree_drag]] calls the titlebar's `end_drag` and clears the region bar's). The bars normally do that from their own mouse-up listeners, but a release outside the window reaches a bar only through GPUI's capture-phase `on_mouse_up_out`, where the root's handler runs first and stops propagation; left set, the titlebar went on painting whichever tab next occupied the dragged slot as the tab in hand, a blank recess with no title, after every tear-out. Release then commits one of three server transactions, none of which moves anything locally. A sibling target sends a cross-window `MoveWorkspace` with `MoveTab` ([[crates/scribe-client/src/main.rs#TerminalView#commit_external_tab_drop]]). An armed tear-out sends `TransferTab` through [[crates/scribe-client/src/main.rs#TerminalView#begin_tab_transfer]], which reuses the workspace tear-out coordinator, so retries, idempotency, and the claimed-window open at the release point with the source size are shared; `WorkspaceTransferRequest::tab` selects the frame, and a retry waits for a connection that negotiated `tab_transfer`, since an older server cannot decode `TransferTab`. An in-window target keeps its same-window `MoveTab`.
+
+A window's only tab never tears out into a second window; dragging it out carries the window itself, as a browser does, and needs no server transaction. Where no sibling can be a target (Wayland, macOS, an older server, or a lone window), arming calls [[crates/scribe-client/src/main.rs#TerminalView#hand_sole_tab_to_window_move]], which ends the drag and hands the window to the compositor's live `start_window_move`. On X11 with other windows open that handoff would be wrong: the live move owns the pointer for the rest of the gesture, and a sweep toward a sibling crosses this window's edge band and the gap between windows first, so the window would be carried along instead of its tab being dropped. There the drag stays a drag, a sibling under the pointer still wins, and a release over empty desktop places the window at the release point with the grab point under the cursor ([[crates/scribe-client/src/main.rs#TerminalView#carry_window_to_release]]). Dropping a window's last tab into a sibling closes the empty source.
+
+Every drop shows and focuses the tab where it lands. The server activates the moved tab in its destination leaf, and [[crates/scribe-client/src/main.rs#TerminalView#apply_pending_drop_focus]] focuses its region (and, for a cross-window drop, raises the window) once the authoritative list puts the tab there. It deliberately waits for that list, since activating the tab while it still sat in its source would switch the source onto it just before the move took it away. Escape and window blur cancel a held drag and clear any sibling preview; blur previously cancelled only workspace drags. The palette's `MoveTabToNewWindow` and `MoveTabToWindow` rows reach the same two transactions without a pointer, on every platform.
 
 Reordering only happens while the pointer is inside the dragged tab's own bar.
 `TitlebarView::update_drag` takes the full pointer and freezes the slot when
@@ -2629,6 +2686,12 @@ Verifies a drag carried out of its own group bar and released without reordering
 ### Out-of-range interactions are no-ops
 
 Verifies that select, close, and begin-drag on out-of-range indices leave the tab list unchanged and emit no events, so stray hit targets cannot corrupt state.
+
+### Tab tear-out arms past the window edge
+
+Verifies a tab drag arms tear-out once the pointer leaves the window, or sits in its 8px left, right, or bottom band, but never in the top band (the tab strip itself) or over a tab bar.
+
+An armed drag holds until the pointer is strictly more than 24px inside, and a bar under the pointer disarms it at once.
 
 ### Accessibility IDs survive tab reordering
 
@@ -2938,6 +3001,10 @@ The settings row's destination is another top-level window: it lowers onto `KeyA
 ### Palette base entries and update row
 
 Verifies  leads with "Open Settings" and ends with the remote-connect row, and that  appends the "Update Scribe to v{version}" row only when an update is available.
+
+### Palette tab move rows
+
+Verifies the tab-move rows lead with "Move tab to new window" and add one "Move tab to {region} in {window}" row per eligible sibling window, each carrying that window and region as its destination.
 
 ### Palette profile rows tag the active profile
 
@@ -3313,7 +3380,7 @@ A workspace can also land in a window that already exists.
 
 The palette is the platform-neutral path. [[crates/scribe-client/src/command_palette.rs#workspace_move_entries]] offers each eligible window exactly two deterministic rows — one insert at the destination region's right edge, one centre swap — and the swap row carries [[crates/scribe-client/src/workspace_drag.rs#swap_hint_text]] as a dimmed explanatory line, which is the same sentence the pointer's centre zone paints. It is part of the row rather than a hover tooltip because a keyboard-driven palette never produces a hover.
 
-Pointer targeting is X11-only. `TerminalView::cross_window_pointer_supported` gates it: X11 publishes every window's mapped, root-relative frame and keeps delivering drag motion past the source surface, while Wayland exposes neither a global cursor nor client window positions and macOS has no sanctioned native proof for the shipped pill, so both keep the palette as their complete cross-window path. Whether the pointer has even left this window is decided from the size GPUI already holds, so an in-window rearrange issues no X11 round trip; only once it is outside does [[crates/scribe-client/src/monitor.rs#mapped_window_bounds]] measure the frame that turns a window-local pointer into a root position. [[crates/scribe-client/src/main.rs#TerminalView#adopt_guest_drop]] then hands that root position to each sibling, which resolves it through the same viewport, divider veto, and [[crates/scribe-client/src/workspace_drag.rs#zone_at]] rule the local drag uses and paints the result with the very same zone element — one preview surface and one `AnimationSettings` for both windows, not a second overlay system. A resolved sibling suppresses tear arming, so the release commits a move instead of detaching.
+Pointer targeting is X11-only. `TerminalView::cross_window_pointer_supported` gates it: X11 publishes every window's mapped, root-relative frame and keeps delivering drag motion past the source surface, while Wayland exposes neither a global cursor nor client window positions and macOS has no sanctioned native proof for the shipped pill, so both keep the palette as their complete cross-window path. Who owns the pointer is [[crates/scribe-client/src/main.rs#TerminalView#drag_pointer_owner]]'s answer, shared by workspace and tab drags. Inside this window it is this window's, decided from the size GPUI already holds, so an in-window rearrange issues no X11 round trip, unless a sibling overlaps this window (measured once per drag), because a sibling stacked above can cover part of it. Otherwise [[crates/scribe-client/src/monitor.rs#mapped_window_bounds]] turns the window-local pointer into a root position and [[crates/scribe-client/src/monitor.rs#toplevel_at]] asks the X server which top-level is visible there: `TranslateCoordinates` from the root to itself names the root child under the point, walking children top-down and honouring input shapes. Only the sibling whose top-level ([[crates/scribe-client/src/monitor.rs#toplevel_of]], its window manager frame) is that window is probed, so where two Scribe windows overlap the drop goes to the one on top, and a window of another application covering a sibling blocks a drop into it. Before this the first sibling by window id whose rect held the pointer won, which put one of every two overlapping drops into the window underneath. All of this is in logical pixels: the monitor module scales the X server's device pixels by the window's scale factor on the way in and out (`apply_saved_position` takes logical positions too), because a root position built from device pixels plus a logical pointer resolved sibling targets, and placed carried and torn-out windows, twice as far away at scale 2. Tear-outs open at the root origin X11 measures (`root_window_bounds`) rather than GPUI's cached origin, which a reparenting window manager can leave frame-relative. [[crates/scribe-client/src/main.rs#TerminalView#adopt_guest_drop]] then hands that root position to each sibling, which resolves it through the same viewport, divider veto, and [[crates/scribe-client/src/workspace_drag.rs#zone_at]] rule the local drag uses and paints the result with the very same zone element — one preview surface and one `AnimationSettings` for both windows, not a second overlay system. A resolved sibling suppresses tear arming, so the release commits a move instead of detaching.
 
 A centre target explains itself through [[crates/scribe-client/src/workspace_drag.rs#swap_hint]], which returns wording only for `Center` and takes the destination region's usable name or generic wording when it has none. The sentence lives on the zone element itself, and only the fading-*in* live target carries it: an edge transition, cancel, Escape, or blur drops the wording on the frame it happens rather than letting it ride out the highlight's own fade, so no residue survives either path. `tests/e2e/visual/workspace-cross-window.sh` drives both palette rows plus measured X11 edge and centre drops, while `workspace-drag-tearout.sh` retains the same-window preview matrix.
 
