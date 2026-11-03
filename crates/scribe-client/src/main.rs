@@ -8959,7 +8959,7 @@ impl TerminalView {
     /// region stacked below gets the legacy client's in-region bar here, at
     /// the top of its rect, above the panes [`PaneShell::placements`] already
     /// shrank to make room.
-    /// One [`tab_bridge`] per open tab whose pane card sits directly under its
+    /// One [`paint_tab_bridge`] per open tab whose pane card sits directly under its
     /// bar: the titlebar's measured runs for top-row regions, the equal-share
     /// slot for a lower region's own bar.
     ///
@@ -8967,27 +8967,28 @@ impl TerminalView {
     /// bridge, since its open tab opens onto that band instead. The bridge is
     /// clipped to the card's straight top edge so it can never square off a
     /// corner.
-    fn render_tab_bridges(&self, cx: &App) -> Vec<gpui::AnyElement> {
+    ///
+    /// Titlebar tabs flex, so their boxes exist only once the titlebar's
+    /// prepaint has measured them, after this render. The bridges are therefore
+    /// one canvas that reads those boxes when it paints: prepaint covers the
+    /// whole window before any paint, so a bridge always lands on the card
+    /// painted in the same frame.
+    fn render_tab_bridges(&self, cx: &App) -> Option<gpui::AnyElement> {
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
-            return Vec::new();
+            return None;
         }
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
         let fill = surface(self.terminal_colors.background, self.opacity);
-        let origin = self.workspace_drag_grid_origin();
+        let top_row: Vec<(WorkspaceId, Rect)> = self
+            .shell
+            .workspace_rects(viewport, cx)
+            .into_iter()
+            .filter(|(_, rect)| rect.y <= f32::EPSILON)
+            .collect();
+        let titlebar_runs = self.titlebar.read(cx).open_tab_runs();
         // (workspace, bar bottom, left, width, edge), in grid pixels.
         let mut runs: Vec<(WorkspaceId, f32, f32, f32, gpui::Rgba)> = Vec::new();
-        for (left, width, edge) in self.titlebar.read(cx).open_tab_runs() {
-            let left = left - origin.x;
-            let Some((workspace_id, _)) =
-                self.shell.workspace_rects(viewport, cx).into_iter().find(|(_, rect)| {
-                    rect.y <= f32::EPSILON && rect.x <= left && left < rect.x + rect.width
-                })
-            else {
-                continue;
-            };
-            runs.push((workspace_id, 0.0, left, width, edge));
-        }
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
         for (workspace_id, rect) in self.shell.region_bar_rects(viewport, self.tab_bar_height, cx) {
             let Some(bar) =
@@ -9011,12 +9012,28 @@ impl TerminalView {
                 edge,
             ));
         }
-        runs.into_iter()
-            .filter_map(|(workspace_id, bar_bottom, left, width, edge)| {
-                let bridge = tab_bridge_rect(&placements, workspace_id, bar_bottom, left, width)?;
-                Some(tab_bridge(&bridge, fill, edge))
-            })
-            .collect()
+        let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
+            let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let titlebar = titlebar_runs.read().into_iter().filter_map(|(left, width, edge)| {
+                let left = left - origin.0;
+                let (workspace_id, _) = top_row
+                    .iter()
+                    .find(|(_, rect)| rect.x <= left && left < rect.x + rect.width)?;
+                Some((*workspace_id, 0.0, left, width, edge))
+            });
+            let bridges = titlebar.chain(runs.iter().copied()).filter_map(
+                |(workspace_id, bar_bottom, left, width, edge)| {
+                    Some((
+                        tab_bridge_rect(&placements, workspace_id, bar_bottom, left, width)?,
+                        edge,
+                    ))
+                },
+            );
+            for (bridge, edge) in bridges {
+                paint_tab_bridge(window, origin, &bridge, fill, edge);
+            }
+        };
+        Some(canvas(|_, _, _| {}, paint).absolute().inset_0().into_any_element())
     }
 
     fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -18420,39 +18437,40 @@ struct TabBridge {
 /// below it: it covers the window-ground gap and the card's top border under
 /// the tab, carrying the card's side outline down, so tab and pane read as
 /// one surface.
-fn tab_bridge(bridge: &TabBridge, fill: gpui::Rgba, edge: gpui::Rgba) -> gpui::AnyElement {
+///
+/// `origin` is the grid's window position, which the bridge's grid-pixel
+/// rect is relative to.
+fn paint_tab_bridge(
+    window: &mut Window,
+    origin: (f32, f32),
+    bridge: &TabBridge,
+    fill: gpui::Rgba,
+    edge: gpui::Rgba,
+) {
     let TabBridge { rect, cap_left, cap_right } = *bridge;
+    let quad = |x: f32, y: f32, width: f32, height: f32, left: bool, right: bool| {
+        let side = |on: bool| px(if on { 1.0 } else { 0.0 });
+        gpui::quad(
+            Bounds::new(point(px(origin.0 + x), px(origin.1 + y)), size(px(width), px(height))),
+            px(0.0),
+            fill,
+            gpui::Edges { top: px(0.0), right: side(right), bottom: px(0.0), left: side(left) },
+            edge,
+            gpui::BorderStyle::default(),
+        )
+    };
+    window.paint_quad(quad(rect.x, rect.y, rect.width, rect.height, true, true));
     // A squared corner runs the card's side outline straight down over its
     // curve; the cap sits inside the card's content padding, so no glyph is
     // under it.
-    let cap = |x: f32, outer_left: bool| {
-        div()
-            .absolute()
-            .left(px(x))
-            .top(px(rect.y + rect.height))
-            .w(px(PANE_CARD_RADIUS))
-            .h(px(PANE_CARD_RADIUS - PANE_BORDER_WIDTH))
-            .bg(fill)
-            .when(outer_left, gpui::Styled::border_l_1)
-            .when(!outer_left, gpui::Styled::border_r_1)
-            .border_color(edge)
-            .into_any_element()
-    };
-    let strip = div()
-        .absolute()
-        .left(px(rect.x))
-        .top(px(rect.y))
-        .w(px(rect.width))
-        .h(px(rect.height))
-        .bg(fill)
-        .border_l_1()
-        .border_r_1()
-        .border_color(edge);
-    div()
-        .child(strip)
-        .children(cap_left.then(|| cap(rect.x, true)))
-        .children(cap_right.then(|| cap(rect.x + rect.width - PANE_CARD_RADIUS, false)))
-        .into_any_element()
+    let (cap_y, cap_h) = (rect.y + rect.height, PANE_CARD_RADIUS - PANE_BORDER_WIDTH);
+    if cap_left {
+        window.paint_quad(quad(rect.x, cap_y, PANE_CARD_RADIUS, cap_h, true, false));
+    }
+    if cap_right {
+        let x = rect.x + rect.width - PANE_CARD_RADIUS;
+        window.paint_quad(quad(x, cap_y, PANE_CARD_RADIUS, cap_h, false, true));
+    }
 }
 
 fn pane_card(

@@ -114,6 +114,34 @@ pub fn open_tab_edge(tab: &TabData, colors: &TabBarColors) -> Option<Rgba> {
     }
 }
 
+/// The titlebar's open tabs, resolved to painted boxes only when read.
+///
+/// Taken while the shell renders, read while it paints. GPUI runs prepaint for
+/// the whole window before any paint, so a read from a paint callback sees the
+/// boxes this frame's geometry probes recorded rather than the last frame's,
+/// which left the bridge under a moved card offset until something unrelated
+/// repainted the shell.
+pub struct OpenTabRuns {
+    measured: Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
+    edges: Vec<(usize, Rgba)>,
+}
+
+impl OpenTabRuns {
+    /// Painted `(left, width, edge)` of every open tab, in window pixels. A
+    /// tab no frame has painted yet has nothing to join to.
+    #[must_use]
+    pub fn read(&self) -> Vec<(f32, f32, Rgba)> {
+        let measured = self.measured.borrow();
+        self.edges
+            .iter()
+            .filter_map(|&(index, edge)| {
+                let (left, width) = measured.get(index).copied()?;
+                (left.is_finite() && width > 0.0).then_some((left, width, edge))
+            })
+            .collect()
+    }
+}
+
 /// Pointer travel, in pixels, required before an armed press on the move region
 /// hands the window to the compositor. Absorbs the jitter of an ordinary click
 /// so a wobbly press on empty chrome does not turn into a window move.
@@ -458,7 +486,7 @@ pub struct TitlebarView {
     /// rather than a constant, and side-by-side regions give each group its
     /// own width. Drag-reorder geometry has to use what the user is looking
     /// at, not the basis it started from.
-    measured_tabs: std::rc::Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
+    measured_tabs: Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
     /// The shell's resolved tab drag: the landing gap and closed slot.
     drop_preview: TitlebarDropPreview,
     /// The animated widths `drop_preview` is moving toward, and the landing
@@ -838,23 +866,19 @@ impl TitlebarView {
         })
     }
 
-    /// Painted `(left, width, edge)` of every open tab, in window pixels, for
-    /// the grid to bridge each one into the pane card below it.
-    ///
-    /// Measured geometry only: a tab no frame has painted yet has nothing to
-    /// join to.
+    /// Every open tab and its edge, for the grid to bridge each one into the
+    /// pane card below it once the frame's tab boxes exist.
     #[must_use]
-    pub fn open_tab_runs(&self) -> Vec<(f32, f32, Rgba)> {
-        let measured = self.measured_tabs.borrow();
-        self.tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tab)| {
-                let edge = open_tab_edge(tab, &self.colors)?;
-                let (left, width) = measured.get(index).copied()?;
-                (left.is_finite() && width > 0.0).then_some((left, width, edge))
-            })
-            .collect()
+    pub fn open_tab_runs(&self) -> OpenTabRuns {
+        OpenTabRuns {
+            measured: Rc::clone(&self.measured_tabs),
+            edges: self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tab)| Some((index, open_tab_edge(tab, &self.colors)?)))
+                .collect(),
+        }
     }
 
     /// Whether a titlebar control owns keyboard focus. The shell uses this to
@@ -2012,6 +2036,39 @@ mod tests {
             assert!(children.agent_indicator.is_some());
             assert!(children.ai_indicator.is_some());
         });
+    }
+
+    // @lat: [[client#GPUI Titlebar#Open tab runs read the frame that painted them]]
+    #[gpui::test]
+    fn open_tab_runs_read_the_frame_that_painted_them(cx: &mut TestAppContext) {
+        let colors = TabBarColors::from(&minimal_dark().chrome);
+        let window = cx.add_window(|_, cx| {
+            let mut bar = TitlebarView::new(colors, TEST_TAB_BAR_HEIGHT, cx);
+            let mut open = TabData::new("open".to_owned());
+            open.shown = TabShown::from_active(true);
+            bar.set_tabs(vec![open], cx);
+            bar
+        });
+        let bar = window.root(cx).expect("titlebar root");
+        let first = bar.read_with(cx, |bar, _| bar.open_tab_runs().read());
+        assert_eq!(first.len(), 1, "the opening paint measured the open tab");
+
+        // A tab opens ahead of the open one, moving its card right. The runs
+        // are taken as the shell takes them, after the strip changed and before
+        // the frame that lays it out.
+        let runs = bar.update(cx, |bar, cx| {
+            let mut open = TabData::new("open".to_owned());
+            open.shown = TabShown::from_active(true);
+            bar.set_tabs(vec![TabData::new("new".to_owned()), open], cx);
+            bar.open_tab_runs()
+        });
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw titlebar");
+        let painted = bar.read_with(cx, |bar, _| bar.tab_geometry(1, 0.0));
+        let moved = runs.read();
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].0 > first[0].0, "the open card moved right");
+        assert!((moved[0].0 - painted.0).abs() < 0.5 && (moved[0].1 - painted.1).abs() < 0.5);
     }
 
     #[gpui::test]
