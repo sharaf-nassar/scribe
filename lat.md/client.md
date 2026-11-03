@@ -2432,7 +2432,7 @@ the click. The same pattern is used by the settings window titlebar.
 ### Keyboard operation
 
 Every interactive titlebar control is a GPUI tab stop in painted order: tabs,
-their close targets, equalize when visible, settings, then
+their mirror and close targets, equalize when visible, settings, then
 minimize, maximize, and close.
 
 Their tracked focus handles are explicit tab stops with one shared tab index,
@@ -2443,6 +2443,8 @@ Every tab's close node stays mounted in that order at zero opacity until its
 tab is active or hovered, its tab has focus, or the close node itself has
 focus. This keeps forward and reverse traversal stable because pinned GPUI
 registers only mounted focus handles; focus reveals the glyph on the next frame.
+The magnifier beside it ([[client#Client#GPUI Titlebar#Tab mirrors]]) follows
+the same rule, but only hover or its own focus reveals it.
 
 Tab traversal is scoped to the chrome: once a chrome control has focus, Tab
 advances that order and Shift+Tab reverses it, and focused controls paint the
@@ -2628,6 +2630,24 @@ the user held, the subtree drag reset to that tab's identity, and the release
 resolved no move at all, which left the top row of a wide window the only bars a
 tab could not cross. The cross-region transfer belongs to the shell's release
 path, so the titlebar now declines it by construction.
+
+### Tab mirrors
+
+A magnifier beside a hovered tab's close button opens that tab's focused pane in a floating window centred over the source window. The mirror stays bound to that pane session and repaints with it.
+
+Both tab bars carry it. [[crates/scribe-client/src/titlebar.rs#TitlebarView]] emits `TitlebarEvent::MirrorTab` from [[crates/scribe-client/src/titlebar.rs#magnifier_icon]]'s control, which has its own tab stop between the tab and its close node. A lower region bar shows the same mark through a GPUI group hover. Both reach [[crates/scribe-client/src/mirror_window.rs#TerminalView#open_tab_mirror]], which resolves the tab's focused pane through [[crates/scribe-client/src/pane_shell.rs#PaneShell#tab_focused_session]] once and never retargets it, opens a window centred on the source window's live rect, and records it. Several mirrors may be open at once.
+
+A mirror opens at the size the user last resized one to, or at 60% of the source window before any resize, never under 360x220 and never larger than the display it opens on. [[crates/scribe-client/src/mirror_window.rs#MirrorView]] observes its window bounds and hands every report that is not the size it opened at to [[crates/scribe-client/src/mirror_size.rs]], skipping maximized, fullscreen, and tiled states because that size is the compositor's. The size is shared by every window in the process and written to `mirror_state.toml` under the flavor's state root, at most once per 400 ms of a drag-resize, from a detached task so closing the mirror cannot drop the write. The position is deliberately not remembered: a mirror always opens centred over the window that opened it, shifted only as far as needed to stay on that display.
+
+A mirror is a second rendering of the pane's published grid, not a second attachment. The server lets one connection attach a window's sessions and a second one would be refused, so [[crates/scribe-client/src/mirror_window.rs#MirrorView]] reads the source view's [[crates/scribe-client/src/terminal.rs#PaneFrame]] directly and paints it with the source's font, palette, and opacity. It observes the source view for repaints, and [[crates/scribe-client/src/main.rs#TerminalView#capture_pane_frames]] counts every mirrored session as placed in the redraw signal's visible set, so output from a tab hidden behind another one still wakes the frame that repaints its mirror.
+
+The PTY keeps the size the tab gave it, because one program can only draw for one size. The mirror instead re-wraps the tab's visible screen onto its own cells ([[crates/scribe-client/src/mirror_window.rs#rewrap]]): soft-wrapped rows are joined, trailing padding and blank rows below the cursor are dropped, and lines are re-chunked at the mirror's width with the cursor carried along. A mirror with more rows than the tab fills from the scrollback just above the tab's screen, as a taller terminal would: it asks the pane through [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#set_history_rows]] to publish that many rows (scaled up when the mirror is wider, since joined rows shrink) with every snapshot in [[crates/scribe-client/src/terminal.rs#PaneFrame]], and the request is dropped once no mirror shows the session. Without it a tall mirror painted the tab's screen at the top and left the rest blank. A program that laid out to the tab's width itself (Claude Code's input box, for example) re-wraps raggedly when the mirror is narrower. On the alternate screen, re-wrapping would scramble a full-screen program, so the grid keeps the tab's cells and the font is scaled to fit. Scrollback, selection, links, find, terminal images, mouse input, and IME are not mirrored.
+
+Keystrokes typed into a mirror go to its session through [[crates/scribe-client/src/mirror_window.rs#TerminalView#mirror_key_down]], encoded with that session's own negotiated keyboard mode. The Ctrl+Z guard for AI-launched sessions applies there too. Fixed terminal-shortcut bytes still reach the session, but bound layout and overlay chords are dropped, because they act on the source window's panes and tabs. The exception is paste: it is routed to the mirror's session through the same confirmation gate, which holds the target until the gate answers.
+
+The mirror draws its own minimal chrome instead of the window manager's titlebar. It opens with `WindowDecorations::Client`, and [[crates/scribe-client/src/mirror_window.rs#MirrorView]] renders one card in the pane's own background: a 22px strip holding the dim tab title, the pin switch, and a close button, over the grid. Under client decorations the card wears the pane divider as a 1px outline with the pane card's 8px radius, and the window keeps a transparent resize gutter on each untiled side. It reuses the settings window's edge hit-testing ([[crates/scribe-client/src/settings/window.rs#resize_edge]], [[crates/scribe-client/src/settings/window.rs#resize_cursor_overlay]]), which hands a press there to `Window::start_window_resize`. A left press anywhere on the strip outside its controls arms a move, and the first motion with the button held calls `Window::start_window_move`, the same press-arm-move the settings titlebar uses because both Linux backends ignore `WindowControlArea::Drag`. X11 without a compositor refuses client decorations, so there the window manager's frame stays, the gutter and outline are dropped, and the strip simply sits at the top of the client area.
+
+A mirror is kept on top by default. On X11 the window opens as a normal window with `_NET_WM_STATE_ABOVE` asserted through [[crates/scribe-client/src/monitor.rs#set_always_on_top]] at map time, then checked and re-sent every 100 ms (for up to 3 s) until the window manager reports it, because a request sent before the window is managed is silently dropped. The pin switch in its chrome strip removes or restores that state. Wayland has no always-on-top protocol and GPUI fixes a macOS window's level at creation, so there the mirror opens as GPUI's `Floating` kind above its parent and shows no switch. A mirror closes itself when its session leaves the source window (closed, exited, or moved to another window) and when the source view is released, so a mirror never outlives the terminal window that owns its session.
 
 ### Context suffix bands and suppression
 

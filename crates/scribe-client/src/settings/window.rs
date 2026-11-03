@@ -130,7 +130,7 @@ const THEME_PRESET_DEBOUNCE: Duration = Duration::from_millis(250);
 /// [`WindowBackgroundAppearance::Opaque`] — the gutter is a solid painted frame,
 /// not Zed's translucent drop shadow, so it has to read as chrome rather than as
 /// stray padding.
-const RESIZE_GUTTER: Pixels = px(6.0);
+pub const RESIZE_GUTTER: Pixels = px(6.0);
 
 /// Ceiling on the whole-pixel scroll units the content pane's scrollbar
 /// geometry counts in. A settings page is nowhere near 65 535 pixels tall, and
@@ -3479,7 +3479,7 @@ impl EntityInputHandler for SettingsWindow {
 
 /// Edge tiling reported for the window, or "nothing tiled" under server
 /// decorations where the app never draws a gutter in the first place.
-fn client_tiling(decorations: Decorations) -> Tiling {
+pub fn client_tiling(decorations: Decorations) -> Tiling {
     match decorations {
         Decorations::Server => Tiling::default(),
         Decorations::Client { tiling } => tiling,
@@ -3492,7 +3492,7 @@ fn client_tiling(decorations: Decorations) -> Tiling {
 /// Corners take a square of `gutter * 1.5` so diagonal resizes stay reachable;
 /// tiled sides are excluded because a tiled or maximized edge cannot be dragged.
 /// Mirrors the geometry of Zed's `client_side_decorations` helper.
-fn resize_edge(
+pub fn resize_edge(
     pos: Point<Pixels>,
     gutter: Pixels,
     window_size: Size<Pixels>,
@@ -3546,7 +3546,7 @@ const fn resize_cursor(edge: ResizeEdge) -> CursorStyle {
 /// never swallows a click; it exists purely so [`Window::set_cursor_style`] has
 /// a hovered hitbox to attach to, and it paints last so its cursor wins over the
 /// content beneath it.
-fn resize_cursor_overlay(tiling: Tiling) -> impl IntoElement {
+pub fn resize_cursor_overlay(tiling: Tiling) -> impl IntoElement {
     canvas(
         |_bounds, window, _cx| {
             let bounds =

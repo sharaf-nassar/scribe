@@ -66,6 +66,10 @@ cursor to; because it never blocks the mouse, it cannot eat a click. A
 `resize_edge` change recorded on the view triggers the repaint that swaps the
 cursor glyph.
 
+`RESIZE_GUTTER`, `client_tiling`, `resize_edge`, and `resize_cursor_overlay`
+are public so the tab mirror's client-side frame resizes by the same contract
+rather than a copy of it; see [[client#Client#GPUI Titlebar#Tab mirrors]].
+
 ### Move contract
 
 The titlebar keeps its `WindowControlArea::Drag` declarations — that hit-test hook is what moves the window on Windows — and adds an explicit press/move pair, because both Linux backends implement `on_hit_test_window_control` as an empty body.

@@ -142,6 +142,8 @@ pub enum TitlebarEvent {
     SelectTab { index: usize, source: TabActivationSource },
     /// A tab's close button was clicked.
     CloseTab(usize),
+    /// A tab's magnifier was clicked: open its focused pane in a mirror window.
+    MirrorTab(usize),
     /// A tab finished a drag-reorder from `from` to `to`.
     ReorderTab { from: usize, to: usize },
     /// The equalize icon was clicked (equalize the active tab's panes).
@@ -375,6 +377,7 @@ struct TabChildren {
     agent_indicator: Option<AnyElement>,
     ai_indicator: Option<AnyElement>,
     suffix: Option<AnyElement>,
+    mirror: Option<AnyElement>,
     close: Option<AnyElement>,
     mark: Option<AnyElement>,
 }
@@ -391,6 +394,7 @@ impl TabChildren {
             // tab and the visible text rides up.
             .child(div().flex_1().truncate().child(self.display))
             .children(self.suffix)
+            .children(self.mirror)
             .children(self.close)
     }
 }
@@ -402,7 +406,15 @@ struct TabRender<'a> {
     foreground: Rgba,
     id: &'a ElementId,
     focused: bool,
-    close_focused: bool,
+    control_focus: TabControlFocus,
+}
+
+/// Which of a tab's own controls holds keyboard focus, if either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TabControlFocus {
+    None,
+    Mirror,
+    Close,
 }
 
 /// A workspace pill whose region currently has no terminal tabs.
@@ -435,6 +447,7 @@ pub struct TitlebarView {
     move_arm: Option<Point<Pixels>>,
     focus_handle: FocusHandle,
     tab_focus_handles: Vec<FocusHandle>,
+    tab_mirror_focus_handles: Vec<FocusHandle>,
     tab_close_focus_handles: Vec<FocusHandle>,
     equalize_focus_handle: FocusHandle,
     beads_focus_handles: Vec<FocusHandle>,
@@ -471,6 +484,7 @@ impl TitlebarView {
             move_arm: None,
             focus_handle: cx.focus_handle(),
             tab_focus_handles: Vec::new(),
+            tab_mirror_focus_handles: Vec::new(),
             tab_close_focus_handles: Vec::new(),
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
             beads_focus_handles: Vec::new(),
@@ -602,10 +616,12 @@ impl TitlebarView {
         self.tabs = tabs;
         while self.tab_focus_handles.len() < self.tabs.len() {
             self.tab_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
+            self.tab_mirror_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
             self.tab_close_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
             self.beads_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
         }
         self.tab_focus_handles.truncate(self.tabs.len());
+        self.tab_mirror_focus_handles.truncate(self.tabs.len());
         self.tab_close_focus_handles.truncate(self.tabs.len());
         self.beads_focus_handles.truncate(self.tabs.len());
         cx.notify();
@@ -658,6 +674,7 @@ impl TitlebarView {
         };
         self.tabs.remove(index);
         self.tab_focus_handles.remove(index);
+        self.tab_mirror_focus_handles.remove(index);
         self.tab_close_focus_handles.remove(index);
         self.beads_focus_handles.remove(index);
         if was_active && !self.tabs.is_empty() {
@@ -801,6 +818,8 @@ impl TitlebarView {
         self.tabs.insert(to, tab);
         let focus = self.tab_focus_handles.remove(from);
         self.tab_focus_handles.insert(to, focus);
+        let mirror_focus = self.tab_mirror_focus_handles.remove(from);
+        self.tab_mirror_focus_handles.insert(to, mirror_focus);
         let close_focus = self.tab_close_focus_handles.remove(from);
         self.tab_close_focus_handles.insert(to, close_focus);
         let beads_focus = self.beads_focus_handles.remove(from);
@@ -842,6 +861,7 @@ impl TitlebarView {
     /// avoid taking focus back to the terminal during an ordinary repaint.
     pub fn has_keyboard_focus(&self, window: &Window) -> bool {
         self.tab_focus_handles.iter().any(|handle| handle.is_focused(window))
+            || self.tab_mirror_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.tab_close_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.equalize_focus_handle.is_focused(window)
             || self.beads_focus_handles.iter().any(|handle| handle.is_focused(window))
@@ -951,6 +971,31 @@ pub fn beads_graph_icon(color: Rgba) -> AnyElement {
         .child(
             div().absolute().left(px(2.0)).bottom(px(1.0)).size(px(4.0)).rounded_full().bg(color),
         )
+        .into_any_element()
+}
+
+/// Magnifier mark for the tab-mirror control: a ring and a stepped handle,
+/// shared by both tab-bar renderers.
+#[must_use]
+pub fn magnifier_icon(color: Rgba) -> AnyElement {
+    let step = |at: f32| div().absolute().left(px(at)).top(px(at)).size(px(2.0)).bg(color);
+    div()
+        .relative()
+        .flex_none()
+        .size(px(12.0))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .size(px(8.0))
+                .rounded_full()
+                .border_1()
+                .border_color(color),
+        )
+        .child(step(7.0))
+        .child(step(8.0))
+        .child(step(9.0))
         .into_any_element()
 }
 
@@ -1104,8 +1149,62 @@ impl TitlebarView {
             .into_any_element()
     }
 
+    fn tab_control_focus(&self, index: usize, window: &Window) -> TabControlFocus {
+        let holds = |handles: &[FocusHandle]| {
+            handles.get(index).is_some_and(|focus| focus.is_focused(window))
+        };
+        if holds(&self.tab_close_focus_handles) {
+            TabControlFocus::Close
+        } else if holds(&self.tab_mirror_focus_handles) {
+            TabControlFocus::Mirror
+        } else {
+            TabControlFocus::None
+        }
+    }
+
+    /// The hover-only magnifier beside a tab's close button, which opens the
+    /// tab in a mirror window. Mounted like the close node, collapsed while
+    /// hidden, so Tab traversal stays stable and focus can still reveal it.
+    fn render_tab_mirror(&self, close: TabClose<'_>, cx: &mut Context<Self>) -> AnyElement {
+        let TabClose { index, id: tab_id, title, foreground: fg, visible, focused } = close;
+        let Some(focus) = self.tab_mirror_focus_handles.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        div()
+            .id((tab_id, "mirror"))
+            .role(Role::Button)
+            .aria_label(format!("Open {title} in a mirror window"))
+            .track_focus(&focus)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .w(if visible { px(14.0) } else { px(0.0) })
+            .when(visible, gpui::Styled::ml_1)
+            .opacity(if visible { 1.0 } else { 0.0 })
+            .when(focused, |this| this.bg(self.colors.accent))
+            .child(magnifier_icon(if focused { self.colors.active_text } else { fg }))
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(
+                cx.listener(move |_, _, _window, ctx| ctx.emit(TitlebarEvent::MirrorTab(index))),
+            )
+            .on_key_down(cx.listener(move |_, event: &KeyDownEvent, window, ctx| {
+                ctx.stop_propagation();
+                if Self::focus_next_or_previous(event, window, ctx) {
+                    return;
+                }
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    ctx.emit(TitlebarEvent::MirrorTab(index));
+                }
+            }))
+            .into_any_element()
+    }
+
     fn render_tab_children(&self, render: TabRender<'_>, cx: &mut Context<Self>) -> TabChildren {
-        let TabRender { index, tab, foreground, id, focused, close_focused } = render;
+        let TabRender { index, tab, foreground, id, focused, control_focus } = render;
+        let close_focused = control_focus == TabControlFocus::Close;
+        let mirror_focused = control_focus == TabControlFocus::Mirror;
         // No column budget here. The label is a flex child with `truncate`, so
         // it already ends in an ellipsis exactly where the tab runs out of
         // room; pre-cutting it to a fixed 22-column slot only made every title
@@ -1120,6 +1219,17 @@ impl TitlebarView {
         });
         let visible =
             tab.is_focused() || self.hovered_tab == Some(index) || focused || close_focused;
+        let mirror = Some(self.render_tab_mirror(
+            TabClose {
+                index,
+                id: id.clone(),
+                title: &tab.title,
+                foreground,
+                visible: self.hovered_tab == Some(index) || mirror_focused,
+                focused: mirror_focused,
+            },
+            cx,
+        ));
         let close = Some(self.render_tab_close(
             TabClose {
                 index,
@@ -1140,7 +1250,7 @@ impl TitlebarView {
         // "which tab is open here".
         let mark =
             tab.is_focused().then(|| focus_mark(tab.group_accent.unwrap_or(self.colors.accent)));
-        TabChildren { display, agent_indicator, ai_indicator, suffix, close, mark }
+        TabChildren { display, agent_indicator, ai_indicator, suffix, mirror, close, mark }
     }
 
     /// The Tab-key focus ring: an absolute child, not a border, because a
@@ -1180,12 +1290,9 @@ impl TitlebarView {
         // back, and a ring that flashed then read as the card's edge breaking.
         let focused =
             tab_focus.is_focused(focused_window) && focused_window.last_input_was_keyboard();
-        let close_focused = self
-            .tab_close_focus_handles
-            .get(index)
-            .is_some_and(|focus| focus.is_focused(focused_window));
+        let control_focus = self.tab_control_focus(index, focused_window);
         let children = self.render_tab_children(
-            TabRender { index, tab, foreground: fg, id: &tab_id, focused, close_focused },
+            TabRender { index, tab, foreground: fg, id: &tab_id, focused, control_focus },
             cx,
         );
 
@@ -1898,7 +2005,7 @@ mod tests {
                     foreground: bar.colors.text,
                     id: &id,
                     focused: false,
-                    close_focused: false,
+                    control_focus: super::TabControlFocus::None,
                 },
                 cx,
             );

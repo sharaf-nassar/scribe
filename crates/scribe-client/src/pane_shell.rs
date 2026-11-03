@@ -857,6 +857,11 @@ impl PaneShell {
         self.shown_tabs.get(&workspace_id).and_then(|tab| self.focused.get(tab)).copied()
     }
 
+    /// The session in `tab`'s focused pane, shown or dormant.
+    pub fn tab_focused_session(&self, tab: SessionId) -> Option<SessionId> {
+        self.focused.get(&tab).and_then(|pane| self.sessions.get(pane)).copied()
+    }
+
     /// The session the focused pane is showing.
     pub fn focused_session(&self, cx: &App) -> Option<SessionId> {
         self.focused_pane(cx).and_then(|pane| self.sessions.get(&pane).copied())

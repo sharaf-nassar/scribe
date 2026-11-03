@@ -1,6 +1,8 @@
 //! GPUI Scribe client over Scribe's frozen local IPC protocol.
 
 mod ipc_bridge;
+mod mirror_size;
+mod mirror_window;
 mod pane_shell;
 mod session_lifecycle;
 mod sync_frames;
@@ -174,7 +176,8 @@ use scribe_client::{
         TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag, TabDragGhost,
         TitlebarDropPreview, TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource,
         agent_active_glyph, badge_width_px, beads_graph_icon, drag_placeholder, drop_gap,
-        focus_mark, narrowed_slot, new_window_chip, open_tab_edge, tab_card, workspace_pill_dot,
+        focus_mark, magnifier_icon, narrowed_slot, new_window_chip, open_tab_edge, tab_card,
+        workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -2338,6 +2341,11 @@ struct TerminalView {
     x11_focus: Option<X11FocusGuard>,
     /// Pair a swallowed press with its release even after focus/modifiers change.
     swallowed_suspend_z: bool,
+    /// Floating windows mirroring one of this window's pane sessions.
+    mirrors: Vec<mirror_window::TabMirror>,
+    /// The session a paste waiting on the confirmation gate is bound for, when
+    /// a tab mirror rather than the focused pane asked for it.
+    paste_target: Option<SessionId>,
     /// IME composition state, handed to the platform by the focused pane's
     /// paint pass. Owning it here (rather than per pane) matches the platform:
     /// a window has exactly one input handler, and it belongs to whichever pane
@@ -3284,6 +3292,8 @@ impl TerminalView {
             jump_button_focus: HashMap::new(),
             x11_focus,
             swallowed_suspend_z: false,
+            mirrors: Vec::new(),
+            paste_target: None,
             ime: Self::start_ime(cx),
             bell,
             notifications,
@@ -3538,6 +3548,7 @@ impl TerminalView {
                     this.close_tab(slot.session_id, ctx);
                 }
             }
+            TitlebarEvent::MirrorTab(index) => this.mirror_titlebar_tab(*index, ctx),
             TitlebarEvent::Equalize => this.equalize_layout(ctx),
             TitlebarEvent::BeadsHover { index, hovered } => {
                 let Some(workspace_id) = this.titlebar_slot(*index).map(|slot| slot.workspace_id)
@@ -3585,6 +3596,14 @@ impl TerminalView {
     /// than acting on whichever tab now happens to sit at that position.
     fn titlebar_slot(&self, titlebar_index: usize) -> Option<TabAddress> {
         self.titlebar_slots.get(titlebar_index).copied()
+    }
+
+    /// Open the titlebar tab at `titlebar_index` in a mirror window.
+    fn mirror_titlebar_tab(&mut self, titlebar_index: usize, cx: &mut Context<Self>) {
+        let Some(slot) = self.titlebar_slot(titlebar_index) else { return };
+        let tabs = self.titlebar.read(cx).tabs();
+        let title = tabs.get(titlebar_index).map(|tab| tab.title.clone()).unwrap_or_default();
+        self.open_tab_mirror(slot.session_id, &title, cx);
     }
 
     /// Drain a pending config-file change and reapply it to the live window.
@@ -4223,10 +4242,16 @@ impl TerminalView {
         } else {
             Vec::new()
         };
+        let mirrored = self.live_mirror_sessions(cx);
         // Publish visibility before reading any frame: a concurrent commit is
         // either captured below or wakes the next render, including on reveal.
+        // A mirrored session counts as placed so its output repaints the mirror.
         if let Ok(mut visible) = self.shared.generation.visible.lock() {
-            *visible = placements.iter().filter_map(|placement| placement.session_id).collect();
+            *visible = placements
+                .iter()
+                .filter_map(|placement| placement.session_id)
+                .chain(mirrored)
+                .collect();
         }
         self.render_frames = Some(
             placements
@@ -5112,6 +5137,7 @@ impl TerminalView {
             }
             DialogOutcome::Paste(PasteConfirmationAction::Cancel) => {
                 tracing::info!("paste dropped at the confirmation");
+                self.paste_target = None;
                 self.clipboard.gate.update(cx, |gate, _| gate.cancel());
             }
             DialogOutcome::Clipboard(action) => {
@@ -5278,8 +5304,14 @@ impl TerminalView {
     /// Paste the system clipboard into the focused pane (the `paste` chord and
     /// the context menu's Paste row).
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.paste_clipboard_into(None, cx);
+    }
+
+    /// Paste the system clipboard into `target`, or the focused pane for `None`
+    /// (a tab mirror names its own session).
+    fn paste_clipboard_into(&mut self, target: Option<SessionId>, cx: &mut Context<Self>) {
         match self.clipboard.handle.read(ClipboardSelection::Clipboard) {
-            Ok(text) => self.request_paste(&text, cx),
+            Ok(text) => self.request_paste_into(&text, target, cx),
             Err(error) => tracing::debug!(?error, "paste ignored: host clipboard unavailable"),
         }
     }
@@ -5303,12 +5335,26 @@ impl TerminalView {
     /// into DEC 2004 can already tell pasted bytes from typed ones, so the gate
     /// stands down and the markers are added instead.
     fn request_paste(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.request_paste_into(text, None, cx);
+    }
+
+    /// [`Self::request_paste`] aimed at `target`, held until the gate answers.
+    fn request_paste_into(
+        &mut self,
+        text: &str,
+        target: Option<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
         if text.is_empty() {
             return;
         }
+        let pane = target.map_or_else(|| self.focused_pane(), |session| self.pane_for(session));
         let bracketed =
-            self.with_focused_grid(|terminal| terminal.bracketed_paste()).unwrap_or(false);
-        self.clipboard.gate.update(cx, |gate, ctx| gate.request(text, bracketed, ctx));
+            pane.and_then(|pane| pane.with_terminal(|terminal| terminal.bracketed_paste()));
+        self.paste_target = target;
+        self.clipboard.gate.update(cx, |gate, ctx| {
+            gate.request(text, bracketed.unwrap_or(false), ctx);
+        });
     }
 
     /// Route the paste gate's decision: deliver now, or raise the confirmation.
@@ -5316,7 +5362,8 @@ impl TerminalView {
         match event {
             PasteGateEvent::Send { text, bracketed } => {
                 tracing::info!(bytes = text.len(), bracketed, "delivering a paste to the pane");
-                self.deliver_paste(&text, bracketed);
+                let target = self.paste_target.take();
+                self.deliver_paste(&text, bracketed, target);
             }
             PasteGateEvent::Confirm(parked) => {
                 tracing::info!(bytes = parked.text.len(), "paste parked behind the confirmation");
@@ -5356,7 +5403,7 @@ impl TerminalView {
                 bytes = insertion.len(),
                 "inserting a dropped file path into the focused pane"
             );
-            self.deliver_paste(&insertion, bracketed);
+            self.deliver_paste(&insertion, bracketed, None);
         }
         cx.notify();
     }
@@ -5364,9 +5411,12 @@ impl TerminalView {
     /// Send resolved paste bytes to the focused pane, split into frames the
     /// server's `KeyInput` size limit accepts and wrapped in the DEC 2004
     /// markers when the application asked for them.
-    fn deliver_paste(&self, text: &str, bracketed: bool) {
+    fn deliver_paste(&self, text: &str, bracketed: bool, target: Option<SessionId>) {
         for chunk in paste_chunks(text, bracketed) {
-            self.send_key_bytes(chunk);
+            match target {
+                Some(session_id) => self.send_session_key_bytes(session_id, chunk),
+                None => self.send_key_bytes(chunk),
+            }
         }
     }
 
@@ -8667,9 +8717,7 @@ impl TerminalView {
         let FocusedPanePaint { ime, cursor } = focused;
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
-            if let Ok(mut visible) = self.shared.generation.visible.lock() {
-                visible.clear();
-            }
+            self.retain_mirrored_visible();
             self.pane_bounds.clear();
             self.visible_ai_sessions.clear();
             self.pane_content_views.clear();
@@ -8755,6 +8803,12 @@ impl TerminalView {
                 pane.into_any_element()
             })
             .collect()
+    }
+
+    /// Empty the placed set except for sessions a tab mirror still shows.
+    fn retain_mirrored_visible(&self) {
+        let Ok(mut visible) = self.shared.generation.visible.lock() else { return };
+        visible.retain(|session| self.mirrors.iter().any(|mirror| mirror.session_id == *session));
     }
 
     fn mount_pane_content(
@@ -11215,6 +11269,8 @@ impl TerminalView {
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
+        let hover_group = format!("region-tab-{session_id}");
+        let mirror = Self::region_tab_mirror(session_id, &tab.title, (fg, &hover_group), cx);
         let close = tab.is_focused().then(|| {
             div()
                 .id(ElementId::from(format!("region-tab-close-{session_id}")))
@@ -11232,6 +11288,7 @@ impl TerminalView {
         });
         let element = div()
             .id(ElementId::from(format!("region-tab-{session_id}")))
+            .group(hover_group)
             .relative()
             .flex()
             .items_center()
@@ -11267,10 +11324,36 @@ impl TerminalView {
                     // visible text rides up.
                     .child(div().flex_1().truncate().child(display))
                     .children(suffix)
+                    .child(mirror)
                     .children(close)
             })
             .into_any_element();
         Some(element)
+    }
+
+    /// A lower-bar tab's magnifier, shown while the tab's `hover_group` is
+    /// hovered. Pointer-only, like the rest of this bar.
+    fn region_tab_mirror(
+        session_id: SessionId,
+        title: &str,
+        (color, hover_group): (gpui::Rgba, &str),
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mirror_title = title.to_owned();
+        div()
+            .id(ElementId::from(format!("region-tab-mirror-{session_id}")))
+            .role(gpui::Role::Button)
+            .aria_label(format!("Open {title} in a mirror window"))
+            .flex_none()
+            .w(px(0.0))
+            .invisible()
+            .group_hover(hover_group.to_owned(), |style| style.visible().w(px(12.0)).ml_1())
+            .cursor_pointer()
+            .child(magnifier_icon(color))
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(cx.listener(move |view, _, _window, ctx| {
+                view.open_tab_mirror(session_id, &mirror_title, ctx);
+            }))
     }
 
     /// Focus an empty region through its retained pane.
@@ -13137,20 +13220,9 @@ impl TerminalView {
         if self.run_share_key(event, cx) {
             return;
         }
-        let key = &event.keystroke;
-        let modifiers = key.modifiers;
-        if key.key.eq_ignore_ascii_case("z")
-            && modifiers.control
-            && !modifiers.alt
-            && !modifiers.shift
-            && !modifiers.platform
-            && !modifiers.function
-            && self.focused_session().is_some_and(|session| {
-                self.shared
-                    .ai_launch_origin
-                    .lock()
-                    .is_ok_and(|origins| origins.get(&session) == Some(&true))
-            })
+        if self
+            .focused_session()
+            .is_some_and(|session| self.guards_suspend(session, &event.keystroke))
         {
             self.swallowed_suspend_z = true;
             return;
@@ -13206,16 +13278,42 @@ impl TerminalView {
     /// Read for every generic press/repeat/release so focus changes, alternate
     /// screens, and Kitty push/pop operations take effect on the next event.
     fn focused_terminal_mode(&self) -> TerminalMode {
+        self.focused_session()
+            .map_or_else(TerminalMode::legacy, |session| self.session_terminal_mode(session))
+    }
+
+    /// [`Self::focused_terminal_mode`] for any one session's pane.
+    fn session_terminal_mode(&self, session_id: SessionId) -> TerminalMode {
         let enhanced = self.config.config().config.terminal.keyboard_protocol_enhanced;
-        self.focused_pane()
+        self.pane_for(session_id)
             .and_then(|pane| pane.keyboard_mode(enhanced))
             .unwrap_or_else(TerminalMode::legacy)
     }
 
     fn focused_pane_is_codex(&self) -> bool {
-        self.focused_session().and_then(|session_id| {
-            self.shared.ai.lock().ok()?.tracker.provider_for_session(session_id)
-        }) == Some(AiProvider::CodexCode)
+        self.focused_session().is_some_and(|session| self.session_is_codex(session))
+    }
+
+    fn session_is_codex(&self, session_id: SessionId) -> bool {
+        self.shared.ai.lock().ok().and_then(|ai| ai.tracker.provider_for_session(session_id))
+            == Some(AiProvider::CodexCode)
+    }
+
+    /// Whether `key` is the bare Ctrl+Z Scribe swallows for `session_id`: only
+    /// a session it proved it launched as AI, so a stray suspend cannot stop it.
+    fn guards_suspend(&self, session_id: SessionId, key: &gpui::Keystroke) -> bool {
+        let modifiers = key.modifiers;
+        key.key.eq_ignore_ascii_case("z")
+            && modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.platform
+            && !modifiers.function
+            && self
+                .shared
+                .ai_launch_origin
+                .lock()
+                .is_ok_and(|origins| origins.get(&session_id) == Some(&true))
     }
 
     /// Whether a `ControlRequested` grant/deny prompt is currently modal.
@@ -13275,8 +13373,9 @@ impl TerminalView {
     /// every keystroke except `Enter`, which submits and therefore ends the
     /// "compose while reading" session. Ported one-for-one from the winit
     /// client's `send_key_bytes` seam.
-    fn snap_to_bottom_for_input(&self, bytes: &[u8]) {
-        let snapped = self.with_focused_grid(|terminal| {
+    fn snap_to_bottom_for_input(&self, session_id: SessionId, bytes: &[u8]) {
+        let Some(pane) = self.pane_for(session_id) else { return };
+        let snapped = pane.with_terminal(|terminal| {
             if terminal.display_offset() == 0 {
                 return None;
             }
@@ -13299,7 +13398,12 @@ impl TerminalView {
         let Some(session_id) = session_id else {
             return;
         };
-        self.snap_to_bottom_for_input(&bytes);
+        self.send_session_key_bytes(session_id, bytes);
+    }
+
+    /// Enqueue already-encoded bytes for one session, wherever it is shown.
+    fn send_session_key_bytes(&self, session_id: SessionId, bytes: Vec<u8>) {
+        self.snap_to_bottom_for_input(session_id, &bytes);
         if let Err(error) = self.sink.key_input(session_id, bytes, true) {
             tracing::warn!(%error, "keystroke refused");
             self.report_refused_input(error);

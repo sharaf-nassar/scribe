@@ -299,6 +299,22 @@ pub fn assert_window_state(window: &Window, state: WindowState) -> bool {
     x11::add_placement_state(window, state)
 }
 
+/// Keep a window above every other one (`_NET_WM_STATE_ABOVE`), or let it
+/// stack normally again.
+///
+/// Returns whether the request was sent: false off X11 and on a window manager
+/// that does not advertise the state. Like every EWMH state change it only
+/// lands once the window manager manages the window.
+pub fn set_always_on_top(window: &Window, above: bool) -> bool {
+    x11::set_above(window, above)
+}
+
+/// Whether the window manager reports the window kept on top. False off X11.
+#[must_use]
+pub fn is_always_on_top(window: &Window) -> bool {
+    x11::has_above(window)
+}
+
 #[cfg(target_os = "linux")]
 mod x11 {
     use std::cell::OnceCell;
@@ -622,6 +638,32 @@ mod x11 {
         .is_some()
     }
 
+    pub(super) fn has_above(window: &Window) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            let property = intern(conn, b"_NET_WM_STATE")?;
+            let above = intern(conn, b"_NET_WM_STATE_ABOVE")?;
+            let reply = conn
+                .get_property(false, xid, property, AtomEnum::ATOM, 0, 64)
+                .ok()?
+                .reply()
+                .ok()?;
+            reply.value32()?.any(|atom| atom == above).then_some(())
+        })
+        .is_some()
+    }
+
+    pub(super) fn set_above(window: &Window, above: bool) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            let atom = supported_atom(conn, root, b"_NET_WM_STATE_ABOVE")?;
+            let action = if above { WM_STATE_ADD } else { WM_STATE_REMOVE };
+            set_wm_state(conn, root, xid, action, &[atom]).then_some(())
+        })
+        .is_some()
+    }
+
     pub(super) fn configure_position_only(window: &Window, x: i32, y: i32) -> bool {
         let Some(xid) = xcb_window_id(window) else { return false };
         with_connection(|conn| configure_position(conn, xid, x, y).then_some(())).is_some()
@@ -850,6 +892,14 @@ mod x11 {
     }
 
     pub(super) fn add_placement_state(_window: &Window, _state: WindowState) -> bool {
+        false
+    }
+
+    pub(super) fn set_above(_window: &Window, _above: bool) -> bool {
+        false
+    }
+
+    pub(super) fn has_above(_window: &Window) -> bool {
         false
     }
 

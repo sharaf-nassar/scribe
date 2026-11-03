@@ -3103,6 +3103,12 @@ Focused unit regressions cover structured and legacy Pi launch representation be
 
 Both forms require Bash/Zsh/unknown-shell `pi; exit $?`, fish `pi; exit $status`, nushell `pi; exit $env.LAST_EXIT_CODE`, and PowerShell's existing `pi` command form. Zsh and fish assertions retain the restore-delta preamble. Structured Pi ignores malformed resume metadata, so no Pi argv can carry a resume flag or conversation id. A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`. Structured provider compatibility and the v8 handoff gate are covered separately by [[test#Test Harness#Pi Provider Compatibility]].
 
+### Tab mirrors open, repaint, type, and pin
+
+`tests/e2e/visual/tab-mirror.sh` (`just e2e-visual-tab-mirror`) drives a tab mirror through the shared-pane rig, so the tab's output and the mirror's keystrokes are observable on one session.
+
+The hover magnifier is located as the only difference between a resting and a hovered titlebar capture, so the test proves it shows only on hover and clicks exactly where it painted. The mirror must open centred over its window with `_NET_WM_STATE_ABOVE` set, repaint when the session prints, and deliver typed keystrokes that `scribe-test wait-output` sees evaluated. Its strip's pin switch must clear and restore that state, and its close button must close the mirror without touching the terminal window. A resize must publish no new pane grid, proving the mirror re-wraps instead of resizing the tab's PTY, and a reopened mirror must open at that resized size, centred over the terminal rather than where the last one was dragged, with the size saved to `mirror_state.toml`, then close once its session exits. The container's X11 has no compositor, so this run exercises the window-manager-frame fallback; the client-side frame is only drawn where a compositor grants it. See [[client#Client#GPUI Titlebar#Tab mirrors]].
+
 ### Tab switching is live
 
 `tests/e2e/visual/tab-switching.sh` proves live tab switching and post-click typing by driving keyboard shortcuts and titlebar clicks in a two-tab window, then requiring matching `AttachSessions` frames plus typed output from the active session.
@@ -5564,6 +5570,48 @@ Applying spans to one resolved row leaves every cell outside them untouched, giv
 The overlay can only ask; the sink is what turns the ask into a frame, so the lowering is asserted on the outbound channel.
 
  enqueues a `ClientMessage::SearchRequest` naming the session, the query verbatim, and the 256-match limit.
+
+### Tab mirror re-wrap
+
+Pins [[crates/scribe-client/src/mirror_window.rs#rewrap]], the pure step that lets a mirror show a tab's screen at its own size while the PTY keeps the tab's.
+
+See [[client#Client#GPUI Titlebar#Tab mirrors]] for the surface these feed.
+
+#### Narrowing re-wraps a line and follows the cursor
+
+A line wider than the mirror is re-chunked onto more rows, each padded to the mirror's width, and the shell cursor lands on the cell it marked in the tab.
+
+#### Widening joins soft-wrapped rows
+
+Rows the terminal soft-wrapped (`WRAPLINE` on their last cell) are joined back into one logical line when the mirror is wider, while hard line breaks stay breaks.
+
+#### A short mirror keeps the live bottom
+
+Blank rows below the cursor are dropped and the bottom of the re-wrapped screen is kept, so the live prompt stays in view in a mirror shorter than the tab.
+
+#### A wide character never splits
+
+A double-width character that would straddle the mirror's right edge moves whole to the next row together with its spacer cell.
+
+#### Scrollback fills a mirror taller than the tab
+
+Scrollback rows above the tab's screen fill a mirror with more rows than the tab, soft wraps join across that seam, and the cursor stays on the live line.
+
+A wider mirror asks for proportionally more history, because joined rows shrink.
+
+### Tab mirror size
+
+Pins how a tab mirror's opening size follows the last user resize, kept by [[crates/scribe-client/src/mirror_size.rs]] while the position is never remembered.
+
+#### A remembered size opens on the display
+
+With no resize yet a mirror opens at its share of the source window; once one exists, a remembered size wins.
+
+A size saved on a larger display is capped to the current display, the minimum floor still applies, and an overhanging mirror is shifted back on screen without being resized.
+
+#### A saved size is validated
+
+A written size reads back unchanged, while a side outside 100 to 16384 logical pixels or an unparseable file is ignored rather than opened, and fractional pixels round to whole ones.
 
 ### Cell-accurate paint path
 

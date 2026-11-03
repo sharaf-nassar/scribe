@@ -426,6 +426,11 @@ e2e-visual-settings-scrollbar: e2e-visual-image-current
 e2e-visual-tab-switching: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/tab-switching-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-switching.sh
 
+# Run the tab-mirror E2E through the shared-pane rig, so the mirror's typed
+# keystrokes and the tab's output are observable on one session.
+e2e-visual-tab-mirror image="scribe-test-visual": e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=120 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} "{{ image }}" /tests/visual/tab-mirror.sh
+
 # Run the maximized-restore E2E. It stops the client with SIGTERM the way the
 # package upgrade does and relaunches it, so it needs room for two client
 # starts.

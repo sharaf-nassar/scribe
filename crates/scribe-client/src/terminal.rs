@@ -303,6 +303,11 @@ pub struct DisplayOnlyTerminal {
     /// Scrollback capacity this grid was built with, restored after a
     /// [`Self::trim_history`] shrinks the ring to drop rows.
     scrollback_lines: usize,
+    /// Scrollback rows above the viewport a tab mirror taller than this pane
+    /// asked to see; `0` (no mirror) publishes none.
+    history_rows: usize,
+    /// Those rows, oldest first, rebuilt with every snapshot while requested.
+    history: Arc<Vec<Arc<Vec<Cell>>>>,
 }
 
 impl DisplayOnlyTerminal {
@@ -319,6 +324,8 @@ impl DisplayOnlyTerminal {
             content_revision: 0,
             content_stale: false,
             scrollback_lines,
+            history_rows: 0,
+            history: Arc::default(),
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
             selection_dragging: false,
@@ -770,6 +777,35 @@ impl DisplayOnlyTerminal {
         self.content.pin_rows != before
     }
 
+    /// Publish `rows` of scrollback above the viewport with every snapshot, or
+    /// stop with `0`, for a tab mirror taller than this pane.
+    pub fn set_history_rows(&mut self, rows: usize) {
+        if self.history_rows != rows {
+            self.history_rows = rows;
+            self.make_content();
+        }
+    }
+
+    /// The requested scrollback rows just above the viewport, oldest first.
+    // shortcut: rereads every requested row per snapshot while a mirror is
+    // open; cache rows by absolute line if mirrors show up in profiles.
+    fn read_history(&self) -> Arc<Vec<Arc<Vec<Cell>>>> {
+        if self.history_rows == 0 {
+            return Arc::default();
+        }
+        let offset = self.display_offset();
+        let take = self.history_rows.min(self.history_size().saturating_sub(offset));
+        let top = -grid_i32(offset);
+        let columns = self.term.columns();
+        Arc::new(
+            (0..take)
+                .map(|row| {
+                    Arc::new(Self::read_row(&self.term, top - grid_i32(take - row), columns))
+                })
+                .collect(),
+        )
+    }
+
     /// How many rows the split-scroll pin currently occupies (`0` when off).
     #[must_use]
     pub fn pin_rows(&self) -> usize {
@@ -1111,6 +1147,9 @@ impl DisplayOnlyTerminal {
             vi_cursor,
             shell_cursor,
         });
+        if self.history_rows > 0 || !self.history.is_empty() {
+            self.history = self.read_history();
+        }
         self.content_stale = false;
         self.term.reset_damage();
     }
@@ -1282,11 +1321,21 @@ pub struct PaneFrame {
     /// The split-scroll gate the grid was last given, so the shell can tell
     /// whether this projection already reflects the gate it wants to push.
     pub split_scroll: SplitScrollEligibility,
+    /// Whether the application is on the alternate screen, which a tab mirror
+    /// scales instead of re-wrapping.
+    pub alt_screen: bool,
+    /// Scrollback rows above the viewport a tab mirror asked for, oldest first.
+    pub history: Arc<Vec<Arc<Vec<Cell>>>>,
+    /// How many such rows were requested, so a mirror asks again only to grow.
+    pub history_rows: usize,
 }
 
 impl PaneFrame {
     fn capture(terminal: &DisplayOnlyTerminal) -> Self {
         Self {
+            history: Arc::clone(&terminal.history),
+            history_rows: terminal.history_rows,
+            alt_screen: terminal.term.mode().contains(TermMode::ALT_SCREEN),
             content: terminal.content(),
             image_scene: terminal.image_scene(),
             metrics: terminal.scroll_metrics(),
@@ -1351,6 +1400,11 @@ impl PaneGrid {
     #[must_use]
     pub fn frame(&self) -> Option<Arc<PaneFrame>> {
         self.published.lock().ok().map(|published| Arc::clone(&published))
+    }
+
+    /// Publish `rows` of scrollback with every frame, or stop with `0`.
+    pub fn set_history_rows(&self, rows: usize) {
+        self.with_terminal(|terminal| terminal.set_history_rows(rows));
     }
 
     /// Read this pane's negotiated keyboard mode without republishing its
@@ -1451,6 +1505,13 @@ impl PaneGrids {
         Arc::clone(
             self.grids.entry(session_id).or_insert_with(|| Arc::new(PaneGrid::new(columns, lines))),
         )
+    }
+
+    /// A handle on `session_id`'s pane only when one already exists, so a
+    /// lookup for an exited session never recreates its grid.
+    #[must_use]
+    pub fn existing(&self, session_id: SessionId) -> Option<Arc<PaneGrid>> {
+        self.grids.get(&session_id).map(Arc::clone)
     }
 
     /// Every live pane, so a caller can walk them all with the registry lock
