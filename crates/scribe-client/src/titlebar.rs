@@ -22,6 +22,7 @@ use gpui::{
 };
 use scribe_common::ids::{SessionId, WorkspaceId};
 
+use crate::painted_tabs::PaintedTabs;
 use crate::tab_bar::{
     GroupBadge, TabBarColors, TabData, TabShown, flash_blend, lifted_tone, pill_fill, px_units,
     reorder_target_index, tab_display_title,
@@ -111,34 +112,6 @@ pub fn open_tab_edge(tab: &TabData, colors: &TabBarColors) -> Option<Rgba> {
         Some(colors.pane_edge)
     } else {
         None
-    }
-}
-
-/// The titlebar's open tabs, resolved to painted boxes only when read.
-///
-/// Taken while the shell renders, read while it paints. GPUI runs prepaint for
-/// the whole window before any paint, so a read from a paint callback sees the
-/// boxes this frame's geometry probes recorded rather than the last frame's,
-/// which left the bridge under a moved card offset until something unrelated
-/// repainted the shell.
-pub struct OpenTabRuns {
-    measured: Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
-    edges: Vec<(usize, Rgba)>,
-}
-
-impl OpenTabRuns {
-    /// Painted `(left, width, edge)` of every open tab, in window pixels. A
-    /// tab no frame has painted yet has nothing to join to.
-    #[must_use]
-    pub fn read(&self) -> Vec<(f32, f32, Rgba)> {
-        let measured = self.measured.borrow();
-        self.edges
-            .iter()
-            .filter_map(|&(index, edge)| {
-                let (left, width) = measured.get(index).copied()?;
-                (left.is_finite() && width > 0.0).then_some((left, width, edge))
-            })
-            .collect()
     }
 }
 
@@ -291,8 +264,14 @@ pub struct TitlebarDropPreview {
 /// an accent hairline card over a faint accent tint (a solid accent tone read
 /// as a slab louder than the tab being dropped). Its width is animated by the
 /// caller's [`TabDropMotion`], so it can open, close, and slide between slots.
+/// It records its painted box as `slot`'s, where a released tab lands.
 #[must_use]
-pub fn drop_gap(width: f32, colors: &TabBarColors) -> AnyElement {
+pub fn drop_gap(
+    width: f32,
+    colors: &TabBarColors,
+    painted: &PaintedTabs,
+    slot: GapSlot,
+) -> AnyElement {
     let accent = colors.accent;
     div()
         .flex_none()
@@ -312,6 +291,7 @@ pub fn drop_gap(width: f32, colors: &TabBarColors) -> AnyElement {
                 .border_color(Rgba { a: 0.6, ..accent })
                 .bg(Rgba { a: 0.1, ..accent }),
         )
+        .child(painted.gap_probe(slot))
         .into_any_element()
 }
 
@@ -480,13 +460,9 @@ pub struct TitlebarView {
     equalize_focus_handle: FocusHandle,
     beads_focus_handles: Vec<FocusHandle>,
     standalone_beads_focus_handles: Vec<FocusHandle>,
-    /// Painted `(left, width)` of every tab, by strip index.
-    ///
-    /// Tabs flex to fill their group, so their geometry is a layout result
-    /// rather than a constant, and side-by-side regions give each group its
-    /// own width. Drag-reorder geometry has to use what the user is looking
-    /// at, not the basis it started from.
-    measured_tabs: Rc<std::cell::RefCell<Vec<(f32, f32)>>>,
+    /// Where every tab in the window was last painted. The titlebar's tabs
+    /// record into it, and the shell's lower region bars share the same one.
+    painted: PaintedTabs,
     /// The shell's resolved tab drag: the landing gap and closed slot.
     drop_preview: TitlebarDropPreview,
     /// The animated widths `drop_preview` is moving toward, and the landing
@@ -517,7 +493,7 @@ impl TitlebarView {
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
             beads_focus_handles: Vec::new(),
             standalone_beads_focus_handles: Vec::new(),
-            measured_tabs: std::rc::Rc::default(),
+            painted: PaintedTabs::default(),
             drop_preview: TitlebarDropPreview::default(),
             drop_motion: TabDropMotion::default(),
             drop_landings_seen: 0,
@@ -563,33 +539,14 @@ impl TitlebarView {
         })
     }
 
-    /// A zero-ink overlay that records the tab it sits in.
-    ///
-    /// Tabs flex, so their geometry is a layout result. The drag geometry
-    /// needs what the user is looking at, and this is the only place the
-    /// painted value exists.
-    fn tab_geometry_probe(&self, index: usize) -> AnyElement {
-        let measured = std::rc::Rc::clone(&self.measured_tabs);
-        gpui::canvas(
-            move |bounds, _window, _cx| {
-                if let Some(slot) = measured.borrow_mut().get_mut(index) {
-                    *slot = (f32::from(bounds.origin.x), f32::from(bounds.size.width));
-                }
-            },
-            |_, (), _window, _cx| {},
-        )
-        // Pinned to every edge so the record is the tab's own box, not its
-        // padding-inset content box: the card and the bridge both span the
-        // full tab.
-        .absolute()
-        .inset_0()
-        .into_any_element()
-    }
-
     /// `(left, width)` of the tab at `index`: measured when a frame has
     /// painted, the fixed basis from `origin_x` before that.
     fn tab_geometry(&self, index: usize, origin_x: f32) -> (f32, f32) {
-        let measured = self.measured_tabs.borrow().get(index).copied();
+        let measured = self
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.session_id)
+            .and_then(|session_id| self.painted.tab(session_id));
         match measured {
             Some((left, width)) if left.is_finite() && width >= TAB_MIN_WIDTH => (left, width),
             _ => (origin_x + px_units(index) * TAB_WIDTH, TAB_WIDTH),
@@ -854,31 +811,31 @@ impl TitlebarView {
         self.beads_focus_handles.insert(to, beads_focus);
     }
 
-    /// Left edge of the first tab: region edge plus an optional badge pill.
+    /// Left edge of the first group's run, before its pill.
     ///
-    /// Only the fallback for a strip no frame has measured yet; painted
+    /// Only the fallback for a strip no frame has painted yet; painted
     /// geometry comes from [`Self::tab_geometry`].
     fn tabs_origin_x(&self) -> f32 {
-        self.tabs.first().map_or(0.0, |tab| {
-            tab.group_region_x.unwrap_or(0.0)
-                + TAB_RUN_INSET
-                + tab.badge.as_ref().map_or(0.0, badge_width_px)
-        })
+        self.tabs.first().map_or(0.0, |tab| tab.group_region_x.unwrap_or(0.0) + TAB_RUN_INSET)
     }
 
-    /// Every open tab and its edge, for the grid to bridge each one into the
-    /// pane card below it once the frame's tab boxes exist.
+    /// Every open tab's strip index, session, and edge, for the grid to join
+    /// each one into the card below it from its painted box.
     #[must_use]
-    pub fn open_tab_runs(&self) -> OpenTabRuns {
-        OpenTabRuns {
-            measured: Rc::clone(&self.measured_tabs),
-            edges: self
-                .tabs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, tab)| Some((index, open_tab_edge(tab, &self.colors)?)))
-                .collect(),
-        }
+    pub fn open_tabs(&self) -> Vec<(usize, SessionId, Rgba)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                Some((index, tab.session_id?, open_tab_edge(tab, &self.colors)?))
+            })
+            .collect()
+    }
+
+    /// The window's painted-tab store, shared with the lower region bars.
+    #[must_use]
+    pub fn painted_tabs(&self) -> PaintedTabs {
+        self.painted.clone()
     }
 
     /// Whether a titlebar control owns keyboard focus. The shell uses this to
@@ -966,12 +923,6 @@ impl TitlebarView {
             window.focus(focus, cx);
         }
     }
-}
-
-/// Pixel width of the badge, including the optional Beads icon target.
-#[must_use]
-pub fn badge_width_px(badge: &GroupBadge) -> f32 {
-    px_units(badge.label.chars().count() + 2) * CHAR_WIDTH + if badge.beads { 42.0 } else { 16.0 }
 }
 
 /// The 7px square identity dot leading a workspace pill: the one place a
@@ -1352,7 +1303,8 @@ impl TitlebarView {
             .children(dragging.then(|| drag_placeholder(&self.colors)))
             .children(self.tab_boundary_mark(index, tab));
         tab_el = tab_el.children(focused.then(|| self.keyboard_focus_ring()));
-        tab_el = tab_el.child(self.tab_geometry_probe(index));
+        tab_el =
+            tab_el.children(tab.session_id.map(|session_id| self.painted.tab_probe(session_id)));
         let ghost = TabDragGhost {
             title: tab.title.clone(),
             colors: self.colors,
@@ -1466,9 +1418,6 @@ impl TitlebarView {
     /// edge) the groups flow left-to-right as one row.
     fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let tabs = self.tabs.clone();
-        // Stale slots are refreshed by this frame's probes; a shorter strip
-        // drops the tail so no removed tab's geometry outlives it.
-        self.measured_tabs.borrow_mut().resize(tabs.len(), (f32::NAN, 0.0));
         let groups = workspace_group_ranges(&tabs);
         let edges: Vec<Option<f32>> = groups
             .iter()
@@ -1528,7 +1477,8 @@ impl TitlebarView {
             self.tab_geometry(start, self.tabs_origin_x()).1.clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
         let gap = |slot: Option<GapSlot>| {
             let open = slot.map_or(0.0, |slot| self.drop_motion.gap(slot, now));
-            (open > 0.0).then(|| drop_gap(full * open, &self.colors))
+            let slot = slot?;
+            (open > 0.0).then(|| drop_gap(full * open, &self.colors, &self.painted, slot))
         };
         let mut cells = Vec::new();
         for index in start..end {
@@ -1889,11 +1839,14 @@ mod tests {
     };
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use scribe_common::{ids::WorkspaceId, theme::minimal_dark};
+    use scribe_common::{
+        ids::{SessionId, WorkspaceId},
+        theme::minimal_dark,
+    };
 
     use super::{
         StandaloneBadge, TAB_RUN_INSET, TabActivationSource, TitlebarEvent, TitlebarView,
-        badge_width_px, tab_accessible_label, workspace_group_ranges,
+        tab_accessible_label, workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData, TabShown};
 
@@ -2038,54 +1991,47 @@ mod tests {
         });
     }
 
-    // @lat: [[client#GPUI Titlebar#Open tab runs read the frame that painted them]]
+    // @lat: [[client#GPUI Titlebar#Painted tab boxes read the frame that painted them]]
     #[gpui::test]
-    fn open_tab_runs_read_the_frame_that_painted_them(cx: &mut TestAppContext) {
+    fn painted_tab_boxes_read_the_frame_that_painted_them(cx: &mut TestAppContext) {
         let colors = TabBarColors::from(&minimal_dark().chrome);
+        let open_session = SessionId::new();
+        let tab = |title: &str, session_id: SessionId, open: bool| {
+            let mut tab = TabData::new(title.to_owned());
+            tab.session_id = Some(session_id);
+            tab.shown = TabShown::from_active(open);
+            tab
+        };
         let window = cx.add_window(|_, cx| {
             let mut bar = TitlebarView::new(colors, TEST_TAB_BAR_HEIGHT, cx);
-            let mut open = TabData::new("open".to_owned());
-            open.shown = TabShown::from_active(true);
-            bar.set_tabs(vec![open], cx);
+            bar.set_tabs(vec![tab("open", open_session, true)], cx);
             bar
         });
         let bar = window.root(cx).expect("titlebar root");
-        let first = bar.read_with(cx, |bar, _| bar.open_tab_runs().read());
-        assert_eq!(first.len(), 1, "the opening paint measured the open tab");
+        let painted = bar.read_with(cx, |bar, _| bar.painted_tabs());
+        let first = painted.tab(open_session).expect("the opening paint recorded the open tab");
 
-        // A tab opens ahead of the open one, moving its card right. The runs
-        // are taken as the shell takes them, after the strip changed and before
-        // the frame that lays it out.
-        let runs = bar.update(cx, |bar, cx| {
-            let mut open = TabData::new("open".to_owned());
-            open.shown = TabShown::from_active(true);
-            bar.set_tabs(vec![TabData::new("new".to_owned()), open], cx);
-            bar.open_tab_runs()
+        // A tab opens ahead of the open one, moving its card right. The store
+        // is the one the shell holds, read after the frame that lays it out.
+        bar.update(cx, |bar, cx| {
+            let tabs = vec![tab("new", SessionId::new(), false), tab("open", open_session, true)];
+            bar.set_tabs(tabs, cx);
+            assert_eq!(bar.open_tabs().first().map(|open| open.1), Some(open_session));
         });
         cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
             .expect("draw titlebar");
-        let painted = bar.read_with(cx, |bar, _| bar.tab_geometry(1, 0.0));
-        let moved = runs.read();
-        assert_eq!(moved.len(), 1);
-        assert!(moved[0].0 > first[0].0, "the open card moved right");
-        assert!((moved[0].0 - painted.0).abs() < 0.5 && (moved[0].1 - painted.1).abs() < 0.5);
+        let moved = painted.tab(open_session).expect("the moved tab recorded again");
+        let geometry = bar.read_with(cx, |bar, _| bar.tab_geometry(1, 0.0));
+        assert!(moved.0 > first.0, "the open card moved right");
+        assert!((moved.0 - geometry.0).abs() < 0.5 && (moved.1 - geometry.1).abs() < 0.5);
     }
 
     #[gpui::test]
-    fn first_tab_origin_uses_region_edge_with_optional_badge(cx: &mut TestAppContext) {
+    fn first_tab_origin_falls_back_to_the_region_edge(cx: &mut TestAppContext) {
         let (bar, _) = titlebar_with_tabs(1, cx);
         bar.update(cx, |bar, _| {
             bar.tabs[0].group_region_x = Some(24.0);
-            let run = 24.0 + TAB_RUN_INSET;
-            assert!((bar.tabs_origin_x() - run).abs() < f32::EPSILON);
-
-            bar.tabs[0].badge = Some(GroupBadge {
-                label: "scribe".to_owned(),
-                accent: bar.colors.accent,
-                beads: true,
-            });
-            let badge = bar.tabs[0].badge.as_ref().expect("badge");
-            assert!((bar.tabs_origin_x() - run - badge_width_px(badge)).abs() < f32::EPSILON);
+            assert!((bar.tabs_origin_x() - (24.0 + TAB_RUN_INSET)).abs() < f32::EPSILON);
         });
     }
 

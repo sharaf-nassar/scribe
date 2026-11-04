@@ -97,6 +97,7 @@ pub mod native_window;
 pub mod notification_dispatcher;
 pub mod notifications;
 pub mod opacity;
+pub mod painted_tabs;
 pub mod palette;
 pub mod pane_tree;
 pub mod paste;

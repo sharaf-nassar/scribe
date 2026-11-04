@@ -96,6 +96,7 @@ use scribe_client::notifications::{
     state_label,
 };
 use scribe_client::opacity::{clamp_opacity, opaque_slot, surface};
+use scribe_client::painted_tabs::PaintedTabs;
 use scribe_client::paste::{PasteGate, PasteGateEvent, paste_chunks};
 use scribe_client::preedit::{Ime, ImeEvent};
 use scribe_client::prompt_bar::{self, PromptBarColors, PromptBarData, PromptContextIndicator};
@@ -167,17 +168,17 @@ use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{
         GroupBadge, TabBarColors, TabData, TabShown, accent_tab_tone, context_suffix, flash_blend,
-        pill_fill, px_units, reorder_target_index, workspace_pill_label,
+        pill_fill, reorder_target_index, workspace_pill_label,
     },
     tab_drop_motion::{GapSlot, TabDropMotion, TabDropTarget},
     tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        GHOST_LIFT, OpenTabRuns, StandaloneBadge, TAB_CARD_TOP_GAP, TAB_DRAG_ANIMATION_MS,
-        TAB_MAX_WIDTH, TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag,
-        TabDragGhost, TitlebarDropPreview, TitlebarEvent, TitlebarView,
-        TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px, beads_graph_icon,
-        drag_placeholder, drop_gap, focus_mark, magnifier_icon, narrowed_slot, new_window_chip,
-        open_tab_edge, tab_card, workspace_pill_dot,
+        GHOST_LIFT, StandaloneBadge, TAB_CARD_TOP_GAP, TAB_DRAG_ANIMATION_MS, TAB_MAX_WIDTH,
+        TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag, TabDragGhost,
+        TitlebarDropPreview, TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource,
+        agent_active_glyph, beads_graph_icon, drag_placeholder, drop_gap, focus_mark,
+        magnifier_icon, narrowed_slot, new_window_chip, open_tab_edge, tab_card,
+        workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -2192,6 +2193,9 @@ struct TerminalView {
     /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
     /// region's top strip.
     region_chrome: RegionChrome,
+    /// Where every tab in this window was last painted, shared with the
+    /// titlebar; see [`PaintedTabs`].
+    painted_tabs: PaintedTabs,
     /// Cross-region destination tracked while a top or lower tab drag is live.
     tab_subtree_drag: Option<TabSubtreeDragState>,
     /// Another window's tab drag currently aimed at this window.
@@ -2437,11 +2441,9 @@ struct RegionTabSlot {
 ///
 /// The window titlebar keeps its drag inside `TitlebarView`, but a region bar is
 /// rendered inline by the view, so this is where its drag lives. The target slot
-/// comes from pointer travel rather than the titlebar's absolute edge walk: a
-/// region bar's tab run starts after a workspace pill whose width is derived
-/// from the badge text, which a listener has no way to measure. Travel divided
-/// by tab width and rounded puts the boundary at half a tab of overlap, which is
-/// the same rule the titlebar's centre test applies.
+/// comes from the same centre test the titlebar's drag applies, against the
+/// bar's painted tab boxes: a swap needs half a tab of overlap wherever inside
+/// the tab the grab landed.
 #[derive(Clone, Copy)]
 struct RegionTabDragState {
     /// The root session whose complete pane subtree is being dragged.
@@ -2452,7 +2454,8 @@ struct RegionTabDragState {
     origin: usize,
     /// Slot the tab currently occupies, which is what the next swap moves from.
     current: usize,
-    press_x: f32,
+    /// How far right of the pressed tab's painted left edge the press landed.
+    grab_offset: f32,
     /// Whether any swap committed, so the release can tell a drag from a click.
     reordered: bool,
 }
@@ -3200,6 +3203,7 @@ impl TerminalView {
         let status_bar_height = appearance.status_bar_height;
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, tab_bar_height, cx);
+        let painted_tabs = titlebar.read(cx).painted_tabs();
         Self {
             shared,
             sink,
@@ -3244,6 +3248,7 @@ impl TerminalView {
             rendered_tabs: TabSessions::new(),
             titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
+            painted_tabs,
             tab_subtree_drag: None,
             tab_drop_guest: None,
             tab_drag_ghost: None,
@@ -8994,14 +8999,8 @@ impl TerminalView {
             .chain(pinned.iter().copied())
             .collect();
         let surfaces = OpenTabSurfaces {
-            titlebar: self.titlebar.read(cx).open_tab_runs(),
-            top_row: self
-                .shell
-                .workspace_rects(viewport, cx)
-                .into_iter()
-                .filter(|(_, rect)| rect.y <= f32::EPSILON)
-                .collect(),
-            region_runs: self.region_open_runs(viewport, cx),
+            open: self.open_tabs(viewport, cx),
+            painted: self.painted_tabs.clone(),
             floating,
             pinned,
             cards,
@@ -9016,36 +9015,44 @@ impl TerminalView {
         Some(canvas(|_, _, _| {}, paint).absolute().inset_0().into_any_element())
     }
 
-    /// The open tab of every lower region's own bar, as an equal-share slot.
-    fn region_open_runs(&self, viewport: Rect, cx: &App) -> Vec<OpenRun> {
+    /// Every open tab in the window, titlebar and lower bars alike, by the
+    /// session whose painted box the joins read when they paint.
+    fn open_tabs(&self, viewport: Rect, cx: &App) -> Vec<OpenTab> {
+        let mut open: Vec<OpenTab> = self
+            .titlebar
+            .read(cx)
+            .open_tabs()
+            .into_iter()
+            .filter_map(|(index, session_id, edge)| {
+                let workspace_id = self.titlebar_slots.get(index)?.workspace_id;
+                Some(OpenTab { workspace_id, session_id, bar_bottom: 0.0, edge })
+            })
+            .collect();
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
-        let mut runs = Vec::new();
         for (workspace_id, rect) in self.shell.region_bar_rects(viewport, self.tab_bar_height, cx) {
             let Some(bar) =
                 self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id)
             else {
                 continue;
             };
-            let Some((index, (_, tab))) =
-                bar.tabs.iter().enumerate().find(|(_, (_, tab))| tab.is_active())
-            else {
+            let Some((session_id, tab)) = bar.tabs.iter().find(|(_, tab)| tab.is_active()) else {
                 continue;
             };
             let Some(edge) = open_tab_edge(tab, &colors) else { continue };
-            let badge = bar.badge.as_ref().map_or(0.0, badge_width_px);
-            let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, bar.tabs.len());
-            runs.push(OpenRun {
+            open.push(OpenTab {
                 workspace_id,
+                session_id: *session_id,
                 bar_bottom: rect.y + rect.height,
-                left: run_left + px_units(index) * slot,
-                width: slot,
                 edge,
             });
         }
-        runs
+        open
     }
 
     fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        // Every frame's tab bars start here, the titlebar's included, so this
+        // is where the painted-tab records start the frame too.
+        self.begin_painted_tabs_frame(cx);
         let bar_rects = self.shell.region_bar_rects(self.pane_viewport(), self.tab_bar_height, cx);
         if bar_rects.is_empty() {
             return Vec::new();
@@ -9055,6 +9062,32 @@ impl TerminalView {
             .into_iter()
             .map(|(workspace_id, rect)| self.render_region_bar(workspace_id, rect, &colors, cx))
             .collect()
+    }
+
+    /// Start this frame's painted-tab records: keep the boxes of tabs some bar
+    /// still holds, and drop every gap for the frame's probes to record again.
+    fn begin_painted_tabs_frame(&self, cx: &App) {
+        let titlebar = self.titlebar.read(cx);
+        let live: HashSet<SessionId> = titlebar
+            .tabs()
+            .iter()
+            .filter_map(|tab| tab.session_id)
+            .chain(self.region_chrome.bars.iter().flat_map(|bar| bar.tabs.iter().map(|tab| tab.0)))
+            .collect();
+        self.painted_tabs.begin_frame(|session_id| live.contains(&session_id));
+    }
+
+    /// A bar's tabs in painted order: a lower region's own bar, else the
+    /// titlebar run its top-row region shows.
+    fn bar_sessions(&self, workspace_id: WorkspaceId) -> Vec<SessionId> {
+        self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id).map_or_else(
+            || {
+                self.rendered_tabs.region(workspace_id).map_or_else(Vec::new, |region| {
+                    region.tabs().iter().map(|tab| tab.session_id).collect()
+                })
+            },
+            |bar| bar.tabs.iter().map(|tab| tab.0).collect(),
+        )
     }
 
     /// Arm a workspace-pill press without changing focus or selection.
@@ -9984,30 +10017,6 @@ impl TerminalView {
         })
     }
 
-    fn tab_bar_insertion_index(
-        pointer_x: f32,
-        bar_left: f32,
-        bar_width: f32,
-        badge_width: f32,
-        tab_count: usize,
-    ) -> usize {
-        if tab_count == 0 {
-            return 0;
-        }
-        let (tabs_left, slot_width) = tab_run_slots(bar_left, bar_width, badge_width, tab_count);
-        if slot_width <= 0.0 {
-            return tab_count;
-        }
-        let center = pointer_x - tabs_left + slot_width / 2.0;
-        let mut index = 0;
-        let mut edge = slot_width;
-        while center >= edge && index < tab_count {
-            index += 1;
-            edge += slot_width;
-        }
-        index
-    }
-
     fn point_in_workspace_tab_bar(
         &self,
         point: Point<Pixels>,
@@ -10036,17 +10045,6 @@ impl TerminalView {
         })
     }
 
-    fn titlebar_badge_width(&self, workspace_id: WorkspaceId, cx: &App) -> f32 {
-        self.titlebar_slots
-            .iter()
-            .zip(self.titlebar.read(cx).tabs())
-            .find_map(|(slot, tab)| {
-                (slot.workspace_id == workspace_id).then_some(tab.badge.as_ref())
-            })
-            .flatten()
-            .map_or(0.0, badge_width_px)
-    }
-
     fn top_tab_subtree_target(
         &self,
         pointer: DragPoint,
@@ -10065,11 +10063,10 @@ impl TerminalView {
             if pointer.x < left || pointer.x > left + rect.width {
                 continue;
             }
-            let count = self.rendered_tabs.region(workspace_id).map_or(0, WorkspaceTabs::len);
-            let badge = self.titlebar_badge_width(workspace_id, cx);
+            let tabs = self.bar_sessions(workspace_id);
             return Some(TabSubtreeDropTarget {
                 workspace_id,
-                index: Self::tab_bar_insertion_index(pointer.x, left, rect.width, badge, count),
+                index: self.painted_tabs.insertion_index(pointer.x, workspace_id, &tabs),
             });
         }
         None
@@ -10101,20 +10098,18 @@ impl TerminalView {
             {
                 continue;
             }
-            let bar = self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id);
-            let count = bar.map_or(0, |bar| bar.tabs.len());
-            let badge = bar.and_then(|bar| bar.badge.as_ref()).map_or(0.0, badge_width_px);
+            let tabs = self.bar_sessions(workspace_id);
             return Some(TabSubtreeDropTarget {
                 workspace_id,
-                index: Self::tab_bar_insertion_index(pointer.x, rect.x, rect.width, badge, count),
+                index: self.painted_tabs.insertion_index(pointer.x, workspace_id, &tabs),
             });
         }
         None
     }
 
     /// The window-local rect of the slot a drop on `target` fills: the
-    /// target bar's band at the boundary `tab_bar_insertion_index` resolved,
-    /// one equal-share slot wide.
+    /// target bar's band, from where the landing gap painted (or the painted
+    /// tab boundary when it has not yet), one painted tab wide.
     fn tab_drop_slot_rect(&self, target: TabSubtreeDropTarget, cx: &App) -> Option<Rect> {
         let origin = self.workspace_drag_grid_origin();
         let viewport = self.pane_viewport();
@@ -10123,34 +10118,15 @@ impl TerminalView {
             .region_bar_rects(viewport, self.tab_bar_height, cx)
             .into_iter()
             .find(|(id, _)| *id == target.workspace_id);
-        let (rect, badge, count) = if let Some((_, rect)) = lower_bar {
-            let bar =
-                self.region_chrome.bars.iter().find(|bar| bar.workspace_id == target.workspace_id);
-            (
-                Rect { x: origin.x + rect.x, y: origin.y + rect.y, ..rect },
-                bar.and_then(|bar| bar.badge.as_ref()).map_or(0.0, badge_width_px),
-                bar.map_or(0, |bar| bar.tabs.len()),
-            )
+        let (y, height) = if let Some((_, rect)) = lower_bar {
+            (origin.y + rect.y, rect.height)
         } else {
-            let rect = self.shell.workspace_rect(target.workspace_id, viewport, cx)?;
-            (
-                Rect {
-                    x: origin.x + rect.x,
-                    y: 0.0,
-                    width: rect.width,
-                    height: self.tab_bar_height,
-                },
-                self.titlebar_badge_width(target.workspace_id, cx),
-                self.rendered_tabs.region(target.workspace_id).map_or(0, WorkspaceTabs::len),
-            )
+            self.shell.workspace_rect(target.workspace_id, viewport, cx)?;
+            (0.0, self.tab_bar_height)
         };
-        let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, count);
-        Some(Rect {
-            x: run_left + px_units(target.index.min(count)) * slot,
-            y: rect.y,
-            width: drop_gap_width(slot),
-            height: rect.height,
-        })
+        let tabs = self.bar_sessions(target.workspace_id);
+        let x = self.painted_tabs.landing_left(target.workspace_id, &tabs, target.index)?;
+        Some(Rect { x, y, width: drop_gap_width(self.painted_tabs.slot_width(&tabs)), height })
     }
 
     /// Where this window opens a landing gap: its own drag's in-window
@@ -10968,16 +10944,14 @@ impl TerminalView {
             return;
         };
         let count = bar.tabs.len();
-        if count == 0 {
+        let Some((left, width)) = bar.tabs.first().and_then(|tab| self.painted_tabs.tab(tab.0))
+        else {
             return;
-        }
-        // Reuse the titlebar's edge walker rather than round pointer travel
-        // here: it clamps and avoids a float-to-index cast. Anchoring its origin
-        // half a tab left of the press makes the walk resolve to
-        // `origin + round(travel / TAB_WIDTH)`, so the swap boundary still sits
-        // at half a tab of overlap wherever inside the tab the grab landed.
-        let anchor = drag.press_x - px_units(drag.origin) * TAB_WIDTH - TAB_WIDTH / 2.0;
-        let target = reorder_target_index(cursor_x, anchor, TAB_WIDTH, count, drag.current);
+        };
+        // The titlebar's centre test against this bar's painted run: the
+        // dragged tab's centre, not the raw cursor, picks the slot.
+        let center = cursor_x - drag.grab_offset + width / 2.0;
+        let target = reorder_target_index(center, left, width, count, drag.current);
         if target == drag.current {
             return;
         }
@@ -11163,21 +11137,17 @@ impl TerminalView {
             let pill = pill.child(label);
             row = row.child(pill);
         }
-        // Tabs flex to share the run after the pill, the same split
-        // `tab_bar_insertion_index` assumes, so this is the width a tab paints
-        // at and the width its ghost must take to sit where it was grabbed.
-        let badge_width = bar.badge.as_ref().map_or(0.0, badge_width_px);
-        let ghost_width = tab_run_slots(rect.x, rect.width, badge_width, bar.tabs.len().max(1))
-            .1
-            .clamp(TAB_MIN_WIDTH, TAB_WIDTH.max(rect.width));
+        // A tab's ghost is the tab at the width it painted, so it sits where
+        // it was grabbed, and a gap is one painted tab wide.
+        let painted = &self.painted_tabs;
+        let sessions: Vec<SessionId> = bar.tabs.iter().map(|tab| tab.0).collect();
         let dragged = self.region_chrome.drag.map(|drag| drag.session_id);
         let now = Instant::now();
         let motion = &self.tab_drop_motion;
-        let full_gap =
-            drop_gap_width(tab_run_slots(rect.x, rect.width, badge_width, bar.tabs.len()).1);
+        let full_gap = drop_gap_width(painted.slot_width(&sessions));
         let gap = |slot: GapSlot| {
             let open = motion.gap(slot, now);
-            (open > 0.0).then(|| drop_gap(full_gap * open, colors))
+            (open > 0.0).then(|| drop_gap(full_gap * open, colors, painted, slot))
         };
         let mut cells: Vec<gpui::AnyElement> = Vec::new();
         for index in 0..bar.tabs.len() {
@@ -11187,12 +11157,18 @@ impl TerminalView {
             let ghost = TabDragGhost {
                 title: String::new(),
                 colors: *colors,
-                width: ghost_width,
+                width: painted.tab(session_id).map_or(TAB_WIDTH, |span| span.1),
                 height: rect.height,
                 grab: std::rc::Rc::default(),
             };
             let open = motion.slot(session_id, now);
-            cells.extend(Self::render_region_bar_tab(&bar.tabs, slot, ghost, (dragged, open), cx));
+            cells.extend(Self::render_region_bar_tab(
+                &bar.tabs,
+                slot,
+                ghost,
+                (dragged, open, painted),
+                cx,
+            ));
         }
         cells.extend(gap(bar
             .tabs
@@ -11225,7 +11201,10 @@ impl TerminalView {
                         workspace_id,
                         origin: index,
                         current: index,
-                        press_x: f32::from(event.position.x),
+                        grab_offset: view
+                            .painted_tabs
+                            .tab(session_id)
+                            .map_or(0.0, |span| f32::from(event.position.x) - span.0),
                         reordered: false,
                     });
                     ctx.stop_propagation();
@@ -11247,6 +11226,27 @@ impl TerminalView {
             }))
     }
 
+    /// The focused region tab's close button.
+    fn region_tab_close(
+        session_id: SessionId,
+        fg: gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(ElementId::from(format!("region-tab-close-{session_id}")))
+            .flex_none()
+            .ml_1()
+            .px_0p5()
+            .text_color(fg)
+            .cursor_pointer()
+            .child("\u{00D7}")
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(cx.listener(move |view, _, _window, _ctx| {
+                view.close_session(session_id, "tab close dropped");
+            }))
+            .into_any_element()
+    }
+
     /// AI dot, context suffix) minus its keyboard chrome.
     ///
     /// Drag-reorder is not part of that subtraction. A region bar holds every
@@ -11262,7 +11262,7 @@ impl TerminalView {
         tabs: &[(SessionId, TabData)],
         slot: RegionTabSlot,
         mut ghost: TabDragGhost,
-        (dragged, open): (Option<SessionId>, f32),
+        (dragged, open, painted): (Option<SessionId>, f32, &PaintedTabs),
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let (session_id, tab) = tabs.get(slot.index)?;
@@ -11297,21 +11297,7 @@ impl TerminalView {
         });
         let hover_group = format!("region-tab-{session_id}");
         let mirror = Self::region_tab_mirror(session_id, &tab.title, (fg, &hover_group), cx);
-        let close = tab.is_focused().then(|| {
-            div()
-                .id(ElementId::from(format!("region-tab-close-{session_id}")))
-                .flex_none()
-                .ml_1()
-                .px_0p5()
-                .text_color(fg)
-                .cursor_pointer()
-                .child("\u{00D7}")
-                .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-                .on_click(cx.listener(move |view, _, _window, _ctx| {
-                    view.close_session(session_id, "tab close dropped");
-                }))
-                .into_any_element()
-        });
+        let close = tab.is_focused().then(|| Self::region_tab_close(session_id, fg, cx));
         let element = div()
             .id(ElementId::from(format!("region-tab-{session_id}")))
             .group(hover_group)
@@ -11339,6 +11325,7 @@ impl TerminalView {
             )
             // The ghost in hand is the tab; its slot stays as an empty recess.
             .children(in_hand.then(|| drag_placeholder(colors)))
+            .child(painted.tab_probe(session_id))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, ghost, cx))
             .when(!in_hand, |tab| {
                 tab.children(mark)
@@ -18379,8 +18366,6 @@ fn pane_ground(bg: [f32; 4]) -> [f32; 4] {
 /// theme-background fill (skipped default-bg cells show this, not the
 /// ground), and the hairline card border — the focused pane's takes the
 /// region tone. The gap around it comes from the placement inset itself.
-/// The equal-share slots a bar's tabs occupy after its run inset and pill:
-/// the run's left edge and one slot's width, in the bar's own coordinates.
 /// The width a landing gap opens to: the bar's slot, or a fresh tab's basis
 /// in a bar that has no tabs yet.
 fn drop_gap_width(slot: f32) -> f32 {
@@ -18434,16 +18419,6 @@ fn board_grip(rect: Rect, handle: Option<(gpui::Rgba, gpui::Rgba)>) -> gpui::Any
         .into_any_element()
 }
 
-fn tab_run_slots(bar_left: f32, bar_width: f32, badge_width: f32, count: usize) -> (f32, f32) {
-    let inner = (bar_width - 2.0 * TAB_RUN_INSET).max(0.0);
-    let badge = badge_width.min(inner);
-    let left = bar_left + TAB_RUN_INSET + badge;
-    // Tabs share the run equally up to their cap, then leave the rest bare.
-    let slot =
-        if count == 0 { 0.0 } else { ((inner - badge) / px_units(count)).min(TAB_MAX_WIDTH) };
-    (left, slot)
-}
-
 /// Where an open tab's bridge lands: from `bar_bottom` down over the top
 /// border of the card directly under the tab (a pane's, or a pinned board's),
 /// or `None` when something else is reserved between the bar and the cards.
@@ -18487,6 +18462,15 @@ fn tab_bridge_rect(
     })
 }
 
+/// An open tab: its region, the session whose painted box locates it, and
+/// the bottom of the bar it sits in, in grid pixels.
+struct OpenTab {
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    bar_bottom: f32,
+    edge: gpui::Rgba,
+}
+
 /// One region's open tab, in grid pixels: the bar it sits in and its box.
 #[derive(Clone, Copy)]
 struct OpenRun {
@@ -18501,11 +18485,9 @@ struct OpenRun {
 /// gathered while the shell renders and painted once the titlebar's tab boxes
 /// for the same frame exist.
 struct OpenTabSurfaces {
-    titlebar: OpenTabRuns,
-    /// Top-row regions, which own the titlebar's tabs.
-    top_row: Vec<(WorkspaceId, Rect)>,
-    /// Lower regions' open tabs, laid out by the shell itself.
-    region_runs: Vec<OpenRun>,
+    /// Every open tab, titlebar and lower bars alike.
+    open: Vec<OpenTab>,
+    painted: PaintedTabs,
     /// Regions whose board is only hovered open and floats over the rest.
     floating: Vec<WorkspaceId>,
     /// Pinned board cards: each the top card of its region's surface.
@@ -18555,20 +18537,22 @@ impl OpenTabSurfaces {
         }
     }
 
-    /// Every open tab this frame, titlebar boxes resolved to their top-row
-    /// region against the grid's own left edge `origin_x`.
+    /// Every open tab this frame at its painted box, in grid pixels from the
+    /// grid's left edge `origin_x`.
     fn open_runs(&self, origin_x: f32) -> Vec<OpenRun> {
-        let titlebar = self.titlebar.read().into_iter().filter_map(|(left, width, edge)| {
-            let left = left - origin_x;
-            let (workspace_id, _) = self
-                .top_row
-                .iter()
-                .find(|(_, rect)| rect.x <= left && left < rect.x + rect.width)?;
-            Some(OpenRun { workspace_id: *workspace_id, bar_bottom: 0.0, left, width, edge })
-        });
-        titlebar
-            .chain(self.region_runs.iter().copied())
-            .filter(|run| !self.floating.contains(&run.workspace_id))
+        self.open
+            .iter()
+            .filter(|tab| !self.floating.contains(&tab.workspace_id))
+            .filter_map(|tab| {
+                let (left, width) = self.painted.tab(tab.session_id)?;
+                Some(OpenRun {
+                    workspace_id: tab.workspace_id,
+                    bar_bottom: tab.bar_bottom,
+                    left: left - origin_x,
+                    width,
+                    edge: tab.edge,
+                })
+            })
             .collect()
     }
 }
@@ -21938,19 +21922,6 @@ mod tests {
         // A replay pairs panes with sessions through its own FIFO fill.
         assert_eq!(tab_adoption_candidate(true, Some(fresh), &assigned), None);
         assert_eq!(tab_adoption_candidate(false, None, &assigned), None);
-    }
-
-    // @lat: [[test#GPUI Client Headless Suites#Atomic tab-subtree region transfer]]
-    #[test]
-    fn cross_region_tab_drop_resolves_an_insertion_slot() {
-        assert_eq!(TerminalView::tab_bar_insertion_index(100.0, 0.0, 400.0, 0.0, 4), 1);
-        assert_eq!(TerminalView::tab_bar_insertion_index(390.0, 0.0, 400.0, 0.0, 4), 4);
-        assert_eq!(
-            TerminalView::tab_bar_insertion_index(90.0, 0.0, 400.0, 80.0, 4),
-            0,
-            "the workspace pill targets the front of its bar"
-        );
-        assert_eq!(TerminalView::tab_bar_insertion_index(200.0, 0.0, 400.0, 80.0, 0), 0);
     }
 
     #[test]

@@ -4779,7 +4779,7 @@ A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to 
 
 Focused client/server tests cover atomic top↔lower tab-subtree moves without starting a live Scribe process.
 
-`TabSessions` proves the authoritative root re-file uses the shared departure clamp while pane sessions stay out of the strip; `PaneShell` adopts the resulting two-region tree with exact tab order, pane split, active indices, and focused child session. The drag-slot helper pins destination insertion at tab midpoints and at the workspace pill's leading edge.
+`TabSessions` proves the authoritative root re-file uses the shared departure clamp while pane sessions stay out of the strip; `PaneShell` adopts the resulting two-region tree with exact tab order, pane split, active indices, and focused child session. The painted-tab store pins destination insertion at painted tab midpoints, so a pointer over the workspace pill lands at the front of its bar.
 
 Server manager tests move a split-bearing tab top→lower and lower→top, preserve inactive-region selection, collapse an emptied source only after commit, and serialize/restore the committed tree and workspace membership through handoff. IPC transaction tests prove live PTY routes and attached sets remain intact, the window receives one full `SessionList`, and typed/handoff refusals leave serialized manager/live state unchanged. The named MessagePack fixture freezes the additive `MoveTab` operation under the existing `workspace_move` capability.
 
@@ -4788,6 +4788,14 @@ Server manager tests move a split-bearing tab top→lower and lower→top, prese
 Unit coverage for the shared lower-region content-rect rule at a live 80px tab-row height.
 
 A top-row region keeps its full rect, a stacked region cedes the supplied height, and a region shorter than the bar clamps instead of going negative. Every pane-geometry consumer (`placements`, `dividers`, directional focus, CI/board offsets) receives that same resolved height, so paint and hit tests agree.
+
+### Drops land between painted tab centres
+
+A drop's insertion index counts the bar's painted tab centres left of the pointer, an empty bar takes index 0, and an open landing gap is subtracted from the tabs it pushed right, so the gap a drop opens cannot move the drop.
+
+### A drop lands on its painted gap
+
+A released tab lands on its open gap's painted left edge, or on the painted boundary between tabs before any gap has painted, and a bar nothing has painted in has no landing. Starting a frame forgets tabs that left every bar and clears every gap.
 
 ### A pinned board is its region's top card
 

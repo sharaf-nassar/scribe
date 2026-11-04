@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use scribe_common::ids::{SessionId, WorkspaceId};
 
 /// Where a landing gap opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GapSlot {
     /// Before this tab.
     Before(SessionId),

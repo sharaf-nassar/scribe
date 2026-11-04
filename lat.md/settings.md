@@ -101,8 +101,8 @@ One top or lower tab-bar row has the effective height `tab_height + tab_bar_padd
 
 `status_bar_height` is the status band's single border-box metric, 36px by default. A Settings save hot-reloads it into the bottom renderer, reflows the flex-grown terminal grid, and republishes changed pane rows without restarting; startup chrome sizing uses the same resolution. The update CTA, balance button, and settings gear remain clipped to and hit-tested within that configured band. The band's type, graphs and spacing are fractions of the same metric (see [[crates/scribe-client/src/status_bar.rs#StatusBarMetrics]]), so raising it grows the bar's contents rather than padding them.
 
-Tab width is deliberately absent: `TAB_WIDTH` is flex basis and drag-fallback
-geometry, not a saved setting. Legacy `appearance.tab_width` is ignored on load
+Tab width is deliberately absent: `TAB_WIDTH` is flex basis and the fallback
+for a tab no frame has painted yet, not a saved setting. Legacy `appearance.tab_width` is ignored on load
 and omitted by the next Settings save.
 
 ### Colors Keys
