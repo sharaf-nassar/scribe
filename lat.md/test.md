@@ -4811,7 +4811,7 @@ The divider below the board spans its width over the gap and the panes' top bord
 
 ### The divider rule runs through the grip
 
-The rule across a pinned board's divider band spans the board's width, is one border wide, and sits on the band's fourth row, the centre row of the pill painted over it.
+The rule across a pinned board's divider band spans the board's width, is one border wide, and sits on the band's fourth row, the centre row of the pill painted over it. Its colour is the tab edge's lighter shade, same alpha.
 
 ### A pinned board's whole divider grabs
 
@@ -4900,7 +4900,7 @@ than board paint. `tracks` prints window x back for the pointer, `a2-drag`
 takes window x, and every contract-relative pointer offset adds the inset. The
 pinned grip is the shell's 36px pill centred on the divider band, whose lit
 centre row sits 4px below the floor's top, in place of the mock's 34x1 floor
-grip a hovered board still paints. That row is also the divider's outline-coloured
+grip a hovered board still paints. That row is also the divider's lighter-toned
 rule, so the pill is measured against the rule, and the rule must stand clear of
 the floor band.
 
@@ -5622,7 +5622,7 @@ The overlay can only ask; the sink is what turns the ask into a frame, so the lo
 
 ### Tab mirror re-wrap
 
-Pins [[crates/scribe-client/src/mirror_window.rs#rewrap]], the pure step that lets a mirror show a tab's screen at its own size while the PTY keeps the tab's.
+Pins [[crates/scribe-client/src/mirror_window.rs#rewrap]], the pure step that lets a mirror show a tab's screen at its own size while the PTY keeps the tab's, and the mirror's own walk back through the pane's whole buffer.
 
 See [[client#Client#GPUI Titlebar#Tab mirrors]] for the surface these feed.
 
@@ -5647,6 +5647,14 @@ A double-width character that would straddle the mirror's right edge moves whole
 Scrollback rows above the tab's screen fill a mirror with more rows than the tab, soft wraps join across that seam, and the cursor stays on the live line.
 
 A wider mirror asks for proportionally more history, because joined rows shrink.
+
+#### Scrolling back walks the whole buffer
+
+A pane scrolled to its oldest line still hands the mirror every line of its buffer. The mirror's wheel walks that buffer back from the bottom, holds at the oldest line, and reports when it is back at the bottom so the live view resumes.
+
+#### An alternate-screen wheel reports a tab cell
+
+A wheel over an alternate-screen mirror is reported at the tab cell under the pointer, measured on the font-scaled grid. Spare room past the fitted grid clamps onto the tab's last row or column, and a pointer off the grid reports nothing.
 
 ### Tab mirror size
 
@@ -6137,18 +6145,6 @@ Side-by-side regions use GPUI's left-right resize cursor and stacked regions use
 ### Live drag resizes regions
 
 Dragging the outer divider between workspace regions republishes both pane grids and reports the changed ratio so the layout persists.
-
-## GPUI Focus Borders
-
-Covers the focus-border edge geometry in  — the four accent strips the GPUI paint path fills for a focused pane or workspace, kept pure so the corner-overlap math is verifiable without a window.
-
-### Border edges frame the rect without corner overlap
-
-`border_edges` returns full-width top/bottom strips and vertically inset left/right strips at the  2px width, so the four quads frame the rect without double-painting the corners.
-
-### Border side strips clamp on tiny rects
-
-On a rect shorter than twice the border width, the left/right strip heights clamp to zero instead of going negative, so a tiny pane never produces an inverted quad.
 
 ## GPUI Split-Scroll
 

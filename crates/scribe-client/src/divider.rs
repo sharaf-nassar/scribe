@@ -6,9 +6,8 @@
 //! geometry ported from the legacy client: collecting divider rects from the
 //! split tree, applying viewport padding insets, hit-testing with a 4px
 //! tolerance, and mapping a drag position back to a split ratio. The GPUI
-//! paint path (a solid-quad overlay) and the focus-border quads
-//! ([`crate::focus_border`]) consume these rects in a later bead; the logic
-//! here stays renderer-independent so it can be exercised by `#[gpui::test]`.
+//! paint path (a solid-quad overlay) consumes these rects; the logic here
+//! stays renderer-independent so it can be exercised by `#[gpui::test]`.
 
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
 

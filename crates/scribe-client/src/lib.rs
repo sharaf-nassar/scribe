@@ -76,7 +76,6 @@ pub mod context_menu;
 pub mod dialog;
 pub mod divider;
 pub mod drag_drop;
-pub mod focus_border;
 pub mod fonts;
 pub mod gpui_image_lifecycle;
 pub mod hook_setup;

@@ -32,7 +32,7 @@ use gpui::{
     canvas, div, ease_out_quint, point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
-use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
+use scribe_client::ai_indicator::AiStateTracker;
 use scribe_client::animation::AnimationSettings;
 use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
@@ -400,6 +400,9 @@ const ROWS: u16 = 36;
 /// [`TerminalView::painted_pane_rect`] takes it back off before the PTY is
 /// told how many columns it has.
 const PANE_BORDER_WIDTH: f32 = 1.0;
+
+/// Width of the pulsing AI outline laid over a pane card, in logical pixels.
+const AI_BORDER_WIDTH: f32 = 1.0;
 
 /// Corner radius of a pane card. The card's own fill and border round
 /// correctly; children paint under GPUI's rectangular content mask, so a
@@ -2159,6 +2162,9 @@ struct TerminalView {
     render_focused_session: Option<SessionId>,
     last_chrome_frame: Instant,
     visible_ai_sessions: HashMap<WorkspaceId, Vec<SessionId>>,
+    /// This frame's AI border colour per region, read again by the tab
+    /// bridges so a squared pane corner carries the border through.
+    ai_borders: HashMap<WorkspaceId, gpui::Rgba>,
     /// Geometry of the focused pane, which is where a new tab or a split's
     /// session opens. Starts at the whole window and shrinks with the layout.
     focused_pane_size: TerminalSize,
@@ -3235,6 +3241,7 @@ impl TerminalView {
             render_focused_session: None,
             last_chrome_frame: Instant::now(),
             visible_ai_sessions: HashMap::new(),
+            ai_borders: HashMap::new(),
             focused_pane_size: seed.terminal_size,
             reported_trees: VecDeque::new(),
             titlebar,
@@ -5842,31 +5849,48 @@ impl TerminalView {
         if rows == 0 {
             return;
         }
+        let cell = self
+            .pane_grid_bounds(session_id)
+            .and_then(|bounds| self.report_cell_in(bounds, event.position));
+        if !self.wheel_to_program(session_id, rows, cell, event.modifiers) {
+            self.scroll_session(session_id, Scroll::Delta(rows), cx);
+        }
+    }
+
+    /// Hand `rows` of wheel to the session's program when it claims the wheel:
+    /// a button 64 / 65 report at `cell` (dropped when the pointer is off the
+    /// grid), or cursor keys under alternate scroll. Returns false when nothing
+    /// claimed it, so the caller moves its own viewport instead.
+    fn wheel_to_program(
+        &self,
+        session_id: SessionId,
+        rows: i32,
+        cell: Option<(u16, u16)>,
+        modifiers: gpui::Modifiers,
+    ) -> bool {
         let modes = self.session_mouse_modes(session_id);
         let action = mouse_reporting::wheel_action(modes);
         tracing::info!(rows, ?action, "mouse wheel");
         match action {
             WheelAction::Report => {
-                let Some((col, row)) = self
-                    .pane_grid_bounds(session_id)
-                    .and_then(|bounds| self.report_cell_in(bounds, event.position))
-                else {
-                    return;
-                };
-                let bytes = mouse_reporting::encode_mouse_scroll(
-                    ScrollDirection::from_rows(rows),
-                    col,
-                    row,
-                    event.modifiers,
-                    modes.encoding,
-                );
-                self.send_pty_bytes_to(session_id, "scroll", bytes);
+                if let Some((col, row)) = cell {
+                    let bytes = mouse_reporting::encode_mouse_scroll(
+                        ScrollDirection::from_rows(rows),
+                        col,
+                        row,
+                        modifiers,
+                        modes.encoding,
+                    );
+                    self.send_pty_bytes_to(session_id, "scroll", bytes);
+                }
+                true
             }
             WheelAction::CursorKeys => {
                 let bytes = mouse_reporting::alternate_scroll_keys(rows);
                 self.send_pty_bytes_to(session_id, "alternate-scroll", bytes);
+                true
             }
-            WheelAction::Scrollback => self.scroll_session(session_id, Scroll::Delta(rows), cx),
+            WheelAction::Scrollback => false,
         }
     }
 
@@ -8552,6 +8576,7 @@ impl TerminalView {
                 .collect()
         });
         self.visible_ai_sessions = sessions;
+        self.ai_borders.clone_from(&colors);
         colors
     }
 
@@ -8725,6 +8750,7 @@ impl TerminalView {
             self.retain_mirrored_visible();
             self.pane_bounds.clear();
             self.visible_ai_sessions.clear();
+            self.ai_borders.clear();
             self.pane_content_views.clear();
             return Vec::new();
         }
@@ -8803,7 +8829,7 @@ impl TerminalView {
                 let pane = self.compose_pane_content(pane, grid_el, &placement, cx);
                 let mut pane = Self::attach_wheel(pane, &placement, cx);
                 if let Some(color) = ai_border {
-                    pane = pane.children(ai_pane_border(placement.rect, color));
+                    pane = pane.child(ai_pane_border(color));
                 }
                 pane.into_any_element()
             })
@@ -9008,6 +9034,7 @@ impl TerminalView {
             pane_fill: surface(self.terminal_colors.background, self.opacity),
             board_ground: self.beads_colors.ground,
             board_band: self.beads_colors.band,
+            ai_borders: self.ai_borders.clone(),
         };
         let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
             surfaces.paint(window, (f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -18389,9 +18416,20 @@ fn board_grab_span(rect: Rect, pinned: bool) -> (f32, f32) {
     }
 }
 
-/// The rule through a pinned board's divider band, in its open tab's edge
-/// colour, so the band reads as the board's edge rather than one more row of
-/// terminal. It runs under the grip's pill, through the pill's centre row.
+/// How far the divider rule's colour moves from its tab's edge toward white.
+const DIVIDER_RULE_LIFT: f32 = 0.35;
+
+/// `color` mixed [`DIVIDER_RULE_LIFT`] of the way toward white, keeping its
+/// alpha: a lighter shade of the same hue.
+fn lighter_tone(color: gpui::Rgba) -> gpui::Rgba {
+    let lift = |channel: f32| (1.0 - channel).mul_add(DIVIDER_RULE_LIFT, channel);
+    gpui::Rgba { r: lift(color.r), g: lift(color.g), b: lift(color.b), a: color.a }
+}
+
+/// The rule through a pinned board's divider band, in a lighter shade of its
+/// open tab's edge colour, so the band reads as the board's edge rather than
+/// one more row of terminal. It runs under the grip's pill, through the
+/// pill's centre row.
 fn board_divider_line(card: Rect) -> Rect {
     let (top, bottom) = board_grab_span(card, true);
     Rect {
@@ -18511,6 +18549,8 @@ struct OpenTabSurfaces {
     pane_fill: gpui::Rgba,
     board_ground: gpui::Rgba,
     board_band: gpui::Rgba,
+    /// The AI border colour of each region whose panes wear one this frame.
+    ai_borders: HashMap<WorkspaceId, gpui::Rgba>,
 }
 
 impl OpenTabSurfaces {
@@ -18527,8 +18567,12 @@ impl OpenTabSurfaces {
             // and the panes' top border, its caps squaring the pane corners
             // below it, with one rule in the outline's colour through it.
             if let Some(seam) = board_divider_rect(&self.panes, workspace_id, card) {
-                let paint =
-                    BridgePaint { strip: self.board_band, cap: self.pane_fill, edge: run.edge };
+                let paint = BridgePaint {
+                    strip: self.board_band,
+                    cap: self.pane_fill,
+                    edge: run.edge,
+                    ai: self.ai_borders.get(&workspace_id).copied(),
+                };
                 paint_tab_bridge(window, origin, &seam, paint);
                 let line = board_divider_line(card);
                 window.paint_quad(gpui::fill(
@@ -18536,7 +18580,7 @@ impl OpenTabSurfaces {
                         point(px(origin.0 + line.x), px(origin.1 + line.y)),
                         size(px(line.width), px(line.height)),
                     ),
-                    run.edge,
+                    lighter_tone(run.edge),
                 ));
             }
         }
@@ -18549,11 +18593,13 @@ impl OpenTabSurfaces {
             // Under a pinned board the tab opens into the board's ground.
             let on_board = self.pinned.iter().any(|(id, _)| *id == run.workspace_id);
             let fill = if on_board { self.board_ground } else { self.pane_fill };
+            // Only a pane card wears the AI border; a board's corners carry none.
+            let ai = if on_board { None } else { self.ai_borders.get(&run.workspace_id).copied() };
             paint_tab_bridge(
                 window,
                 origin,
                 &bridge,
-                BridgePaint { strip: fill, cap: fill, edge: run.edge },
+                BridgePaint { strip: fill, cap: fill, edge: run.edge, ai },
             );
         }
     }
@@ -18647,6 +18693,9 @@ struct BridgePaint {
     strip: gpui::Rgba,
     cap: gpui::Rgba,
     edge: gpui::Rgba,
+    /// The card's AI border, when it wears one: a squared corner carries it
+    /// straight through, since the cap covers the rounded corner it drew.
+    ai: Option<gpui::Rgba>,
 }
 
 /// A bridge's geometry: the strip over the gap and the card's top border, and
@@ -18672,7 +18721,7 @@ fn paint_tab_bridge(
     paint: BridgePaint,
 ) {
     let TabBridge { rect, cap_left, cap_right } = *bridge;
-    let BridgePaint { strip, cap, edge } = paint;
+    let BridgePaint { strip, cap, edge, ai } = paint;
     // `(x, width)` of one quad, its fill, and whether it carries the left and
     // right outline; every quad shares the bridge's own vertical span or the
     // caps' span below it.
@@ -18697,12 +18746,37 @@ fn paint_tab_bridge(
     // curve; the cap sits inside the card's content padding, so no glyph is
     // under it.
     let (cap_y, cap_h) = (rect.y + rect.height, PANE_CARD_RADIUS - PANE_BORDER_WIDTH);
+    // The AI border's corner under a cap: its top row is the cap's top row
+    // and its side sits one card border inside the cap's outlined side.
+    let ai_corner = |x: f32, sides: (bool, bool)| {
+        let ai = ai?;
+        let side = |on: bool| px(if on { AI_BORDER_WIDTH } else { 0.0 });
+        Some(gpui::quad(
+            Bounds::new(point(px(origin.0 + x), px(origin.1 + cap_y)), size(px(cap_h), px(cap_h))),
+            px(0.0),
+            gpui::transparent_black(),
+            gpui::Edges {
+                top: px(AI_BORDER_WIDTH),
+                right: side(sides.1),
+                bottom: px(0.0),
+                left: side(sides.0),
+            },
+            ai,
+            gpui::BorderStyle::default(),
+        ))
+    };
     if cap_left {
         window.paint_quad(quad(rect.x, PANE_CARD_RADIUS, cap_y, cap_h, cap, (true, false)));
+        if let Some(corner) = ai_corner(rect.x + PANE_BORDER_WIDTH, (true, false)) {
+            window.paint_quad(corner);
+        }
     }
     if cap_right {
         let x = rect.x + rect.width - PANE_CARD_RADIUS;
         window.paint_quad(quad(x, PANE_CARD_RADIUS, cap_y, cap_h, cap, (false, true)));
+        if let Some(corner) = ai_corner(x, (false, true)) {
+            window.paint_quad(corner);
+        }
     }
 }
 
@@ -18772,34 +18846,20 @@ fn pane_border(
     }
 }
 
-/// Paintable AI border strips inset into one pane's local coordinate space.
+/// The AI border: a hairline outline laid over the pane card's padding box.
 ///
-/// The card's absolute children resolve against its padding box — shrunk by
-/// the 1px card border — and the card clips there too, so strips sized to
-/// the full placement rect overflowed by the border width at the bottom and
-/// right and were clipped away entirely: the pulse showed on two edges only.
-/// Shrinking the local rect by the border on both axes keeps all four
-/// strips inside the visible card.
-fn ai_pane_border(rect: Rect, color: gpui::Rgba) -> Vec<gpui::AnyElement> {
-    let local = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: (rect.width - 2.0 * PANE_BORDER_WIDTH).max(0.0),
-        height: (rect.height - 2.0 * PANE_BORDER_WIDTH).max(0.0),
-    };
-    pane_border_edges(local, 0.0)
-        .into_iter()
-        .map(|edge| {
-            div()
-                .absolute()
-                .left(px(edge.x))
-                .top(px(edge.y))
-                .w(px(edge.width))
-                .h(px(edge.height))
-                .bg(color)
-                .into_any_element()
-        })
-        .collect()
+/// One rounded element rather than four strips: the card clips its children
+/// to its rounded corners, so straight strips lost their ends at every corner
+/// and the top edge floated free of the sides. The outline is inset by the
+/// card's own border and rounded to match it, so it follows the curve.
+fn ai_pane_border(color: gpui::Rgba) -> gpui::AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(PANE_CARD_RADIUS - PANE_BORDER_WIDTH))
+        .border(px(AI_BORDER_WIDTH))
+        .border_color(color)
+        .into_any_element()
 }
 
 /// Return the context suffix for one tab from its latest independent AI state.
@@ -21029,6 +21089,11 @@ mod tests {
         // The 10px band's pill paints its rows 3 to 5; the rule takes row 4.
         assert!((line.y - (top + 4.0)).abs() < 0.001, "through the pill's centre row");
         assert!(line.y > top && line.y + line.height < bottom, "inside the band");
+
+        let edge = gpui::Rgba { r: 0.98, g: 0.44, b: 0.52, a: 0.8 };
+        let rule = lighter_tone(edge);
+        assert!(rule.r >= edge.r && rule.g > edge.g && rule.b > edge.b, "lighter");
+        assert!(rule.g < 1.0 && (rule.a - edge.a).abs() < f32::EPSILON, "same hue, same alpha");
     }
 
     fn suspend_test_backend() -> PreparedWindowBackend {

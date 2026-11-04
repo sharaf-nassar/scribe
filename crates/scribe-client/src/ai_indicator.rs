@@ -3,11 +3,9 @@
 //! Ports the winit client's `AiStateTracker` state machine byte-for-byte: the
 //! per-session pulse envelope, the Layer-2 stale-`Processing` clear, the
 //! attention-state keystroke clear, the workspace-level priority ordering, and
-//! the decoupled context-window store. The winit client emitted the pulsing
-//! pane border as GPU quads through the legacy renderer; the GPUI
-//! rebuild keeps the same geometry pure — [`pane_border_edges`] returns the
-//! four edge [`Rect`]s and the GPUI paint path fills them with
-//! [`AiStateTracker::workspace_border_color`], mirroring [`crate::focus_border`].
+//! the decoupled context-window store. The GPUI paint path lays one rounded
+//! hairline outline over the pane card in
+//! [`AiStateTracker::workspace_border_color`].
 //!
 //! The tab context-% suffix banding now lives in [`crate::tab_bar`]; this module
 //! only owns the per-session context store that feeds it ([`AiStateTracker::context_for`])
@@ -22,12 +20,6 @@ use std::time::{Duration, Instant};
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
 use scribe_common::config::{AiStateEntry, AiStateStylesConfig, TerminalConfig};
 use scribe_common::ids::SessionId;
-
-use crate::focus_border::border_edges;
-use crate::layout::Rect;
-
-/// Width of the animated border overlay in pixels.
-const BORDER_WIDTH: f32 = 2.0;
 
 /// Default pulse frequency when `pulse_ms` is 0 (static display).
 const DEFAULT_PULSE_HZ: f32 = 1.0;
@@ -595,32 +587,9 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
     mid + amp * (t * std::f32::consts::TAU * hz).sin()
 }
 
-// ---------------------------------------------------------------------------
-// Border geometry
-// ---------------------------------------------------------------------------
-
-/// Compute the four edge rects of the AI pane-border overlay (top, bottom,
-/// left, right) around a pane's terminal content area, excluding the tab bar.
-///
-/// The winit client emitted these as four solid renderer quads; the GPUI paint
-/// path fills the returned rects with the colour from
-/// [`AiStateTracker::workspace_border_color`], reusing the shared
-/// [`crate::focus_border::border_edges`] corner-safe strip math.
-#[must_use]
-pub fn pane_border_edges(pane_rect: Rect, tab_bar_height: f32) -> [Rect; 4] {
-    let content = Rect {
-        x: pane_rect.x,
-        y: pane_rect.y + tab_bar_height,
-        width: pane_rect.width,
-        height: (pane_rect.height - tab_bar_height).max(0.0),
-    };
-    border_edges(content, BORDER_WIDTH)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AiStateTracker, STALE_PROCESSING_CLEAR, pane_border_edges};
-    use crate::layout::Rect;
+    use super::{AiStateTracker, STALE_PROCESSING_CLEAR};
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
     use scribe_common::config::{AiColor, AiStateStylesConfig, TerminalConfig};
     use scribe_common::ids::SessionId;
@@ -1011,23 +980,5 @@ mod tests {
         tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
         tracker.remove(sid);
         assert_eq!(tracker.context_for(sid), None);
-    }
-
-    // --- Border geometry ---------------------------------------------------
-
-    // @lat: [[client#GPUI AI Indicator#Pane border edges exclude the tab bar]]
-    #[gpui::test]
-    fn pane_border_edges_exclude_tab_bar() {
-        let pane = Rect { x: 10.0, y: 20.0, width: 200.0, height: 150.0 };
-        let tab_bar_height = 24.0;
-        let [top, bottom, left, right] = pane_border_edges(pane, tab_bar_height);
-        // Top strip starts below the tab bar.
-        assert!((top.y - (20.0 + 24.0)).abs() < f32::EPSILON);
-        assert!((top.width - 200.0).abs() < f32::EPSILON);
-        // Bottom strip sits at the pane's lower edge.
-        assert!((bottom.y - (20.0 + 150.0 - 2.0)).abs() < f32::EPSILON);
-        // Side strips are 2px wide and inset between top and bottom.
-        assert!((left.width - 2.0).abs() < f32::EPSILON);
-        assert!((right.x - (10.0 + 200.0 - 2.0)).abs() < f32::EPSILON);
     }
 }

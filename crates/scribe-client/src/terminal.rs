@@ -806,6 +806,18 @@ impl DisplayOnlyTerminal {
         )
     }
 
+    /// Every line of the buffer, oldest scrollback first through the live
+    /// screen's last row, wherever the viewport is scrolled. A tab mirror reads
+    /// it once when the user scrolls the mirror back.
+    #[must_use]
+    pub fn buffer_rows(&self) -> Vec<Arc<Vec<Cell>>> {
+        let grid = self.term.grid();
+        let columns = self.term.columns();
+        (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(|line| Arc::new(Self::read_row(&self.term, line, columns)))
+            .collect()
+    }
+
     /// How many rows the split-scroll pin currently occupies (`0` when off).
     #[must_use]
     pub fn pin_rows(&self) -> usize {

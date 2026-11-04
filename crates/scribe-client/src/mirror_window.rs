@@ -13,14 +13,15 @@ use std::time::Duration;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Decorations, Entity, FocusHandle,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ResizeEdge,
-    Rgba, Role, Size, Subscription, Task, Tiling, TitlebarOptions, Toggled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions, div,
-    point, prelude::*, px, size,
+    Rgba, Role, ScrollWheelEvent, Size, Subscription, Task, Tiling, TitlebarOptions, Toggled,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind,
+    WindowOptions, div, point, prelude::*, px, size,
 };
 use scribe_client::input::KeyInput;
 use scribe_client::keybindings::{KeyAction, LayoutAction, translate_key_action};
 use scribe_client::layout::Rect;
 use scribe_client::monitor;
+use scribe_client::mouse_reporting;
 use scribe_client::opacity::surface;
 use scribe_client::restore_replay::grid_for_rect;
 use scribe_client::search::MatchHighlightColors;
@@ -35,7 +36,7 @@ use scribe_common::ids::SessionId;
 use crate::mirror_size::{self, MirrorSize};
 use crate::terminal::{Cell, Content, Flags, PaneFrame, ShellCursor, ViewportPoint};
 use crate::terminal_element::{
-    CursorPaint, GridColors, GridFont, PaneContentView, TerminalElement,
+    CursorPaint, GridBounds, GridColors, GridFont, PaneContentView, TerminalElement, cell_at,
 };
 use crate::{
     PANE_BORDER_WIDTH, PANE_CARD_RADIUS, PANE_CONTENT_PADDING, TerminalView,
@@ -327,6 +328,54 @@ struct Wrapped {
     content: Arc<Content>,
 }
 
+/// One grid row, shared between snapshots.
+type Row = Arc<Vec<Cell>>;
+
+/// A mirror scrolled back into its pane's buffer.
+///
+/// The buffer is read once when the scroll begins and the view holds still
+/// from then on, so text does not move under the reader while the tab keeps
+/// printing; scrolling back to the bottom resumes the live view.
+struct Scrollback {
+    /// Every line of the pane's buffer when the scroll began, oldest first.
+    source: Vec<Arc<Vec<Cell>>>,
+    /// `source` re-wrapped at `cols`.
+    cols: usize,
+    lines: Vec<Arc<Vec<Cell>>>,
+    /// Re-wrapped rows between the bottom of the view and the buffer's end.
+    below: usize,
+}
+
+impl Scrollback {
+    fn new(source: Vec<Arc<Vec<Cell>>>) -> Self {
+        Self { source, cols: 0, lines: Vec::new(), below: 0 }
+    }
+
+    /// Re-wrap the buffer when the mirror's width changed.
+    fn fit(&mut self, cols: usize) {
+        if self.cols != cols {
+            self.lines = reflow(self.source.iter(), None, cols).0;
+            self.cols = cols;
+        }
+    }
+
+    /// Walk `delta` rows back (positive) or forward on a `cols` x `rows` grid.
+    /// Returns false once the view is back at the bottom.
+    fn scroll(&mut self, delta: i32, (cols, rows): (usize, usize)) -> bool {
+        self.fit(cols);
+        let top = self.lines.len().saturating_sub(rows);
+        let delta = isize::try_from(delta).unwrap_or_default();
+        self.below = self.below.min(top).saturating_add_signed(delta).min(top);
+        self.below > 0
+    }
+
+    fn content(&mut self, (cols, rows): (usize, usize)) -> Content {
+        self.fit(cols);
+        let below = self.below.min(self.lines.len().saturating_sub(rows));
+        Content { rows: view_rows(&self.lines, cols, rows, below).0, ..Content::default() }
+    }
+}
+
 /// The mirror window's root view.
 pub struct MirrorView {
     parent: WeakEntity<TerminalView>,
@@ -345,6 +394,11 @@ pub struct MirrorView {
     /// at any other size, after which every size is the user's.
     opened_size: Option<MirrorSize>,
     wrapped: Option<Wrapped>,
+    /// Set while the wheel has walked the view back from the live bottom.
+    scrollback: Option<Scrollback>,
+    /// Where the grid painted last frame, so an alternate-screen wheel can be
+    /// reported at the tab cell under the pointer.
+    grid_bounds: GridBounds,
     content_view: Option<Entity<PaneContentView>>,
     _subscriptions: [Subscription; 3],
     _pin_settle: Task<()>,
@@ -378,6 +432,8 @@ impl MirrorView {
             resize_edge: None,
             opened_size: MirrorSize::of(opened),
             wrapped: None,
+            scrollback: None,
+            grid_bounds: GridBounds::default(),
             content_view: None,
             _subscriptions: [repaint, close, resized],
             _pin_settle: pin_settle,
@@ -510,7 +566,11 @@ impl MirrorView {
                     window.start_window_move();
                 }
             }))
-            .child(div().flex_1().truncate().child(self.title.clone()))
+            .child(div().flex_1().truncate().child(if self.scrollback.is_some() {
+                format!("{} (scrolled back)", self.title)
+            } else {
+                self.title.clone()
+            }))
             .children(pin)
             .child(close)
             .into_any_element()
@@ -557,8 +617,59 @@ impl MirrorView {
             .child(resize_cursor_overlay(tiling))
     }
 
+    /// On the main screen, walk the view back through the pane's whole buffer
+    /// or forward to the live bottom. On the alternate screen the mirror shows
+    /// the tab's own grid and the program owns any history, so the wheel goes
+    /// to the program exactly as the tab would send it.
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.parent.upgrade() else { return };
+        let source = parent.read(cx);
+        let natural = source.config.config().config.terminal.scroll.natural_scroll;
+        let rows = mouse_reporting::wheel_lines(event.delta, source.font.line_height, natural);
+        let Some(frame) =
+            source.shared.panes.lock().ok().and_then(|panes| panes.frame(self.session_id))
+        else {
+            return;
+        };
+        if rows == 0 {
+            return;
+        }
+        let (width, height) = grid_extent(window);
+        if frame.alt_screen {
+            let font = fit_font(&source.font, frame.dimensions, (width, height));
+            let cell = self
+                .grid_bounds
+                .get()
+                .and_then(|bounds| report_cell(bounds, &font, event.position, frame.dimensions));
+            source.wheel_to_program(self.session_id, rows, cell, event.modifiers);
+            return;
+        }
+        let grid = grid_cells(&source.font, width, height);
+        let scrolled = match self.scrollback.as_mut() {
+            Some(scrollback) => scrollback.scroll(rows, grid),
+            None if rows > 0 => {
+                let pane =
+                    source.shared.panes.lock().ok().and_then(|p| p.existing(self.session_id));
+                let Some(buffer) = pane.and_then(|pane| pane.with_terminal(|t| t.buffer_rows()))
+                else {
+                    return;
+                };
+                self.scrollback.insert(Scrollback::new(buffer)).scroll(rows, grid)
+            }
+            None => return,
+        };
+        if !scrolled {
+            self.scrollback = None;
+        }
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        // Typing returns to the live bottom, as a terminal's scrollback does.
+        if self.scrollback.take().is_some() {
+            cx.notify();
+        }
         let Some(parent) = self.parent.upgrade() else { return };
         let session = self.session_id;
         if !event.is_held && event.keystroke.key.eq_ignore_ascii_case("z") {
@@ -589,9 +700,15 @@ impl MirrorView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (width, height) = grid_extent(window);
+        if frame.alt_screen {
+            self.scrollback = None;
+        }
         let (content, font) = if frame.alt_screen {
             let fitted = fit_font(&style.font, frame.dimensions, (width, height));
             (Arc::clone(&frame.content), fitted)
+        } else if let Some(scrollback) = self.scrollback.as_mut() {
+            let grid = grid_cells(&style.font, width, height);
+            (Arc::new(scrollback.content(grid)), style.font.clone())
         } else {
             let grid = grid_cells(&style.font, width, height);
             (self.wrapped_content(frame, grid), style.font.clone())
@@ -601,7 +718,7 @@ impl MirrorView {
             font,
             style.colors.clone(),
             style.highlight,
-            Rc::default(),
+            Rc::clone(&self.grid_bounds),
         )
         .with_cursor(Some(CursorPaint { visible: true, shape: style.cursor }));
         let view = self
@@ -698,6 +815,9 @@ impl Render for MirrorView {
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .p(px(PANE_CONTENT_PADDING))
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, win, cx| {
+                        this.on_scroll(event, win, cx);
+                    }))
                     .child(grid),
             );
         Self::render_frame(decorations, card, style.edge, cx)
@@ -760,7 +880,7 @@ fn strip_control(id: &'static str, hover: Rgba) -> gpui::Stateful<gpui::Div> {
 fn grid_cells(font: &GridFont, width: f32, height: f32) -> (usize, usize) {
     let rect = Rect { x: 0.0, y: 0.0, width, height };
     let grid = grid_for_rect(rect, (font.cell_width(), font.line_height));
-    (usize::from(grid.cols), usize::from(grid.rows))
+    (usize::from(grid.cols).max(2), usize::from(grid.rows).max(1))
 }
 
 /// `font` scaled so a `cols` x `rows` grid fits `width` x `height` pixels.
@@ -778,6 +898,21 @@ fn fit_font(
     let scale = (width / natural_width).min(height / natural_height);
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     GridFont { size: font.size * scale, line_height: font.line_height * scale, ..font.clone() }
+}
+
+/// The tab cell a mouse report names for `position` over an alternate-screen
+/// grid painted at `bounds` with `font`, clamped onto the tab's `cols` x
+/// `rows`: the fitted grid leaves spare room on one axis, and a wheel there
+/// still belongs to the program.
+fn report_cell(
+    bounds: Bounds<Pixels>,
+    font: &GridFont,
+    position: gpui::Point<Pixels>,
+    (cols, rows): (usize, usize),
+) -> Option<(u16, u16)> {
+    let at = cell_at(bounds, font, position)?;
+    let axis = |value: usize, len: usize| u16::try_from(value.min(len.max(1) - 1)).ok();
+    Some((axis(at.col, cols)?, axis(at.row, rows)?))
 }
 
 fn cell_count_f32(count: usize) -> f32 {
@@ -820,15 +955,41 @@ pub fn rewrap(history: &[Arc<Vec<Cell>>], content: &Content, cols: usize, rows: 
     let cols = cols.max(2);
     let rows = rows.max(1);
     let cursor = content.shell_cursor;
-    let cursor_row = cursor.map(|cursor| cursor.point.row + history.len());
+    let at = cursor.map(|cursor| (cursor.point.row + history.len(), cursor.point.col));
+    let (out, out_cursor) = reflow(history.iter().chain(&content.rows), at, cols);
+    let (visible, start) = view_rows(&out, cols, rows, 0);
+    let shell_cursor = cursor.zip(out_cursor).and_then(|(cursor, (row, col))| {
+        let row = row.checked_sub(start)?;
+        Some(ShellCursor { point: ViewportPoint { row, col }, shape: cursor.shape })
+    });
+    Content { rows: visible, display_offset: 0, pin_rows: 0, vi_cursor: None, shell_cursor }
+}
 
+/// `rows` re-wrapped rows ending `below` rows above the bottom of `lines`,
+/// padded with blank rows when `lines` is shorter, and the index of the first.
+fn view_rows(lines: &[Row], cols: usize, rows: usize, below: usize) -> (Vec<Row>, usize) {
+    let end = lines.len().saturating_sub(below);
+    let start = end.saturating_sub(rows);
+    let mut visible: Vec<Row> = lines.iter().take(end).skip(start).cloned().collect();
+    let blank = Arc::new(vec![Cell::default(); cols]);
+    visible.resize_with(rows, || Arc::clone(&blank));
+    (visible, start)
+}
+
+/// Join `rows` into logical lines and re-chunk them at `cols`, returning every
+/// re-wrapped row and where `cursor` (row, column in `rows`) landed.
+fn reflow<'a>(
+    rows: impl Iterator<Item = &'a Arc<Vec<Cell>>>,
+    cursor: Option<(usize, usize)>,
+    cols: usize,
+) -> (Vec<Row>, Option<(usize, usize)>) {
     // Logical lines, each with the cursor's offset when it sits on that line.
     let mut lines: Vec<(Vec<Cell>, Option<usize>)> = Vec::new();
     let mut line: Vec<Cell> = Vec::new();
     let mut line_cursor = None;
-    for (row_index, row) in history.iter().chain(&content.rows).enumerate() {
-        if let Some(cursor) = cursor.filter(|_| cursor_row == Some(row_index)) {
-            line_cursor = Some(line.len() + cursor.point.col);
+    for (row_index, row) in rows.enumerate() {
+        if let Some((_, col)) = cursor.filter(|(cursor_row, _)| *cursor_row == row_index) {
+            line_cursor = Some(line.len() + col);
         }
         let wraps = row.last().is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
         line.extend(
@@ -875,16 +1036,7 @@ pub fn rewrap(history: &[Arc<Vec<Cell>>], content: &Content, cols: usize, rows: 
         pad(&mut row);
         out.push(row);
     }
-
-    let start = out.len().saturating_sub(rows);
-    let shell_cursor = cursor.zip(out_cursor).and_then(|(cursor, (row, col))| {
-        let row = row.checked_sub(start)?;
-        Some(ShellCursor { point: ViewportPoint { row, col }, shape: cursor.shape })
-    });
-    let mut visible: Vec<Arc<Vec<Cell>>> = out.into_iter().skip(start).map(Arc::new).collect();
-    let blank = Arc::new(vec![Cell::default(); cols]);
-    visible.resize_with(rows, || Arc::clone(&blank));
-    Content { rows: visible, display_offset: 0, pin_rows: 0, vi_cursor: None, shell_cursor }
+    (out.into_iter().map(Arc::new).collect(), out_cursor)
 }
 
 #[cfg(test)]
@@ -976,6 +1128,42 @@ mod tests {
         assert_eq!(texts(&wrapped), ["ab", "\u{754c}"]);
         assert!(wrapped.rows[1][0].flags.contains(Flags::WIDE_CHAR));
         assert!(wrapped.rows[1][1].flags.contains(Flags::WIDE_CHAR_SPACER));
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Tab mirror re-wrap#Scrolling back walks the whole buffer]]
+    #[test]
+    fn scrolling_back_walks_the_whole_buffer() {
+        let mut terminal = crate::terminal::DisplayOnlyTerminal::new(6, 3);
+        let body = (1..=8).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\r\n");
+        terminal.feed_output(body.as_bytes());
+        // The tab scrolled to its oldest line still hands over its whole buffer.
+        assert!(terminal.scroll_to_abs(0));
+        let mut scrollback = Scrollback::new(terminal.buffer_rows());
+
+        assert!(scrollback.scroll(3, (6, 2)));
+        assert_eq!(texts(&scrollback.content((6, 2))), ["l4", "l5"]);
+        assert!(scrollback.scroll(100, (6, 2)), "held at the oldest line");
+        assert_eq!(texts(&scrollback.content((6, 2))), ["l1", "l2"]);
+        assert!(!scrollback.scroll(-100, (6, 2)), "back at the bottom: the live view resumes");
+        assert_eq!(texts(&scrollback.content((6, 2))), ["l7", "l8"]);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Tab mirror re-wrap#An alternate-screen wheel reports a tab cell]]
+    #[test]
+    fn an_alternate_screen_wheel_reports_a_tab_cell() {
+        let font = GridFont::default();
+        let (cw, lh) = (font.cell_width(), font.line_height);
+        // A fitted 4 x 2 grid in an area with spare room below it.
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(cw * 4.0), px(lh * 5.0)));
+        let at = |x: f32, y: f32| point(px(10.0 + x), px(20.0 + y));
+
+        assert_eq!(report_cell(bounds, &font, at(cw * 2.5, lh * 0.5), (4, 2)), Some((2, 0)));
+        assert_eq!(
+            report_cell(bounds, &font, at(cw * 0.5, lh * 4.5), (4, 2)),
+            Some((0, 1)),
+            "spare room below the fitted grid clamps onto its last row"
+        );
+        assert_eq!(report_cell(bounds, &font, at(-1.0, 0.0), (4, 2)), None, "off the grid");
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Tab mirror size#A remembered size opens on the display]]
