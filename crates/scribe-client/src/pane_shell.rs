@@ -707,14 +707,32 @@ impl PaneShell {
         cx: &App,
     ) -> Option<Rect> {
         let content = self.board_rect(workspace_id, f32::MAX, geometry, cx)?;
-        Some(Rect {
-            height: Self::reserved_board_height(
-                content.height,
-                reservation.height,
-                reservation.terminal,
-            ),
-            ..content
-        })
+        Some(Self::pinned_board_card(content, reservation))
+    }
+
+    /// A pinned board is the top of its region's pane surface, so it keeps a
+    /// pane card's margin to the region's sides and top, and the strip it
+    /// reserves is that margin plus the board: the board's bottom then sits
+    /// one card margin above the pane cards below it, the gap the divider
+    /// between them fills.
+    fn pinned_board_card(content: Rect, reservation: BoardReservation) -> Rect {
+        let strip = Self::reserved_board_height(
+            content.height,
+            reservation.height + PANE_CARD_MARGIN,
+            reservation.terminal,
+        );
+        Rect {
+            x: content.x + PANE_CARD_MARGIN,
+            y: content.y + PANE_CARD_MARGIN,
+            width: (content.width - 2.0 * PANE_CARD_MARGIN).max(0.0),
+            height: (strip - PANE_CARD_MARGIN).max(0.0),
+        }
+    }
+
+    /// The strip a pinned board card reserves from the top of its region.
+    #[must_use]
+    pub fn pinned_board_strip(card: Rect) -> f32 {
+        card.height + PANE_CARD_MARGIN
     }
 
     fn reserved_board_height(content: f32, requested: f32, terminal_reservation: f32) -> f32 {
@@ -2281,6 +2299,28 @@ mod tests {
         assert!(
             (PaneShell::reserved_board_height(180.0, board, 60.0) - 120.0).abs() < 0.001,
             "a short stacked region keeps its terminal reservation"
+        );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#A pinned board is its region's top card]]
+    #[test]
+    fn a_pinned_board_is_its_regions_top_card() {
+        let content = Rect { x: 400.0, y: 80.0, width: 400.0, height: 600.0 };
+        let reservation = BoardReservation { height: 246.0, terminal: 60.0 };
+        let card = PaneShell::pinned_board_card(content, reservation);
+        let m = PANE_CARD_MARGIN;
+        assert_eq!(card, Rect { x: 400.0 + m, y: 80.0 + m, width: 400.0 - 2.0 * m, height: 246.0 });
+        let strip = PaneShell::pinned_board_strip(card);
+        assert!((strip - (246.0 + m)).abs() < 0.001, "the strip is the card plus its margin");
+        // The panes' top card margin then leaves one margin of gap below it.
+        let panes = PaneShell::content_rect(content, 0.0, 0.0, strip);
+        assert!((panes.y + m - (card.y + card.height) - m).abs() < 0.001);
+
+        let short = Rect { height: 180.0, ..content };
+        let short_card = PaneShell::pinned_board_card(short, reservation);
+        assert!(
+            (PaneShell::pinned_board_strip(short_card) - 120.0).abs() < 0.001,
+            "the margin comes out of the board, never the terminal reservation"
         );
     }
 

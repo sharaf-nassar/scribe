@@ -39,7 +39,7 @@ use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, BoardStrip, FlowHoverSource,
     HoverSource, LaneHoverSource,
 };
-use scribe_client::beads_board_a2::RailState;
+use scribe_client::beads_board_a2::{self, RailState};
 use scribe_client::beads_flow::{FlowBandControl, FlowNodeControl};
 use scribe_client::beads_panel::{
     BeadsEditor, BeadsEditorKeyRoute, BeadsPanels, PanelLayer, PanelLayerInputs, PanelWriteIntent,
@@ -172,12 +172,12 @@ use scribe_client::{
     tab_drop_motion::{GapSlot, TabDropMotion, TabDropTarget},
     tab_session::{TabAddress, TabEntry, TabSessions, WorkspaceTabs},
     titlebar::{
-        GHOST_LIFT, StandaloneBadge, TAB_CARD_TOP_GAP, TAB_DRAG_ANIMATION_MS, TAB_MAX_WIDTH,
-        TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag, TabDragGhost,
-        TitlebarDropPreview, TitlebarEvent, TitlebarView, TitlebarWorkspaceDragSource,
-        agent_active_glyph, badge_width_px, beads_graph_icon, drag_placeholder, drop_gap,
-        focus_mark, magnifier_icon, narrowed_slot, new_window_chip, open_tab_edge, tab_card,
-        workspace_pill_dot,
+        GHOST_LIFT, OpenTabRuns, StandaloneBadge, TAB_CARD_TOP_GAP, TAB_DRAG_ANIMATION_MS,
+        TAB_MAX_WIDTH, TAB_MIN_WIDTH, TAB_RUN_INSET, TAB_WIDTH, TabActivationSource, TabDrag,
+        TabDragGhost, TitlebarDropPreview, TitlebarEvent, TitlebarView,
+        TitlebarWorkspaceDragSource, agent_active_glyph, badge_width_px, beads_graph_icon,
+        drag_placeholder, drop_gap, focus_mark, magnifier_icon, narrowed_slot, new_window_chip,
+        open_tab_edge, tab_card, workspace_pill_dot,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -405,7 +405,7 @@ const PANE_BORDER_WIDTH: f32 = 1.0;
 /// full-background application's corner cells can square off the curve.
 // ponytail: rectangular content mask — thread corner radii into the grid's
 // corner cell-bg quads if that artifact ever matters.
-const PANE_CARD_RADIUS: f32 = 8.0;
+const PANE_CARD_RADIUS: f32 = scribe_client::layout::PANE_CARD_RADIUS;
 
 /// Entrance transition for a toast chip; removal stays timer-owned.
 const TOAST_ENTRANCE: Duration = Duration::from_millis(150);
@@ -8959,14 +8959,18 @@ impl TerminalView {
     /// region stacked below gets the legacy client's in-region bar here, at
     /// the top of its rect, above the panes [`PaneShell::placements`] already
     /// shrank to make room.
-    /// One [`paint_tab_bridge`] per open tab whose pane card sits directly under its
-    /// bar: the titlebar's measured runs for top-row regions, the equal-share
-    /// slot for a lower region's own bar.
+    /// One [`paint_tab_bridge`] per open tab whose top card sits directly under
+    /// its bar: the titlebar's measured runs for top-row regions, the
+    /// equal-share slot for a lower region's own bar.
     ///
-    /// A region with a CI band or a pinned board between bar and panes gets no
-    /// bridge, since its open tab opens onto that band instead. The bridge is
-    /// clipped to the card's straight top edge so it can never square off a
-    /// corner.
+    /// A pinned Beads board is the top of its region's pane surface, so the
+    /// open tab bridges into the board's card instead of a pane's, the board
+    /// wears the tab's outline on its top and sides, and a neutral divider
+    /// band ([`board_divider_rect`]) carries that outline on down into the
+    /// pane cards below. A region with a CI band between bar and cards gets no
+    /// bridge, since its open tab opens onto that band instead, and a board
+    /// only hovered open floats over all of it. The bridge is clipped to the
+    /// card's straight top edge so it can never square off a corner.
     ///
     /// Titlebar tabs flex, so their boxes exist only once the titlebar's
     /// prepaint has measured them, after this render. The bridges are therefore
@@ -8979,17 +8983,43 @@ impl TerminalView {
             return None;
         }
         let placements = self.shell.placements(viewport, self.tab_bar_height, cx);
-        let fill = surface(self.terminal_colors.background, self.opacity);
-        let top_row: Vec<(WorkspaceId, Rect)> = self
-            .shell
-            .workspace_rects(viewport, cx)
-            .into_iter()
-            .filter(|(_, rect)| rect.y <= f32::EPSILON)
+        let (pinned, floating) = self.board_cards(cx);
+        let panes: Vec<(WorkspaceId, Rect)> =
+            placements.iter().map(|placement| (placement.workspace_id, placement.rect)).collect();
+        // Every region's top card row: its pinned board's card, else its panes.
+        let cards = panes
+            .iter()
+            .copied()
+            .filter(|(workspace_id, _)| !pinned.iter().any(|(id, _)| id == workspace_id))
+            .chain(pinned.iter().copied())
             .collect();
-        let titlebar_runs = self.titlebar.read(cx).open_tab_runs();
-        // (workspace, bar bottom, left, width, edge), in grid pixels.
-        let mut runs: Vec<(WorkspaceId, f32, f32, f32, gpui::Rgba)> = Vec::new();
+        let surfaces = OpenTabSurfaces {
+            titlebar: self.titlebar.read(cx).open_tab_runs(),
+            top_row: self
+                .shell
+                .workspace_rects(viewport, cx)
+                .into_iter()
+                .filter(|(_, rect)| rect.y <= f32::EPSILON)
+                .collect(),
+            region_runs: self.region_open_runs(viewport, cx),
+            floating,
+            pinned,
+            cards,
+            panes,
+            pane_fill: surface(self.terminal_colors.background, self.opacity),
+            board_ground: self.beads_colors.ground,
+            board_band: self.beads_colors.band,
+        };
+        let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
+            surfaces.paint(window, (f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+        };
+        Some(canvas(|_, _, _| {}, paint).absolute().inset_0().into_any_element())
+    }
+
+    /// The open tab of every lower region's own bar, as an equal-share slot.
+    fn region_open_runs(&self, viewport: Rect, cx: &App) -> Vec<OpenRun> {
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        let mut runs = Vec::new();
         for (workspace_id, rect) in self.shell.region_bar_rects(viewport, self.tab_bar_height, cx) {
             let Some(bar) =
                 self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id)
@@ -9004,36 +9034,15 @@ impl TerminalView {
             let Some(edge) = open_tab_edge(tab, &colors) else { continue };
             let badge = bar.badge.as_ref().map_or(0.0, badge_width_px);
             let (run_left, slot) = tab_run_slots(rect.x, rect.width, badge, bar.tabs.len());
-            runs.push((
+            runs.push(OpenRun {
                 workspace_id,
-                rect.y + rect.height,
-                run_left + px_units(index) * slot,
-                slot,
+                bar_bottom: rect.y + rect.height,
+                left: run_left + px_units(index) * slot,
+                width: slot,
                 edge,
-            ));
-        }
-        let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-            let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-            let titlebar = titlebar_runs.read().into_iter().filter_map(|(left, width, edge)| {
-                let left = left - origin.0;
-                let (workspace_id, _) = top_row
-                    .iter()
-                    .find(|(_, rect)| rect.x <= left && left < rect.x + rect.width)?;
-                Some((*workspace_id, 0.0, left, width, edge))
             });
-            let bridges = titlebar.chain(runs.iter().copied()).filter_map(
-                |(workspace_id, bar_bottom, left, width, edge)| {
-                    Some((
-                        tab_bridge_rect(&placements, workspace_id, bar_bottom, left, width)?,
-                        edge,
-                    ))
-                },
-            );
-            for (bridge, edge) in bridges {
-                paint_tab_bridge(window, origin, &bridge, fill, edge);
-            }
-        };
-        Some(canvas(|_, _, _| {}, paint).absolute().inset_0().into_any_element())
+        }
+        runs
     }
 
     fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -11459,6 +11468,24 @@ impl TerminalView {
         }
     }
 
+    /// Cards of every pinned board in grid pixels, and the regions whose board
+    /// is only hovered open, which float over their region's chrome.
+    fn board_cards(&self, cx: &App) -> (Vec<(WorkspaceId, Rect)>, Vec<WorkspaceId>) {
+        let Ok(boards) = self.shared.beads_boards.lock() else { return (Vec::new(), Vec::new()) };
+        let mut cards = Vec::new();
+        let mut floating = Vec::new();
+        for &(workspace_id, pinned) in &self.visible_beads_boards {
+            if !pinned {
+                floating.push(workspace_id);
+            } else if let Some(card) =
+                self.beads_board_rect(workspace_id, true, boards.height(workspace_id), cx)
+            {
+                cards.push((workspace_id, card));
+            }
+        }
+        (cards, floating)
+    }
+
     /// Start a resize when the pointer lands on an open board's bottom bar.
     ///
     /// Resolved here rather than by a listener inside the board so the press is
@@ -11474,9 +11501,8 @@ impl TerminalView {
         let grabbed = self.visible_beads_boards.iter().find(|(workspace_id, pinned)| {
             self.beads_board_rect(*workspace_id, *pinned, boards.height(*workspace_id), cx)
                 .is_some_and(|rect| {
-                    x >= rect.x
-                        && x < rect.x + rect.width
-                        && (y - (rect.y + rect.height)).abs() <= BEADS_BOARD_GRIP
+                    let (top, bottom) = board_grab_span(rect, *pinned);
+                    x >= rect.x && x < rect.x + rect.width && (top..=bottom).contains(&y)
                 })
         });
         let Some((workspace_id, _)) = grabbed else { return false };
@@ -14203,7 +14229,7 @@ impl TerminalView {
         // The board is placed against the same region rects the panes are, so
         // it belongs in the grid band with them rather than in a window-wide
         // band that would span every region.
-        let beads_boards = self.render_beads_boards(cx);
+        let (beads_boards, board_grips) = self.render_beads_boards(cx);
         div()
             .id("terminal-grid")
             .flex_1()
@@ -14215,11 +14241,11 @@ impl TerminalView {
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(region_bars)
-            // After the panes and bars: each bridge paints over its pane
-            // card's top border and up to its bar's bottom edge.
-            .children(self.render_tab_bridges(cx))
             .children(ci_bars)
             .children(beads_boards)
+            // Tab bridges and pinned-board outlines paint over the cards' edges,
+            // and the board grips over the divider band those bridges paint.
+            .children(self.render_tab_bridges(cx).into_iter().chain(board_grips))
             .children(self.render_beads_panels(cx))
             // Dividers paint last, over panes, region bars, and boards alike:
             // a region divider runs the full height of the split, so two
@@ -14337,7 +14363,7 @@ impl TerminalView {
                     .filter(|(_, pinned)| *pinned)
                     .filter_map(|(workspace_id, _)| {
                         self.beads_board_rect(*workspace_id, true, boards.height(*workspace_id), cx)
-                            .map(|rect| (*workspace_id, rect.height))
+                            .map(|rect| (*workspace_id, PaneShell::pinned_board_strip(rect)))
                     })
                     .collect();
                 visible
@@ -14878,13 +14904,19 @@ impl TerminalView {
         (view, false)
     }
 
-    fn render_beads_boards(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    /// Every visible board, and each board's resize grip; the grips paint
+    /// later, over the divider band a pinned board's join lays under them.
+    fn render_beads_boards(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (Vec<gpui::AnyElement>, Vec<gpui::AnyElement>) {
         self.sync_flow_node_controls(cx);
         let visible = self.visible_beads_boards.clone();
         let live: HashSet<WorkspaceId> = visible.iter().map(|(id, _)| *id).collect();
         self.beads_strip_views.retain(|workspace_id, _| live.contains(workspace_id));
         let colors = self.beads_colors;
-        let mut out = Vec::with_capacity(visible.len() * 2);
+        let mut out = Vec::with_capacity(visible.len());
+        let mut grips = Vec::with_capacity(visible.len());
         for (workspace_id, pinned) in visible {
             // Locked through a local handle rather than `self.shared` so the
             // guard can ride into `sync_strip_view` alongside `&mut self`.
@@ -14943,28 +14975,18 @@ impl TerminalView {
                 // lock for itself.
                 flow: boards.flow_snapshot(workspace_id),
             };
+            let resizing = boards.resizing() == Some(workspace_id);
             let (strip, changed) = self.sync_strip_view(boards, name, wiring, cx);
             // The wrapper spans the whole grid band so the strip's own
             // absolutely-positioned root keeps today's coordinate space; the
             // band is definite, which is what `cached` needs, and an
             // unstyled wrapper intercepts no events of its own.
             out.push(mount_synced_view(strip, changed));
-            // The bar's grab band, carrying nothing but the pointer a
-            // divider's does — the press itself is resolved against the
-            // same rect over in `press_board_edge`, so the two cannot
-            // disagree about where the bar is.
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(rect.x))
-                    .top(px(rect.y + rect.height - BEADS_BOARD_GRIP))
-                    .w(px(rect.width))
-                    .h(px(BEADS_BOARD_GRIP * 2.0))
-                    .cursor(gpui::CursorStyle::ResizeUpDown)
-                    .into_any_element(),
-            );
+            // Held lit for the whole drag, which can outrun the band.
+            let handle = if resizing { colors.muted } else { colors.grip };
+            grips.push(board_grip(rect, pinned.then_some((handle, colors.muted))));
         }
-        out
+        (out, grips)
     }
 
     /// The panel twin of `sync_strip_view`: get-or-create the workspace's
@@ -18365,6 +18387,53 @@ fn drop_gap_width(slot: f32) -> f32 {
     (if slot > 0.0 { slot } else { TAB_WIDTH }).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
 }
 
+/// Size of the handle centred on a pinned board's divider band.
+const BOARD_GRIP_W: f32 = 36.0;
+const BOARD_GRIP_H: f32 = 3.0;
+
+/// The `(top, bottom)` a press must land in to resize a board, in grid
+/// pixels. A pinned board's whole divider band grabs: its floor plus the gap
+/// and pane border below it. A board only hovered open keeps the divider
+/// tolerance either side of its bottom edge.
+fn board_grab_span(rect: Rect, pinned: bool) -> (f32, f32) {
+    let bottom = rect.y + rect.height;
+    if pinned {
+        (bottom - beads_board_a2::FLOOR_H, bottom + PANE_CARD_MARGIN + PANE_BORDER_WIDTH)
+    } else {
+        (bottom - BEADS_BOARD_GRIP, bottom + BEADS_BOARD_GRIP)
+    }
+}
+
+/// A board's grab band: the resize pointer over [`board_grab_span`], and on a
+/// pinned board's divider a centred pill handle. `handle` is that pill's
+/// `(rest, lit)` colours, lit while the band is hovered; a hovered-open board
+/// has none, its handle being the grip in its own floor.
+fn board_grip(rect: Rect, handle: Option<(gpui::Rgba, gpui::Rgba)>) -> gpui::AnyElement {
+    let (top, bottom) = board_grab_span(rect, handle.is_some());
+    let group = gpui::SharedString::from(format!("board-grip-{}-{}", rect.x, rect.y));
+    let pill = handle.map(|(rest, lit)| {
+        div()
+            .w(px(BOARD_GRIP_W))
+            .h(px(BOARD_GRIP_H))
+            .rounded(px(BOARD_GRIP_H / 2.0))
+            .bg(rest)
+            .group_hover(group.clone(), move |style| style.bg(lit))
+    });
+    div()
+        .group(group)
+        .absolute()
+        .left(px(rect.x))
+        .top(px(top))
+        .w(px(rect.width))
+        .h(px(bottom - top))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(gpui::CursorStyle::ResizeUpDown)
+        .children(pill)
+        .into_any_element()
+}
+
 fn tab_run_slots(bar_left: f32, bar_width: f32, badge_width: f32, count: usize) -> (f32, f32) {
     let inner = (bar_width - 2.0 * TAB_RUN_INSET).max(0.0);
     let badge = badge_width.min(inner);
@@ -18376,10 +18445,10 @@ fn tab_run_slots(bar_left: f32, bar_width: f32, badge_width: f32, count: usize) 
 }
 
 /// Where an open tab's bridge lands: from `bar_bottom` down over the top
-/// border of the pane card directly under the tab, or `None` when something
-/// else is reserved between the bar and the panes.
+/// border of the card directly under the tab (a pane's, or a pinned board's),
+/// or `None` when something else is reserved between the bar and the cards.
 fn tab_bridge_rect(
-    placements: &[PanePlacement],
+    cards: &[(WorkspaceId, Rect)],
     workspace_id: WorkspaceId,
     bar_bottom: f32,
     left: f32,
@@ -18387,23 +18456,16 @@ fn tab_bridge_rect(
 ) -> Option<TabBridge> {
     // The region's top card row: its top edge is the bar bottom plus the
     // card margin only when nothing else is reserved.
-    let card_top = placements
-        .iter()
-        .filter(|placement| placement.workspace_id == workspace_id)
-        .map(|placement| placement.rect.y)
-        .min_by(f32::total_cmp)?;
+    let card_top = top_card_row(cards, workspace_id)?;
     if (card_top - bar_bottom - PANE_CARD_MARGIN).abs() > 0.5 {
         return None;
     }
-    let card = placements
-        .iter()
-        .find(|placement| {
-            placement.workspace_id == workspace_id
-                && (placement.rect.y - card_top).abs() <= 0.5
-                && placement.rect.x <= left + width
-                && left <= placement.rect.x + placement.rect.width
-        })?
-        .rect;
+    let (_, card) = *cards.iter().find(|(id, card)| {
+        *id == workspace_id
+            && (card.y - card_top).abs() <= 0.5
+            && card.x <= left + width
+            && left <= card.x + card.width
+    })?;
     // A tab flush with the card's side squares that corner, as a browser tab
     // does at its toolbar's edge; a tab edge that only nears a corner stops
     // short of the curve instead.
@@ -18425,6 +18487,163 @@ fn tab_bridge_rect(
     })
 }
 
+/// One region's open tab, in grid pixels: the bar it sits in and its box.
+#[derive(Clone, Copy)]
+struct OpenRun {
+    workspace_id: WorkspaceId,
+    bar_bottom: f32,
+    left: f32,
+    width: f32,
+    edge: gpui::Rgba,
+}
+
+/// Everything the grid paints to join each open tab to the surface below it,
+/// gathered while the shell renders and painted once the titlebar's tab boxes
+/// for the same frame exist.
+struct OpenTabSurfaces {
+    titlebar: OpenTabRuns,
+    /// Top-row regions, which own the titlebar's tabs.
+    top_row: Vec<(WorkspaceId, Rect)>,
+    /// Lower regions' open tabs, laid out by the shell itself.
+    region_runs: Vec<OpenRun>,
+    /// Regions whose board is only hovered open and floats over the rest.
+    floating: Vec<WorkspaceId>,
+    /// Pinned board cards: each the top card of its region's surface.
+    pinned: Vec<(WorkspaceId, Rect)>,
+    /// Each region's cards under its bar: its pinned board, else its panes.
+    cards: Vec<(WorkspaceId, Rect)>,
+    panes: Vec<(WorkspaceId, Rect)>,
+    pane_fill: gpui::Rgba,
+    board_ground: gpui::Rgba,
+    board_band: gpui::Rgba,
+}
+
+impl OpenTabSurfaces {
+    fn paint(&self, window: &mut Window, origin: (f32, f32)) {
+        let open = self.open_runs(origin.0);
+        // Outlines first: the bridge under the open tab paints over the
+        // board's top edge, which is what opens the board into the tab.
+        for &(workspace_id, card) in &self.pinned {
+            let Some(run) = open.iter().find(|run| run.workspace_id == workspace_id) else {
+                continue;
+            };
+            paint_board_outline(window, origin, card, run.edge);
+            // The divider is the board's floor band carried down over the gap
+            // and the panes' top border, so the accent never runs between
+            // board and terminal; its caps square the pane corners below it.
+            if let Some(seam) = board_divider_rect(&self.panes, workspace_id, card) {
+                let paint =
+                    BridgePaint { strip: self.board_band, cap: self.pane_fill, edge: run.edge };
+                paint_tab_bridge(window, origin, &seam, paint);
+            }
+        }
+        for run in &open {
+            let Some(bridge) =
+                tab_bridge_rect(&self.cards, run.workspace_id, run.bar_bottom, run.left, run.width)
+            else {
+                continue;
+            };
+            // Under a pinned board the tab opens into the board's ground.
+            let on_board = self.pinned.iter().any(|(id, _)| *id == run.workspace_id);
+            let fill = if on_board { self.board_ground } else { self.pane_fill };
+            paint_tab_bridge(
+                window,
+                origin,
+                &bridge,
+                BridgePaint { strip: fill, cap: fill, edge: run.edge },
+            );
+        }
+    }
+
+    /// Every open tab this frame, titlebar boxes resolved to their top-row
+    /// region against the grid's own left edge `origin_x`.
+    fn open_runs(&self, origin_x: f32) -> Vec<OpenRun> {
+        let titlebar = self.titlebar.read().into_iter().filter_map(|(left, width, edge)| {
+            let left = left - origin_x;
+            let (workspace_id, _) = self
+                .top_row
+                .iter()
+                .find(|(_, rect)| rect.x <= left && left < rect.x + rect.width)?;
+            Some(OpenRun { workspace_id: *workspace_id, bar_bottom: 0.0, left, width, edge })
+        });
+        titlebar
+            .chain(self.region_runs.iter().copied())
+            .filter(|run| !self.floating.contains(&run.workspace_id))
+            .collect()
+    }
+}
+
+/// The top edge of `workspace_id`'s first row of cards.
+fn top_card_row(cards: &[(WorkspaceId, Rect)], workspace_id: WorkspaceId) -> Option<f32> {
+    cards
+        .iter()
+        .filter(|(id, _)| *id == workspace_id)
+        .map(|(_, card)| card.y)
+        .min_by(f32::total_cmp)
+}
+
+/// The divider between a pinned board's card and the pane cards below it:
+/// the board's width, from its bottom edge down over the panes' top border,
+/// squaring the pane corners flush with the board's sides. `None` when the
+/// panes do not start one card margin below the board.
+fn board_divider_rect(
+    panes: &[(WorkspaceId, Rect)],
+    workspace_id: WorkspaceId,
+    board: Rect,
+) -> Option<TabBridge> {
+    let top = board.y + board.height;
+    let pane_top = top_card_row(panes, workspace_id)?;
+    if (pane_top - top - PANE_CARD_MARGIN).abs() > 0.5 {
+        return None;
+    }
+    let top_row = || {
+        panes.iter().filter(|(id, pane)| *id == workspace_id && (pane.y - pane_top).abs() <= 0.5)
+    };
+    let right = board.x + board.width;
+    Some(TabBridge {
+        rect: Rect {
+            x: board.x,
+            y: top,
+            width: board.width,
+            height: PANE_CARD_MARGIN + PANE_BORDER_WIDTH,
+        },
+        cap_left: top_row().any(|(_, pane)| (pane.x - board.x).abs() <= 1.0),
+        cap_right: top_row().any(|(_, pane)| (pane.x + pane.width - right).abs() <= 1.0),
+    })
+}
+
+/// A pinned board card's outline: the open tab's edge on its top and sides,
+/// rounded at the top like a pane card. Its bottom is the divider's.
+fn paint_board_outline(window: &mut Window, origin: (f32, f32), card: Rect, edge: gpui::Rgba) {
+    let radius = px(PANE_CARD_RADIUS);
+    let border = px(PANE_BORDER_WIDTH);
+    window.paint_quad(gpui::quad(
+        Bounds::new(
+            point(px(origin.0 + card.x), px(origin.1 + card.y)),
+            size(px(card.width), px(card.height)),
+        ),
+        gpui::Corners {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: px(0.0),
+            bottom_left: px(0.0),
+        },
+        gpui::transparent_black(),
+        gpui::Edges { top: border, right: border, bottom: px(0.0), left: border },
+        edge,
+        gpui::BorderStyle::default(),
+    ));
+}
+
+/// A bridge's colours: the strip's fill, the squared corners' fill, and the
+/// outline it carries down its sides.
+#[derive(Clone, Copy)]
+struct BridgePaint {
+    strip: gpui::Rgba,
+    cap: gpui::Rgba,
+    edge: gpui::Rgba,
+}
+
 /// A bridge's geometry: the strip over the gap and the card's top border, and
 /// which card corners it squares off below that.
 struct TabBridge {
@@ -18433,10 +18652,11 @@ struct TabBridge {
     cap_right: bool,
 }
 
-/// The strip of pane fill that joins an open tab's card to the pane card
-/// below it: it covers the window-ground gap and the card's top border under
-/// the tab, carrying the card's side outline down, so tab and pane read as
-/// one surface.
+/// The strip that joins one card to the card below it: it covers the
+/// window-ground gap and the lower card's top border, carrying the outline's
+/// sides down, so the two read as one surface. `strip` fills the gap (the
+/// upper card's fill for an open tab, the divider band under a pinned board);
+/// `cap` fills the squared corners inside the lower card.
 ///
 /// `origin` is the grid's window position, which the bridge's grid-pixel
 /// rect is relative to.
@@ -18444,32 +18664,40 @@ fn paint_tab_bridge(
     window: &mut Window,
     origin: (f32, f32),
     bridge: &TabBridge,
-    fill: gpui::Rgba,
-    edge: gpui::Rgba,
+    paint: BridgePaint,
 ) {
     let TabBridge { rect, cap_left, cap_right } = *bridge;
-    let quad = |x: f32, y: f32, width: f32, height: f32, left: bool, right: bool| {
+    let BridgePaint { strip, cap, edge } = paint;
+    // `(x, width)` of one quad, its fill, and whether it carries the left and
+    // right outline; every quad shares the bridge's own vertical span or the
+    // caps' span below it.
+    let quad = |x: f32, width: f32, y: f32, height: f32, fill: gpui::Rgba, sides: (bool, bool)| {
         let side = |on: bool| px(if on { 1.0 } else { 0.0 });
         gpui::quad(
             Bounds::new(point(px(origin.0 + x), px(origin.1 + y)), size(px(width), px(height))),
             px(0.0),
             fill,
-            gpui::Edges { top: px(0.0), right: side(right), bottom: px(0.0), left: side(left) },
+            gpui::Edges {
+                top: px(0.0),
+                right: side(sides.1),
+                bottom: px(0.0),
+                left: side(sides.0),
+            },
             edge,
             gpui::BorderStyle::default(),
         )
     };
-    window.paint_quad(quad(rect.x, rect.y, rect.width, rect.height, true, true));
+    window.paint_quad(quad(rect.x, rect.width, rect.y, rect.height, strip, (true, true)));
     // A squared corner runs the card's side outline straight down over its
     // curve; the cap sits inside the card's content padding, so no glyph is
     // under it.
     let (cap_y, cap_h) = (rect.y + rect.height, PANE_CARD_RADIUS - PANE_BORDER_WIDTH);
     if cap_left {
-        window.paint_quad(quad(rect.x, cap_y, PANE_CARD_RADIUS, cap_h, true, false));
+        window.paint_quad(quad(rect.x, PANE_CARD_RADIUS, cap_y, cap_h, cap, (true, false)));
     }
     if cap_right {
         let x = rect.x + rect.width - PANE_CARD_RADIUS;
-        window.paint_quad(quad(x, cap_y, PANE_CARD_RADIUS, cap_h, false, true));
+        window.paint_quad(quad(x, PANE_CARD_RADIUS, cap_y, cap_h, cap, (false, true)));
     }
 }
 
@@ -20736,6 +20964,54 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[test#GPUI Client Headless Suites#A pinned board joins its tab and panes]]
+    #[test]
+    fn a_pinned_board_joins_its_tab_and_panes() {
+        let ws = WorkspaceId::new();
+        let m = PANE_CARD_MARGIN;
+        let board = Rect { x: m, y: m, width: 788.0, height: 246.0 };
+        // Two panes side by side under the board, starting one margin below it.
+        let pane_top = board.y + board.height + m;
+        let panes = [
+            (ws, Rect { x: m, y: pane_top, width: 391.0, height: 300.0 }),
+            (
+                ws,
+                Rect { x: 403.0, y: pane_top, width: board.x + board.width - 403.0, height: 300.0 },
+            ),
+        ];
+
+        // The open tab bridges into the board, the region's top card.
+        let bridge = tab_bridge_rect(&[(ws, board)], ws, 0.0, m, 176.0).expect("tab joins board");
+        assert!((bridge.rect.y).abs() < 0.001 && bridge.cap_left && !bridge.cap_right);
+        assert!(
+            tab_bridge_rect(&panes, ws, 0.0, m, 176.0).is_none(),
+            "panes under a board are not the tab's top card"
+        );
+
+        // The divider spans the board and squares both outer pane corners.
+        let seam = board_divider_rect(&panes, ws, board).expect("board joins panes");
+        assert_eq!(
+            seam.rect,
+            Rect { x: board.x, y: board.y + board.height, width: board.width, height: m + 1.0 }
+        );
+        assert!(seam.cap_left && seam.cap_right);
+        let lower = panes.map(|(id, rect)| (id, Rect { y: rect.y + 20.0, ..rect }));
+        assert!(board_divider_rect(&lower, ws, board).is_none(), "a gap wider than a margin");
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#A pinned board's whole divider grabs]]
+    #[test]
+    fn a_pinned_boards_whole_divider_grabs() {
+        let board = Rect { x: 6.0, y: 6.0, width: 788.0, height: 246.0 };
+        let bottom = board.y + board.height;
+        let (top, end) = board_grab_span(board, true);
+        assert!((top - (bottom - beads_board_a2::FLOOR_H)).abs() < 0.001, "from the floor");
+        assert!((end - (bottom + PANE_CARD_MARGIN + PANE_BORDER_WIDTH)).abs() < 0.001);
+        let (hover_top, hover_end) = board_grab_span(board, false);
+        assert!((hover_top - (bottom - BEADS_BOARD_GRIP)).abs() < 0.001, "a hovered board keeps");
+        assert!((hover_end - (bottom + BEADS_BOARD_GRIP)).abs() < 0.001, "the divider tolerance");
+    }
 
     fn suspend_test_backend() -> PreparedWindowBackend {
         PROCESS_SHUTDOWN.get_or_init(ProcessShutdown::for_test);

@@ -60,6 +60,10 @@ pub enum SplitDirection {
     Vertical,
 }
 
+/// Corner radius of a pane card, and of a pinned Beads board, which is the top
+/// card of its region's pane surface.
+pub const PANE_CARD_RADIUS: f32 = 8.0;
+
 /// Axis-aligned rectangle in pixel coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {

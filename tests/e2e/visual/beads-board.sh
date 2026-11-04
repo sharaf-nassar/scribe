@@ -218,8 +218,10 @@ print(json.dumps({
 PY
 }
 
-# ponytail: periodic last-good injection only counters the bd-less visual
-# server's NotDetected poll; replace it if the harness gains a static-board mode.
+# The recipe runs the share tap in static-board mode, so the bd-less server's
+# NotDetected poll never reaches the client and cannot close or unpin the board
+# the suite injected. The keeper still re-injects the last fixture so every
+# capture reads a freshly refreshed snapshot.
 KEEPER_FILE=/tmp/beads-board-keeper.json
 KEEPER_PID=""
 
@@ -448,8 +450,16 @@ done
 [ "${PINNED_ROWS:-$UNPINNED_ROWS}" -lt "$UNPINNED_ROWS" ] || fail "board badge did not pin the strip"
 inject "$(board_message "$WORKSPACE" sparse)"
 park_pointer
+# A pinned board is the top card of its region's pane surface: inset the
+# client's PANE_CARD_MARGIN from the region's sides and top. From here on the
+# oracles read x relative to the board's own left edge, the space the contract
+# is written in, and the board's top is re-measured on the pinned card.
+BOARD_X=6
+export BEADS_PINNED_BOARD_INSET=$BOARD_X
+shot a2-pinned-probe.png
+BOARD_TOP=$(python3 "$ORACLE" board-top "$CONTRACT" /output/a2-pinned-probe.png) || fail "could not measure the pinned A2 board top"
 shot a2-collapsed-sparse.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-collapsed-sparse.png "$BOARD_TOP" sparse --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-collapsed-sparse.png "$BOARD_TOP" sparse --width "$((WIN_W - 2 * BOARD_X))"
 load_tracks /output/a2-collapsed-sparse.png
 
 # Both collapsed tabs open the same exact overlay on their own hover repaint,
@@ -485,7 +495,7 @@ xdotool click 1
 sleep 0.2
 park_pointer 0.1
 shot a2-pinned-done.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-pinned-done.png "$BOARD_TOP" pinned-done --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-pinned-done.png "$BOARD_TOP" pinned-done --width "$((WIN_W - 2 * BOARD_X))"
 load_tracks /output/a2-pinned-done.png
 xdotool mousemove --sync --window "$WID" "$((T4_X + T4_W - 8))" "$((BOARD_TOP + A2_LANES_PADDING_TOP + A2_HEAD_H / 2))"
 xdotool click 1
@@ -495,7 +505,7 @@ xdotool click 1
 sleep 0.2
 inject "$(board_message "$WORKSPACE" busy)" 0.08
 shot a2-collapsed-busy.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-collapsed-busy.png "$BOARD_TOP" busy --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-collapsed-busy.png "$BOARD_TOP" busy --width "$((WIN_W - 2 * BOARD_X))"
 inject "$(board_message "$WORKSPACE" busy)" 0.05
 shot a2-pin-blocked-base.png
 load_tracks /output/a2-pin-blocked-base.png
@@ -504,7 +514,7 @@ xdotool click 1
 sleep 0.2
 park_pointer 0.1
 shot a2-pinned-blocked.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-pinned-blocked.png "$BOARD_TOP" pinned-blocked --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-pinned-blocked.png "$BOARD_TOP" pinned-blocked --width "$((WIN_W - 2 * BOARD_X))"
 load_tracks /output/a2-pinned-blocked.png
 xdotool mousemove --sync --window "$WID" "$((T3_X + T3_W - 8))" "$((BOARD_TOP + A2_LANES_PADDING_TOP + A2_HEAD_H / 2))"
 xdotool click 1
@@ -516,10 +526,10 @@ sleep 0.25
 # Empty copy, whole-row overflow, 51px hover/focus, and three metadata columns.
 show_board empty
 shot a2-empty.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-empty.png "$BOARD_TOP" collapsed --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-empty.png "$BOARD_TOP" collapsed --width "$((WIN_W - 2 * BOARD_X))"
 show_board busy
 shot a2-overflow.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-overflow.png "$BOARD_TOP" busy --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-overflow.png "$BOARD_TOP" busy --width "$((WIN_W - 2 * BOARD_X))"
 python3 "$ORACLE" a2-metadata "$CONTRACT" /output/a2-overflow.png "$BOARD_TOP" 1 0
 load_tracks /output/a2-overflow.png
 ROW_Y=$((BOARD_TOP + A2_HEADBAND_H + A2_ROW_H / 2))
@@ -577,8 +587,8 @@ sleep 0.3
 
 # Text scale uses the contract's left-gutter steppers and keeps the reservation.
 show_board busy
-PLUS_X=$((A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2))
-MINUS_X=$((A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2))
+PLUS_X=$((BOARD_X + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2))
+MINUS_X=$((BOARD_X + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2))
 ZOOM_Y=$((BOARD_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2))
 scale_steps() {
     local x=$1 count=$2 fixture=${3:-busy}
@@ -602,7 +612,7 @@ python3 "$ORACLE" a2-row "$CONTRACT" /output/a2-scale-1.0.png /output/a2-scale-1
 scale_steps "$PLUS_X" 6
 show_board busy
 shot a2-scale-1.6.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-scale-1.6.png "$BOARD_TOP" busy --width "$WIN_W" --scale 1.6
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-scale-1.6.png "$BOARD_TOP" busy --width "$((WIN_W - 2 * BOARD_X))" --scale 1.6
 load_tracks /output/a2-scale-1.6.png
 xdotool mousemove --sync --window "$WID" "$((T0_X + T0_W / 2))" "$((BOARD_TOP + A2_HEADBAND_H + A2_ROW_H * 16 / 20 / 2))"
 sleep 0.18
@@ -611,7 +621,7 @@ python3 "$ORACLE" a2-row "$CONTRACT" /output/a2-scale-1.6.png /output/a2-scale-1
 scale_steps "$MINUS_X" 10
 show_board busy
 shot a2-scale-0.8.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-scale-0.8.png "$BOARD_TOP" busy --width "$WIN_W" --scale 0.8
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-scale-0.8.png "$BOARD_TOP" busy --width "$((WIN_W - 2 * BOARD_X))" --scale 0.8
 load_tracks /output/a2-scale-0.8.png
 xdotool mousemove --sync --window "$WID" "$((T0_X + T0_W / 2))" "$((BOARD_TOP + A2_HEADBAND_H + A2_ROW_H * 8 / 20 / 2))"
 sleep 0.18
@@ -643,7 +653,7 @@ enter_flow flow standard
 shot a3-opened.png
 cp /output/a3-opened.png /output/a3-theme-before.png
 python3 "$ORACLE" flow-opened "$CONTRACT" /output/a3-opened.png "$BOARD_TOP"
-FLOW_CURSOR_X=$((A3_LEFT_PAD + 2 * A3_RANK_PITCH + 90))
+FLOW_CURSOR_X=$((BOARD_X + A3_LEFT_PAD + 2 * A3_RANK_PITCH + 90))
 FLOW_CURSOR_Y=$((BOARD_TOP + A3_GRAPH_TOP + (A3_GRAPH_H - (2 * A3_NODE_H + A3_ROW_GAP)) / 2 + A3_NODE_H / 2))
 xdotool mousemove --sync --window "$WID" "$FLOW_CURSOR_X" "$FLOW_CURSOR_Y"
 sleep 0.35
@@ -668,14 +678,14 @@ xdotool key --clearmodifiers Escape
 sleep 0.25
 enter_flow flow standard
 shot a3-back-focus-base.png
-xdotool mousemove --sync --window "$WID" "$((A3_LEFT_PAD + 80))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_LEFT_PAD + 80))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
 xdotool click 1
 xdotool key --clearmodifiers shift+Tab
 xdotool key --clearmodifiers shift+Tab
 sleep 0.3
 shot a3-back-focus.png
 python3 "$ORACLE" focus-control "$CONTRACT" /output/a3-back-focus-base.png /output/a3-back-focus.png "$BOARD_TOP" back
-xdotool mousemove --sync --window "$WID" "$((A3_BAND_PAD_LEFT + 24))" "$((BOARD_TOP + A3_BAND_H / 2))"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_BAND_PAD_LEFT + 24))" "$((BOARD_TOP + A3_BAND_H / 2))"
 xdotool click 1
 sleep 0.5
 board_park 0.2
@@ -685,7 +695,7 @@ shot a3-back-returned.png
 # The mode-pair LANES control is the second Tab stop and activates by Enter.
 enter_flow flow standard
 shot a3-lanes-focus-base.png
-xdotool mousemove --sync --window "$WID" "$((A3_LEFT_PAD + 80))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_LEFT_PAD + 80))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
 xdotool click 1
 xdotool key --clearmodifiers shift+Tab
 sleep 0.3
@@ -707,13 +717,13 @@ wait_theme_reload
 sleep 0.5
 show_board busy
 shot a2-theme-after.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-theme-after.png "$BOARD_TOP" busy --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-theme-after.png "$BOARD_TOP" busy --width "$((WIN_W - 2 * BOARD_X))"
 python3 "$ORACLE" theme "$CONTRACT" /output/a2-theme-before.png /output/a2-theme-after.png "$BOARD_TOP" a2
 enter_flow flow standard
 shot a3-theme-after.png
 python3 "$ORACLE" flow-opened "$CONTRACT" /output/a3-theme-after.png "$BOARD_TOP"
 python3 "$ORACLE" theme "$CONTRACT" /output/a3-theme-before.png /output/a3-theme-after.png "$BOARD_TOP" a3
-xdotool mousemove --sync --window "$WID" "$((A3_BAND_PAD_LEFT + 24))" "$((BOARD_TOP + A3_BAND_H / 2))"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_BAND_PAD_LEFT + 24))" "$((BOARD_TOP + A3_BAND_H / 2))"
 xdotool click 1
 sleep 0.35
 printf '[appearance]\ntheme = "minimal-dark"\nanimations = false\n' >"$CONFIG_FILE"
@@ -727,14 +737,14 @@ board_park 0.2
 shot a3-deep-near.png
 python3 "$ORACLE" flow-overflow "$CONTRACT" /output/a3-deep-near.png "$BOARD_TOP" near
 DEEP_FIRST_Y=$((BOARD_TOP + A3_GRAPH_TOP + (A3_GRAPH_H - (4 * A3_NODE_H + 3 * A3_ROW_GAP)) / 2 + A3_NODE_H / 2))
-xdotool mousemove --sync --window "$WID" "$((A3_LEFT_PAD + 80))" "$DEEP_FIRST_Y"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_LEFT_PAD + 80))" "$DEEP_FIRST_Y"
 xdotool click 1
 xdotool key --clearmodifiers shift+Tab
 sleep 0.25
 xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((BOARD_TOP + A3_GRAPH_TOP + 60))"
 xdotool click 5
 sleep 0.3
-xdotool mousemove --sync --window "$WID" "$((WIN_W - A3_FADE_W - A3_NODE_W / 4))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
+xdotool mousemove --sync --window "$WID" "$((WIN_W - BOARD_X - A3_FADE_W - A3_NODE_W / 4))" "$((BOARD_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2))"
 sleep 0.25
 shot a3-deep-middle.png
 python3 "$ORACLE" flow-overflow "$CONTRACT" /output/a3-deep-middle.png "$BOARD_TOP" middle
@@ -751,7 +761,7 @@ for _ in $(seq 1 40); do xdotool click 4; done
 sleep 0.35
 
 # Keyboard focus on the far node auto-scrolls it fully into view.
-xdotool mousemove --sync --window "$WID" "$((A3_LEFT_PAD + 80))" "$DEEP_FIRST_Y"
+xdotool mousemove --sync --window "$WID" "$((BOARD_X + A3_LEFT_PAD + 80))" "$DEEP_FIRST_Y"
 xdotool click 1
 for _ in $(seq 1 10); do xdotool key --clearmodifiers Tab; done
 sleep 0.6
@@ -775,7 +785,7 @@ focus
 inject "$(board_message "$WORKSPACE" busy)"
 park_pointer 0.2
 shot a2-narrow.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow.png "$BOARD_TOP" pinned-blocked --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow.png "$BOARD_TOP" pinned-blocked --width "$((WIN_W - 2 * BOARD_X))"
 
 # Sparse active lanes at the narrow 0.8 scale retain each header inside its
 # painted seam track, including the persisted Blocked pin and Done tab.
@@ -783,9 +793,12 @@ scale_steps "$MINUS_X" 2 sparse
 show_board sparse
 park_pointer 0.2
 shot a2-narrow-sparse-scale-0.8.png
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" sparse-pinned-blocked --width "$WIN_W" --scale 0.8
-python3 "$ORACLE" a2-header-ink "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" --width "$WIN_W"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" sparse-pinned-blocked --width "$((WIN_W - 2 * BOARD_X))" --scale 0.8
+python3 "$ORACLE" a2-header-ink "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" --width "$((WIN_W - 2 * BOARD_X))"
 scale_steps "$PLUS_X" 2 sparse
+# The keeper re-injects its fixture every frame, so the split's busy board has
+# to be the keeper's too, or the left region keeps painting the sparse one.
+set_board busy
 xdotool windowsize --sync "$WID" 1008 739
 sleep 0.5
 focus
@@ -815,8 +828,10 @@ fi
 park_pointer 0.2
 shot a2-narrow-split.png
 HALF=$((WIN_W / 2))
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-split.png "$BOARD_TOP" auto-collapsed --left 0 --width "$HALF"
-python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-split.png "$BOARD_TOP" busy --left "$HALF" --width "$HALF"
+# Each region's board is inset inside its own half; board-relative, the right
+# one starts where the window's half does.
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-split.png "$BOARD_TOP" auto-collapsed --left 0 --width "$((HALF - 2 * BOARD_X))"
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-split.png "$BOARD_TOP" busy --left "$HALF" --width "$((HALF - 2 * BOARD_X))"
 
 python3 "$ORACLE" inventory "$CONTRACT" /output /output/beads-a2a3-contract-evidence.json
 

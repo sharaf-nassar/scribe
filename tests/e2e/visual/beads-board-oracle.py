@@ -11,7 +11,30 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from beads_board_image_oracle import Image, close, contract, delta, find_strip, runs, seam_tracks
+from beads_board_image_oracle import (
+    Image,
+    close,
+    contract,
+    delta,
+    find_strip,
+    pinned_board_inset,
+    runs,
+    seam_tracks,
+)
+
+# A pinned board's resize handle is the shell's pill centred on the divider
+# band below the board (`BOARD_GRIP_W` in the client), not the mock's floor
+# grip: its fully lit centre row sits this far below the floor's top.
+PINNED_GRIP_W = 36
+PINNED_GRIP_ROW = 4
+
+
+def grip_geometry(data: dict) -> tuple[float, float]:
+    """`(row offset below the floor top, width)` of the board's grip."""
+    if pinned_board_inset():
+        return PINNED_GRIP_ROW, PINNED_GRIP_W
+    geometry = data["geometry"]["a2"]
+    return geometry["floor_grip_top"], geometry["floor_grip_w"]
 
 
 class Failure(Exception):
@@ -59,9 +82,13 @@ def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dic
     grip_runs = []
     floor_top = expected_floor
     floor = ground
+    grip_top, grip_w = grip_geometry(data)
     for candidate in range(round(expected_floor - 1), round(expected_floor + 2)):
         candidate_floor = image.pixel(left + 2, candidate)
-        grip_y = candidate + geometry["floor_grip_top"]
+        # A row of board ground is not the floor, however its grip row reads.
+        if delta(candidate_floor, ground) < 8:
+            continue
+        grip_y = candidate + grip_top
         flags = [delta(image.pixel(x, grip_y), candidate_floor) > 8 for x in range(left, left + width)]
         candidate_runs = [(left + start, length) for start, length in runs(flags, 3)]
         if len(candidate_runs) == 1:
@@ -71,8 +98,8 @@ def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dic
     require(len(grip_runs) == 1, f"A2 floor has {len(grip_runs)} grip runs, expected one: {grip_runs}")
     require(abs(floor_top - expected_floor) <= 1, f"A2 floor starts at {floor_top}, expected {expected_floor}")
     grip_x, grip_width = grip_runs[0]
-    require(close(grip_width, geometry["floor_grip_w"]), f"A2 grip is {grip_width}px, expected {geometry['floor_grip_w']}px")
-    expected_x = left + (width - geometry["floor_grip_w"]) / 2
+    require(close(grip_width, grip_w), f"A2 grip is {grip_width}px, expected {grip_w}px")
+    expected_x = left + (width - grip_w) / 2
     require(close(grip_x, expected_x), f"A2 grip starts at {grip_x}, expected centered x={expected_x}")
 
 
@@ -100,7 +127,8 @@ def command_tracks(args: argparse.Namespace) -> None:
     data = contract(args.contract)
     tracks = seam_tracks(image, args.top, data, args.left, args.width)
     require(len(tracks) == 5, f"found {len(tracks)} A2 tracks, expected five: {tracks}")
-    print(" ".join(f"{x}:{width}" for x, width in tracks))
+    # Window x, which is what the suite points the cursor at.
+    print(" ".join(f"{x + image.origin}:{width}" for x, width in tracks))
 
 
 def assert_priorities(image: Image, top: int, tracks: list[tuple[int, int]], data: dict, scale: float) -> None:
@@ -312,6 +340,9 @@ def region_contrast(image: Image, x: int, y: int, width: int, height: int) -> in
 
 def command_a2_drag(args: argparse.Namespace) -> None:
     before, dragged = Image(args.before), Image(args.dragged)
+    # Every x argument arrives in window pixels, as `tracks` printed it.
+    for name in ("ghost_x", "source_x", "done_x", "blocked_x"):
+        setattr(args, name, getattr(args, name) - before.origin)
     data = contract(args.contract)
     geometry = data["geometry"]["a2"]
     x, y = args.ghost_x, args.ghost_y
@@ -343,7 +374,7 @@ def command_a2_drag(args: argparse.Namespace) -> None:
 def floor_grip_y(image: Image, top: int, data: dict) -> int:
     geometry = data["geometry"]["a2"]
     centre = image.width // 2
-    half = round(geometry["floor_grip_w"] / 2)
+    half = round(grip_geometry(data)[1] / 2)
     start = round(top + geometry["strip_h"] - geometry["floor_h"])
     for y in range(start, image.height - 1):
         outside = image.pixel(2, y)
@@ -364,7 +395,7 @@ def command_a2_resize(args: argparse.Namespace) -> None:
     after_y = floor_grip_y(resized, args.top, data)
     moved = after_y - before_y
     require(abs(moved - args.drag) <= 3, f"A2 floor moved {moved}px, drag was {args.drag}px")
-    board_height = after_y - args.top - geometry["floor_grip_top"] + geometry["floor_h"]
+    board_height = after_y - args.top - grip_geometry(data)[0] + geometry["floor_h"]
     chrome = geometry["headband_h"] + geometry["lanes_padding_bottom"] + geometry["floor_h"]
     rows = math.floor((board_height - chrome) / geometry["row_h"])
     require(rows >= geometry["body_rows"] + 1, f"resized A2 fits only {rows} whole rows")
@@ -430,7 +461,9 @@ def hbar_thumb(image: Image, top: int, geometry: dict) -> tuple[int, int] | None
     y = round(top + geometry["hbar_top"])
     floor_top = round(top + geometry["strip_h"] - geometry["floor_h"] - 1)
     band = image.pixel(2, floor_top)
-    grip = image.pixel(image.width / 2, floor_top + geometry["floor_grip_top"])
+    # The thumb wears the grip's colour; a pinned board's grip is its pill.
+    grip_top = PINNED_GRIP_ROW if pinned_board_inset() else geometry["floor_grip_top"]
+    grip = image.pixel(image.width / 2, floor_top + grip_top)
     row = [image.pixel(x, y) for x in range(image.width)]
     candidates = runs([delta(color, grip) < delta(color, band) for color in row], 30)
     if not candidates:

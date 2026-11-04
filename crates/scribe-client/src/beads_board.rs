@@ -2243,7 +2243,15 @@ pub fn render(
     let colors = &colors;
     let metrics = Metrics { scale };
     let (snapshot, status) = board_content(state);
-    let board = board_shell(workspace_name, workspace_id, rect, colors, &hover_state);
+    let board = board_shell(workspace_name, workspace_id, rect, colors, &hover_state)
+        // A hovered board floats and closes itself off with a hairline. A
+        // pinned one is the top card of its region's pane surface: the shell
+        // outlines it, rounds it, and draws the divider and handle below it.
+        .when(overlay, |board| board.border_b_1().border_color(colors.hairline))
+        .when(!overlay, |board| board.rounded_t(px(crate::layout::PANE_CARD_RADIUS)));
+    // The floor's own grip is only the hovered board's; a pinned board's
+    // handle is centred on the whole divider band instead.
+    let floor = || floor(colors, overlay);
     // Flow replaces the lanes inside the same strip: the reservation, the
     // resize grip and the text-size controls all stay where the board put
     // them, so returning to lanes cannot move the furniture around it.
@@ -2259,7 +2267,7 @@ pub fn render(
             band: &flow_band,
         })
     {
-        return lift(board.child(strip).child(floor(colors)), overlay);
+        return lift(board.child(strip).child(floor()), overlay);
     }
     let board = match snapshot {
         Some(snapshot) => board.child(lanes(
@@ -2295,7 +2303,7 @@ pub fn render(
                 .child(status),
         ),
     };
-    lift(board.child(floor(colors)), overlay)
+    lift(board.child(floor()), overlay)
 }
 
 /// The board's own root: positioned over the strip the region gave it --
@@ -2323,8 +2331,6 @@ fn board_shell(
         .flex()
         .flex_col()
         .bg(colors.ground)
-        .border_b_1()
-        .border_color(colors.hairline)
         .on_drag_move(move |event: &DragMoveEvent<BeadsCardDrag>, window, _app| {
             if let Ok(mut boards) = drag_move.lock()
                 && boards.update_card_drag(
@@ -2364,8 +2370,8 @@ fn headband(colors: &BeadsBoardColors) -> AnyElement {
 }
 
 /// The strip's own bottom resize grip: a 3px floor with a centred 34×1px
-/// grip mark (A2-G9).
-fn floor(colors: &BeadsBoardColors) -> AnyElement {
+/// grip mark (A2-G9) when `grip`.
+fn floor(colors: &BeadsBoardColors, grip: bool) -> AnyElement {
     div()
         .absolute()
         .left_0()
@@ -2375,14 +2381,14 @@ fn floor(colors: &BeadsBoardColors) -> AnyElement {
         .flex()
         .justify_center()
         .bg(colors.band)
-        .child(
+        .children(grip.then(|| {
             div()
                 .mt(px(FLOOR_GRIP_TOP))
                 .flex_none()
                 .w(px(FLOOR_GRIP_W))
                 .h(px(FLOOR_GRIP_H))
-                .bg(colors.grip),
-        )
+                .bg(colors.grip)
+        }))
         .into_any_element()
 }
 

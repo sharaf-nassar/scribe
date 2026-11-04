@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -18,21 +19,42 @@ from pathlib import Path
 INK_TOLERANCE = 10
 
 
+def pinned_board_inset() -> int:
+    """Columns a pinned board sits in from each window edge, or 0.
+
+    A pinned board is the top card of its region's pane surface, inset by the
+    client's `PANE_CARD_MARGIN`; a suite measuring one exports
+    `BEADS_PINNED_BOARD_INSET` so x reads relative to the board's own left
+    edge, the space the contract's geometry is written in.
+    """
+    return int(os.environ.get("BEADS_PINNED_BOARD_INSET", "0"))
+
+
 class Image:
-    """An ImageMagick RGBA capture with clamped pixel lookup."""
+    """An ImageMagick RGBA capture with clamped pixel lookup.
+
+    With a pinned board inset, x is board-relative (`origin` is where the
+    board starts in the window) and `width` is the board's. The shell paints
+    the board's 1px outline over its two edge columns, which is chrome rather
+    than board paint, so those read the column beside them.
+    """
 
     def __init__(self, path: str):
         self.path = path
         size = subprocess.check_output(
             ["identify", "-format", "%w %h", path], text=True
         ).split()
-        self.width, self.height = (int(value) for value in size)
+        self.stride, self.height = (int(value) for value in size)
+        self.origin = pinned_board_inset()
+        self.width = self.stride - 2 * self.origin
         self.data = subprocess.check_output(["convert", path, "rgba:-"])
 
     def pixel(self, x: float, y: float) -> tuple[int, int, int]:
         x = min(self.width - 1, max(0, round(x)))
+        if self.origin:
+            x = min(self.width - 2, max(1, x))
         y = min(self.height - 1, max(0, round(y)))
-        offset = 4 * (y * self.width + x)
+        offset = 4 * (y * self.stride + x + self.origin)
         return tuple(self.data[offset : offset + 3])
 
 

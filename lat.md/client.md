@@ -2195,7 +2195,8 @@ from the row count [[crates/scribe-client/src/beads_board_a2.rs#visible_row_coun
 fits and the terminal below is untouched.
 
 The one thing that does move that outer height is a drag of the board's bottom
-bar, which is a resize grip with a divider's four-pixel tolerance either side.
+bar, which is a resize grip: a pinned board's whole divider band below it, or a
+hovered board's divider tolerance of four pixels either side.
 Height is per workspace, not per window like the text size, because the strip a
 pinned board holds comes out of that region's terminal and no other's. The
 gesture is resolved by the grid's own press chain
@@ -2229,6 +2230,30 @@ showing two regions side by side would cover the terminal it does not describe.
 A pinned board's strip is a second region reservation stacked on the in-region
 tab bar's, so only that region's panes and published PTY rows give up the
 space.
+
+A pinned board is the top card of its region's pane surface, not a band laid
+across it. [[crates/scribe-client/src/pane_shell.rs#PaneShell#pinned_board_card]]
+insets it by a pane card's margin on its sides and top, and the strip the
+region reserves is that margin plus the board, so the stored height stays the
+board's own and the board's bottom sits one card margin above the panes. The
+grid then joins the three pieces into one outlined surface
+([[crates/scribe-client/src/main.rs#OpenTabSurfaces#paint]]): the board wears
+its open tab's edge on its top and sides with a pane card's rounded top
+corners, the tab bridges into the board's ground rather than into a pane, and
+the gap below the board is filled with the board's floor band
+([[crates/scribe-client/src/main.rs#board_divider_rect]]), covering the panes'
+top border and carrying only the side outline down. The accent therefore runs
+around the board and terminal together, while the line between them is the
+neutral floor-and-gap band, so board and terminal stay easy to tell apart.
+That band is also the resize handle: a pinned board drops its own bottom
+hairline and floor grip, and
+[[crates/scribe-client/src/main.rs#board_grip]] centres a 36×3px rounded pill
+on the whole band, lit to the board's muted text tone while the band is
+hovered or the board is being dragged. The whole band grabs
+([[crates/scribe-client/src/main.rs#board_grab_span]]); a hovered-open board
+keeps its floor grip and the divider tolerance either side of its edge. A
+board only hovered open still floats full width with its lift shadow, and the
+grid paints no join for its region.
 
 Boards are per region in state as well as in geometry: hover, pin, and snapshot
 are all keyed by workspace, so every region opens, pins, and closes its own
@@ -2386,7 +2411,7 @@ Tabs wear a browser-style raised card: an active, hovered, or flashing tab's fil
 
 An open tab's card is the top of its pane card, not a box on the strip: it wears the pane's outline on its top and sides, and the grid bridges it across the gap into the pane.
 
-Before this the active card was a borderless rectangle of pane fill with a 2px tick on top, ending at the band's bottom edge 6px above a pane card that kept its own top border and corners, so on a near-black theme it floated as a soft box with a bar over it. Three pieces make the join. [[crates/scribe-client/src/titlebar.rs#open_tab_edge]] gives an open tab's card the pane card's own outline (`TabBarColors::pane_edge`, the divider at 40% alpha, or the region accent where the pane wears its focus ring) on its top and sides through `tab_card`'s `edge`; hover and flash cards pass none and still float. Every bar insets its pill-and-tab run by [[crates/scribe-client/src/titlebar.rs#TAB_RUN_INSET]], which is the shell's `PANE_CARD_MARGIN`, so a tab card always sits over the pane card's straight top edge and never overhangs its side or rounds into its corner; [[crates/scribe-client/src/main.rs#tab_run_slots]] folds the same inset into the equal-share slot math behind insertion targets, drop markers, and ghost widths. [[crates/scribe-client/src/main.rs#TerminalView#render_tab_bridges]] then paints one bridge per open tab ([[crates/scribe-client/src/main.rs#paint_tab_bridge]]) in the grid band, after the panes and region bars: a strip of pane fill from the bar's bottom edge down over the pane card's top border, carrying the card's side outline, so the tab card, the bridge, and the pane are one outlined surface. Titlebar tabs supply their painted runs through [[crates/scribe-client/src/titlebar.rs#TitlebarView#open_tab_runs]], an [[crates/scribe-client/src/titlebar.rs#OpenTabRuns]] that resolves each open tab to its box only when read; a lower region's bar supplies its active slot. A bridge is withheld when the region's top card row does not start exactly one card margin below the bar — a CI band or pinned board is reserved there and the tab opens onto that instead — and it is clipped to the card's straight edge between its corner radii. The lower region bar's active tab now wears the same card and mark rather than a full-bleed fill, so the two bars read as one component.
+Before this the active card was a borderless rectangle of pane fill with a 2px tick on top, ending at the band's bottom edge 6px above a pane card that kept its own top border and corners, so on a near-black theme it floated as a soft box with a bar over it. Three pieces make the join. [[crates/scribe-client/src/titlebar.rs#open_tab_edge]] gives an open tab's card the pane card's own outline (`TabBarColors::pane_edge`, the divider at 40% alpha, or the region accent where the pane wears its focus ring) on its top and sides through `tab_card`'s `edge`; hover and flash cards pass none and still float. Every bar insets its pill-and-tab run by [[crates/scribe-client/src/titlebar.rs#TAB_RUN_INSET]], which is the shell's `PANE_CARD_MARGIN`, so a tab card always sits over the pane card's straight top edge and never overhangs its side or rounds into its corner; [[crates/scribe-client/src/main.rs#tab_run_slots]] folds the same inset into the equal-share slot math behind insertion targets, drop markers, and ghost widths. [[crates/scribe-client/src/main.rs#TerminalView#render_tab_bridges]] then paints one bridge per open tab ([[crates/scribe-client/src/main.rs#paint_tab_bridge]]) in the grid band, after the panes and region bars: a strip of pane fill from the bar's bottom edge down over the pane card's top border, carrying the card's side outline, so the tab card, the bridge, and the pane are one outlined surface. Titlebar tabs supply their painted runs through [[crates/scribe-client/src/titlebar.rs#TitlebarView#open_tab_runs]], an [[crates/scribe-client/src/titlebar.rs#OpenTabRuns]] that resolves each open tab to its box only when read; a lower region's bar supplies its active slot. The region's top card row is its pinned board's card when one is pinned (see the board reservation above), and its pane cards otherwise. A bridge is withheld when that row does not start exactly one card margin below the bar — a CI band is reserved there and the tab opens onto that instead — and it is clipped to the card's straight edge between its corner radii. The lower region bar's active tab now wears the same card and mark rather than a full-bleed fill, so the two bars read as one component.
 
 The card and its bridge are painted by two entities: the titlebar paints the card on its own notify, while the bridge is a child of this view's grid. A tab switch therefore notifies the view at the end of [[crates/scribe-client/src/main.rs#TerminalView#switch_tab]] (and a pane-focus activation does the same), because without it the titlebar repainted the new tab's card while the grid kept the bridge under the old tab until the next unrelated repaint, which showed for a frame or two as a card whose edge broke at the strip's bottom.
 

@@ -4789,6 +4789,22 @@ Unit coverage for the shared lower-region content-rect rule at a live 80px tab-r
 
 A top-row region keeps its full rect, a stacked region cedes the supplied height, and a region shorter than the bar clamps instead of going negative. Every pane-geometry consumer (`placements`, `dividers`, directional focus, CI/board offsets) receives that same resolved height, so paint and hit tests agree.
 
+### A pinned board is its region's top card
+
+Unit coverage for a pinned board's card: inset one pane card margin from its region's sides and top, at the stored height.
+
+It reserves that height plus the margin, so the panes below start exactly one margin under it. In a short stacked region the margin comes out of the board, never the three-line terminal reservation.
+
+### A pinned board joins its tab and panes
+
+The open tab's bridge lands on the board card, the region's top card, and not on the panes under it.
+
+The divider below the board spans its width over the gap and the panes' top border, squaring both outer pane corners of a side-by-side split, and is withheld when the panes do not start one margin below the board.
+
+### A pinned board's whole divider grabs
+
+A press anywhere on a pinned board's divider band, from its floor down through the gap and the panes' top border, starts a resize, while a hovered-open board keeps the divider tolerance either side of its bottom edge.
+
 ### A pinned board reserves only its own region
 
 Unit coverage for the second reservation the region content rect carries: a pinned Beads board takes its strip from the top of its own region, stacking below a lower region's tab bar.
@@ -4861,6 +4877,19 @@ the functional run's `rail-search` uses, then proves the full `strip_h`
 height by finding the header hairline, the 3px floor band, and the centred
 grip at their contract offsets from that top.
 
+That first top is the hovered board's, which floats full width. Once the badge
+pins it the board becomes its region's top card, inset `PANE_CARD_MARGIN` (6px)
+from the region's sides and top, so the suite exports
+`BEADS_PINNED_BOARD_INSET` and re-measures `board-top` on the pinned card. From
+there the shared `Image` reads x relative to the board's own left edge, the
+space the contract is written in, and its two edge columns read the column
+beside them, because the 1px accent outline over them is shell chrome rather
+than board paint. `tracks` prints window x back for the pointer, `a2-drag`
+takes window x, and every contract-relative pointer offset adds the inset. The
+pinned grip is the shell's 36px pill centred on the divider band, whose lit
+centre row sits 4px below the floor's top, in place of the mock's 34x1 floor
+grip a hovered board still paints.
+
 A2's named captures cover sparse and busy collapsed rails, both hover drawers,
 both exclusive pinned lanes, and the native drag state. Extended captures pin
 empty copy, overflow without a partial fourth row, 51px hover and focus boxes,
@@ -4872,8 +4901,14 @@ pinned share. The floor oracle measures its 3px band and centered 34x1 grip;
 the drag oracle measures the 320x36 ghost, dimmed source, accepted Done wash,
 and rejected Blocked edge.
 
-The keeper only prevents the bd-less visual server's periodic `NotDetected`
-from erasing long-running fixtures. It is paused for the Blocked/Done hover
+The bd-less visual server answers every board poll with `NotDetected`, which
+closes and unpins the board, so the recipe runs the share tap in static-board
+mode (`SCRIBE_SHARE_TAP_DROP_BEADS_BOARD=1`): the tap still records the
+server's `BeadsBoard` frames but no longer delivers them, and the injected
+fixtures are the only board the client sees. Before the pinned board was inset
+this went unnoticed, because a board unpinned mid-suite was re-opened hovered
+at the same full-width geometry. The keeper re-injects the last fixture so
+every capture reads a freshly refreshed snapshot. It is paused for the Blocked/Done hover
 regression: each tab must paint its exact generated drawer on the hover's own
 next frame, with no injected frame, then remove it after the existing grace.
 This is the running-client regression layer for scribe-zwtv.22. The visual

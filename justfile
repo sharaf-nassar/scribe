@@ -644,7 +644,7 @@ e2e-visual-workspace-cross-window-hidpi: e2e-visual-image-current
 
 # Run the workspace Beads board visual contract against the generated mock manifest.
 e2e-visual-beads-board: e2e-visual-image-current
-    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/contract/a2a3-contract.json:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SHARE_TAP_DROP_BEADS_BOARD=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/contract/a2a3-contract.json:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
 
 # Decode the complete card-detail fixture matrix through the visual wire tap.
 e2e-visual-beads-detail-fixtures: e2e-visual-image-current

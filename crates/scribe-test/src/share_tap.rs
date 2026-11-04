@@ -43,6 +43,18 @@ type InjectTarget = Arc<Mutex<Option<UnboundedSender<ServerMessage>>>>;
 /// delivery is delayed inside the disposable harness.
 const SESSION_CREATED_DELAY_ENV: &str = "SCRIBE_SHARE_TAP_SESSION_CREATED_DELAY_MS";
 
+/// Optional static-board mode: hold back the real server's `BeadsBoard` frames.
+///
+/// The visual board suite runs a server with no Beads project, so every board
+/// poll answers `NotDetected`, which closes and unpins the board the suite
+/// injected. With this set the injected fixtures are the only board the
+/// client ever sees. The frames are still recorded.
+const DROP_BEADS_BOARD_ENV: &str = "SCRIBE_SHARE_TAP_DROP_BEADS_BOARD";
+
+fn drops_server_frame(raw: Option<&OsStr>, message: &ServerMessage) -> bool {
+    raw.is_some_and(|value| value == "1") && matches!(message, ServerMessage::BeadsBoard { .. })
+}
+
 fn session_created_delay(raw: Option<&OsStr>, message: &ServerMessage) -> Duration {
     if !matches!(message, ServerMessage::SessionCreated { .. }) {
         return Duration::ZERO;
@@ -123,6 +135,9 @@ async fn relay(
                 return;
             };
             record_frame(&downlink_record, "server", &message);
+            if drops_server_frame(std::env::var_os(DROP_BEADS_BOARD_ENV).as_deref(), &message) {
+                continue;
+            }
             let delay = session_created_delay(
                 std::env::var_os(SESSION_CREATED_DELAY_ENV).as_deref(),
                 &message,
@@ -221,6 +236,20 @@ mod tests {
     use scribe_common::ids::{SessionId, WorkspaceId};
 
     use super::*;
+
+    #[test]
+    fn static_board_mode_drops_only_server_beads_boards() {
+        let board = ServerMessage::BeadsBoard {
+            workspace_id: WorkspaceId::new(),
+            protocol_version: 1,
+            state: scribe_common::protocol::BeadsBoardState::NotDetected,
+        };
+        let other = ServerMessage::Error { message: "kept".to_owned() };
+        assert!(drops_server_frame(Some(OsStr::new("1")), &board));
+        assert!(!drops_server_frame(Some(OsStr::new("1")), &other));
+        assert!(!drops_server_frame(None, &board), "off by default");
+        assert!(!drops_server_frame(Some(OsStr::new("0")), &board));
+    }
 
     #[test]
     fn only_session_created_frames_take_the_configured_delay() {
