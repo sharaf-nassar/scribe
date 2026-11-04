@@ -18389,6 +18389,19 @@ fn board_grab_span(rect: Rect, pinned: bool) -> (f32, f32) {
     }
 }
 
+/// The rule through a pinned board's divider band, in its open tab's edge
+/// colour, so the band reads as the board's edge rather than one more row of
+/// terminal. It runs under the grip's pill, through the pill's centre row.
+fn board_divider_line(card: Rect) -> Rect {
+    let (top, bottom) = board_grab_span(card, true);
+    Rect {
+        x: card.x,
+        y: top + ((bottom - top - PANE_BORDER_WIDTH) / 2.0).floor(),
+        width: card.width,
+        height: PANE_BORDER_WIDTH,
+    }
+}
+
 /// A board's grab band: the resize pointer over [`board_grab_span`], and on a
 /// pinned board's divider a centred pill handle. `handle` is that pill's
 /// `(rest, lit)` colours, lit while the band is hovered; a hovered-open board
@@ -18511,12 +18524,20 @@ impl OpenTabSurfaces {
             };
             paint_board_outline(window, origin, card, run.edge);
             // The divider is the board's floor band carried down over the gap
-            // and the panes' top border, so the accent never runs between
-            // board and terminal; its caps square the pane corners below it.
+            // and the panes' top border, its caps squaring the pane corners
+            // below it, with one rule in the outline's colour through it.
             if let Some(seam) = board_divider_rect(&self.panes, workspace_id, card) {
                 let paint =
                     BridgePaint { strip: self.board_band, cap: self.pane_fill, edge: run.edge };
                 paint_tab_bridge(window, origin, &seam, paint);
+                let line = board_divider_line(card);
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(origin.0 + line.x), px(origin.1 + line.y)),
+                        size(px(line.width), px(line.height)),
+                    ),
+                    run.edge,
+                ));
             }
         }
         for run in &open {
@@ -20995,6 +21016,19 @@ mod tests {
         let (hover_top, hover_end) = board_grab_span(board, false);
         assert!((hover_top - (bottom - BEADS_BOARD_GRIP)).abs() < 0.001, "a hovered board keeps");
         assert!((hover_end - (bottom + BEADS_BOARD_GRIP)).abs() < 0.001, "the divider tolerance");
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#The divider rule runs through the grip]]
+    #[test]
+    fn the_divider_rule_runs_through_the_grip() {
+        let board = Rect { x: 6.0, y: 6.0, width: 788.0, height: 246.0 };
+        let (top, bottom) = board_grab_span(board, true);
+        let line = board_divider_line(board);
+        assert!((line.x - board.x).abs() < 0.001 && (line.width - board.width).abs() < 0.001);
+        assert!((line.height - PANE_BORDER_WIDTH).abs() < 0.001);
+        // The 10px band's pill paints its rows 3 to 5; the rule takes row 4.
+        assert!((line.y - (top + 4.0)).abs() < 0.001, "through the pill's centre row");
+        assert!(line.y > top && line.y + line.height < bottom, "inside the band");
     }
 
     fn suspend_test_backend() -> PreparedWindowBackend {

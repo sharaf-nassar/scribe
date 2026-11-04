@@ -4809,6 +4809,10 @@ The open tab's bridge lands on the board card, the region's top card, and not on
 
 The divider below the board spans its width over the gap and the panes' top border, squaring both outer pane corners of a side-by-side split, and is withheld when the panes do not start one margin below the board.
 
+### The divider rule runs through the grip
+
+The rule across a pinned board's divider band spans the board's width, is one border wide, and sits on the band's fourth row, the centre row of the pill painted over it.
+
 ### A pinned board's whole divider grabs
 
 A press anywhere on a pinned board's divider band, from its floor down through the gap and the panes' top border, starts a resize, while a hovered-open board keeps the divider tolerance either side of its bottom edge.
@@ -4896,7 +4900,9 @@ than board paint. `tracks` prints window x back for the pointer, `a2-drag`
 takes window x, and every contract-relative pointer offset adds the inset. The
 pinned grip is the shell's 36px pill centred on the divider band, whose lit
 centre row sits 4px below the floor's top, in place of the mock's 34x1 floor
-grip a hovered board still paints.
+grip a hovered board still paints. That row is also the divider's outline-coloured
+rule, so the pill is measured against the rule, and the rule must stand clear of
+the floor band.
 
 A2's named captures cover sparse and busy collapsed rails, both hover drawers,
 both exclusive pinned lanes, and the native drag state. Extended captures pin

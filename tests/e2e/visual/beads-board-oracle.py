@@ -89,12 +89,18 @@ def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dic
         if delta(candidate_floor, ground) < 8:
             continue
         grip_y = candidate + grip_top
-        flags = [delta(image.pixel(x, grip_y), candidate_floor) > 8 for x in range(left, left + width)]
+        # A pinned board's grip row is the outline-coloured rule its pill sits
+        # on, so the pill is read against the rule rather than the floor.
+        behind = image.pixel(left + 2, grip_y) if pinned_board_inset() else candidate_floor
+        flags = [delta(image.pixel(x, grip_y), behind) > 8 for x in range(left, left + width)]
         candidate_runs = [(left + start, length) for start, length in runs(flags, 3)]
         if len(candidate_runs) == 1:
             floor_top, floor, grip_runs = candidate, candidate_floor, candidate_runs
             break
     require(delta(floor, ground) >= 8, "A2 floor does not separate from board ground")
+    if pinned_board_inset():
+        rule = image.pixel(left + 2, floor_top + grip_top)
+        require(delta(rule, floor) >= 24, f"pinned divider has no rule through it ({rule} on {floor})")
     require(len(grip_runs) == 1, f"A2 floor has {len(grip_runs)} grip runs, expected one: {grip_runs}")
     require(abs(floor_top - expected_floor) <= 1, f"A2 floor starts at {floor_top}, expected {expected_floor}")
     grip_x, grip_width = grip_runs[0]

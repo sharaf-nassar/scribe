@@ -2244,11 +2244,14 @@ the gap below the board is filled with the board's floor band
 ([[crates/scribe-client/src/main.rs#board_divider_rect]]), covering the panes'
 top border and carrying only the side outline down. The accent therefore runs
 around the board and terminal together, while the line between them is the
-neutral floor-and-gap band, so board and terminal stay easy to tell apart.
+neutral floor-and-gap band, so board and terminal stay easy to tell apart. One
+1px rule in the open tab's edge colour runs the band's full width through its
+centre row ([[crates/scribe-client/src/main.rs#board_divider_line]]), so the
+band reads as the board's edge rather than one more row of terminal text.
 That band is also the resize handle: a pinned board drops its own bottom
 hairline and floor grip, and
 [[crates/scribe-client/src/main.rs#board_grip]] centres a 36×3px rounded pill
-on the whole band, lit to the board's muted text tone while the band is
+on the whole band, over that rule, lit to the board's muted text tone while the band is
 hovered or the board is being dragged. The whole band grabs
 ([[crates/scribe-client/src/main.rs#board_grab_span]]); a hovered-open board
 keeps its floor grip and the divider tolerance either side of its edge. A
