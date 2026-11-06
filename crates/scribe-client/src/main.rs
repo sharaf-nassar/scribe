@@ -24,12 +24,13 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent,
-    ElementId, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, ScrollWheelEvent, Size, StyleRefinement, Subscription, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
-    canvas, div, ease_out_quint, point, prelude::*, px, relative, size,
+    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context,
+    DragMoveEvent, ElementId, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StyleRefinement, Subscription,
+    Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, ease_out_quint, point, prelude::*, px, relative,
+    size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::AiStateTracker;
@@ -855,6 +856,9 @@ struct Shared {
     ci_runs: Arc<Mutex<CiRunBars>>,
     /// Host actions exist only on this machine's owning local connection.
     ci_owner_controls: bool,
+    /// Grids a program renders for this window's tab mirrors; see
+    /// [`mirror_window::MirrorFeeds`].
+    mirror_feeds: mirror_window::MirrorFeeds,
     /// Window close / quit / focus-report state. The view raises a close, a
     /// quit, or a focus change here from a real UI event and the reader folds
     /// the server's `WindowClosed` / `QuitRequested` / `WindowList` answer back
@@ -3141,10 +3145,12 @@ impl TerminalView {
     fn start_drivers(
         generation: Arc<RedrawSignal>,
         config_signal: ConfigChangeSignal,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> (Task<()>, Task<()>, Task<()>) {
+        let handle = window.window_handle();
         (
-            cx.spawn(async move |view, app| drive_window_lifecycle(view, app).await),
+            cx.spawn(async move |view, app| drive_window_lifecycle(view, handle, app).await),
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await),
             cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await),
         )
@@ -3187,7 +3193,8 @@ impl TerminalView {
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         Self::register_close_veto(window, cx);
         let notifications = Self::start_notifications(&shared, &config, window, cx);
-        let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
+        let drivers =
+            Self::start_drivers(Arc::clone(&shared.generation), config.signal(), window, cx);
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
         let (chrome, opacity) = (config.config().chrome, clamp_opacity(config.opacity()));
         let beads_colors = BeadsBoardColors::from_theme(
@@ -13777,10 +13784,26 @@ async fn drive_x11_focus_polls(view: WeakEntity<TerminalView>, app: &mut AsyncAp
 /// sink's UI-side callers. This task is where those cross-thread facts become
 /// actions: closing this window (or quitting the app on a quit-all), reporting
 /// focus, and re-polling the window list.
-async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncApp) {
+///
+/// The tick is addressed to the window by its handle, never through the view's
+/// "current window". GPUI points that at whichever window last drew while
+/// reading the view, and a tab mirror reads this view on every one of its
+/// frames, so while a mirror is open the view's current window is the
+/// mirror's: a tick resolved through it would verify the mirror's geometry and,
+/// on a close, remove the mirror instead of this window and then stop.
+async fn drive_window_lifecycle(
+    view: WeakEntity<TerminalView>,
+    handle: AnyWindowHandle,
+    app: &mut AsyncApp,
+) {
     loop {
         app.background_executor().timer(WINDOW_LIFECYCLE_TICK).await;
-        if view.update_in(app, TerminalView::poll_window_lifecycle).is_err() {
+        let ticked = handle.update(app, |_, window, cx| {
+            view.upgrade().map(|view| {
+                view.update(cx, |view, cx| view.poll_window_lifecycle(window, cx));
+            })
+        });
+        if !matches!(ticked, Ok(Some(()))) {
             return;
         }
     }
@@ -15912,6 +15935,7 @@ fn prepare_window_backend(
         update: Arc::new(Mutex::new(UpdateState::default())),
         ci_runs: Arc::new(Mutex::new(CiRunBars::default())),
         ci_owner_controls,
+        mirror_feeds: Arc::default(),
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
         process_shutdown,
         bells: Arc::new(Mutex::new(Vec::new())),
@@ -17549,6 +17573,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         share: Arc::clone(&ctx.shared.share),
         update: Arc::clone(&ctx.shared.update),
         ci_runs: Arc::clone(&ctx.shared.ci_runs),
+        mirror_feeds: Arc::clone(&ctx.shared.mirror_feeds),
         lifecycle: Arc::clone(&ctx.shared.lifecycle),
         bells: Arc::clone(&ctx.shared.bells),
         ai_notices: Arc::clone(&ctx.shared.ai_notices),
@@ -18047,6 +18072,8 @@ struct ReaderCtx {
     update: Arc<Mutex<UpdateState>>,
     /// Repository-keyed CI snapshots the workspace-region bands render from.
     ci_runs: Arc<Mutex<CiRunBars>>,
+    /// Program-rendered mirror grids; see the `mirror_feeds` field of `Shared`.
+    mirror_feeds: mirror_window::MirrorFeeds,
     /// Window-lifecycle state the reader adopts a window id into and folds the
     /// server's close / quit / window-list answers onto.
     lifecycle: Arc<Mutex<WindowLifecycle>>,
@@ -18968,6 +18995,8 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::ControlRequested { .. } => "ControlRequested",
         ServerMessage::ControlDenied { .. } => "ControlDenied",
         ServerMessage::ShareEnded { .. } => "ShareEnded",
+        ServerMessage::MirrorViewport { .. } | ServerMessage::MirrorScroll { .. } => "MirrorStream",
+        ServerMessage::MirrorFeed { .. } | ServerMessage::MirrorOutput { .. } => "MirrorFeed",
     }
 }
 
@@ -19493,6 +19522,25 @@ async fn dispatch_server_message(
         | ServerMessage::RunAction { .. }
         | ServerMessage::RunActionCorrelated { .. }
         | ServerMessage::ActionDispatched { .. }) => on_remote_message(ctx, remote),
+        // A tab mirror's program-rendered grid: frames land in the shared feed
+        // the mirror paints from, and a lost stream drops it so the mirror
+        // returns to its own rendering.
+        ServerMessage::MirrorOutput { session_id, size, data } => {
+            mirror_window::feed_mirror_frame(&ctx.mirror_feeds, session_id, size, &data);
+            ctx.generation.bump();
+        }
+        ServerMessage::MirrorFeed { session_id, available } => {
+            if !available {
+                mirror_window::drop_mirror_feed(&ctx.mirror_feeds, session_id);
+                ctx.generation.bump();
+            }
+        }
+        // Addressed to the mirror stream, never to a window; a server that sent
+        // one here has nothing for this client to do.
+        ServerMessage::MirrorViewport { session_id, .. }
+        | ServerMessage::MirrorScroll { session_id, .. } => {
+            tracing::debug!(%session_id, "stream-bound mirror message reached a window");
+        }
         other => unhandled_server_message(&other),
     }
     Ok(())

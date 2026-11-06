@@ -1327,6 +1327,44 @@ first seen at the next turn boundary or terminal frame. An older helper or
 server drops the unknown state, so a partially upgraded install shows
 Processing through a background wait: never a false idle or notification.
 
+#### Mirror rendering
+
+The adapter is also the producer behind [[server#Tab Mirror Streams]]: it
+renders Pi's fullscreen UI a second time at a tab mirror's size and streams
+the frames through the helper.
+
+In TUI mode it spawns one `scribe-hook-helper --provider=pi
+--event=mirror_stream` for the session's life and, while a viewport is set,
+renders every frame twice. The second render reuses
+pi-tui's own compositor: `TuiAltScreen.prototype.doRender` is patched to run
+first against a terminal facade reporting the mirror's columns and rows, with
+the per-size render fields (`previousScreen` and its siblings, the overlay
+layouts, the image protocol) swapped to the mirror's copies and the primary
+`ScrollView`'s scroll fields swapped to the mirror's own, then restored before
+the tab's real render. Mirror first, tab second, so every side effect the tab
+depends on (the editor's wrap width, overlay hit-test bounds, scroll geometry)
+is left as the tab's render set it. The captured ANSI diff goes up the helper's
+stdin as one JSON line per frame, tagged with the grid it was drawn for.
+
+The mirror follows the transcript's end until a `scroll` command arrives,
+which steps the mirror's own `ScrollView` copy, so the two views scroll
+independently and the tab's position is never moved by the mirror. Images are
+rendered as their text fallback in the mirror, since uploads would go to the
+tab's terminal. `Text`, `Markdown`, and any transcript component that keeps a
+one-width `cachedLines` cache (pi-coding-agent's `VisualLinePreview`) get a
+side cache of the last two widths, because two viewports otherwise evict each
+other every frame and re-render the whole transcript twice; with it the second
+render costs about as much as the first. Regular (non-fullscreen) mode renders
+nothing here, and the mirror keeps re-wrapping the grid itself.
+
+All of this rides on pi-tui internals and is feature-detected: the pi-tui
+classes are imported lazily, the prototype methods and the per-instance fields
+are checked before any swap, and a missing name or a throwing render disables
+the mirror render for the session and leaves the tab untouched. The patches
+are removed at `session_shutdown`, so a Pi `/reload` reinstalls them cleanly.
+A server without mirror streams closes the helper's connection at once; the
+extension respawns it three times, five seconds apart, then stops asking.
+
 ### Pi Extension Installation
 
 Scribe installs Pi integration once at user scope and repairs only extension content it owns.
@@ -1404,7 +1442,21 @@ while leaving step (1) and step (4) unchanged.
 
 Hook subprocesses must never break the AI tool — even outside Scribe.
 
-The helper exits 0 in every code path (FR-007), writes nothing to stdout (FR-008) or stderr (FR-009), does not open `/dev/tty` (FR-010), and bounds its connect+write+server-close wait to 100 ms (FR-012). Absence of `SCRIBE_HOOK_SOCK` or `SCRIBE_SESSION_ID` is the canonical "not under Scribe" signal — the helper exits 0 silently (FR-003). The same holds for unreachable sockets, dead Scribe servers, malformed args, or any other failure. This contract is what makes the AI tool's view of "is Scribe installed?" identical to "is the channel reachable right now?", so Scribe-installed hooks run safely in cloud sessions, subagents, SSH, and CI (FR-025).
+The helper exits 0 in every code path (FR-007), writes nothing to stdout (FR-008) or stderr (FR-009), does not open `/dev/tty` (FR-010), and bounds its connect+write+server-close wait to 100 ms (FR-012). The one deliberate exception is `--event=mirror_stream`, which is not an event at all but the long-lived bridge of [[server#Tab Mirror Streams]]: it writes the server's JSON commands to stdout for the Pi extension that spawned it, and lives as long as that extension keeps its stdin open. Absence of `SCRIBE_HOOK_SOCK` or `SCRIBE_SESSION_ID` is the canonical "not under Scribe" signal — the helper exits 0 silently (FR-003). The same holds for unreachable sockets, dead Scribe servers, malformed args, or any other failure. This contract is what makes the AI tool's view of "is Scribe installed?" identical to "is the channel reachable right now?", so Scribe-installed hooks run safely in cloud sessions, subagents, SSH, and CI (FR-025).
+
+## Tab Mirror Streams
+
+A program may render its own screen a second time at a tab mirror's size and stream those frames to the mirror, which a scaled copy of the tab can never show. [[crates/scribe-server/src/mirror_stream.rs]] pairs such a stream with the window viewing the mirror.
+
+A tab mirror ([[client#Client#GPUI Titlebar#Tab mirrors]]) otherwise re-draws the pane's published grid, which cannot show a full-screen program larger than its tab. The only producer today is the Pi extension ([[server#Server#Hook Channel#Pi Extension Adapter#Mirror rendering]]).
+
+### A stream and its viewer are paired per session
+
+A session's stream and the window mirroring it are registered against each other, so viewport changes flow down to the stream and frames flow up to the window, and either side leaving tells the other.
+
+The stream is a local connection whose first frame is `ClientMessage::MirrorStreamAttach { session_id }`, opened by `scribe-hook-helper --event=mirror_stream` because the extension cannot speak the msgpack IPC itself. The helper bridges JSON lines on its pipes to frames on the socket: `{"cols","rows","frame"}` lines on stdin become `ClientMessage::MirrorFrame`, and the server's `MirrorViewport` and `MirrorScroll` come back out as `{"cols","rows"}` and `{"scroll"}` lines. Like a window the connection is long-lived, so it is charged to the client admission pool rather than the one-shot transient pool; like every other non-`Hello` first frame it is refused over a remote transport. [[crates/scribe-server/src/mirror_stream.rs#serve]] registers it for the session (a newer stream for the same session replaces an older one, which then relays nothing), hands it any viewport already waiting, relays every frame to the viewing window as `ServerMessage::MirrorOutput`, and on exit sends that window `MirrorFeed { available: false }` so the mirror returns to its own rendering. A stream for a session the server does not know is closed at once.
+
+The viewer side is the window's own session connection. `ClientMessage::MirrorViewport { session_id, size }` records the window as the session's viewer and the grid it wants, is forwarded to the stream when one is attached, and is always answered with `MirrorFeed { available }` so the window knows whether to expect frames; a later viewport (a resize) repeats the exchange. `MirrorClose` and the window's disconnect ([[crates/scribe-server/src/mirror_stream.rs#viewer_disconnected]]) both tell the stream to stop with a zero-sized viewport, so a program never renders frames nobody receives. `MirrorScroll` is relayed to the stream, which owns the mirror's scroll position. Every viewer message is honoured only from the window that owns the session ([[crates/scribe-server/src/ipc_server.rs#dispatch_mirror_message]]), so one window cannot read another's screen through its stream. The frame payload is relayed verbatim: the server parses nothing, and the client runs its own display-only terminal over it. See [[test#Test Harness#AI Hook Helper#Mirror stream bridges pipes and socket]] for the helper's bridge.
 
 ## Shell Integration
 

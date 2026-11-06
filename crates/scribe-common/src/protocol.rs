@@ -1226,6 +1226,39 @@ pub enum ClientMessage {
         /// `true` transfers control; `false` denies the request.
         accept: bool,
     },
+    /// First frame of a long-lived local connection from `scribe-hook-helper
+    /// --mirror-stream`, run by the Pi extension inside `session_id`. The
+    /// program behind the session offers to render its own screen a second
+    /// time at whatever size a tab mirror asks for; the connection then
+    /// carries [`ClientMessage::MirrorFrame`]s up and
+    /// [`ServerMessage::MirrorViewport`]s down until either side closes.
+    MirrorStreamAttach {
+        session_id: SessionId,
+    },
+    /// One rendered mirror frame from a mirror stream: the ANSI bytes that
+    /// bring a `size` grid from the previous frame to this one.
+    MirrorFrame {
+        session_id: SessionId,
+        size: TerminalSize,
+        data: Vec<u8>,
+    },
+    /// A window's tab mirror of `session_id` wants frames rendered at `size`.
+    /// Sent on open and on every resize; answered by
+    /// [`ServerMessage::MirrorFeed`] saying whether a stream can serve it.
+    MirrorViewport {
+        session_id: SessionId,
+        size: TerminalSize,
+    },
+    /// A tab mirror of `session_id` closed: stop rendering frames for it.
+    MirrorClose {
+        session_id: SessionId,
+    },
+    /// The wheel moved over a mirror fed by a stream: scroll the mirror's
+    /// own viewport by `delta` rows (positive is back into history).
+    MirrorScroll {
+        session_id: SessionId,
+        delta: i32,
+    },
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -1822,6 +1855,30 @@ pub enum ServerMessage {
     ShareEnded {
         window_id: WindowId,
         reason: ShareEndReason,
+    },
+    /// To a mirror stream: render frames for `session_id` at `size`, or stop
+    /// when `size` is zero. Replaces any earlier viewport.
+    MirrorViewport {
+        session_id: SessionId,
+        size: TerminalSize,
+    },
+    /// To a mirror stream: scroll its viewport by `delta` rows.
+    MirrorScroll {
+        session_id: SessionId,
+        delta: i32,
+    },
+    /// To the window mirroring `session_id`: whether a mirror stream is
+    /// serving its viewport. `false` returns the mirror to its own rendering.
+    MirrorFeed {
+        session_id: SessionId,
+        available: bool,
+    },
+    /// To the window mirroring `session_id`: one frame from its stream, the
+    /// ANSI bytes for a `size` grid.
+    MirrorOutput {
+        session_id: SessionId,
+        size: TerminalSize,
+        data: Vec<u8>,
     },
 }
 

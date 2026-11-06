@@ -5,9 +5,16 @@
 //! tab's screen onto its own columns and rows (or, on the alternate screen,
 //! scales the grid to fit) instead of asking the program to redraw. Keystrokes
 //! typed into it reach the same session the tab shows.
+//!
+//! A program on the alternate screen can offer better than a scaled copy: Pi's
+//! extension renders its own screen a second time at the mirror's size and
+//! streams those frames through the server ([`MirrorFeeds`]). While such a
+//! feed is live the mirror paints it at its own cell count, with its own zoom
+//! and its own scroll position, and the tab is untouched.
 
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
@@ -30,11 +37,16 @@ use scribe_client::settings::window::{
 };
 use scribe_client::tab_bar::{TabBarColors, srgba};
 use scribe_client::window_state::{WindowState, logical_px_to_i32};
+use scribe_client::zoom::ZoomState;
 use scribe_common::config::CursorShape;
 use scribe_common::ids::SessionId;
+use scribe_common::protocol::TerminalSize;
 
+use crate::ipc_bridge::IpcSink;
 use crate::mirror_size::{self, MirrorSize};
-use crate::terminal::{Cell, Content, Flags, PaneFrame, ShellCursor, ViewportPoint};
+use crate::terminal::{
+    Cell, Content, DisplayOnlyTerminal, Flags, PaneFrame, ShellCursor, ViewportPoint,
+};
 use crate::terminal_element::{
     CursorPaint, GridBounds, GridColors, GridFont, PaneContentView, TerminalElement, cell_at,
 };
@@ -74,6 +86,56 @@ impl Pin {
     const fn is_on(self) -> bool {
         !matches!(self, Self::Off)
     }
+}
+
+/// The grid a program renders for one session's mirror, parsed from the
+/// frames its stream sends; see [`feed_mirror_frame`].
+pub struct MirrorFeed {
+    terminal: DisplayOnlyTerminal,
+}
+
+/// Every session with a live program-rendered mirror grid, shared between the
+/// IPC reader that feeds it and the mirror window that paints it.
+pub type MirrorFeeds = Arc<Mutex<HashMap<SessionId, MirrorFeed>>>;
+
+/// Parse one streamed frame into `session_id`'s feed grid, sized to the frame.
+/// Every frame after a size change is a full redraw, so resizing the grid
+/// first and feeding the bytes after is consistent.
+pub fn feed_mirror_frame(
+    feeds: &MirrorFeeds,
+    session_id: SessionId,
+    size: TerminalSize,
+    data: &[u8],
+) {
+    let Ok(mut feeds) = feeds.lock() else { return };
+    let grid = (usize::from(size.cols).max(1), usize::from(size.rows).max(1));
+    let feed = feeds
+        .entry(session_id)
+        .or_insert_with(|| MirrorFeed { terminal: DisplayOnlyTerminal::new(grid.0, grid.1) });
+    if feed.terminal.dimensions() != grid {
+        feed.terminal.resize(grid.0, grid.1);
+    }
+    feed.terminal.advance_output(data);
+    feed.terminal.publish_content();
+}
+
+/// Forget `session_id`'s feed grid: its stream ended or its mirror closed.
+pub fn drop_mirror_feed(feeds: &MirrorFeeds, session_id: SessionId) {
+    if let Ok(mut feeds) = feeds.lock() {
+        feeds.remove(&session_id);
+    }
+}
+
+/// The feed grid for `session_id` if it is live and rendered at `grid`; a
+/// frame at any other size is a stale one from before the last resize.
+fn feed_content(
+    feeds: &MirrorFeeds,
+    session_id: SessionId,
+    grid: (usize, usize),
+) -> Option<Arc<Content>> {
+    let feeds = feeds.lock().ok()?;
+    let feed = feeds.get(&session_id)?;
+    (feed.terminal.dimensions() == grid).then(|| feed.terminal.content())
 }
 
 /// One open mirror, as its source window tracks it.
@@ -166,7 +228,11 @@ fn open_mirror_window(
             }
             let pin = if pin_toggle { Pin::On { confirmed: false } } else { Pin::Fixed };
             let opened = (session_id, title, bounds.size);
-            let view = cx.new(|cx| MirrorView::new(parent, opened, pin, window, cx));
+            let feed = {
+                let source = parent.read(cx);
+                (source.sink.clone(), Arc::clone(&source.shared.mirror_feeds))
+            };
+            let view = cx.new(|cx| MirrorView::new(parent, opened, (pin, feed), window, cx));
             let focus = view.read(cx).focus.clone();
             window.focus(&focus, cx);
             view
@@ -400,15 +466,31 @@ pub struct MirrorView {
     /// reported at the tab cell under the pointer.
     grid_bounds: GridBounds,
     content_view: Option<Entity<PaneContentView>>,
+    /// This window's IPC writer, for the viewport the session's program is
+    /// asked to render; kept here so the close can be sent from `Drop`.
+    sink: IpcSink,
+    /// Program-rendered grids, shared with the IPC reader.
+    feeds: MirrorFeeds,
+    /// The grid last asked of the session's program, `None` while the mirror
+    /// re-wraps or scales the tab itself.
+    viewport: Option<(usize, usize)>,
+    /// The mirror's own font step, independent of the tab's zoom.
+    zoom: ZoomState,
     _subscriptions: [Subscription; 3],
     _pin_settle: Task<()>,
+}
+
+impl Drop for MirrorView {
+    fn drop(&mut self) {
+        self.set_viewport(None);
+    }
 }
 
 impl MirrorView {
     fn new(
         parent: &Entity<TerminalView>,
         (session_id, title, opened): (SessionId, String, Size<Pixels>),
-        pin: Pin,
+        (pin, (sink, feeds)): (Pin, (IpcSink, MirrorFeeds)),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -435,9 +517,63 @@ impl MirrorView {
             scrollback: None,
             grid_bounds: GridBounds::default(),
             content_view: None,
+            sink,
+            feeds,
+            viewport: None,
+            zoom: ZoomState::new(),
             _subscriptions: [repaint, close, resized],
             _pin_settle: pin_settle,
         }
+    }
+
+    /// Ask the session's program for frames at `grid`, or for none, when that
+    /// differs from what it was last asked. A `None` also drops the feed grid,
+    /// so a stale frame cannot paint after the mirror went back to scaling.
+    fn set_viewport(&mut self, grid: Option<(usize, usize)>) {
+        if self.viewport == grid {
+            return;
+        }
+        self.viewport = grid;
+        let sent = if let Some((cols, rows)) = grid {
+            let size = TerminalSize {
+                cols: u16::try_from(cols).unwrap_or(u16::MAX),
+                rows: u16::try_from(rows).unwrap_or(u16::MAX),
+                ..TerminalSize::default()
+            };
+            self.sink.mirror_viewport(self.session_id, size)
+        } else {
+            drop_mirror_feed(&self.feeds, self.session_id);
+            self.sink.mirror_close(self.session_id)
+        };
+        tracing::info!(session = %self.session_id, ?grid, "tab mirror viewport");
+        if let Err(error) = sent {
+            tracing::warn!(%error, "mirror viewport dropped: IPC writer closed");
+        }
+    }
+
+    /// Whether a program-rendered grid at the asked viewport is live.
+    fn feed_live(&self) -> bool {
+        self.viewport.is_some_and(|grid| feed_content(&self.feeds, self.session_id, grid).is_some())
+    }
+
+    /// The tab's font at the mirror's own zoom step.
+    fn zoomed(&self, font: &GridFont) -> GridFont {
+        let size = self.zoom.effective_font_size(font.size);
+        let scale = if font.size > 0.0 { size / font.size } else { 1.0 };
+        GridFont { size, line_height: font.line_height * scale, ..font.clone() }
+    }
+
+    /// A zoom chord typed into the mirror steps the mirror's own font.
+    fn apply_zoom(&mut self, action: LayoutAction, cx: &mut Context<Self>) {
+        match action {
+            LayoutAction::ZoomIn => self.zoom.zoom_in(),
+            LayoutAction::ZoomOut => self.zoom.zoom_out(),
+            LayoutAction::ZoomReset => self.zoom.reset(),
+            _ => return,
+        }
+        let level = self.zoom.level();
+        tracing::info!(session = %self.session_id, level, "tab mirror zoom changed");
+        cx.notify();
     }
 
     /// Remember a user resize so the next mirror opens at the same size. A
@@ -635,6 +771,13 @@ impl MirrorView {
             return;
         }
         let (width, height) = grid_extent(window);
+        // A program rendering the mirror itself owns the mirror's scroll.
+        if frame.alt_screen && self.feed_live() {
+            if let Err(error) = self.sink.mirror_scroll(self.session_id, rows) {
+                tracing::warn!(%error, "mirror scroll dropped: IPC writer closed");
+            }
+            return;
+        }
         if frame.alt_screen {
             let font = fit_font(&source.font, frame.dimensions, (width, height));
             let cell = self
@@ -671,6 +814,15 @@ impl MirrorView {
             cx.notify();
         }
         let Some(parent) = self.parent.upgrade() else { return };
+        let zoom = KeyInput::from_key_down(event)
+            .and_then(|input| translate_key_action(&input, parent.read(cx).config.bindings()));
+        if let Some(KeyAction::Layout(
+            action @ (LayoutAction::ZoomIn | LayoutAction::ZoomOut | LayoutAction::ZoomReset),
+        )) = zoom
+        {
+            self.apply_zoom(action, cx);
+            return;
+        }
         let session = self.session_id;
         if !event.is_held && event.keystroke.key.eq_ignore_ascii_case("z") {
             self.swallowed_suspend_z = false;
@@ -690,8 +842,9 @@ impl MirrorView {
         parent.read(cx).mirror_key_up(self.session_id, event);
     }
 
-    /// The grid for this frame: re-wrapped onto the mirror's own cells, or on
-    /// the alternate screen the tab's grid with the font scaled to fit.
+    /// The grid for this frame: re-wrapped onto the mirror's own cells; on the
+    /// alternate screen the program's own rendering at the mirror's size when
+    /// it streams one, else the tab's grid with the font scaled to fit.
     fn grid(
         &mut self,
         frame: &PaneFrame,
@@ -703,15 +856,21 @@ impl MirrorView {
         if frame.alt_screen {
             self.scrollback = None;
         }
+        let own = self.zoomed(&style.font);
+        let grid = grid_cells(&own, width, height);
+        self.set_viewport(frame.alt_screen.then_some(grid));
         let (content, font) = if frame.alt_screen {
-            let fitted = fit_font(&style.font, frame.dimensions, (width, height));
-            (Arc::clone(&frame.content), fitted)
+            feed_content(&self.feeds, self.session_id, grid).map_or_else(
+                || {
+                    let fitted = fit_font(&style.font, frame.dimensions, (width, height));
+                    (Arc::clone(&frame.content), fitted)
+                },
+                |content| (content, own.clone()),
+            )
         } else if let Some(scrollback) = self.scrollback.as_mut() {
-            let grid = grid_cells(&style.font, width, height);
-            (Arc::new(scrollback.content(grid)), style.font.clone())
+            (Arc::new(scrollback.content(grid)), own)
         } else {
-            let grid = grid_cells(&style.font, width, height);
-            (self.wrapped_content(frame, grid), style.font.clone())
+            (self.wrapped_content(frame, grid), own)
         };
         let mut element = TerminalElement::new(
             content,
@@ -773,9 +932,19 @@ impl Render for MirrorView {
             return div().into_any_element();
         };
         let source = parent.read(cx);
-        let Some(frame) =
-            source.shared.panes.lock().ok().and_then(|panes| panes.frame(self.session_id))
-        else {
+        // The strip is the reader's record of every open session, panes
+        // included, and drops one before the repaint its exit requests. The
+        // grid alone cannot say: a late output batch for an exited session
+        // recreates its grid, which kept a mirror of a split pane open.
+        let open = source
+            .shared
+            .tabs
+            .lock()
+            .is_ok_and(|tabs| tabs.workspace_of(self.session_id).is_some());
+        let frame = open
+            .then(|| source.shared.panes.lock().ok().and_then(|panes| panes.frame(self.session_id)))
+            .flatten();
+        let Some(frame) = frame else {
             // The tab closed, exited, or moved to another window.
             tracing::info!(session = %self.session_id, "tab mirror closed: its session left");
             window.remove_window();
@@ -786,8 +955,8 @@ impl Render for MirrorView {
         // tab's screen, the way a taller terminal would show it. Only ever
         // grown here; the source resets it once no mirror shows the session.
         let (width, height) = grid_extent(window);
-        let wanted =
-            history_rows_wanted(grid_cells(&style.font, width, height), frame.dimensions.0);
+        let own = self.zoomed(&style.font);
+        let wanted = history_rows_wanted(grid_cells(&own, width, height), frame.dimensions.0);
         if !frame.alt_screen && frame.history_rows < wanted {
             let pane = source.shared.panes.lock().ok().and_then(|p| p.existing(self.session_id));
             if let Some(pane) = pane {
@@ -1205,5 +1374,36 @@ mod tests {
         let cursor = wrapped.shell_cursor.expect("the cursor stays on the live line");
         assert_eq!((cursor.point.row, cursor.point.col), (3, 2));
         assert_eq!(history_rows_wanted((12, 4), 6), 8, "a wider mirror asks for joined rows");
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Tab mirror re-wrap#A streamed frame paints at its own size]]
+    #[test]
+    fn a_streamed_frame_paints_at_its_own_size() {
+        let feeds: MirrorFeeds = Arc::default();
+        let session = SessionId::new();
+        let wide = TerminalSize { cols: 12, rows: 3, ..TerminalSize::default() };
+        // Pi's compositor writes one synchronized full redraw per frame.
+        let frame = b"\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[2Khello mirror\x1b[2;1H\x1b[2K> typed\x1b[2;8H\x1b[?25h\x1b[?2026l";
+        feed_mirror_frame(&feeds, session, wide, frame);
+
+        let content = feed_content(&feeds, session, (12, 3)).expect("the frame's grid is live");
+        assert_eq!(texts(&content), ["hello mirror", "> typed", ""]);
+        let cursor = content.shell_cursor.expect("the frame placed the cursor");
+        assert_eq!((cursor.point.row, cursor.point.col), (1, 7));
+        assert!(feed_content(&feeds, session, (80, 24)).is_none(), "another size is stale");
+
+        // A frame for a new size regrows the grid before it is drawn.
+        let narrow = TerminalSize { cols: 6, rows: 2, ..TerminalSize::default() };
+        feed_mirror_frame(
+            &feeds,
+            session,
+            narrow,
+            b"\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[2Ksmall\x1b[?2026l",
+        );
+        let resized = feed_content(&feeds, session, (6, 2)).expect("resized grid is live");
+        assert_eq!(texts(&resized), ["small", ""]);
+
+        drop_mirror_feed(&feeds, session);
+        assert!(feed_content(&feeds, session, (6, 2)).is_none(), "a dropped feed paints nothing");
     }
 }

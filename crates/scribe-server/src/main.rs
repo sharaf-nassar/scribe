@@ -21,6 +21,7 @@ mod handoff;
 mod hook_ingress;
 mod ipc_server;
 mod macos_proc;
+mod mirror_stream;
 mod pty_guard;
 mod releases;
 mod search_cache;
@@ -560,6 +561,7 @@ async fn run_server_loop(
         agent_api: agent_api::AgentApiState::new(agent_api),
         recovered_sessions: Arc::new(std::sync::Mutex::new(recovered_sessions)),
         workspace_transfers: Arc::clone(&workspace_transfers),
+        mirror_streams: Arc::default(),
     };
 
     // Crash-recovery dump: checkpoint the live state on a dirty-gated interval

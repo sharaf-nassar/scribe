@@ -1,7 +1,7 @@
 // SCRIBE-MANAGED-PI-EXTENSION
 // Scribe lifecycle adapter for Pi. Installed at user scope by Scribe.
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -331,6 +331,367 @@ async function executeAgentCli(argv: string[], signal: AbortSignal | undefined) 
   return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
+// ── Tab mirror stream ───────────────────────────────────────────────────
+//
+// A Scribe tab mirror of this session can show more than the tab: Pi renders
+// its fullscreen UI a second time at the mirror's size and streams those
+// frames to Scribe through `scribe-hook-helper --event=mirror_stream`. The
+// second render reuses pi-tui's own compositor (`TuiAltScreen.doRender`)
+// against a terminal facade that reports the mirror's size, with the per-size
+// render state swapped around the call, so the tab's own frame is untouched.
+// Everything here rides on pi-tui internals and is feature-detected: when a
+// name is missing the patch is not installed and the mirror falls back to
+// Scribe's scaled copy.
+
+type Any = Record<string, unknown>;
+/** The pi-tui classes the mirror patches, loaded lazily so a pi-tui without
+ *  one of them costs the mirror and nothing else in this extension. */
+type TuiClasses = { Container: Any; Markdown: Any; Text: Any; TuiAltScreen: Any };
+
+// Fields of TuiAltScreen/TuiBase that doRender reads or writes per frame.
+const MIRROR_RENDER_STATE = [
+  "previousScreen",
+  "previousScreenWidth",
+  "previousScreenHeight",
+  "currentLayout",
+  "lastDocument",
+  "renderedOverlayLayouts",
+  "scrollToEndIndicatorRect",
+  "fullRedrawCount",
+  "imageProtocol",
+] as const;
+// Fields of the primary ScrollView that layout mutates.
+const MIRROR_SCROLL_STATE = [
+  "currentScrollTop",
+  "contentHeight",
+  "currentViewportHeight",
+  "followingEnd",
+  "followSuppressedAtEnd",
+] as const;
+const MIRROR_HELPER_RESPAWNS = 3;
+const MIRROR_HELPER_RESPAWN_MS = 5000;
+
+function freshMirrorRenderState(): Any {
+  return {
+    previousScreen: [],
+    previousScreenWidth: 0,
+    previousScreenHeight: 0,
+    currentLayout: undefined,
+    lastDocument: [],
+    renderedOverlayLayouts: [],
+    scrollToEndIndicatorRect: undefined,
+    fullRedrawCount: 0,
+    // Images would be uploaded to the tab's terminal; the mirror shows their
+    // text fallback instead.
+    imageProtocol: null,
+  };
+}
+
+// Text, Markdown, and pi-coding-agent's VisualLinePreview remember one
+// rendered width; two viewports would evict each other every frame and
+// re-render the whole transcript twice. Keep the last two widths beside the
+// component and treat its own cache being cleared as the invalidation signal.
+function multiWidthCache(proto: Any): () => void {
+  const original = proto.render as (this: Any, width: number) => string[];
+  const side = new WeakMap<object, Map<number, { text: unknown; lines: string[] }>>();
+  proto.render = function cached(this: Any, width: number) {
+    let slots = side.get(this);
+    if (this.cachedLines === undefined) {
+      slots?.clear();
+    } else if (slots) {
+      const hit = slots.get(width);
+      if (hit && hit.text === this.text) return hit.lines;
+    }
+    const lines = original.call(this, width);
+    if (!slots) {
+      slots = new Map();
+      side.set(this, slots);
+    }
+    slots.set(width, { text: this.text, lines });
+    if (slots.size > 2) slots.delete(slots.keys().next().value as number);
+    return lines;
+  };
+  return () => {
+    proto.render = original;
+  };
+}
+
+// Give every child class with a one-width `cachedLines` cache the side cache
+// the first time one of its instances renders under a Container. Mirrors
+// `Container.render`, including the mouse layout it records.
+function hookContainerRender(
+  proto: Any,
+  patched: WeakSet<object>,
+  restores: (() => void)[],
+): () => void {
+  const original = proto.render as (this: Any, width: number) => string[];
+  proto.render = function hooked(this: Any, width: number) {
+    const lines: string[] = [];
+    const mouseChildren: { component: Any; height: number }[] = [];
+    for (const child of this.children as Any[]) {
+      if ("cachedLines" in child && "cachedWidth" in child) {
+        const childProto = Object.getPrototypeOf(child) as object | null;
+        if (childProto && !patched.has(childProto)) {
+          patched.add(childProto);
+          restores.push(multiWidthCache(childProto as Any));
+        }
+      }
+      const childLines = (child.render as (width: number) => string[]).call(child, width);
+      mouseChildren.push({ component: child, height: childLines.length });
+      for (const line of childLines) lines.push(line);
+    }
+    this.mouseLayout = { width, children: mouseChildren };
+    return lines;
+  };
+  return () => {
+    proto.render = original;
+  };
+}
+
+async function loadTuiClasses(): Promise<TuiClasses | undefined> {
+  let module: Partial<TuiClasses>;
+  try {
+    module = (await import("@earendil-works/pi-tui")) as Partial<TuiClasses>;
+  } catch {
+    return undefined;
+  }
+  const { Container, Markdown, Text, TuiAltScreen } = module;
+  const proto = (cls: unknown) => (cls as { prototype?: Any } | undefined)?.prototype;
+  const alt = proto(TuiAltScreen);
+  const present =
+    typeof alt?.doRender === "function" &&
+    typeof alt.getPrimaryScrollView === "function" &&
+    typeof proto(Container)?.render === "function" &&
+    typeof proto(Text)?.render === "function" &&
+    typeof proto(Markdown)?.render === "function";
+  if (!present || !Container || !Markdown || !Text || !TuiAltScreen) return undefined;
+  return { Container, Markdown, Text, TuiAltScreen };
+}
+
+/** Whether a live TUI and its scroll view carry every field the swap needs. */
+function mirrorInstanceSupported(tui: Any, scroll: Any): boolean {
+  return (
+    "terminal" in tui &&
+    "altScreenActive" in tui &&
+    "stopped" in tui &&
+    MIRROR_RENDER_STATE.every((key) => key in tui) &&
+    MIRROR_SCROLL_STATE.every((key) => key in scroll) &&
+    typeof scroll.scrollBy === "function"
+  );
+}
+
+class MirrorStream {
+  private viewport: { cols: number; rows: number } | undefined;
+  private renderState = freshMirrorRenderState();
+  // The mirror's own scroll position, `undefined` until its first frame, which
+  // follows the transcript's end.
+  private scrollState: Any | undefined;
+  private pendingScroll = 0;
+  private child: ChildProcess | undefined;
+  private respawns = 0;
+  private respawnTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopped = false;
+  private disabled = false;
+  private restores: (() => void)[] = [];
+  // The live TUI, for a render when the mirror opens or scrolls; the one the
+  // host hands widget factories, which follows a regular/fullscreen switch.
+  tui: Any | undefined;
+
+  constructor(private readonly helperPath: string) {}
+
+  private starting = false;
+
+  async start() {
+    if (this.stopped || this.disabled || this.starting || this.restores.length) return;
+    this.starting = true;
+    const classes = await loadTuiClasses();
+    this.starting = false;
+    if (this.stopped) return;
+    if (!classes) {
+      this.disabled = true;
+      return;
+    }
+    const patched = new WeakSet<object>();
+    for (const cls of [classes.Text, classes.Markdown]) {
+      const proto = cls.prototype as Any;
+      patched.add(proto);
+      this.restores.push(multiWidthCache(proto));
+    }
+    const container = classes.Container.prototype as Any;
+    this.restores.push(hookContainerRender(container, patched, this.restores));
+    const alt = classes.TuiAltScreen.prototype as Any;
+    const original = alt.doRender as (this: Any) => void;
+    const stream = this;
+    alt.doRender = function patchedDoRender(this: Any) {
+      stream.render(this, original);
+    };
+    this.restores.push(() => {
+      alt.doRender = original;
+    });
+    this.spawnHelper();
+  }
+
+  stop() {
+    this.stopped = true;
+    if (this.respawnTimer) clearTimeout(this.respawnTimer);
+    this.respawnTimer = undefined;
+    for (const restore of this.restores.splice(0).reverse()) restore();
+    const child = this.child;
+    this.child = undefined;
+    if (child) {
+      try {
+        child.stdin?.end();
+        child.kill("SIGTERM");
+      } catch {
+        // Best effort only.
+      }
+    }
+  }
+
+  private spawnHelper() {
+    if (this.stopped || this.disabled) return;
+    let child: ChildProcess;
+    try {
+      child = spawn(this.helperPath, ["--provider=pi", "--event=mirror_stream"], {
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch {
+      return;
+    }
+    this.child = child;
+    child.stdin?.on("error", () => {});
+    let buffered = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      buffered += chunk;
+      let newline = buffered.indexOf("\n");
+      while (newline !== -1) {
+        this.onCommand(buffered.slice(0, newline));
+        buffered = buffered.slice(newline + 1);
+        newline = buffered.indexOf("\n");
+      }
+    });
+    child.once("error", () => {});
+    child.once("close", () => {
+      if (this.child !== child) return;
+      this.child = undefined;
+      this.setViewport(undefined);
+      // A server without mirror streams closes at once; three tries bound
+      // the cost of asking an older server forever.
+      if (this.stopped || this.respawns >= MIRROR_HELPER_RESPAWNS) return;
+      this.respawns += 1;
+      this.respawnTimer = setTimeout(() => {
+        this.respawnTimer = undefined;
+        this.spawnHelper();
+      }, MIRROR_HELPER_RESPAWN_MS);
+    });
+  }
+
+  private onCommand(line: string) {
+    let command: { cols?: unknown; rows?: unknown; scroll?: unknown };
+    try {
+      command = JSON.parse(line) as typeof command;
+    } catch {
+      return;
+    }
+    if (typeof command.scroll === "number" && Number.isFinite(command.scroll)) {
+      // Scribe counts positive as back into history; ScrollView counts
+      // positive as toward the end.
+      this.pendingScroll -= Math.trunc(command.scroll);
+      this.requestRender();
+      return;
+    }
+    if (typeof command.cols !== "number" || typeof command.rows !== "number") return;
+    const cols = Math.trunc(command.cols);
+    const rows = Math.trunc(command.rows);
+    this.setViewport(cols > 0 && rows > 0 ? { cols, rows } : undefined);
+  }
+
+  private setViewport(viewport: { cols: number; rows: number } | undefined) {
+    this.viewport = viewport;
+    if (!viewport) {
+      // The next mirror starts from a full redraw at the transcript's end.
+      this.renderState = freshMirrorRenderState();
+      this.scrollState = undefined;
+      this.pendingScroll = 0;
+      return;
+    }
+    this.requestRender();
+  }
+
+  private requestRender() {
+    try {
+      (this.tui?.requestRender as (() => void) | undefined)?.call(this.tui);
+    } catch {
+      // The TUI may be stopped; the next natural render still carries the frame.
+    }
+  }
+
+  /** Render the mirror's frame, then the tab's, in that order so every piece
+   *  of state the tab depends on (editor wrap width, overlay hit-test bounds,
+   *  scroll geometry) is left as the tab's own render set it. */
+  private render(tui: Any, original: (this: Any) => void) {
+    const viewport = this.viewport;
+    if (!viewport || this.disabled || tui.stopped || !tui.altScreenActive) {
+      original.call(tui);
+      return;
+    }
+    this.tui ??= tui;
+    const scroll = (tui.getPrimaryScrollView as () => Any).call(tui);
+    if (!mirrorInstanceSupported(tui, scroll)) {
+      this.disabled = true;
+      original.call(tui);
+      return;
+    }
+    const savedTui: Any = {};
+    for (const key of MIRROR_RENDER_STATE) savedTui[key] = tui[key];
+    const savedTerminal = tui.terminal as object;
+    const savedScroll: Any = {};
+    for (const key of MIRROR_SCROLL_STATE) savedScroll[key] = scroll[key];
+    let out = "";
+    const facade = Object.create(savedTerminal) as Any;
+    Object.defineProperties(facade, {
+      columns: { get: () => viewport.cols },
+      rows: { get: () => viewport.rows },
+      write: {
+        value: (data: string) => {
+          out += data;
+        },
+      },
+    });
+    try {
+      for (const key of MIRROR_RENDER_STATE) tui[key] = this.renderState[key];
+      tui.terminal = facade;
+      if (this.scrollState) {
+        Object.assign(scroll, this.scrollState);
+        if (this.pendingScroll !== 0) {
+          (scroll.scrollBy as (lines: number) => number).call(scroll, this.pendingScroll);
+        }
+      } else {
+        scroll.followingEnd = true;
+      }
+      this.pendingScroll = 0;
+      original.call(tui);
+      for (const key of MIRROR_RENDER_STATE) this.renderState[key] = tui[key];
+      const next: Any = {};
+      for (const key of MIRROR_SCROLL_STATE) next[key] = scroll[key];
+      this.scrollState = next;
+    } catch {
+      this.disabled = true;
+    } finally {
+      for (const key of MIRROR_RENDER_STATE) tui[key] = savedTui[key];
+      tui.terminal = savedTerminal;
+      Object.assign(scroll, savedScroll);
+    }
+    if (out && this.child?.stdin?.writable) {
+      const frame = JSON.stringify({ cols: viewport.cols, rows: viewport.rows, frame: out });
+      this.child.stdin.write(`${frame}\n`);
+    }
+    original.call(tui);
+  }
+}
+
 function registerAgentTools(pi: ExtensionAPI) {
   // Older Pi runtimes without registerTool keep lifecycle reporting only.
   if (typeof pi.registerTool !== "function") return;
@@ -388,6 +749,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   let lastPercent: number | undefined;
   let refreshQueued = false;
   let unsubscribeSubagentStatus: (() => void) | undefined;
+  const mirror = new MirrorStream(helperPath);
 
   // What running background work leaves a settled agent waiting on: its own
   // wake-up when a task will start another turn, otherwise the user, because
@@ -572,11 +934,25 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     drain();
   }
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
     capturedInputs = 0;
     latestAssistant = "";
     latestError = false;
     lastPercent = undefined;
+    if (ctx.mode === "tui") {
+      // A zero-line widget is the one public path to the live TUI handle;
+      // it is removed again in the same tick, so the layout never changes.
+      try {
+        ctx.ui.setWidget("scribe-mirror-probe", (tui) => {
+          mirror.tui = tui as unknown as Any;
+          return { render: () => [], invalidate: () => {} };
+        });
+        ctx.ui.setWidget("scribe-mirror-probe", undefined);
+      } catch {
+        // Without the handle the mirror still renders on Pi's next natural frame.
+      }
+      void mirror.start();
+    }
     enqueue("task_label_cleared");
     setParentState("state_changed", { state: "idle_prompt" });
     refreshSubagents();
@@ -659,6 +1035,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
       unsubscribeBackgroundTerminal();
       generation += 1;
       pending = [];
+      mirror.stop();
       if (active) await active;
       await invoke("state_cleared", {});
       if (globalRegistry[REGISTRATION] === registration) delete globalRegistry[REGISTRATION];

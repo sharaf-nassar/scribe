@@ -1750,6 +1750,12 @@ The helper writes one complete hook frame but remains connected until the server
 
 The Docker functional harness drives the staged release helper against a stub Unix peer and proves the real process stays alive after its complete frame is read, exiting only after the peer closes.
 
+### Mirror stream bridges pipes and socket
+
+The helper's `--event=mirror_stream` mode, driven as the Pi extension drives it, carries JSON lines on its pipes and framed messages on the socket in both directions.
+
+`scribe-hook-helper --provider=pi --event=mirror_stream` opens one connection whose first frame is `MirrorStreamAttach` for `SCRIBE_SESSION_ID`, writes the server's `MirrorViewport` and `MirrorScroll` to stdout as the JSON lines `{"cols","rows"}` and `{"scroll"}` while ignoring other server traffic, turns each `{"cols","rows","frame"}` line on stdin into a `MirrorFrame` carrying that grid and the frame's bytes, and exits 0 silently when its stdin closes ([[server#Tab Mirror Streams#A stream and its viewer are paired per session]]).
+
 ## Pi Provider Compatibility
 
 Unit and transport tests pin Pi's shared provider boundary and every mixed-version fallback before provider-specific lifecycle installation is involved.
@@ -5655,6 +5661,12 @@ A pane scrolled to its oldest line still hands the mirror every line of its buff
 #### An alternate-screen wheel reports a tab cell
 
 A wheel over an alternate-screen mirror is reported at the tab cell under the pointer, measured on the font-scaled grid. Spare room past the fitted grid clamps onto the tab's last row or column, and a pointer off the grid reports nothing.
+
+#### A streamed frame paints at its own size
+
+A program-rendered frame ([[server#Tab Mirror Streams]]) parsed through [[crates/scribe-client/src/mirror_window.rs#feed_mirror_frame]] yields a grid of the size the frame names, with the text and cursor the ANSI placed.
+
+The grid is only live for that size, so a frame from before a resize paints nothing; a frame naming a new size regrows the grid before it is drawn; and dropping the feed leaves nothing to paint.
 
 ### Tab mirror size
 

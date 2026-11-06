@@ -1319,6 +1319,9 @@ pub struct IpcServerState {
     /// agent world capture all acquire it before their registry guards, so no
     /// reader ever observes a half-committed move.
     pub workspace_transfers: crate::workspace_transfer::TransferGate,
+    /// Tab-mirror streams paired with the windows viewing them; see
+    /// [`crate::mirror_stream`].
+    pub mirror_streams: crate::mirror_stream::MirrorStreams,
 }
 
 struct ClientDispatchContext<'a> {
@@ -5198,6 +5201,17 @@ where
             Ok(hello @ ClientMessage::Hello { .. }) => {
                 return claim_hello_window(hello, conn, controller, local.as_deref_mut()).await;
             }
+            // A Pi session's mirror stream: long-lived like a client, so it is
+            // charged to the client pool, but it registers no window. Local
+            // only, like every other non-`Hello` first frame.
+            Ok(ClientMessage::MirrorStreamAttach { session_id }) if !is_remote => {
+                if !claim_local_slot(local.as_deref_mut(), LocalSlotKind::Client) {
+                    return None;
+                }
+                Box::pin(crate::mirror_stream::serve(reader, conn.server, conn.writer, session_id))
+                    .await;
+                return None;
+            }
             // Feature 013 (fix 5): the picker's window-probe. An ALREADY-authorized
             // remote connection may enumerate this machine's windows read-only
             // BEFORE `Hello`; reply with `WindowList` and keep reading (the probe
@@ -6632,6 +6646,7 @@ async fn detach_client_window(
 ) {
     server.agent_api.fail_actions_for_client(action_client_key(writer));
     server.github_ci_tracker.drop_detail_writer(Arc::clone(writer));
+    crate::mirror_stream::viewer_disconnected(server, writer).await;
     let attached_ids = attached_snapshot(attached_ids).await;
     clear_focused_issues_for_disconnect(
         &server.live_sessions,
@@ -6934,7 +6949,30 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::ControlGrant { .. }) => {
             handle_control_message(msg, context).await;
         }
+        msg @ (ClientMessage::MirrorViewport { .. }
+        | ClientMessage::MirrorClose { .. }
+        | ClientMessage::MirrorScroll { .. }) => dispatch_mirror_message(msg, context).await,
         other => debug!(?other, "unhandled client message"),
+    }
+}
+
+/// A window's tab-mirror viewport, close, or wheel step, honoured only for a
+/// session the window owns, so one window cannot read another's screen through
+/// its mirror stream.
+async fn dispatch_mirror_message(msg: ClientMessage, context: &ClientDispatchContext<'_>) {
+    let session_id = match &msg {
+        ClientMessage::MirrorViewport { session_id, .. }
+        | ClientMessage::MirrorClose { session_id }
+        | ClientMessage::MirrorScroll { session_id, .. } => *session_id,
+        other => {
+            debug!(?other, "ignored non-mirror message in the mirror dispatcher");
+            return;
+        }
+    };
+    if session_owned_by_window(&context.server.workspace_manager, session_id, context.window_id)
+        .await
+    {
+        crate::mirror_stream::handle_viewer(msg, context.server, context.writer).await;
     }
 }
 
@@ -18980,6 +19018,7 @@ mod tests {
             ),
             recovered_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_transfers: crate::workspace_transfer::new_transfer_gate(),
+            mirror_streams: Arc::default(),
         }
     }
 
@@ -20865,5 +20904,107 @@ mod tests {
             fixture.server.workspace_manager.read().await.window_for_session(fixture.left_session),
             Some(target)
         );
+    }
+
+    async fn next_frame<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        what: &str,
+    ) -> ServerMessage {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_message::<ServerMessage, _>(reader),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{what}: no frame arrived"))
+        .unwrap_or_else(|error| panic!("{what}: frame did not decode: {error}"))
+    }
+
+    // @lat: [[server#Tab Mirror Streams#A stream and its viewer are paired per session]]
+    #[tokio::test]
+    async fn mirror_stream_relays_frames_to_the_viewing_window_and_reports_its_loss() {
+        let mut fixture = transfer_fixture([None, None]).await;
+        let session_id = fixture.left_session;
+        let size = TerminalSize { cols: 160, rows: 50, ..TerminalSize::default() };
+        let server = &fixture.server;
+        let client_read = &mut fixture.client_read;
+        let context = ClientDispatchContext {
+            server,
+            writer: &fixture.writer,
+            attached_ids: &fixture.attached_ids,
+            window_id: fixture.source_window,
+            is_remote: false,
+        };
+
+        // The window asks before any stream exists: no feed yet.
+        dispatch_mirror_message(ClientMessage::MirrorViewport { session_id, size }, &context).await;
+        assert!(matches!(
+            next_frame(client_read, "feed refusal").await,
+            ServerMessage::MirrorFeed { session_id: id, available: false } if id == session_id
+        ));
+
+        let (helper_side, server_side) = unix_stream_pair();
+        let (mut helper_read, mut helper_write) = tokio::io::split(helper_side);
+        let (mut stream_read, stream_write) = tokio::io::split(server_side);
+        let stream_writer = test_shared_writer(stream_write);
+        let serving =
+            crate::mirror_stream::serve(&mut stream_read, server, &stream_writer, session_id);
+        let exercise = async {
+            // The stream attaches: it is handed the waiting viewport and the
+            // window hears the feed is live.
+            assert!(matches!(
+                next_frame(&mut helper_read, "viewport on attach").await,
+                ServerMessage::MirrorViewport { session_id: id, size: got }
+                    if id == session_id && got == size
+            ));
+            assert!(matches!(
+                next_frame(client_read, "feed available").await,
+                ServerMessage::MirrorFeed { session_id: id, available: true } if id == session_id
+            ));
+
+            // A frame goes up to the window; a wheel step goes down to the stream.
+            let data = b"\x1b[2Jhello".to_vec();
+            let frame = ClientMessage::MirrorFrame { session_id, size, data: data.clone() };
+            write_message(&mut helper_write, &frame).await.expect("frame written");
+            assert!(matches!(
+                next_frame(client_read, "relayed frame").await,
+                ServerMessage::MirrorOutput { session_id: id, data: got, .. }
+                    if id == session_id && got == data
+            ));
+            dispatch_mirror_message(ClientMessage::MirrorScroll { session_id, delta: 3 }, &context)
+                .await;
+            assert!(matches!(
+                next_frame(&mut helper_read, "scroll").await,
+                ServerMessage::MirrorScroll { session_id: id, delta: 3 } if id == session_id
+            ));
+
+            // A window that does not own the session is ignored: the stream
+            // sees nothing before the viewport the real viewer sends next.
+            let stranger = ClientDispatchContext { window_id: WindowId::new(), ..context };
+            dispatch_mirror_message(
+                ClientMessage::MirrorScroll { session_id, delta: 9 },
+                &stranger,
+            )
+            .await;
+            let smaller = TerminalSize { cols: 80, rows: 24, ..TerminalSize::default() };
+            let viewport = ClientMessage::MirrorViewport { session_id, size: smaller };
+            dispatch_mirror_message(viewport, &context).await;
+            assert!(matches!(
+                next_frame(&mut helper_read, "resized viewport").await,
+                ServerMessage::MirrorViewport { session_id: id, size: got }
+                    if id == session_id && got == smaller
+            ));
+            assert!(matches!(
+                next_frame(client_read, "feed still available").await,
+                ServerMessage::MirrorFeed { session_id: id, available: true } if id == session_id
+            ));
+
+            // The stream closing returns the mirror to its own rendering.
+            tokio::io::AsyncWriteExt::shutdown(&mut helper_write).await.expect("helper closed");
+            assert!(matches!(
+                next_frame(client_read, "feed lost").await,
+                ServerMessage::MirrorFeed { session_id: id, available: false } if id == session_id
+            ));
+        };
+        tokio::join!(serving, exercise);
     }
 }

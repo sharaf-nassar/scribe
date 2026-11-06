@@ -21,6 +21,7 @@ pub mod image_sharing_probe;
 pub mod ipc_server;
 pub mod lan;
 pub mod macos_proc;
+pub mod mirror_stream;
 pub mod pty_guard;
 pub mod releases;
 pub mod search_cache;

@@ -1171,6 +1171,39 @@ impl IpcSink {
         self.enqueue(ClientMessage::Resize { session_id, size })
     }
 
+    /// Asks the program behind `session_id` to render frames for a tab mirror
+    /// of `size`, on open and on every resize.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn mirror_viewport(
+        &self,
+        session_id: SessionId,
+        size: TerminalSize,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::MirrorViewport { session_id, size })
+    }
+
+    /// Tells the program behind `session_id` its tab mirror closed.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn mirror_close(&self, session_id: SessionId) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::MirrorClose { session_id })
+    }
+
+    /// Scrolls the mirror the program renders for `session_id` by `delta`
+    /// rows, positive back into its history.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn mirror_scroll(&self, session_id: SessionId, delta: i32) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::MirrorScroll { session_id, delta })
+    }
+
     /// Announces that the client reapplied an on-disk config edit, so the
     /// server re-reads the same file and swaps its own live surfaces (clipboard
     /// policy, env store, remote/share listeners) in the same round trip.

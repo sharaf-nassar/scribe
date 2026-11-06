@@ -29,11 +29,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use scribe_common::ai_state::{AiProvider, AiState};
-use scribe_common::framing::write_message;
+use scribe_common::framing::{read_message, write_message};
 use scribe_common::hook::{HookEvent, HookEventKind};
 use scribe_common::ids::SessionId;
-use scribe_common::protocol::ClientMessage;
-use tokio::io::AsyncReadExt as _;
+use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
@@ -149,6 +149,11 @@ enum EventKind {
     /// because this selector postdates the argv transport and adding one
     /// would leak the id into world-readable `/proc/<pid>/cmdline`.
     IssueFocused,
+    /// Not an event: run as the long-lived bridge of a tab-mirror stream.
+    /// stdin carries rendered frames up to the server as JSON lines, stdout
+    /// carries the server's viewport and scroll commands down. See
+    /// [`run_mirror_stream`].
+    MirrorStream,
 }
 
 fn main() {
@@ -184,19 +189,100 @@ fn run() -> Result<(), ()> {
     let session_id_str = env::var("SCRIBE_SESSION_ID").map_err(|_| ())?;
     let session_id: SessionId = session_id_str.parse().map_err(|_| ())?;
 
+    let runtime =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ())?;
+
+    if matches!(cli.event, EventKind::MirrorStream) {
+        runtime.block_on(async {
+            _ = run_mirror_stream(&sock_path, session_id).await;
+        });
+        return Ok(());
+    }
+
     let provider = AiProvider::from_id(&cli.provider).ok_or(())?;
     let kind = build_kind(&cli, &payload)?;
 
     let msg = ClientMessage::HookEvent(HookEvent { session_id, provider, kind });
-
-    let runtime =
-        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ())?;
 
     runtime.block_on(async {
         _ = timeout(EMIT_BUDGET, try_send(&sock_path, &msg)).await;
     });
 
     Ok(())
+}
+
+/// One rendered frame on the mirror stream's stdin: the grid it was rendered
+/// for and the ANSI text that draws it.
+#[derive(serde::Deserialize)]
+struct FrameLine {
+    cols: u16,
+    rows: u16,
+    frame: String,
+}
+
+/// One command on the mirror stream's stdout, a JSON line the Pi extension
+/// reads: a viewport (zero when the mirror closed) or a wheel step.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum CommandLine {
+    Viewport { cols: u16, rows: u16 },
+    Scroll { scroll: i32 },
+}
+
+/// Bridge a tab-mirror stream between the Pi extension's pipes and the
+/// server's framed socket until either side closes.
+///
+/// The extension cannot speak the msgpack IPC itself, so it spawns this
+/// helper once per Pi session and keeps it for the session's life: frames go
+/// up as `{"cols","rows","frame"}` lines on stdin, the server's
+/// `MirrorViewport` and `MirrorScroll` come down as JSON lines on stdout.
+/// There is no time budget here, unlike the one-shot path: the stream is
+/// idle most of its life and ends when the session or the server does.
+async fn run_mirror_stream(sock_path: &str, session_id: SessionId) -> Result<(), ()> {
+    let stream = UnixStream::connect(sock_path).await.map_err(|_| ())?;
+    let (mut from_server, mut to_server) = stream.into_split();
+    write_message(&mut to_server, &ClientMessage::MirrorStreamAttach { session_id })
+        .await
+        .map_err(|_| ())?;
+
+    let frames_up = async {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Some(line) = lines.next_line().await.map_err(|_| ())? {
+            let Ok(FrameLine { cols, rows, frame }) = serde_json::from_str::<FrameLine>(&line)
+            else {
+                continue;
+            };
+            let size = TerminalSize { cols, rows, ..TerminalSize::default() };
+            let msg = ClientMessage::MirrorFrame { session_id, size, data: frame.into_bytes() };
+            write_message(&mut to_server, &msg).await.map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    };
+
+    let commands_down = async {
+        let mut stdout = tokio::io::stdout();
+        loop {
+            let command = match read_message::<ServerMessage, _>(&mut from_server).await {
+                Ok(ServerMessage::MirrorViewport { size, .. }) => {
+                    CommandLine::Viewport { cols: size.cols, rows: size.rows }
+                }
+                Ok(ServerMessage::MirrorScroll { delta, .. }) => {
+                    CommandLine::Scroll { scroll: delta }
+                }
+                Ok(_) => continue,
+                Err(_) => return Err(()),
+            };
+            let mut line = serde_json::to_vec(&command).map_err(|_| ())?;
+            line.push(b'\n');
+            stdout.write_all(&line).await.map_err(|_| ())?;
+            stdout.flush().await.map_err(|_| ())?;
+        }
+    };
+
+    tokio::select! {
+        result = frames_up => result,
+        result = commands_down => result,
+    }
 }
 
 async fn try_send(sock_path: &str, msg: &ClientMessage) -> Result<(), ()> {
@@ -307,6 +393,8 @@ fn build_kind(cli: &Cli, payload: &Payload) -> Result<HookEventKind, ()> {
             }
             Ok(HookEventKind::IssueFocused { issue_id })
         }
+        // Handled before this is reached; it carries no event.
+        EventKind::MirrorStream => Err(()),
         EventKind::EnvDelta => {
             let added: Vec<(String, String)> = match payload.added.clone() {
                 Some(map) => map.into_iter().collect(),

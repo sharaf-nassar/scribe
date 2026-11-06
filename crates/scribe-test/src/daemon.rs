@@ -269,6 +269,10 @@ macro_rules! unused_server_message {
             | ServerMessage::ControlRequested { .. }
             | ServerMessage::ControlDenied { .. }
             | ServerMessage::ShareEnded { .. }
+            | ServerMessage::MirrorViewport { .. }
+            | ServerMessage::MirrorScroll { .. }
+            | ServerMessage::MirrorFeed { .. }
+            | ServerMessage::MirrorOutput { .. }
             | ServerMessage::AgentRequestAccepted { .. }
             | ServerMessage::AgentResponse(_)
             | ServerMessage::AgentPromptRequest { .. }

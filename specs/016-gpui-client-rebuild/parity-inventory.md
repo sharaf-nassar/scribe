@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (57 variants, 51 reachable)
+## Client messages (62 variants, 56 reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -151,17 +151,23 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | `main.rs::TerminalView::run_share_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
+| `MirrorStreamAttach` | tab-mirror stream opened by the Pi extension's helper | unit | `crates/scribe-hook-helper/src/main.rs::run_mirror_stream` — out-of-client by design | required |
+| `MirrorFrame` | program-rendered mirror frame from the helper | unit | `crates/scribe-hook-helper/src/main.rs::run_mirror_stream` — out-of-client by design | required |
+| `MirrorViewport` | tab mirror asks the session's program for frames at its grid | unit | `mirror_window.rs::MirrorView::set_viewport` → `ipc_bridge.rs::IpcSink::mirror_viewport` | required |
+| `MirrorClose` | tab mirror stops asking for frames | unit | `mirror_window.rs::MirrorView::set_viewport` → `ipc_bridge.rs::IpcSink::mirror_close` | required |
+| `MirrorScroll` | wheel over a program-fed tab mirror | unit | `mirror_window.rs::MirrorView::on_scroll` → `ipc_bridge.rs::IpcSink::mirror_scroll` | required |
 | `RequestBeadsBoard` | workspace Beads board open, hover refresh and pinned poll | visual-E2E | `main.rs::park_workspace_info`, `main.rs::TerminalView::poll_beads_board`, titlebar/region bead hover and click → `ipc_bridge.rs::IpcSink::request_beads_board` — `tests/e2e/visual/beads-board.sh` | required |
 | `RequestBeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
 | `BeadsIssueWrite` | workspace Beads issue detail edits | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `RequestBeadsEpicGraph` | workspace Beads Flow epic dependency graph | unit | `beads_board.rs::BeadsBoards::request_card_flow` → `main.rs::TerminalView::sync_beads_board_strips` → `ipc_bridge.rs::IpcSink::request_beads_epic_graph` | required |
 
-**Reachability:** 51 of 57 rows name a live-path symbol; 6 are unwired and 0
-are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
-rather than a client symbol, because the hook ingress is a separate binary by
-design; it is the only out-of-client row in the whole inventory.
+**Reachability:** 56 of 62 rows name a live-path symbol; 6 are unwired and 0
+are missing. Three of them — `HookEvent`, `MirrorStreamAttach` and
+`MirrorFrame` — name `scribe-hook-helper` symbols rather than client ones,
+because the hook ingress and the mirror-stream bridge are a separate binary by
+design; they are the only out-of-client rows in the whole inventory.
 
-## Server messages (76 variants, 69 reachable)
+## Server messages (80 variants, 73 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
@@ -256,6 +262,10 @@ erase a replacement.
 | `ControlRequested` | holder or owner grant/deny control prompt | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::request` | required |
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
+| `MirrorViewport` | stream-bound viewport; a window only ignores it | unit | `main.rs::dispatch_server_message` (stream-bound arm) | required |
+| `MirrorScroll` | stream-bound wheel step; a window only ignores it | unit | `main.rs::dispatch_server_message` (stream-bound arm) | required |
+| `MirrorFeed` | whether a tab mirror's program feed is live | unit | `main.rs::dispatch_server_message` → `mirror_window.rs::drop_mirror_feed` | required |
+| `MirrorOutput` | program-rendered tab-mirror frame | unit | `main.rs::dispatch_server_message` → `mirror_window.rs::feed_mirror_frame` → `mirror_window.rs::MirrorView::grid` | required |
 | `BeadsBoard` | workspace Beads board snapshot, loading, unavailable and not-detected states | visual-E2E | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::update` → `beads_board.rs::render` — `tests/e2e/visual/beads-board.sh` | required |
 | `BeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
 | `BeadsIssueWriteResult` | workspace Beads issue detail write outcome | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
@@ -264,7 +274,7 @@ erase a replacement.
 | `BeadsEpicGraph` | workspace Beads Flow epic dependency graph reply | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::apply_epic_graph` → `beads_board.rs::flow_strip` | required |
 | `IssueFocused` | local unshared Flow live-agent issue binding | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::set_focused_issue` → `beads_flow.rs::node_dot` | required |
 
-**Reachability:** 69 of 76 rows name a live-path symbol; 7 are unwired and 0
+**Reachability:** 73 of 80 rows name a live-path symbol; 7 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -487,19 +497,20 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 57 | 51 | 6 | 0 |
-| Server messages | 76 | 69 | 7 | 0 |
+| Client messages | 62 | 56 | 6 | 0 |
+| Server messages | 80 | 73 | 7 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **232** | **219** | **13** | **0** |
+| **Total** | **241** | **228** | **13** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **223 rows, of which 210 are
-reachable (94%)** and 13 are not. **1 of those 223** rows — `HookEvent`, whose
-named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **209 of 223**.
+behaviour), the user-facing parity surface is **232 rows, of which 219 are
+reachable (94%)** and 13 are not. **3 of those 232** rows — `HookEvent`,
+`MirrorStreamAttach` and `MirrorFrame`, whose named symbols are
+`scribe-hook-helper`'s — are out-of-client by design, so
+the in-client figure is **216 of 232**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
