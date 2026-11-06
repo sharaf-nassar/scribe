@@ -75,6 +75,11 @@ ignore = [
   "RUSTSEC-2026-0370", # zvariant
   "RUSTSEC-2026-0371", # zbus_names
   "RUSTSEC-2026-0372", # zvariant_derive
+  # Owner: Scribe maintainers. Review by 2027-01-01 or when hyper drops it.
+  # pin-utils unmaintained, no safe upgrade — a tiny pinning helper hyper 1.x
+  # still depends on, transitive via reqwest (release checks); no unsafe
+  # surface of its own is reached by untrusted input.
+  "RUSTSEC-2026-0441", # pin-utils
 ]
 
 [bans]
