@@ -1340,7 +1340,7 @@ beside it.
 
 ## Native macOS Metal Parity Corpus
 
-`tests/native-macos/terminal-images-metal.sh` is the only terminal-image corpus that runs outside Docker, on the sanctioned Apple-silicon `macos-14` runner, and the only one that can observe Metal.
+`tests/native-macos/terminal-images-metal.sh` is the only terminal-image corpus that runs outside Docker, on the sanctioned Apple-silicon `macos-15` runner, and the only one that can observe Metal.
 
 It exists to answer one question the Linux harness cannot: does the supported
 macOS platform advertise and reach the same image subset? It therefore repeats
@@ -2063,7 +2063,7 @@ Failed nightly runs upload `test-output/` for 14 days, including `test-output/e2
 
 Hosted validation remains external and pending after push: this unpushed implementation has no GitHub pull-request, manual, scheduled, or full hosted-nightly run to cite. Post-push acceptance must record a real warm PR duration and manual-nightly artifact/summary result before treating hosted CI timing and execution as measured.
 
-`quality.yml` runs `just clippy` and `just test` on both platforms — `rust-linux` on `ubuntu-22.04` and `rust-macos` on `macos-14` — always through the justfile so CI and the local `just ready` gate cannot drift apart. Before those jobs existed neither command ran anywhere in CI, and over a thousand unit tests executed nowhere.
+`quality.yml` runs `just clippy` and `just test` on both platforms — `rust-linux` on `ubuntu-22.04` and `rust-macos` on `macos-15` — always through the justfile so CI and the local `just ready` gate cannot drift apart. Before those jobs existed neither command ran anywhere in CI, and over a thousand unit tests executed nowhere.
 
 The macOS job exists because a Linux runner cannot compile `#[cfg(target_os = "macos")]` code at all. Until it was added, the only thing that ever type-checked that code was `release.yml`'s macOS build leg, which fires on a version tag — too late to stop drift, and it runs no tests. That gap is why a `hdiutil` mount-point parse that could never succeed shipped, alongside denied lints in `macos_proc`, `x11_focus`, and `config`. The job needs no system dependencies: the apt list is Linux-only in both workflows.
 

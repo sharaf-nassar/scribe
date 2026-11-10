@@ -1489,7 +1489,7 @@ case-by-case description.
 Native Metal evidence runs only on the sanctioned GitHub-hosted Apple-silicon runner and never on a developer workstation.
 
 `.github/workflows/native-macos-metal.yml` is a manual `workflow_dispatch` job
-on ARM64 `macos-14`, GitHub's standard Apple-silicon macOS runner, which is
+on ARM64 `macos-15`, GitHub's standard Apple-silicon macOS runner, which is
 free for public repositories. Whether that runner exposes a usable Metal
 device is what this corpus verifies; a run that cannot reach Metal fails
 closed rather than degrading silently. The workflow has read-only permission,
@@ -1516,7 +1516,7 @@ per-phase transcripts. The driver receives that directory in
 it with `gh run download <run-id> --dir <destination>`.
 
 The runner identity is asserted in three places that must agree: the workflow
-sets `SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-14`, and both
+sets `SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-15`, and both
 `tools/run-native-macos-terminal-images.sh` and the driver refuse to run unless
 they see that exact marker alongside `GITHUB_ACTIONS`, `RUNNER_OS=macOS`, and
 `RUNNER_ARCH=ARM64`.
