@@ -911,8 +911,9 @@ skill_text = (
     'description: "Observe and control the Scribe terminal hosting this '
     "session - list windows and sibling panes, read pane screen text, "
     "dispatch window actions, and write pane input through the scribe "
-    "agent CLI. Use only inside a Scribe pane, when SCRIBE_SESSION_ID "
-    'is set; otherwise this skill does not apply."\n'
+    "agent CLI, including tabs the user names with a pasted "
+    "scribe://tab/<uuid> reference. Use only inside a Scribe pane, when "
+    'SCRIBE_SESSION_ID is set; otherwise this skill does not apply."\n'
     "---\n"
     "\n"
     f"<!-- {SKILL_MARKER} -->\n"

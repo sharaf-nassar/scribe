@@ -1975,6 +1975,18 @@ discarded by generation rather than drained.
 Loading the extension again then registers and emits normally, proving shutdown
 released the global slot.
 
+### Tab reference paste markers
+
+A bracketed paste of tab references collapses to `[scribe-tab N]` markers, and the patched editor expands them back and segments each one atomically.
+
+A repeated reference reuses its number. An unknown number stays literal. Plain pastes, unbracketed input, and a focused non-editor pass through untouched, and shutdown removes the listener.
+
+### Tab reference links
+
+The Markdown transformer turns only bare references outside code and link syntax into autolinks. The wrapped `openUrl` sends tab references to `scribe action focus-session` and every other link to Pi's opener.
+
+A failing CLI produces one notice, and shutdown restores Pi's opener.
+
 ### Absent environment, child suppression, and missing helper
 
 No Scribe environment registers no handlers, and `PI_SUBAGENT_CHILD=1` registers
@@ -3857,6 +3869,12 @@ A bare relative path may itself start with `.`, `_`, `-`, or `~` rather than onl
 Before this, [[crates/scribe-client/src/url_detect.rs#detect_path_prefix]] rejected the leading character at the scan position it started from, then matched one character later, so `.impeccable/mocks/beads-board-signal-theme.html` was detected and opened as `impeccable/mocks/beads-board-signal-theme.html` — a path that does not exist.
 
 `.impeccable/mocks/beads-board-signal-theme.html`, `_private/notes`, `-draft/notes`, and `~alice/notes` each keep their leading character exactly, alongside each other in one line so none steals a neighbor's prefix. The `./`, `../`, and `~/` explicit forms keep matching first, unaffected by widening the bare-relative start set.
+
+### Tab references are links Scribe opens itself
+
+A whole `scribe://tab/<uuid>` reference is detected, with trailing punctuation stripped, while a malformed reference, one with trailing characters, or another `scribe://` kind is not.
+
+The OSC 8 activation gate still rejects the reference, proving tab links never join the OS opener's allowlist.
 
 ### Backticks terminate detected URLs
 

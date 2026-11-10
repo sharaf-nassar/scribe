@@ -134,10 +134,40 @@ moves can now re-home a workspace or tab subtree across windows, so agents must
 treat every observed move as a fresh `world`/`siblings` snapshot boundary rather
 than caching a session's or workspace's old `window_id`.
 
+## Tab references
+
+Right-clicking any tab and choosing **Copy Tab Reference** puts a reference
+to that tab on the clipboard and shows a short "Copied tab reference"
+notice:
+
+```text
+scribe://tab/a4c2e8d0-9b1f-4c3a-8e5d-6f7a2b4c9e0d
+```
+
+Paste it into a prompt to tell an agent which tab you mean. Pi's editor shows
+the pasted reference as `[scribe-tab 1]` and sends the full URI on submit.
+Ctrl+click a reference anywhere in a Scribe pane to jump to that tab and raise
+its window; a closed tab shows "That tab is no longer open". In fullscreen Pi
+a plain click works too: Scribe's Pi extension shows references as links and
+opens them through `scribe action focus-session`.
+The UUID is the
+tab's root session id (the pane the tab was opened with), so the reference
+is accepted unchanged wherever a command takes a session id: `read`,
+`write`, and `action focus-session`. A tab split into several panes lists
+every pane in `world` with a `tab_id` equal to the reference's UUID.
+
+A reference stays valid while the tab is open: reordering, dragging the tab
+to another region or window, restarting the client, and upgrading the server
+all keep it. It stops resolving (`not_found`) when the tab closes, when the
+tab's root pane exits while its split panes keep running, or after a cold
+restart that recreates sessions. A reference copied from a window connected
+to a remote machine names a session on that machine's server.
+
 ## Commands
 
 Session, window, and workspace ids are full UUIDs, exactly as returned by
-`world` and `siblings`.
+`world` and `siblings`. Session arguments also accept a
+[tab reference](#tab-references).
 
 ### `scribe agent world`
 
@@ -145,7 +175,9 @@ Capability: **read-metadata**. Returns every window, workspace, and session
 the server owns, as one internally consistent snapshot (`snapshot_id` ties
 the entries together). Sessions carry AI provider, state, task label, and
 context fill where the server has them; absent facts are omitted, never
-faked. When a valid origin session is supplied, exactly one session carries
+faked. `tab_id` names the tab a session belongs to by the tab's root session
+id, so a tab's split panes share one `tab_id`; it is omitted until the
+window has reported a layout naming the session. When a valid origin session is supplied, exactly one session carries
 `is_caller: true`.
 
 ```bash
@@ -191,6 +223,7 @@ scribe agent --agent my-agent --model my-model world
           "ai_state": "processing",
           "task_label": "Fixing tests",
           "context_fill_percent": 42,
+          "tab_id": "a4c2e8d0-9b1f-4c3a-8e5d-6f7a2b4c9e0d",
           "is_caller": false
         }
       ],
@@ -225,7 +258,7 @@ plumbing. Requires a valid `SCRIBE_SESSION_ID`; without one it returns
 scribe agent --agent my-agent siblings
 ```
 
-### `scribe agent read <session-id> [--scrollback N]`
+### `scribe agent read <session-id | tab-reference> [--scrollback N]`
 
 Capability: **read-content**. Returns the named session's current screen as
 text, plus up to `N` scrollback lines (clamped to `max_scrollback_lines`).
@@ -265,7 +298,9 @@ scribe agent --agent my-agent read a4c2e8d0-9b1f-4c3a-8e5d-6f7a2b4c9e0d --scroll
 Capability: **dispatch-action**, or **dispatch-destructive-action** for the
 actions marked below — destructive actions cannot ride a benign grant. With
 exactly one connected window `--window` may be omitted; with several, an
-ambiguous action returns `ambiguous_target` rather than guessing. The reply
+ambiguous action returns `ambiguous_target` rather than guessing.
+`focus-session` without `--window` targets the window that holds the session
+(or `not_found` when none does), and raises that window. The reply
 reports real completion, not queuing: session-creating actions return the
 new `created_session_id`, and a failure surfaces as `action_failed`.
 
@@ -284,7 +319,7 @@ new `created_session_id`, and a failure surfaces as `action_failed`.
 | `split-horizontal` | `split_horizontal` | dispatch-action |
 | `new-window` | `new_window` | dispatch-action |
 | `switch-profile <name>` | `switch_profile` | dispatch-action |
-| `focus-session <session-id>` | `focus_session` | dispatch-action |
+| `focus-session <session-id \| tab-reference>` | `focus_session` | dispatch-action |
 | `close-pane` | `close_pane` | dispatch-destructive-action |
 | `close-tab` | `close_tab` | dispatch-destructive-action |
 | `open-update-dialog` | `open_update_dialog` | dispatch-destructive-action |
@@ -308,7 +343,7 @@ scribe agent --agent my-agent action new-tab
 }
 ```
 
-### `scribe agent write <session-id> --text <text> [--submit]`
+### `scribe agent write <session-id | tab-reference> --text <text> [--submit]`
 
 Capability: **write-input**. Writes UTF-8 text into the named session's
 input, as if typed. With `--submit`, the input is submitted (Enter) after

@@ -64,11 +64,17 @@ Display context stays out of the engine. [[crates/scribe-server/src/ipc_server.r
 
 Metadata reads copy one coherent, allowlisted view from the live-session, window-share, and workspace registries.
 
-[[crates/scribe-server/src/agent_api/world.rs#capture]] takes read guards in the order live sessions, window shares, workspace manager, stamps one `snapshot_id` and capture time, then releases the guards before DTO formatting. Windows reuse `ListWindows` workspace names, session counts, connection state, sharing mode, and participant count. Session copies include only identity, title, CWD, provider/state, task label, and context fill; retained prompts, conversation ids, model/tool/agent metadata, environment envelopes, and participant identities never enter the capture type.
+[[crates/scribe-server/src/agent_api/world.rs#capture]] takes read guards in the order live sessions, window shares, workspace manager, stamps one `snapshot_id` and capture time, then releases the guards before DTO formatting. Windows reuse `ListWindows` workspace names, session counts, connection state, sharing mode, and participant count. Session copies include only identity, title, CWD, provider/state, task label, context fill, and tab id; retained prompts, conversation ids, model/tool/agent metadata, environment envelopes, and participant identities never enter the capture type.
 
 `World` returns every window, workspace, and live session server-wide. A matching `origin_session_id` marks exactly one session as `is_caller`; a missing or stale origin marks none. `Siblings` filters the same captured snapshot to the origin session's window and returns typed `NotFound` when the origin is absent or stale.
 
 The dispatcher applies [[protocol#Agent Control Request Family#Negotiation and compatibility|request-level background-wait compatibility]] to the copied reply before response sizing and audit logging. Old callers receive `Processing` without changing retained session state; capable callers receive `WaitingForBackground`. The [[test#Agent Control Surface#Background wait snapshot compatibility|socket regression]] covers both snapshot operations without a Hello handshake.
+
+#### Sessions name their tab
+
+Each world session carries `tab_id`, the root session of the strip tab it is or is a pane of, so a pasted `scribe://tab/` reference finds every pane of its tab.
+
+[[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#tab_for_session]] reads it from the session's window tree as last reported: a leaf's `session_ids` are tab roots and the parallel `pane_trees` hold their panes. [[crates/scribe-server/src/agent_api/world.rs#capture]] fills it under the workspace-manager guard it already holds. A session no report names yet gets no `tab_id` rather than a guessed one.
 
 ### Screen reads
 
@@ -85,6 +91,12 @@ The configured `max_response_bytes` caps only the text field, so [[crates/scribe
 Mutation calls reuse existing window action handlers and live PTY writers, adding policy and completion semantics rather than a second implementation.
 
 `DispatchAction` maps every `AutomationAction` exhaustively to either `DispatchAction` or `DispatchDestructiveAction`; close-pane, close-tab, and update-dialog actions use the destructive gate. [[crates/scribe-server/src/ipc_server.rs#run_agent_action]] accepts an explicit connected window or the sole connected window, returns `AmbiguousTarget` when omission cannot select exactly one, and waits for `RunActionCorrelated` completion. Queue refusal, timeout, or client disconnect becomes `ActionFailed`; successful session-creating actions return the created session id.
+
+#### Focus resolves the session's window
+
+A focus-session action with no window targets the window that holds the session, so a tab reference reaches its tab from any caller, window, or process.
+
+[[crates/scribe-server/src/ipc_server.rs#resolve_action_window]] runs before window selection on both the transient `DispatchAction` path (the `scribe action` CLI and clicked tab links) and the agent path. An explicit window still wins. A session no window holds fails as a transient `Error` or the agent's `NotFound` rather than guessing a window. Every other action keeps the sole-window rule and `ambiguous_target`. The target client raises its window after running a server-dispatched `FocusSession`, as the action's contract says.
 
 Agent writes are bounded before prompting, authorized once, and acknowledged only after the complete PTY write. [[crates/scribe-server/src/agent_api/mod.rs#write_agent_input]] appends exactly one carriage return only when `submit` is true and awaits `write_all`; an absent live session returns `NotFound` and write failure returns `ActionFailed`.
 
@@ -1364,6 +1376,44 @@ the mirror render for the session and leaves the tab untouched. The patches
 are removed at `session_shutdown`, so a Pi `/reload` reinstalls them cleanly.
 A server without mirror streams closes the helper's connection at once; the
 extension respawns it three times, five seconds apart, then stops asking.
+
+#### Tab reference paste markers
+
+A pasted `scribe://tab/<uuid>` reference shows as `[scribe-tab N]` in Pi's
+editor, like Pi's own `[paste #N]` markers, while everything downstream of the
+editor still receives the full URI.
+
+In TUI mode [[dist/pi-extension.ts#tabReferencePaste]] is a terminal-input
+listener that rewrites a bracketed paste bound for the focused component, so
+every paste path goes through it and typed text is never touched.
+[[dist/pi-extension.ts#tabReferences]] patches that editor once, wrapping
+`expandPasteMarkers`, which submit and `getExpandedText` both run, to turn markers
+back into references, and `segment`, to make each marker one atomic segment for
+cursor motion and backspace. Each editor keeps its list of references under a
+global symbol, so a reloaded extension extends the same numbering. Numbers are
+never reused within an editor, so an undo cannot restore a marker that now
+names a different tab. A focused component without both pi-tui methods gets the
+raw paste.
+
+#### Tab reference links
+
+A plain click on a tab reference in fullscreen Pi opens the tab. Pi opens
+clicked OSC 8 links itself through `xdg-open`, so the adapter makes references
+links and takes those clicks over.
+
+A Markdown transformer, [[dist/pi-extension.ts#linkTabReferences]], turns each
+bare reference in user and assistant text into an autolink, leaving code spans,
+fenced code, and existing link syntax as written. Pi renders autolinks as OSC 8
+hyperlinks only for terminals it knows, so
+[[dist/pi-extension.ts#enableScribeHyperlinks]] marks a `TERM_PROGRAM=Scribe`
+terminal hyperlink-capable. [[dist/pi-extension.ts#installTabLinkOpener]] wraps
+the live TUI's `openUrl`: a whole tab reference runs `scribe action
+focus-session <reference>` through the pane's own flavor CLI (see
+[[dist/pi-extension.ts#scribeCli]]), which the server routes to the tab's window (see
+[[server#Server#Agent API#Actions and input#Focus resolves the session's window]]),
+and a failure becomes a Pi warning notice. Every other link keeps Pi's opener,
+and shutdown restores it. Regular mode has no `openUrl` and is left alone;
+Ctrl+click works there as in any pane.
 
 ### Pi Extension Installation
 

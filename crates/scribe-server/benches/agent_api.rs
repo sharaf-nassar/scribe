@@ -367,6 +367,7 @@ fn world_fixture() -> AgentWorldSnapshot {
                     ai_state: Some(AiState::Processing),
                     task_label: Some("benchmark task".into()),
                     context_fill_percent: Some(42),
+                    tab_id: None,
                     is_caller: session_index == 0,
                 });
             }

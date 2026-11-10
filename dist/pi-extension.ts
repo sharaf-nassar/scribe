@@ -3,6 +3,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { basename, dirname } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const REGISTRATION = Symbol.for("scribe.pi.lifecycle-extension");
@@ -153,6 +154,14 @@ const AGENT_ACTION_NAMES = [
   "focus-session",
 ];
 
+/** The CLI of the Scribe hosting this pane, which talks to that Scribe's own
+ *  server: the dev package ships it as `scribe-dev-cli`, beside its helper in
+ *  `/usr/share/scribe-dev`, as the Claude and Codex setup scripts also assume. */
+function scribeCli(): string {
+  const helper = process.env.SCRIBE_HOOK_HELPER ?? "";
+  return basename(dirname(helper)) === "scribe-dev" ? "scribe-dev-cli" : "scribe";
+}
+
 type AgentToolParams = Record<string, string | number | boolean | undefined>;
 
 type AgentToolSpec = {
@@ -161,6 +170,7 @@ type AgentToolSpec = {
   description: string;
   parameters: Record<string, unknown>;
   argv: (params: AgentToolParams) => string[];
+  promptGuidelines?: string[];
 };
 
 function agentParameters(
@@ -196,7 +206,8 @@ const AGENT_TOOLS: AgentToolSpec[] = [
       {
         session_id: {
           type: "string",
-          description: "Full session id from scribe_agent_world or scribe_agent_siblings.",
+          description:
+            "Full session id from scribe_agent_world or scribe_agent_siblings, or a scribe://tab/<uuid> tab reference the user pasted.",
         },
         scrollback: {
           type: "integer",
@@ -209,6 +220,9 @@ const AGENT_TOOLS: AgentToolSpec[] = [
       "read",
       String(params.session_id),
       ...(params.scrollback === undefined ? [] : ["--scrollback", String(params.scrollback)]),
+    ],
+    promptGuidelines: [
+      "A scribe://tab/<uuid> string the user pastes names one Scribe tab: pass it unchanged as session_id to scribe_agent_read (or scribe_agent_write, or scribe_agent_action focus-session). The tab's split panes are the scribe_agent_world sessions whose tab_id is that UUID.",
     ],
   },
   {
@@ -224,7 +238,11 @@ const AGENT_TOOLS: AgentToolSpec[] = [
           description: "Action to dispatch.",
         },
         name: { type: "string", description: "Profile name; only for switch-profile." },
-        session_id: { type: "string", description: "Session to focus; only for focus-session." },
+        session_id: {
+          type: "string",
+          description:
+            "Session id or scribe://tab/<uuid> tab reference to focus; only for focus-session.",
+        },
         window: {
           type: "string",
           description: "Target window id; defaults to this pane's window.",
@@ -247,7 +265,10 @@ const AGENT_TOOLS: AgentToolSpec[] = [
       "Write text into a Scribe terminal session's input, optionally submitting it as a command. Returns versioned JSON.",
     parameters: agentParameters(
       {
-        session_id: { type: "string", description: "Full session id of the target pane." },
+        session_id: {
+          type: "string",
+          description: "Full session id of the target pane, or a scribe://tab/<uuid> tab reference.",
+        },
         text: { type: "string", description: "Text to write into the pane's input." },
         submit: { type: "boolean", description: "Press Enter after writing the text." },
       },
@@ -289,7 +310,7 @@ function runAgentCli(argv: string[], signal: AbortSignal | undefined): Promise<s
     };
 
     try {
-      const child = spawn("scribe", ["agent", ...argv, "--agent", "pi"], {
+      const child = spawn(scribeCli(), ["agent", ...argv, "--agent", "pi"], {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
         signal,
@@ -329,6 +350,176 @@ async function executeAgentCli(argv: string[], signal: AbortSignal | undefined) 
   }
   const text = await runAgentCli(argv, signal);
   return { content: [{ type: "text" as const, text }], details: undefined };
+}
+
+// ── Tab reference paste markers ─────────────────────────────────────────
+//
+// A pasted `scribe://tab/<uuid>` reference shows as `[scribe-tab N]` in the
+// editor, the way Pi shows a large paste as `[paste #N …]`. The marker is
+// display only: the editor's own `expandPasteMarkers`, which submit and
+// `getExpandedText` both run, turns it back into the reference, so the model,
+// prompt history, and other extensions see the full URI. Like the mirror this
+// rides on pi-tui internals and is feature-detected; an editor without them
+// keeps the raw paste.
+
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+const TAB_REFERENCE = /scribe:\/\/tab\/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/g;
+const TAB_MARKER = /\[scribe-tab ([1-9]\d*)\]/g;
+// The references an editor's markers stand for, marker N at index N - 1. It
+// lives on the editor under a global symbol so a reloaded extension extends
+// the same list instead of numbering a second one over the first's markers.
+const TAB_REFERENCES = Symbol.for("scribe.pi.tab-references");
+
+type TextSegment = { segment: string; index: number; input: string };
+type MarkerEditor = Record<PropertyKey, unknown> & {
+  segment(text: string, mode: string): Iterable<TextSegment>;
+  expandPasteMarkers(text: string): string;
+};
+
+function expandTabMarkers(text: string, references: string[]): string {
+  return text.replace(TAB_MARKER, (marker, n: string) => references[Number(n) - 1] ?? marker);
+}
+
+// One segment per known marker, so the cursor steps over it and backspace
+// deletes it whole, as Pi treats its own paste markers.
+function segmentTabMarkers(
+  text: string,
+  segments: Iterable<TextSegment>,
+  references: string[],
+): Iterable<TextSegment> {
+  const spans = [...text.matchAll(TAB_MARKER)].filter(
+    (match) => references[Number(match[1]) - 1] !== undefined,
+  );
+  if (spans.length === 0) return segments;
+  const merged: TextSegment[] = [];
+  for (const segment of segments) {
+    const span = spans.find(
+      (match) => segment.index >= match.index && segment.index < match.index + match[0].length,
+    );
+    if (!span) merged.push(segment);
+    else if (segment.index === span.index) {
+      merged.push({ segment: span[0], index: span.index, input: text });
+    }
+  }
+  return merged;
+}
+
+/** The focused editor's reference list, patching the editor on first use;
+ *  `undefined` when the component is not a pi-tui editor. */
+function tabReferences(component: unknown): string[] | undefined {
+  const editor = component as Partial<MarkerEditor> | null | undefined;
+  if (typeof editor?.segment !== "function" || typeof editor.expandPasteMarkers !== "function") {
+    return undefined;
+  }
+  const existing = editor[TAB_REFERENCES];
+  if (Array.isArray(existing)) return existing as string[];
+  const references: string[] = [];
+  const segment = editor.segment;
+  const expand = editor.expandPasteMarkers;
+  editor.segment = function (this: unknown, text: string, mode: string) {
+    return segmentTabMarkers(text, segment.call(this, text, mode), references);
+  };
+  editor.expandPasteMarkers = function (this: unknown, text: string) {
+    return expandTabMarkers(expand.call(this, text), references);
+  };
+  editor[TAB_REFERENCES] = references;
+  return references;
+}
+
+/** Replace each reference in pasted text with its marker; a reference pasted
+ *  again keeps its first number. */
+function collapseTabReferences(text: string, references: string[]): string {
+  return text.replace(TAB_REFERENCE, (reference) => {
+    let index = references.indexOf(reference);
+    if (index < 0) index = references.push(reference) - 1;
+    return `[scribe-tab ${index + 1}]`;
+  });
+}
+
+// ── Tab reference links ──────────────────────────────────────────────────
+//
+// Pi's fullscreen mode opens a plainly clicked OSC 8 link itself, through its
+// TUI's `openUrl` and `xdg-open`, so Scribe never sees that click. Two pieces
+// make a reference open its tab there: bare references in messages become
+// Markdown autolinks, which Pi renders as OSC 8 hyperlinks, and `openUrl`
+// sends a tab reference to `scribe action focus-session` instead.
+
+const WHOLE_TAB_REFERENCE = new RegExp(`^${TAB_REFERENCE.source}$`);
+// Code is matched first so a reference inside it stays as written; a
+// reference already in link syntax or glued to a word is left alone.
+const LINKABLE_TAB_REFERENCE =
+  /(```[\s\S]*?(?:```|$)|`[^`\n]*`)|(?<![\w/(<[])(scribe:\/\/tab\/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?![\w-])/g;
+const FOCUS_TAB_TIMEOUT_MS = 10_000;
+
+/** Pi's terminal detection does not know Scribe, so it prints links as plain
+ *  text there and a plain click has nothing to open. Scribe renders OSC 8. */
+async function enableScribeHyperlinks() {
+  if (process.env.TERM_PROGRAM?.toLowerCase() !== "scribe") return;
+  try {
+    const tui = (await import("@earendil-works/pi-tui")) as {
+      getCapabilities?: () => Any;
+      setCapabilities?: (capabilities: Any) => void;
+    };
+    const capabilities = tui.getCapabilities?.();
+    if (capabilities && !capabilities.hyperlinks) {
+      tui.setCapabilities?.({ ...capabilities, hyperlinks: true });
+    }
+  } catch {
+    // Without pi-tui's capability API, links keep Pi's plain rendering.
+  }
+}
+
+/** Markdown transformer: each bare tab reference becomes an autolink. */
+function linkTabReferences(markdown: string): string {
+  if (!markdown.includes("scribe://tab/")) return markdown;
+  return markdown.replace(LINKABLE_TAB_REFERENCE, (match, code?: string, reference?: string) =>
+    code === undefined && reference ? `<${reference}>` : match,
+  );
+}
+
+/** Ask the server to focus a reference's tab; a refusal is reported. */
+function focusTab(reference: string, notify: (message: string) => void) {
+  const failed = () => notify("Couldn't open that tab; it may be closed.");
+  try {
+    const child = spawn(scribeCli(), ["action", "focus-session", reference], {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: FOCUS_TAB_TIMEOUT_MS,
+    });
+    child.once("error", failed);
+    child.once("close", (code) => {
+      if (code !== 0) failed();
+    });
+  } catch {
+    failed();
+  }
+}
+
+/** Route the TUI's link opener, returning the restore. A TUI without one
+ *  (Pi's regular mode leaves clicks to the terminal) is left as it is. */
+function installTabLinkOpener(tui: Any | undefined, open: (reference: string) => void) {
+  const original = tui?.openUrl;
+  if (!tui || typeof original !== "function") return undefined;
+  tui.openUrl = (url: string) =>
+    WHOLE_TAB_REFERENCE.test(url) ? open(url) : (original as (url: string) => void)(url);
+  return () => {
+    tui.openUrl = original;
+  };
+}
+
+/** A terminal-input listener that collapses references in a bracketed paste
+ *  bound for the focused editor. Numbers are never reused within an editor,
+ *  so an undo cannot bring back a marker that now means another tab. */
+function tabReferencePaste(focused: () => unknown) {
+  return (data: string) => {
+    if (!data.startsWith(PASTE_START) || !data.endsWith(PASTE_END)) return undefined;
+    if (!data.includes("scribe://tab/")) return undefined;
+    const references = tabReferences(focused());
+    if (!references) return undefined;
+    const content = data.slice(PASTE_START.length, -PASTE_END.length);
+    return { data: PASTE_START + collapseTabReferences(content, references) + PASTE_END };
+  };
 }
 
 // ── Tab mirror stream ───────────────────────────────────────────────────
@@ -701,6 +892,7 @@ function registerAgentTools(pi: ExtensionAPI) {
       label: tool.label,
       description: tool.description,
       parameters: tool.parameters,
+      promptGuidelines: tool.promptGuidelines,
       execute: (_toolCallId: string, params: unknown, signal: AbortSignal | undefined) =>
         executeAgentCli(tool.argv((params ?? {}) as AgentToolParams), signal),
     } as Parameters<ExtensionAPI["registerTool"]>[0]);
@@ -749,6 +941,8 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   let lastPercent: number | undefined;
   let refreshQueued = false;
   let unsubscribeSubagentStatus: (() => void) | undefined;
+  let removeTabPaste: (() => void) | undefined;
+  let removeTabLinkOpener: (() => void) | undefined;
   const mirror = new MirrorStream(helperPath);
 
   // What running background work leaves a settled agent waiting on: its own
@@ -952,6 +1146,17 @@ export default function scribePiExtension(pi: ExtensionAPI) {
         // Without the handle the mirror still renders on Pi's next natural frame.
       }
       void mirror.start();
+      removeTabPaste?.();
+      removeTabPaste = ctx.ui.onTerminalInput?.(
+        tabReferencePaste(() => {
+          const focus = mirror.tui?.getFocusedComponent;
+          return typeof focus === "function" ? focus.call(mirror.tui) : undefined;
+        }),
+      );
+      removeTabLinkOpener?.();
+      removeTabLinkOpener = installTabLinkOpener(mirror.tui, (reference) =>
+        focusTab(reference, (message) => ctx.ui.notify?.(message, "warning")),
+      );
     }
     enqueue("task_label_cleared");
     setParentState("state_changed", { state: "idle_prompt" });
@@ -1035,6 +1240,10 @@ export default function scribePiExtension(pi: ExtensionAPI) {
       unsubscribeBackgroundTerminal();
       generation += 1;
       pending = [];
+      removeTabPaste?.();
+      removeTabPaste = undefined;
+      removeTabLinkOpener?.();
+      removeTabLinkOpener = undefined;
       mirror.stop();
       if (active) await active;
       await invoke("state_cleared", {});
@@ -1044,4 +1253,6 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   });
 
   registerAgentTools(pi);
+  pi.registerMarkdownTransformer?.((markdown) => linkTabReferences(markdown));
+  void enableScribeHyperlinks();
 }

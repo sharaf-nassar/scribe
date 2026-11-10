@@ -62,7 +62,7 @@ use scribe_client::command_palette::{
 use scribe_client::config::{ConfigChangeSignal, ConfigReloadPlan, ConfigRuntime};
 use scribe_client::context_menu::{
     ContextMenuAction, ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
-    MenuItem,
+    MenuItem, build_menu_items, tab_menu_items,
 };
 use scribe_client::dialog::{
     AgentConsentDialog, AnyDialog, ClipboardDialog, ClipboardDialogAction, CloseAction,
@@ -182,7 +182,9 @@ use scribe_client::{
         workspace_pill_dot,
     },
 };
-use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
+use scribe_common::agent::{
+    AgentActionOutcome, AgentCapability, AgentPolicyMode, tab_reference, tab_reference_session,
+};
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
@@ -3568,6 +3570,9 @@ impl TerminalView {
                 }
             }
             TitlebarEvent::MirrorTab(index) => this.mirror_titlebar_tab(*index, ctx),
+            TitlebarEvent::TabContextMenu { index, position } => {
+                this.titlebar_tab_menu(*index, *position, ctx);
+            }
             TitlebarEvent::Equalize => this.equalize_layout(ctx),
             TitlebarEvent::BeadsHover { index, hovered } => {
                 let Some(workspace_id) = this.titlebar_slot(*index).map(|slot| slot.workspace_id)
@@ -3615,6 +3620,18 @@ impl TerminalView {
     /// than acting on whichever tab now happens to sit at that position.
     fn titlebar_slot(&self, titlebar_index: usize) -> Option<TabAddress> {
         self.titlebar_slots.get(titlebar_index).copied()
+    }
+
+    /// Raise the menu of the titlebar tab at `titlebar_index`.
+    fn titlebar_tab_menu(
+        &mut self,
+        titlebar_index: usize,
+        position: Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(slot) = self.titlebar_slot(titlebar_index) {
+            self.show_context_menu(tab_menu_items(slot.session_id), position, cx);
+        }
     }
 
     /// Open the titlebar tab at `titlebar_index` in a mirror window.
@@ -5043,8 +5060,16 @@ impl TerminalView {
     /// which is a separate bead; those rows are counted rather than dropped.
     fn dispatch_context_menu_action(&mut self, action: ContextMenuAction, cx: &mut Context<Self>) {
         match action {
-            ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
-            ContextMenuAction::OpenOsc8Url(uri) => self.route_osc8_activation(uri, cx),
+            ContextMenuAction::OpenUrl(url) => {
+                if !self.open_tab_link(&url, cx) {
+                    url_detect::open_url(&url);
+                }
+            }
+            ContextMenuAction::OpenOsc8Url(uri) => {
+                if !self.open_tab_link(&uri, cx) {
+                    self.route_osc8_activation(uri, cx);
+                }
+            }
             ContextMenuAction::OpenFile(path) => {
                 url_detect::open_path(&path, self.focused_cwd().as_deref());
             }
@@ -5071,6 +5096,11 @@ impl TerminalView {
             ContextMenuAction::CopyText(text) | ContextMenuAction::CopyHyperlinkAddress(text) => {
                 self.write_clipboard(text);
             }
+            ContextMenuAction::CopyTabReference(tab) => {
+                if self.write_clipboard(tab_reference(tab)) {
+                    self.push_toast("Copied tab reference".into(), cx);
+                }
+            }
             // Select All would have to span the whole server-owned scrollback,
             // which this display-only client does not hold; it is counted until
             // a server-side selection request exists to ask for it.
@@ -5079,6 +5109,49 @@ impl TerminalView {
             }
         }
         cx.notify();
+    }
+
+    // @lat: [[client#URL Detection#Tab links]]
+    /// Open a clicked `scribe://tab/` link as the tab it names, returning
+    /// `false` for any other link so it keeps its OS route.
+    ///
+    /// A tab in this window switches here. Any other window, in this process
+    /// or a restore child, is the server's to find: it routes the focus to
+    /// whichever client holds the session, which raises its window.
+    fn open_tab_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = tab_reference_session(target) else { return false };
+        tracing::info!(%tab, "opening a tab link");
+        if self.shared.tabs.lock().is_ok_and(|tabs| tabs.workspace_of(tab).is_some()) {
+            self.activate_session_tab(tab, cx);
+            return true;
+        }
+        let request = gpui_tokio::Tokio::spawn(
+            cx,
+            remote_handshake::transient_local_request(ClientMessage::DispatchAction {
+                window_id: None,
+                action: AutomationAction::FocusSession { session_id: tab },
+            }),
+        );
+        cx.spawn(async move |view, app| {
+            let notice = match request.await {
+                Ok(Ok(ServerMessage::ActionDispatched { .. })) => return,
+                Ok(Ok(reply)) => {
+                    tracing::info!(%tab, ?reply, "the server found no window for a tab link");
+                    "That tab is no longer open"
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%tab, %error, "tab link could not reach the server");
+                    "Couldn't reach the Scribe server"
+                }
+                Err(error) => {
+                    tracing::warn!(%tab, %error, "tab link request stopped unexpectedly");
+                    "Couldn't reach the Scribe server"
+                }
+            };
+            view.update(app, |view, ctx| view.push_toast(notice.into(), ctx)).ok();
+        })
+        .detach();
+        true
     }
 
     /// Route a fire-and-forget OSC 8 activation through the scheme gate.
@@ -5277,14 +5350,15 @@ impl TerminalView {
     }
 
     /// Put `text` on the system clipboard, reporting a dead handle rather than
-    /// failing silently. Shared by every copy surface.
-    fn write_clipboard(&mut self, text: String) {
+    /// failing silently. Shared by every copy surface; `true` once it landed.
+    fn write_clipboard(&mut self, text: String) -> bool {
         let bytes = text.len();
         if let Err(error) = self.clipboard.handle.write(ClipboardSelection::Clipboard, text) {
             tracing::warn!(?error, "copy failed: the host clipboard is unavailable");
-            return;
+            return false;
         }
         tracing::info!(bytes, "copied to the host clipboard");
+        true
     }
 
     /// The focused pane's selection, after the AI copy-cleanup transforms.
@@ -6382,7 +6456,7 @@ impl TerminalView {
         self.poll_lan_approval(cx);
         self.poll_agent_prompt(cx);
         self.poll_clipboard(cx);
-        self.poll_remote_actions(cx);
+        self.poll_remote_actions(window, cx);
         self.poll_restore(cx);
     }
 
@@ -7056,19 +7130,25 @@ impl TerminalView {
     /// command. Each action is marked [`ActionOrigin::Server`] so an action this
     /// shell cannot run is reported rather than bounced back to the server that
     /// just sent it.
-    fn poll_remote_actions(&mut self, cx: &mut Context<Self>) {
+    fn poll_remote_actions(&mut self, window: &Window, cx: &mut Context<Self>) {
         loop {
             let Some(queued) = self.shared.remote.lock().ok().and_then(|mut r| r.take_action())
             else {
                 return;
             };
             tracing::info!(action = ?queued.action, "running a server-dispatched automation action");
+            // A focus names this window from elsewhere (a tab link, the CLI, an
+            // agent), so it raises the window, as `FocusSession` documents.
+            let raise = matches!(queued.action, AutomationAction::FocusSession { .. });
             self.execute_automation_action(
                 queued.action,
                 ActionOrigin::Server,
                 queued.correlation_id,
                 cx,
             );
+            if raise {
+                window.activate_window();
+            }
         }
     }
 
@@ -11244,6 +11324,14 @@ impl TerminalView {
                     ctx.stop_propagation();
                 }),
             )
+            // Stops propagation so the grid's own right-click menu stays shut.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, event: &MouseDownEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    view.show_context_menu(tab_menu_items(session_id), event.position, ctx);
+                }),
+            )
             // Registers the drag once the pressed pointer passes GPUI's
             // threshold; from then on the bar's `on_drag_move` sees every move.
             .on_drag(RegionTabDrag(ghost), |drag, grab, _, cx| {
@@ -12312,8 +12400,6 @@ impl TerminalView {
     /// `position`. A choice runs through [`Self::dispatch_context_menu_action`];
     /// dismissing closes the overlay.
     fn open_context_menu(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        self.command_palette = None;
-        let colors = ContextMenuColors::from(&self.chrome);
         let smart_actions = self.smart_selection_rows(position);
         // The open rows come from the same detector Ctrl+click uses, so the menu
         // can never offer to open something the pointer is not actually on — it
@@ -12338,7 +12424,21 @@ impl TerminalView {
             file_path,
             smart_actions,
         };
-        let menu = cx.new(|cx| ContextMenuView::new(colors, request, position, cx));
+        self.show_context_menu(build_menu_items(request), position, cx);
+    }
+
+    /// Mount the context menu overlay at `position`, replacing the palette: the
+    /// grid's menu and every tab's menu share it. A choice runs through
+    /// [`Self::dispatch_context_menu_action`].
+    fn show_context_menu(
+        &mut self,
+        items: Vec<MenuItem>,
+        position: Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_palette = None;
+        let colors = ContextMenuColors::from(&self.chrome);
+        let menu = cx.new(|cx| ContextMenuView::new(colors, items, position, cx));
         cx.subscribe(&menu, |this, _menu, event: &ContextMenuEvent, ctx| {
             this.context_menu = None;
             ctx.notify();
@@ -12557,6 +12657,10 @@ impl TerminalView {
             return false;
         }
         let Some(link) = self.link_at(event.position) else { return false };
+        if self.open_tab_link(&link.target, cx) {
+            self.pointer.drag = GridDrag::Link;
+            return true;
+        }
         let Some((pane, anchor)) = self.link_open_anchor(event.position, &link, cx) else {
             tracing::trace!("Ctrl+clicked link had no stable pane anchor");
             return false;

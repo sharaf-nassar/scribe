@@ -13,6 +13,7 @@ use tracing::info;
 
 use scribe_common::agent::{
     AgentCapability, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
+    TAB_REFERENCE_PREFIX, session_from_reference,
 };
 use scribe_common::config::{AgentApiConfig, load_config};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -83,6 +84,8 @@ enum ActionCommand {
     },
     OpenUpdateDialog,
     FocusSession {
+        /// Session UUID or `scribe://tab/<uuid>` tab reference.
+        #[arg(value_parser = parse_session_arg)]
         session_id: SessionId,
     },
 }
@@ -92,6 +95,8 @@ enum AgentCommand {
     World,
     Siblings,
     Read {
+        /// Session UUID or `scribe://tab/<uuid>` tab reference.
+        #[arg(value_parser = parse_session_arg)]
         session_id: SessionId,
         #[arg(long)]
         scrollback: Option<u32>,
@@ -103,6 +108,8 @@ enum AgentCommand {
         window: Option<WindowId>,
     },
     Write {
+        /// Session UUID or `scribe://tab/<uuid>` tab reference.
+        #[arg(value_parser = parse_session_arg)]
         session_id: SessionId,
         #[arg(long)]
         text: String,
@@ -256,6 +263,13 @@ fn agent_label(agent: &str, model: Option<String>) -> Result<String, &'static st
         return Err("the composed agent label must be at most 64 characters");
     }
     Ok(label)
+}
+
+/// A session argument: a bare UUID or a tab reference copied from a tab.
+fn parse_session_arg(value: &str) -> Result<SessionId, String> {
+    session_from_reference(value).map_err(|_| {
+        format!("expected a session UUID or a {TAB_REFERENCE_PREFIX}<uuid> tab reference")
+    })
 }
 
 fn origin_session_id(value: Option<OsString>) -> Result<Option<SessionId>, &'static str> {
@@ -434,6 +448,15 @@ fn render_agent_skill(policy: &AgentApiConfig) -> String {
         append_agent_command_policy(&mut markdown, policy, &path);
         markdown.push('\n');
     }
+    markdown.push_str(
+        "\n## Tab references\n\n\
+         The user may paste a tab reference such as `scribe://tab/<uuid>`, copied from a \
+         tab's right-click menu. It names one Scribe tab: pass it unchanged wherever a \
+         command takes a session id (`scribe agent read`, `scribe agent write`, \
+         `scribe agent action focus-session`). It resolves to the pane the tab was opened \
+         with; the tab's other split panes are the `scribe agent world` sessions whose \
+         `tab_id` matches the reference's UUID.\n",
+    );
     markdown
 }
 
@@ -984,6 +1007,30 @@ mod tests {
         for command in commands {
             assert!(Cli::try_parse_from(command).is_ok());
         }
+    }
+
+    // @lat: [[client#Agent Control Surface Consumers#CLI contract and generated discovery#Session arguments accept tab references]]
+    #[test]
+    fn session_arguments_accept_tab_references() {
+        let tab = scribe_common::ids::SessionId::new();
+        let reference = scribe_common::agent::tab_reference(tab);
+        let parsed = Cli::try_parse_from(["scribe", "agent", "read", reference.as_str()]).unwrap();
+        let Some(super::CliCommand::Agent {
+            command: super::AgentCommand::Read { session_id, .. },
+            ..
+        }) = parsed.command
+        else {
+            panic!("`agent read` parses to the read command");
+        };
+        assert_eq!(session_id, tab);
+        for command in [
+            vec!["scribe", "agent", "write", reference.as_str(), "--text", "ls"],
+            vec!["scribe", "agent", "action", "focus-session", reference.as_str()],
+        ] {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        assert!(Cli::try_parse_from(["scribe", "agent", "read", "scribe://tab/nope"]).is_err());
+        assert!(render_agent_skill(&AgentApiConfig::default()).contains("`scribe://tab/<uuid>`"));
     }
 
     #[test]

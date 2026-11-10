@@ -1263,6 +1263,15 @@ impl WorkspaceManager {
         ws.sessions = new_order;
     }
 
+    /// The strip tab a session belongs to, named by the tab's root session, as
+    /// its window's last reported tree lays it out. `None` until a report
+    /// names the session.
+    #[must_use]
+    pub fn tab_for_session(&self, session_id: SessionId) -> Option<SessionId> {
+        let tree = self.window_tree(self.window_for_session(session_id)?)?;
+        tree_tab_for_session(tree, session_id)
+    }
+
     /// Return the window that owns a session, if any.
     pub fn window_for_session(&self, session_id: SessionId) -> Option<WindowId> {
         self.session_to_window.get(&session_id).copied()
@@ -1531,6 +1540,37 @@ impl crate::agent_api::world::WorkspaceView for WorkspaceManager {
 
     fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String> {
         self.workspace_info(workspace_id).and_then(|(name, _, _, _)| name)
+    }
+
+    fn tab_for_session(&self, session_id: SessionId) -> Option<SessionId> {
+        Self::tab_for_session(self, session_id)
+    }
+}
+
+/// The root session of the leaf tab that is, or holds as a pane, `session_id`.
+fn tree_tab_for_session(node: &WorkspaceTreeNode, session_id: SessionId) -> Option<SessionId> {
+    match node {
+        // `pane_trees` runs parallel to `session_ids` and may be shorter.
+        WorkspaceTreeNode::Leaf { session_ids, pane_trees, .. } => {
+            session_ids.iter().enumerate().find_map(|(index, &tab)| {
+                let in_panes = pane_trees
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|panes| pane_tree_contains(panes, session_id));
+                (tab == session_id || in_panes).then_some(tab)
+            })
+        }
+        WorkspaceTreeNode::Split { first, second, .. } => tree_tab_for_session(first, session_id)
+            .or_else(|| tree_tab_for_session(second, session_id)),
+    }
+}
+
+fn pane_tree_contains(node: &PaneTreeNode, session_id: SessionId) -> bool {
+    match node {
+        PaneTreeNode::Leaf { session_id: leaf } => *leaf == session_id,
+        PaneTreeNode::Split { first, second, .. } => {
+            pane_tree_contains(first, session_id) || pane_tree_contains(second, session_id)
+        }
     }
 }
 
@@ -2293,6 +2333,19 @@ mod tests {
             },
         );
         (manager, window, top, lower, sessions, split)
+    }
+
+    // @lat: [[server#Server#Agent API#World and siblings#Sessions name their tab]]
+    #[test]
+    fn tab_for_session_names_each_panes_tab_root() {
+        let (manager, _, _, _, sessions, _) = tab_subtree_fixture();
+        let [root, pane, single, lower_first, lower_second] = sessions;
+        assert_eq!(manager.tab_for_session(root), Some(root));
+        assert_eq!(manager.tab_for_session(pane), Some(root));
+        assert_eq!(manager.tab_for_session(single), Some(single));
+        assert_eq!(manager.tab_for_session(lower_first), Some(lower_first));
+        assert_eq!(manager.tab_for_session(lower_second), Some(lower_second));
+        assert_eq!(manager.tab_for_session(SessionId::new()), None);
     }
 
     // @lat: [[server#Workspace Move#Atomic tab-subtree transfer]]

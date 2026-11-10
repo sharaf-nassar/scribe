@@ -72,7 +72,12 @@ class FakeEventBus {
 class FakeExtensionAPI {
   handlers = new Map();
   tools = new Map();
+  markdownTransformers = [];
   events = new FakeEventBus();
+
+  registerMarkdownTransformer(transformer) {
+    this.markdownTransformers.push(transformer);
+  }
 
   on(name, handler) {
     const handlers = this.handlers.get(name) ?? [];
@@ -861,6 +866,11 @@ process.stdout.write('{"v":1,"ok":true,"data":{}}\\n');
       assert.equal(typeof tool.execute, "function");
     }
     assert.deepEqual(api.tools.get("scribe_agent_read").parameters.required, ["session_id"]);
+    assert.match(
+      api.tools.get("scribe_agent_read").promptGuidelines.join("\n"),
+      /scribe:\/\/tab\/<uuid>/,
+      "pasted tab references must be explained to the model",
+    );
     assert.deepEqual(api.tools.get("scribe_agent_write").parameters.required, [
       "session_id",
       "text",
@@ -905,6 +915,149 @@ process.stdout.write('{"v":1,"ok":true,"data":{}}\\n');
   } finally {
     process.env.PATH = priorPath;
     delete process.env.FAKE_AGENT_CLI_LOG;
+  }
+}
+
+// @lat: [[test#Test Harness#Pi Extension Harness#Tab reference paste markers]]
+async function testTabReferencePasteMarkers() {
+  const logPath = join(tempDir, "tab-paste.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  extensionFactory(api);
+
+  // The two pi-tui Editor methods the markers patch, one segment per char.
+  const editor = {
+    segment: (text) => [...text].map((segment, index) => ({ segment, index, input: text })),
+    expandPasteMarkers: (text) => text,
+  };
+  let focused = editor;
+  const listeners = new Set();
+  const tui = { getFocusedComponent: () => focused };
+  const ctx = {
+    ...makeContext(),
+    mode: "tui",
+    ui: {
+      setWidget: (_key, factory) => factory?.(tui, {}),
+      onTerminalInput: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    },
+  };
+  api.handler("session_start")({ type: "session_start", reason: "startup" }, ctx);
+  assert.equal(listeners.size, 1, "TUI mode registers one paste listener");
+  const [listener] = listeners;
+  const paste = (text) => listener(`\x1b[200~${text}\x1b[201~`);
+
+  const first = `scribe://tab/${randomUUID()}`;
+  const second = `scribe://tab/${randomUUID()}`;
+  assert.deepEqual(paste(`see ${first}, ${second} and ${first}`), {
+    data: "\x1b[200~see [scribe-tab 1], [scribe-tab 2] and [scribe-tab 1]\x1b[201~",
+  });
+  assert.equal(
+    editor.expandPasteMarkers("[scribe-tab 2] [scribe-tab 1] [scribe-tab 9]"),
+    `${second} ${first} [scribe-tab 9]`,
+    "known markers expand back, unknown ones stay literal",
+  );
+  assert.deepEqual(
+    editor.segment("a[scribe-tab 1]b", "grapheme").map((segment) => segment.segment),
+    ["a", "[scribe-tab 1]", "b"],
+    "a marker is one atomic segment",
+  );
+  assert.equal(paste("plain text"), undefined);
+  assert.equal(listener(first), undefined, "typed (unbracketed) input is untouched");
+
+  focused = { handleInput() {} };
+  assert.equal(paste(first), undefined, "a non-editor focus keeps the raw paste");
+
+  await shutdown(api);
+  assert.equal(listeners.size, 0, "shutdown removes the paste listener");
+  return starts(logPath);
+}
+
+// @lat: [[test#Test Harness#Pi Extension Harness#Tab reference links]]
+async function testTabReferenceLinks() {
+  const logPath = join(tempDir, "tab-links.jsonl");
+  setHarnessEnv(logPath);
+  const cliDir = join(tempDir, "link-cli");
+  const cliLog = join(tempDir, "link-cli.log");
+  const stale = `scribe://tab/${randomUUID()}`;
+  await mkdir(cliDir, { recursive: true });
+  await writeFile(
+    join(cliDir, "scribe"),
+    `#!/usr/bin/env node
+require("node:fs").appendFileSync(${JSON.stringify(cliLog)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+process.exit(process.argv.includes(${JSON.stringify(stale)}) ? 1 : 0);
+`,
+  );
+  await chmod(join(cliDir, "scribe"), 0o755);
+  await writeFile(
+    join(cliDir, "scribe-dev-cli"),
+    `#!/usr/bin/env node
+require("node:fs").appendFileSync(${JSON.stringify(cliLog)}, JSON.stringify(["dev", ...process.argv.slice(2)]) + "\\n");
+`,
+  );
+  await chmod(join(cliDir, "scribe-dev-cli"), 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${cliDir}:${priorPath}`;
+  try {
+    const api = new FakeExtensionAPI();
+    extensionFactory(api);
+    assert.equal(api.markdownTransformers.length, 1, "one Markdown transformer");
+    const [linkify] = api.markdownTransformers;
+    const reference = `scribe://tab/${randomUUID()}`;
+    assert.equal(
+      linkify(`see ${reference}, \`${reference}\`, [tab](${reference}), <${reference}>`, {}),
+      `see <${reference}>, \`${reference}\`, [tab](${reference}), <${reference}>`,
+      "only bare references outside code become autolinks",
+    );
+    assert.equal(linkify(`${reference}x`, {}), `${reference}x`);
+
+    const opened = [];
+    const tui = { openUrl: (url) => opened.push(url), getFocusedComponent: () => undefined };
+    const notices = [];
+    const ctx = {
+      ...makeContext(),
+      mode: "tui",
+      ui: {
+        setWidget: (_key, factory) => factory?.(tui, {}),
+        onTerminalInput: () => () => {},
+        notify: (message) => notices.push(message),
+      },
+    };
+    api.handler("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    tui.openUrl("https://example.com");
+    tui.openUrl(reference);
+    tui.openUrl(stale);
+    assert.deepEqual(opened, ["https://example.com"], "tab links never reach Pi's opener");
+    await waitFor(() => notices.length === 1, "a refused focus is reported");
+    const argv = (await readFile(cliLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(argv, [
+      ["action", "focus-session", reference],
+      ["action", "focus-session", stale],
+    ]);
+
+    // A devScribe pane's helper lives in /usr/share/scribe-dev, and its CLI is
+    // scribe-dev-cli: the stable CLI would ask the stable server.
+    const stableHelper = process.env.SCRIBE_HOOK_HELPER;
+    process.env.SCRIBE_HOOK_HELPER = join(tempDir, "scribe-dev", "scribe-hook-helper");
+    tui.openUrl(reference);
+    process.env.SCRIBE_HOOK_HELPER = stableHelper;
+    await waitFor(
+      async () => (await readFile(cliLog, "utf8")).trim().split("\n").length === 3,
+      "the dev CLI was not called",
+    );
+    assert.deepEqual(
+      JSON.parse((await readFile(cliLog, "utf8")).trim().split("\n")[2]),
+      ["dev", "action", "focus-session", reference],
+    );
+
+    await shutdown(api);
+    tui.openUrl(reference);
+    assert.deepEqual(opened, ["https://example.com", reference], "shutdown restores Pi's opener");
+    return starts(logPath);
+  } finally {
+    process.env.PATH = priorPath;
   }
 }
 
@@ -959,6 +1112,8 @@ try {
   allStarts.push(...await testSerialQueueCap());
   allStarts.push(...await testGenerationCancelledShutdownAndReload());
   allStarts.push(...await testAgentToolContract());
+  allStarts.push(...await testTabReferencePasteMarkers());
+  allStarts.push(...await testTabReferenceLinks());
   allStarts.push(...await testAbsentEnvironmentHelperAndChildSuppression());
   assertFixedArgv(allStarts);
   assertNoPermissionPrompt(allStarts);

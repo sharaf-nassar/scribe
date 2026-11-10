@@ -46,7 +46,13 @@ Every request carries `request_id`, a caller-supplied label, optional origin ses
 
 `World` and `Siblings` also carry serde-defaulted `ai_background_wait`. Current CLIs set it true; absent or false keeps replies compatible with the old AI-state enum. [[crates/scribe-common/src/agent.rs#AgentResponse#make_background_wait_compatible]] converts only background waits to `Processing`, sharing the state conversion used by persistent client frames. See [[protocol#Agent Control Request Family#Negotiation and compatibility]].
 
-World DTOs expose window/workspace/session identity and status, with optional title, CWD, provider, AI state, task label, and context fill omitted when unavailable. They deliberately exclude launch ids, retained prompt state and text, conversation ids, model/tool/agent metadata, environment envelopes, controller identity, and participant identity. Screen replies identify the pane and include normalized text, line count, truncation, capture time, and snapshot id.
+World DTOs expose window/workspace/session identity and status, with optional title, CWD, provider, AI state, task label, context fill, and tab id omitted when unavailable. They deliberately exclude launch ids, retained prompt state and text, conversation ids, model/tool/agent metadata, environment envelopes, controller identity, and participant identity. Screen replies identify the pane and include normalized text, line count, truncation, capture time, and snapshot id.
+
+### Tab references
+
+A copied tab reference is the URI `scribe://tab/<uuid>`, where the UUID is the tab's root session id, so it resolves through every session-id argument without new wire types.
+
+[[crates/scribe-common/src/agent.rs#tab_reference]] formats it for the client's tab menu and [[crates/scribe-common/src/agent.rs#session_from_reference]] accepts it or a bare UUID for the CLI, while [[crates/scribe-common/src/agent.rs#tab_reference_session]] accepts only the whole URI, for clicked links. The root session already keys a tab in the client strip, the reported workspace tree, and cross-window tab moves, so a reference survives reorders, moves, client restarts, and hot upgrades; it goes stale when the tab closes or its root pane exits while splits survive. A URI was chosen over a bare UUID because it names its own kind to any model reading a prompt, matching MCP's custom-scheme resource URIs. `AgentSession.tab_id` carries the same id so a split tab's panes are discoverable.
 
 ### Capabilities, actions, and errors
 

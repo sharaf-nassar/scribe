@@ -145,6 +145,8 @@ pub enum TitlebarEvent {
     CloseTab(usize),
     /// A tab's magnifier was clicked: open its focused pane in a mirror window.
     MirrorTab(usize),
+    /// A tab was right-clicked at `position` (window pixels): raise its menu.
+    TabContextMenu { index: usize, position: Point<Pixels> },
     /// A tab finished a drag-reorder from `from` to `to`.
     ReorderTab { from: usize, to: usize },
     /// The equalize icon was clicked (equalize the active tab's panes).
@@ -536,6 +538,17 @@ impl TitlebarView {
             let cursor_x = f32::from(event.position.x);
             let origin_x = this.tabs_origin_x();
             this.begin_drag(index, cursor_x, origin_x, ctx);
+        })
+    }
+
+    /// A right press raises the tab's menu without selecting the tab.
+    fn tab_menu_listener(
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
+        cx.listener(move |_this, event: &MouseDownEvent, _win, ctx| {
+            ctx.stop_propagation();
+            ctx.emit(TitlebarEvent::TabContextMenu { index, position: event.position });
         })
     }
 
@@ -1322,6 +1335,7 @@ impl TitlebarView {
                 ctx.notify();
             }))
             .on_mouse_down(MouseButton::Left, Self::tab_press_listener(index, cx))
+            .on_mouse_down(MouseButton::Right, Self::tab_menu_listener(index, cx))
             // Registers [`TabDrag`] as GPUI's active drag once the pressed
             // pointer travels past the drag threshold; from then on the root's
             // `on_drag_move` receives every mouse move in the window.

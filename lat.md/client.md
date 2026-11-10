@@ -974,7 +974,13 @@ Data commands reserve stdout for a versioned JSON envelope: `{"v":1,"ok":true,"d
 
 [[crates/scribe-cli/src/main.rs#render_agent_skill]] walks the live clap tree and current `AgentApiConfig`, so generated guidance names every current command and marks each gated command as unavailable, promptable, or allowed with its exact settings key. Claude and Codex setup scripts wrap that output in an ownership-marked `scribe-terminal/SKILL.md`, update atomically only when content changes, and refuse non-regular or foreign files. Packaged startup repair reruns those scripts when the managed skill is missing.
 
-Pi receives six typed tools from [[dist/pi-extension.ts#registerAgentTools]] rather than a skill document. Each tool shells to the same CLI with `--agent pi`, returns its JSON text to the model, and rechecks `SCRIBE_SESSION_ID`; outside a Scribe pane the extension registers no handlers/tools or returns an explicit no-op response.
+Pi receives six typed tools from [[dist/pi-extension.ts#registerAgentTools]] rather than a skill document. Each tool shells to the same CLI with `--agent pi`, `scribe-dev-cli` when [[dist/pi-extension.ts#scribeCli]] finds the pane's helper under `/usr/share/scribe-dev` so devScribe panes reach their own server, returns its JSON text to the model, and rechecks `SCRIBE_SESSION_ID`; outside a Scribe pane the extension registers no handlers/tools or returns an explicit no-op response.
+
+#### Session arguments accept tab references
+
+`read`, `write`, and `action focus-session` parse their session argument as a bare UUID or a pasted `scribe://tab/<uuid>` reference, so a model passes what the user pasted unchanged.
+
+The generated skill ends with a tab-reference section, the Claude and Codex skill descriptions name `scribe://tab/` so a pasted reference loads the skill, and Pi's read tool adds a prompt guideline saying the same. See [[common#Common#Agent Control Contract#Tab references]].
 
 ### Consent and policy settings
 
@@ -3053,6 +3059,8 @@ The GPUI rebuild ports the command palette and right-click context menu as `gpui
 
 [[crates/scribe-client/src/context_menu.rs#ContextMenuView]] renders the right-click menu. [[crates/scribe-client/src/context_menu.rs#build_menu_items]] assembles Copy / Paste / Select All, then any detected URL, file, OSC 8 copy-address, and configured smart-selection actions. Copy requires a selection; OSC 8 takes precedence over heuristic URLs.
 
+A right-press on any tab, in the titlebar or a lower region's bar, raises the same overlay with [[crates/scribe-client/src/context_menu.rs#tab_menu_items]] and never selects the tab. Its one row, Copy Tab Reference, writes the tab's `scribe://tab/` reference to the clipboard and pushes a "Copied tab reference" toast only when the write landed. Both menus mount through [[crates/scribe-client/src/main.rs#TerminalView#show_context_menu]], and a divider never leads a menu.
+
 [[crates/scribe-client/src/main.rs#TerminalView#open_context_menu]] derives additional rows only from the cell under the pointer and matching configured rules. Blank grid without matching actions has exactly the three standard rows. Demo entries and test payloads must never be injected by the app; E2E tests supply their own data through real user inputs.
 
 [[crates/scribe-client/src/main.rs#AnnotationDemo]] is the Ctrl+Shift+U visual-test seam for failed-link feedback. It cycles default, busy-row, clamped, and top-flip anchors by inserting the same per-pane annotation state the observed opener path uses; [[crates/scribe-client/src/link_feedback.rs#AnnotationLayout]] computes every placement and [[crates/scribe-client/src/terminal_element.rs#TerminalElement#with_annotation]] paints it. `tests/e2e/visual/overlays.sh` captures every state through the live renderer.
@@ -3108,6 +3116,10 @@ Verifies an OSC 8 URI takes "Open URL" precedence over a heuristic URL (via `Ope
 ### Context menu appends smart-selection actions
 
 Verifies  drops actions with an empty expanded parameter and that surviving smart actions append after the file entry.
+
+### Tab context menu copies the tab reference
+
+Verifies [[crates/scribe-client/src/context_menu.rs#tab_menu_items]] offers exactly one enabled Copy Tab Reference row carrying the right-clicked tab's session.
 
 ### Context menu click dispatches or dismisses
 
@@ -4169,6 +4181,14 @@ Activation of an OSC 8 hyperlink whose scheme is outside the existing outbound a
 [[crates/scribe-client/src/main.rs#TerminalView#route_osc8_activation_from]] shares [[crates/scribe-client/src/url_detect.rs#is_allowed_osc8_target]] between Ctrl+click and `ContextMenuAction::OpenOsc8Url` activation. Absolute filesystem targets such as `/tmp/preview.png` bypass scheme confirmation because they have no URI scheme. They reach the OS handler verbatim, including spaces and colons in filenames; observed opens retain absolute-path metadata for failure feedback. This does not broaden the URL prefix allowlist or automatically allow other scheme-less targets. Heuristic `ContextMenuAction::OpenUrl` actions retain their existing prefix guard.
 
 Plain clicks are forwarded to the mouse-reporting application rather than handled by Scribe's Ctrl+click router. For manual verification after rebuilding the client, print an OSC 8 link with an absolute image target using `printf '\033]8;;/tmp/preview.png\033\\Mobile preview\033]8;;\033\\\n'`. Ctrl+click and right-click "Open URL" must open the image without a scheme dialog; a `custom://host/preview` target must still prompt. No scan or render work is added; the new path check runs only during activation.
+
+### Tab links
+
+A `scribe://tab/<uuid>` link in any pane, as plain text or an OSC 8 target, opens the tab it names instead of going to the OS opener, so a reference an agent prints is a jump to that tab.
+
+The scanner treats only a whole reference as a link, through [[crates/scribe-common/src/agent.rs#tab_reference_session]], and leaves the OS opener's prefix allowlist unchanged. Ctrl+click and the context menu's Open URL row both reach [[crates/scribe-client/src/main.rs#TerminalView#open_tab_link]] before any OS route or the disallowed-scheme dialog. A tab in this window switches directly. Otherwise a transient `DispatchAction` asks the server for the window holding the session, which may be in a restore-child process (see [[server#Server#Agent API#Actions and input#Focus resolves the session's window]]). A refusal toasts "That tab is no longer open"; an unreachable server toasts that instead.
+
+Ctrl+click is caught by Scribe first and works in Pi like in any pane. A plain click in fullscreen Pi goes to Pi's own link opener, which the Pi adapter routes to the tab (see [[server#Server#Hook Channel#Pi Extension Adapter#Tab reference links]]).
 
 ### Clipboard Dialog
 

@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext, point, px};
 use scribe_common::config::SmartSelectionActionKind;
+use scribe_common::ids::SessionId;
 use scribe_common::theme::minimal_dark;
 
 use super::{
     ContextMenuAction, ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
-    MenuItem, build_menu_items, smart_selection_menu_item,
+    MenuItem, build_menu_items, smart_selection_menu_item, tab_menu_items,
 };
 use crate::smart_selection::ResolvedSmartSelectionAction;
 
@@ -84,12 +85,23 @@ fn smart_selection_actions_append_and_drop_empty_parameters() {
     assert!(names.contains(&"Open File".to_owned()));
 }
 
+// @lat: [[client#GPUI Overlays#Tab context menu copies the tab reference]]
+#[test]
+fn tab_menu_offers_only_the_tab_reference_copy() {
+    let tab = SessionId::new();
+    let items = tab_menu_items(tab);
+    assert_eq!(labels(&items), ["Copy Tab Reference"]);
+    assert_eq!(items[0].action, ContextMenuAction::CopyTabReference(tab));
+    assert!(items[0].enabled);
+}
+
 fn menu_with_items(
     request: ContextMenuRequest,
     cx: &mut TestAppContext,
 ) -> (Entity<ContextMenuView>, Arc<Mutex<Vec<ContextMenuEvent>>>) {
     let colors = ContextMenuColors::from(&minimal_dark().chrome);
-    let menu = cx.new(|cx| ContextMenuView::new(colors, request, point(px(40.0), px(60.0)), cx));
+    let items = build_menu_items(request);
+    let menu = cx.new(|cx| ContextMenuView::new(colors, items, point(px(40.0), px(60.0)), cx));
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&log);
     cx.update(|app| {

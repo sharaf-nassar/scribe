@@ -12,6 +12,7 @@
 
 use gpui::{Context, EventEmitter, FocusHandle, MouseButton, Point, Rgba, div, prelude::*, px};
 use scribe_common::config::SmartSelectionActionKind;
+use scribe_common::ids::SessionId;
 use scribe_common::theme::ChromeColors;
 
 use crate::smart_selection::ResolvedSmartSelectionAction;
@@ -49,6 +50,8 @@ pub enum ContextMenuAction {
     /// Copy an OSC 8 hyperlink address verbatim to the clipboard (spec 009
     /// FR-007).
     CopyHyperlinkAddress(String),
+    /// Copy the `scribe://tab/` reference of the tab keyed by this session.
+    CopyTabReference(SessionId),
 }
 
 impl ContextMenuAction {
@@ -146,6 +149,16 @@ pub fn build_menu_items(request: ContextMenuRequest) -> Vec<MenuItem> {
     items
 }
 
+/// The menu a right-click on a tab raises, for the tab keyed by `tab`.
+#[must_use]
+pub fn tab_menu_items(tab: SessionId) -> Vec<MenuItem> {
+    vec![MenuItem {
+        label: "Copy Tab Reference".into(),
+        action: ContextMenuAction::CopyTabReference(tab),
+        enabled: true,
+    }]
+}
+
 /// Map a smart-selection action kind + parameter onto the matching context-menu
 /// action. Ported verbatim from the winit `smart_selection_context_action`.
 #[must_use]
@@ -238,14 +251,15 @@ pub struct ContextMenuView {
 impl EventEmitter<ContextMenuEvent> for ContextMenuView {}
 
 impl ContextMenuView {
-    /// Build a context menu at `position` with the items assembled for `request`.
+    /// Build a context menu at `position` showing `items`: a grid menu's from
+    /// [`build_menu_items`], a tab menu's from [`tab_menu_items`].
     pub fn new(
         colors: ContextMenuColors,
-        request: ContextMenuRequest,
+        items: Vec<MenuItem>,
         position: Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self { colors, items: build_menu_items(request), position, focus_handle: cx.focus_handle() }
+        Self { colors, items, position, focus_handle: cx.focus_handle() }
     }
 
     /// Borrow the assembled menu items (test/inspection surface).
@@ -306,10 +320,11 @@ impl Render for ContextMenuView {
         for (index, item) in &item_data {
             // Insert a divider ahead of the first open/run-group entry, mirroring
             // the winit separator between the copy head and the action group.
-            if item.action.is_open_group() && !prev_open_group {
+            // A divider separates the groups; it never leads a menu.
+            if item.action.is_open_group() && !prev_open_group && !rows.is_empty() {
                 rows.push(div().mx_2().my_1().h(px(1.0)).bg(colors.separator).into_any_element());
-                prev_open_group = true;
             }
+            prev_open_group |= item.action.is_open_group();
             rows.push(Self::render_item(colors, *index, item, cx));
         }
 

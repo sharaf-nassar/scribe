@@ -27,6 +27,7 @@ use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Column, Line, Point};
 use alacritty_terminal_gpui::term::Term;
 use alacritty_terminal_gpui::term::cell::{Cell, Flags, Hyperlink};
+use scribe_common::agent::{TAB_REFERENCE_PREFIX, tab_reference_session};
 
 use crate::link_feedback::{OpenOutcome, OpenTarget};
 
@@ -182,9 +183,15 @@ fn push_segment_cell(segments: &mut Vec<RowSegment>, row: i32, col: usize) {
     segments.push(RowSegment { row, col_start: col, col_end: col });
 }
 
-/// URL schemes recognised by the scanner.
+/// URL schemes recognised by the scanner and handed to the OS opener.
 const PREFIXES: &[&str] =
     &["https://", "http://", "ftp://", "file://", "mailto:", "ssh:", "telnet:"];
+
+/// A whole `scribe://tab/` match is a link too, but Scribe opens it itself, so
+/// it never joins the OS opener's allowlist above.
+fn incomplete_tab_reference(url: &str) -> bool {
+    url.starts_with(TAB_REFERENCE_PREFIX) && tab_reference_session(url).is_none()
+}
 
 /// Characters that terminate a URL when encountered (in addition to whitespace).
 const URL_TERMINATORS: &[char] = &['<', '>', '"', '\'', '`', '|'];
@@ -826,7 +833,7 @@ fn scan_logical_urls(
             continue;
         }
 
-        if url_char_len <= prefix_len_chars {
+        if url_char_len <= prefix_len_chars || incomplete_tab_reference(&url) {
             char_pos = line_end.max(char_pos.saturating_add(1));
             continue;
         }
@@ -874,7 +881,7 @@ fn cell_is_under_osc8(
 /// Match a URL prefix starting at `chars[pos]`, returning the prefix length in
 /// chars if found.
 fn match_prefix_chars(chars: &[char], pos: usize) -> Option<usize> {
-    for prefix in PREFIXES {
+    for prefix in PREFIXES.iter().chain([&TAB_REFERENCE_PREFIX]) {
         let prefix_len = prefix.chars().count();
         let matches = prefix
             .chars()
@@ -1779,6 +1786,22 @@ mod tests {
                 "-draft/notes",
                 "~alice/notes",
             ]
+        );
+    }
+
+    // @lat: [[test#GPUI URL Detection#Tab references are links Scribe opens itself]]
+    #[test]
+    fn whole_tab_references_are_detected_but_never_os_opened() {
+        let reference = scribe_common::agent::tab_reference(scribe_common::ids::SessionId::new());
+        assert_eq!(detected_urls(&format!("see ({reference}).")), std::slice::from_ref(&reference));
+        assert_eq!(
+            detected_urls(&format!("scribe://tab/nope {reference}x scribe://window/1")),
+            Vec::<String>::new(),
+            "only a whole reference is a link"
+        );
+        assert!(
+            !super::is_allowed_osc8_target(&reference),
+            "the OS opener's allowlist is unchanged"
         );
     }
 

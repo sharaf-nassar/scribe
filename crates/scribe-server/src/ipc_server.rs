@@ -5376,8 +5376,14 @@ async fn establish_local_first_frame(
             None
         }
         ClientMessage::DispatchAction { window_id, action } => {
-            handle_transient_dispatch_action(window_id, action, &server.window_shares, writer)
-                .await;
+            handle_transient_dispatch_action(
+                window_id,
+                action,
+                &server.window_shares,
+                &server.workspace_manager,
+                writer,
+            )
+            .await;
             None
         }
         ClientMessage::AgentRequest(request) => {
@@ -11819,16 +11825,43 @@ async fn handle_dispatch_action(
     send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
 }
 
+// @lat: [[server#Server#Agent API#Actions and input#Focus resolves the session's window]]
+/// The window an action targets: the caller's explicit choice, else the
+/// window holding the session a focus-session action names, else `None` for
+/// the caller's own fallback. A focus on a session no window holds is the
+/// session's `Err`, so a stale tab reference fails instead of guessing.
+async fn resolve_action_window(
+    requested_window_id: Option<WindowId>,
+    action: &AutomationAction,
+    workspace_manager: &RwLock<WorkspaceManager>,
+) -> Result<Option<WindowId>, SessionId> {
+    let (None, AutomationAction::FocusSession { session_id }) = (requested_window_id, action)
+    else {
+        return Ok(requested_window_id);
+    };
+    workspace_manager.read().await.window_for_session(*session_id).map(Some).ok_or(*session_id)
+}
+
 /// Route a local one-shot CLI action without registering or impersonating a
 /// window. Unlike a post-`Hello` client, the transient caller has no window of
-/// its own: an explicit target is allowed, while omission is unambiguous only
-/// when exactly one window is connected.
+/// its own: an explicit target is allowed, a focus-session action targets the
+/// session's window, and any other omission is unambiguous only when exactly
+/// one window is connected.
 async fn handle_transient_dispatch_action(
     requested_window_id: Option<WindowId>,
     action: AutomationAction,
     window_shares: &WindowShares,
+    workspace_manager: &RwLock<WorkspaceManager>,
     writer: &SharedWriter,
 ) {
+    let requested_window_id =
+        match resolve_action_window(requested_window_id, &action, workspace_manager).await {
+            Ok(window_id) => window_id,
+            Err(session_id) => {
+                send_error(writer, &format!("no open tab or pane for session {session_id}")).await;
+                return;
+            }
+        };
     let shares = window_shares.read().await;
     let target_window_id = match requested_window_id {
         Some(window_id) if shares.contains_key(&window_id) => Some(window_id),
@@ -11889,6 +11922,12 @@ async fn run_agent_action(
     action: AutomationAction,
     origin_session_id: Option<SessionId>,
 ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
+    let requested_window_id =
+        resolve_action_window(requested_window_id, &action, &context.workspace_manager)
+            .await
+            .map_err(|session_id| scribe_common::agent::AgentError::NotFound {
+                message: format!("session {session_id} is not open"),
+            })?;
     let (target_window_id, target_writer) = {
         let shares = context.window_shares.read().await;
         let target_window_id = if let Some(window_id) = requested_window_id {
@@ -12298,6 +12337,7 @@ fn copy_live_session_for_agent(
         ai_state: session.ai_state.clone(),
         ai_provider_hint: session.ai_provider_hint,
         task_label: session.task_label.clone(),
+        tab_id: None,
     }
 }
 
@@ -18445,6 +18485,86 @@ mod tests {
             Err(scribe_common::agent::AgentError::AmbiguousTarget { .. })
         ));
         assert!(transitions.try_recv().is_err(), "ambiguous actions must emit no activity");
+    }
+
+    // @lat: [[server#Server#Agent API#Actions and input#Focus resolves the session's window]]
+    #[tokio::test]
+    async fn focus_session_without_a_window_reaches_the_sessions_window() {
+        let TargetWindow {
+            window_shares,
+            window_id: owner,
+            writer: owner_writer,
+            client: mut owner_client,
+        } = new_target_window().await;
+        let (bystander_server, _bystander_client) = unix_stream_pair();
+        let (_read, bystander_write) = tokio::io::split(bystander_server);
+        let bystander_writer = test_shared_writer(bystander_write);
+        let bystander = WindowId::new();
+        window_shares.write().await.insert(
+            bystander,
+            WindowShare::new_single_controller(Participant::local(&bystander_writer, false)),
+        );
+        let tab = SessionId::new();
+        let workspaces = action_workspaces(&[(owner, tab), (bystander, SessionId::new())]);
+        let focus = |session_id| AutomationAction::FocusSession { session_id };
+
+        // The transient path a clicked link and `scribe action` use.
+        let (request_server, mut request_client) = unix_stream_pair();
+        let (_request_read, request_write) = tokio::io::split(request_server);
+        let request_writer = test_shared_writer(request_write);
+        handle_transient_dispatch_action(
+            None,
+            focus(tab),
+            &window_shares,
+            &workspaces,
+            &request_writer,
+        )
+        .await;
+        assert!(matches!(
+            read_message(&mut owner_client).await.unwrap(),
+            ServerMessage::RunAction { action: AutomationAction::FocusSession { session_id } } if session_id == tab
+        ));
+        assert!(matches!(
+            read_message(&mut request_client).await.unwrap(),
+            ServerMessage::ActionDispatched { window_id } if window_id == owner
+        ));
+        handle_transient_dispatch_action(
+            None,
+            focus(SessionId::new()),
+            &window_shares,
+            &workspaces,
+            &request_writer,
+        )
+        .await;
+        assert!(matches!(
+            read_message(&mut request_client).await.unwrap(),
+            ServerMessage::Error { .. }
+        ));
+
+        // The agent path resolves the same window instead of `ambiguous_target`.
+        let state = crate::agent_api::AgentApiState::default();
+        let context = || AgentActionContext {
+            state: state.clone(),
+            caller: 71,
+            window_shares: Arc::clone(&window_shares),
+            workspace_manager: Arc::clone(&workspaces),
+        };
+        let run = tokio::spawn(run_agent_action(context(), None, focus(tab), None));
+        let (correlation_id, action) = read_correlated_action(&mut owner_client).await;
+        assert!(
+            matches!(action, AutomationAction::FocusSession { session_id } if session_id == tab)
+        );
+        assert!(state.complete_action(
+            action_client_key(&owner_writer),
+            correlation_id,
+            scribe_common::agent::AgentActionOutcome::Completed,
+            None,
+        ));
+        run.await.unwrap().unwrap();
+        assert!(matches!(
+            run_agent_action(context(), None, focus(SessionId::new()), None).await,
+            Err(scribe_common::agent::AgentError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

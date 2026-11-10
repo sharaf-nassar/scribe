@@ -1348,6 +1348,7 @@ mod tests {
                     ai_state: None,
                     ai_provider_hint: None,
                     task_label: None,
+                    tab_id: None,
                 }
             })
             .await

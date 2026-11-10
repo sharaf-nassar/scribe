@@ -328,9 +328,7 @@ pub async fn probe_remote_env() -> Result<ServerMessage, RemoteDialError> {
 /// # Errors
 /// Returns the human-readable reason the round trip failed: the connect timed
 /// out or was refused, the write failed, or the server did not answer in time.
-pub(crate) async fn transient_local_request(
-    request: ClientMessage,
-) -> Result<ServerMessage, String> {
+pub async fn transient_local_request(request: ClientMessage) -> Result<ServerMessage, String> {
     let path = server_socket_path();
     let mut stream = tokio::time::timeout(LOCAL_PROBE_TIMEOUT, UnixStream::connect(&path))
         .await

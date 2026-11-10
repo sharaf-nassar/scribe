@@ -1,6 +1,7 @@
 //! Shared DTOs for Scribe's local agent control surface.
 
 use std::path::PathBuf;
+use std::str::FromStr as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +130,37 @@ impl AgentResponse {
             }
         }
     }
+}
+
+/// Scheme and kind that open a copied tab reference: `scribe://tab/<uuid>`.
+pub const TAB_REFERENCE_PREFIX: &str = "scribe://tab/";
+
+// @lat: [[common#Common#Agent Control Contract#Tab references]]
+/// The reference a tab's "Copy Tab Reference" puts on the clipboard.
+///
+/// A tab is named by its root session, the id the strip and the reported
+/// workspace tree already key it by, so the reference resolves through every
+/// command that takes a session id.
+#[must_use]
+pub fn tab_reference(tab: SessionId) -> String {
+    format!("{TAB_REFERENCE_PREFIX}{}", tab.to_full_string())
+}
+
+/// The tab a complete `scribe://tab/<uuid>` reference names, or `None` for any
+/// other text: what a clicked link must be before Scribe opens it as a tab.
+#[must_use]
+pub fn tab_reference_session(value: &str) -> Option<SessionId> {
+    SessionId::from_str(value.strip_prefix(TAB_REFERENCE_PREFIX)?).ok()
+}
+
+/// The session a bare session UUID or a pasted tab reference names.
+///
+/// # Errors
+///
+/// Returns the UUID parse error when the value is neither form.
+pub fn session_from_reference(value: &str) -> Result<SessionId, uuid::Error> {
+    let value = value.trim();
+    SessionId::from_str(value.strip_prefix(TAB_REFERENCE_PREFIX).unwrap_or(value))
 }
 
 /// Version of the local agent control surface this build implements.
@@ -266,6 +298,11 @@ pub struct AgentSession {
     pub task_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_fill_percent: Option<u8>,
+    /// The tab this session is a pane of, named by the tab's root session:
+    /// the id a copied `scribe://tab/` reference carries. Absent until the
+    /// session's window reports a layout naming it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<SessionId>,
     pub is_caller: bool,
 }
 
@@ -347,6 +384,7 @@ mod tests {
                 ai_state: Some(AiState::Processing),
                 task_label: Some(String::from("build")),
                 context_fill_percent: Some(42),
+                tab_id: Some(session_id()),
                 is_caller: true,
             }],
             snapshot_id: 7,
@@ -530,6 +568,23 @@ mod tests {
         for action in &ordinary {
             assert_eq!(AgentCapability::for_action(action), AgentCapability::DispatchAction);
         }
+    }
+
+    // @lat: [[common#Common#Agent Control Contract#Tab references]]
+    #[test]
+    fn tab_references_resolve_to_the_session_they_name() {
+        let tab = session_id();
+        let reference = tab_reference(tab);
+        assert_eq!(reference, format!("scribe://tab/{}", tab.to_full_string()));
+        assert_eq!(session_from_reference(&reference).ok(), Some(tab));
+        assert_eq!(session_from_reference(&format!(" {reference}\n")).ok(), Some(tab));
+        assert_eq!(session_from_reference(&tab.to_full_string()).ok(), Some(tab));
+        for invalid in ["scribe://tab/", "scribe://window/x", "tab", ""] {
+            assert!(session_from_reference(invalid).is_err(), "{invalid:?} is not a reference");
+        }
+        assert_eq!(tab_reference_session(&reference), Some(tab));
+        assert_eq!(tab_reference_session(&tab.to_full_string()), None, "links need the scheme");
+        assert_eq!(tab_reference_session(&format!("{reference}x")), None);
     }
 
     #[test]

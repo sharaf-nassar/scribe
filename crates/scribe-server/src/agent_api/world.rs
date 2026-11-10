@@ -52,6 +52,8 @@ pub trait WorkspaceView {
     fn window_for_session(&self, session_id: SessionId) -> Option<WindowId>;
     /// A workspace's user-visible name, if it has one.
     fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String>;
+    /// The root session of the tab a session is, or is a pane of, if reported.
+    fn tab_for_session(&self, session_id: SessionId) -> Option<SessionId>;
 }
 
 /// Window fields copied from the same guards used by `ListWindows`.
@@ -88,6 +90,9 @@ pub struct CapturedSession {
     pub ai_state: Option<AiProcessState>,
     pub ai_provider_hint: Option<AiProvider>,
     pub task_label: Option<String>,
+    /// Filled by [`capture`] from the workspace tree; copy callbacks leave it
+    /// `None`.
+    pub tab_id: Option<SessionId>,
 }
 
 /// One immutable image copied from the three authoritative server registries.
@@ -165,8 +170,9 @@ where
     let sessions: Vec<CapturedSession> = session_ids
         .into_iter()
         .filter_map(|session_id| {
-            live.get(&session_id).map(|session| {
-                copy_session(session_id, session, workspaces.window_for_session(session_id))
+            live.get(&session_id).map(|session| CapturedSession {
+                tab_id: workspaces.tab_for_session(session_id),
+                ..copy_session(session_id, session, workspaces.window_for_session(session_id))
             })
         })
         .collect();
@@ -281,6 +287,7 @@ fn agent_session(session: CapturedSession, is_caller: bool) -> AgentSession {
         ai_state,
         task_label: session.task_label,
         context_fill_percent,
+        tab_id: session.tab_id,
         is_caller,
     }
 }
@@ -362,6 +369,7 @@ mod tests {
             }),
             ai_provider_hint: Some(AiProvider::CodexCode),
             task_label: Some(String::from("Run tests")),
+            tab_id: Some(session_id),
         }
     }
 
@@ -401,6 +409,7 @@ mod tests {
                     ai_state: None,
                     ai_provider_hint: Some(AiProvider::Pi),
                     task_label: None,
+                    tab_id: None,
                 },
                 CapturedSession {
                     session_id: other,
@@ -411,6 +420,7 @@ mod tests {
                     ai_state: None,
                     ai_provider_hint: None,
                     task_label: None,
+                    tab_id: None,
                 },
             ],
             snapshot_id: 77,
@@ -447,6 +457,7 @@ mod tests {
                 ai_state: None,
                 ai_provider_hint: None,
                 task_label: None,
+                tab_id: None,
             })
             .await;
         let snapshot = world(capture, Some(session_id));
@@ -486,6 +497,7 @@ mod tests {
             assert_eq!(caller.ai_state, Some(AiState::Processing));
             assert_eq!(caller.context_fill_percent, Some(42));
             assert_eq!(caller.task_label.as_deref(), Some("Run tests"));
+            assert_eq!(caller.tab_id, Some(fixture.caller));
         }
 
         let sibling =
